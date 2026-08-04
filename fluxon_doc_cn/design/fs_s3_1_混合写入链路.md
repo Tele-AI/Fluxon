@@ -13,14 +13,14 @@
 | 层次 | 选择 | 目的 |
 | --- | --- | --- |
 | S3 写入策略 | `put_small_object` 或 `write-session` | 小对象合并为一次 RPC，大对象使用流水线 |
-| write-session 数据面 | KV-ref 或 Raw RPC | 条件允许时减少大数据 RPC 和 Agent 侧复制 |
+| write-session 数据面 | KV-ref，失败时 Raw RPC 兜底 | 大 payload 统一复用 KV 的本地与跨机传输能力 |
 | KV 生命周期 | Controller 共享 lease 和 keepalive | 防止传输中的临时 key 提前过期 |
 | 临时 key 回收 | Controller-owned cleanup actor | 在 put 结果不确定和 delete 失败时持续收敛 |
 | S3 读取路径 | holder-backed `Bytes` | KV 缓存命中时避免完整解码 `FlatDict` |
 | HTTP 传输 | `TCP_NODELAY` | 避免小响应 body 被 Nagle 算法延迟 |
 | 关闭依赖 | FS 先于 KV，actor 先停 admission 再 join | 证明 holder 释放后才允许 KV unmap |
 
-KV Shared Memory 是通用 `write-session` 的优化，Python FS 也能复用；在写入链路的三个层次中，只有 `4 MiB` 切换策略属于 S3 Gateway。
+KV-backed payload 是通用 `write-session` 的数据路径，Python FS 也能复用；同 Owner 共享内存只是 KV 内部的一项本地优化。在写入链路的三个层次中，只有 `4 MiB` 切换策略属于 S3 Gateway。
 
 ## 1. 接口与内部链路索引
 
@@ -40,8 +40,8 @@ KV Shared Memory 是通用 `write-session` 的优化，Python FS 也能复用；
 - **S3 Gateway**：接收 S3 对象 I/O 和 multipart 控制请求，并维护每个请求的混合写入器。
 - **本地 `FluxonFsAgent` Controller**：调用方进程内的路由与会话客户端；在 S3 路径中，它和 Gateway 同处 FS Master 进程，管理 export 节点快照、session、发送队列和 sender。
 - **目标 FS Agent**：打开目标文件，接收 frame，并通过 WriteExecutor 写入文件。
-- **KV Owner**：管理共享 `mmap.file`、内存分配和 holder 生命周期。
-- **KV Master**：管理 KV 元数据和放置；KV-ref 本地路径不会让它转发文件 payload。
+- **KV Owner**：管理共享 `mmap.file`、内存分配和 holder 生命周期，并通过 KV Transfer Engine 完成跨 Owner payload 搬运。
+- **KV Master**：管理 KV 元数据和放置；文件 payload 由 KV 数据面搬运，不经 FS Master 转发。
 
 S3 请求的常态路径不会逐次查询中心 FS Master。`FluxonFsAgent` Controller 按 export 使用静态节点配置或缓存的在线 Agent 快照，以 round-robin 选择一个节点后直接发起 Agent RPC；只有 `agent_registry` 快照过期或命中 `NodeNotFound` 时，才向 FS Master export registry 刷新快照。路由不能直接使用未按 export 过滤的集群成员列表，因为其中可能包含没有提供该 bucket/export 的 Agent。write-session 打开后会固定目标 Agent，直到 finalize 或 abort。
 
@@ -130,7 +130,7 @@ sequenceDiagram
         opt write-session 已打开
             loop 存在可发送 batch，直到 finalize barrier
                 C->>S: 调度 batch（受 session 在途窗口限制）
-                S->>A: KV-ref 或 Raw batch
+                S->>A: KV-ref batch（失败时 Raw 重试）
                 A->>A: 校验并放入 Agent 有界写队列
                 A-->>S: ACK（已入队或已去重；尚未表示写盘完成）
                 S-->>C: 更新 acked 状态并释放发送窗口
@@ -405,11 +405,11 @@ sequenceDiagram
         loop Controller 队列中存在可发 batch
             C->>S: 调度不超过剩余窗口的 batch
             par sender task 发送 batch n
-                S->>A: batch n（KV-ref 或 Raw）
+                S->>A: batch n（KV-ref，失败时 Raw）
                 A-->>S: ACK（已入队或已去重；尚未表示写盘完成）
                 S-->>C: batch n ACK
             and sender task 发送 batch n+1
-                S->>A: batch n+1（KV-ref 或 Raw）
+                S->>A: batch n+1（KV-ref，失败时 Raw）
                 A-->>S: ACK（已入队或已去重；尚未表示写盘完成）
                 S-->>C: batch n+1 ACK
             and 其他可用 sender task
@@ -471,23 +471,22 @@ sequenceDiagram
 
 finalize 失败时必须进入 abort 分支；abort 本身的失败不覆盖原始 finalize 错误。
 
-## 4. KV Shared Memory 数据面
+## 4. KV-backed payload 数据面
 
-### 4.1 何时使用 KV-ref
+### 4.1 数据路径只按大小切换
 
-session 打开时先判断它是否具备 KV-ref 候选条件；每个 batch 发送前还会重新检查 topology、Owner 和 node generation。使用 KV-ref 需要同时满足：
+S3 Gateway 只根据累计对象大小选择数据路径：小于 `4 MiB` 使用单次 `put_small_object` RPC；达到或超过 `4 MiB` 后进入 `write-session`，每个 batch 都先使用 KV-ref。Controller 与目标 Agent 是否属于同一 Owner、同一 share group 或同一主机，不参与 FS 层的数据路径选择。
 
-- Controller 和目标 Agent 属于同一个 KV share group；
-- 两端完整 Owner 引用一致，即 `owner_id + owner_start_time`；
-- 该 Owner generation 对应当前仍在线的 KV Client 节点；
-- 两端 node generation 和当前 topology snapshot 一致；
-- Agent 声明支持 `fluxon_fs_write_session_kv_ref_v1`；
-- Owner 具有有效 sub-cluster，并能保证共享 Owner 内的本地放置；
-- 如果当前 cluster 的 client 放置范围要求 SSD，该 Owner 还必须声明 `kv_ssd_storage`。
+KV-ref 是 write-session 的引用式 payload 路径。Controller 先将 batch 写入临时 KV key，再向 Agent 发送 key、offset、frame 边界和 sequence。Agent 调用普通 `kv_get` 获取 payload，KV 层自行选择具体传输方式：
 
-只比较 `owner_id` 不够，因为 Owner 重启后 id 可能不变，但旧 mmap generation 已经失效。
+| KV 拓扑 | KV 内部行为 | FS 层行为 |
+| --- | --- | --- |
+| Controller 与 Agent 复用同一 Owner allocation | 共享 mmap 本地读取 | 发送同一种 DataRef |
+| Controller 与 Agent 位于不同 Owner 或不同机器 | `kv_get` 通过 KV Transfer Engine 搬运到 Agent 可访问的 allocation | 仍发送同一种 DataRef |
 
-任一条件不满足时直接使用 Raw RPC，不会先发送 KV-ref 请求做能力探测。已经使用 KV-ref 的 session 如果后续检查失败，会永久降级为 raw，不会在同一 session 内再次升级。这条路径不要求配置 RDMA。
+`PreferredSubCluster` 只是一项可选的 source-local 放置提示。提示缺失或本地 Owner 不满足存储条件时，Controller 仍执行 `kv_put`，由 KV router 选择其他 Owner，不会因此切换到 Raw RPC。
+
+Raw RPC 只用于 KV-backed payload 运行失败后的正确性兜底。共享 lease 无法建立，或某个 batch 的 `kv_put`、DataRef RPC、`kv_get`、引用校验失败时，session 才会降级 raw；Owner 不同本身不是失败条件。
 
 ### 4.2 KV-ref 的写入过程
 
@@ -495,10 +494,10 @@ session 打开时先判断它是否具备 KV-ref 候选条件；每个 batch 发
 
 1. Controller 在 put 开始前先向 cleanup actor 注册 `temp_key + lease_id`；
 2. cleanup actor 作为 put future 和 key 的唯一最终回收者，执行 `kv_put(temp_key, batch, lease)`；
-3. KV Owner 把数据复制一次到共享 mmap；
-4. put 确认成功后，Controller 通过引用 RPC 发送 session、key、offset、frame 边界、Owner generation 和 sequence，不携带文件 payload；
-5. Agent 校验权限、session、generation 和 key 后调用 `kv_get(temp_key)`，单次 get 最长等待 `10 秒`；
-6. `kv_get` 返回 holder-backed `Bytes`，切分 frame 时只创建 slice，不复制到新的 Agent heap buffer；
+3. KV 根据自身放置策略将 batch 写入 Owner allocation；同 Owner 可直接使用共享 mmap，跨 Owner 由 KV Transfer Engine 负责搬运；
+4. put 确认成功后，Controller 通过引用 RPC 发送 session、key、offset、frame 边界、source node generation 和 sequence，不携带文件 payload；
+5. Agent 校验权限、session、source generation 和 key 后调用普通 `kv_get(temp_key)`，单次 get 最长等待 `10 秒`；
+6. `kv_get` 在本地命中时直接返回 holder；跨 Owner 时先由 KV 完成远程传输，再返回 Agent 可持有的 payload；切分 frame 时只创建 `Bytes` slice；
 7. Agent 将 frame 放入写队列并返回 ACK；
 8. sender 放下 cleanup ticket 只表示不再借用 key，cleanup actor 随后负责 delete 及重试；
 9. Agent holder 可在 key 删除后继续固定底层 allocation；最后一个 slice 写完并释放 holder 后，mmap allocation 才可以回收。
@@ -506,8 +505,9 @@ session 打开时先判断它是否具备 KV-ref 候选条件；每个 batch 发
 因此这不是端到端零拷贝。准确说法是：
 
 ```text
-仍然存在：Controller Bytes → KV mmap 的一次 memcpy
-减少的是：大 payload RPC 及 Agent RPC buffer 的额外复制
+同 Owner：Controller Bytes → KV mmap 的一次 memcpy
+跨 Owner：除本地 copy 外，还存在 KV 内部的跨机传输
+减少的是：FS DataRef RPC 不再携带大 payload，FS 不需要暴露第二套 Transfer API
 ```
 
 ### 4.3 Raw RPC 和自动降级
@@ -518,22 +518,20 @@ Raw RPC 指 RPC 直接携带数据本身：
 Controller batch → data RPC raw_bytes → Agent 写队列
 ```
 
-以下情况会使用或降级到 Raw RPC：
+以下运行失败会触发 Raw RPC：
 
-- 两端不共享同一 Owner generation；
-- Agent 不支持 KV-ref；
-- `kv_put`、引用 RPC、`kv_get` 或校验失败；
+- `kv_put`、引用 RPC、`kv_get` 或引用校验失败；
 - 共享 lease 分配或 keepalive 失败。
 
 单 batch 的 KV-ref 失败后，Controller 会用相同 sequence、offset 和原数据通过 Raw RPC 重发，并让该 session 后续固定使用 raw。Agent 使用 received/written sequence 去重，因此 KV-ref 已入队但 ACK 丢失时不会重复写入。
 
-### 4.4 当前实现的 Master–Agent 时序
+### 4.4 当前实现的 Controller–Agent 时序
 
-当前实现按职责拆成五个时序：session 打开、KV-ref 成功、直接 Raw RPC、KV-ref 失败降级和 finalize。后台 keepalive 是独立生命周期，放在第 5 节说明。
+当前实现按职责拆成五个时序：session 打开、KV-ref 成功、Raw 兜底模式、KV-ref 失败降级和 finalize。后台 keepalive 是独立生命周期，放在第 5 节说明。
 
-#### 4.4.1 打开 session 并选择候选数据面
+#### 4.4.1 打开 session 并建立 KV payload 生命周期
 
-session 打开时只确定 KV-ref 候选资格。sender 在每个 batch 发送前还会重验 topology，因此候选资格不代表后续 batch 一定使用 KV-ref。
+对象达到 `4 MiB` 后才会打开 session。Controller 不检查目标 Agent 的 Owner 或 share group；它只获取 Controller 级共享 lease，为后续临时 KV key 建立生命周期。
 
 ```mermaid
 sequenceDiagram
@@ -548,23 +546,17 @@ sequenceDiagram
     C->>A: open_write_session
     A->>A: 打开文件并创建有界写队列
     A-->>C: remote session id
-    C->>C: 检查 share group、Owner generation、topology 和 capability
-
-    alt 不具备 KV-ref 候选条件
-        C->>C: 记录 Raw 模式
-    else 具备 KV-ref 候选条件
-        C->>C: shared_lease.acquire()（single-flight）
-        alt 共享 lease 已激活
-            C->>C: 复用 lease_id + generation
-        else 需要首次申请
-            C->>M: allocate lease(TTL=180s)
-            alt 申请并注册成功
-                M-->>C: lease_id
-                C->>K: register(lease_id, failure callback)
-                K-->>C: registered
-            else 申请或注册失败
-                C->>C: manager 进入 Failed，记录 Raw 模式
-            end
+    C->>C: shared_lease.acquire()（single-flight）
+    alt 共享 lease 已激活
+        C->>C: 复用 lease_id + generation
+    else 需要首次申请
+        C->>M: allocate lease(TTL=180s)
+        alt 申请并注册成功
+            M-->>C: lease_id
+            C->>K: register(lease_id, failure callback)
+            K-->>C: registered
+        else 申请或注册失败
+            C->>C: manager 进入 Failed，记录 Raw 兜底模式
         end
     end
     C-->>G: local session handle
@@ -573,7 +565,7 @@ sequenceDiagram
 
 #### 4.4.2 KV-ref batch 成功时序
 
-sender 仅在发送当前 batch 前的重验仍成功时进入这条路径。临时 key 在 put 前就被 cleanup actor 记录；CleanupTicket 只保护 sender 借用期，不拥有最终删除权。
+只要 session 尚未因运行失败降级，sender 就为每个 batch 进入 KV-ref 路径。临时 key 在 put 前先由 cleanup actor 记录；CleanupTicket 只保护 sender 借用期，不拥有最终删除权。
 
 ```mermaid
 sequenceDiagram
@@ -582,7 +574,7 @@ sequenceDiagram
     participant C as 本地 FluxonFsAgent Controller
     participant S as Sender Pool
     participant D as KV Cleanup Actor
-    participant O as KV Owner / mmap
+    participant K as Fluxon KV / Owners / Transfer Engine
     participant M as KV Master
     participant A as 目标 FS Agent
     participant W as WriteExecutor
@@ -590,29 +582,34 @@ sequenceDiagram
     G->>C: submit 连续 payload
     C->>C: 拆成不超过 8 MiB frame并执行背压
     C->>S: 提交 session 调度票据
-    S->>S: 合并同一 submit 的最多 4 frame<br/>重验 topology 和 Owner generation
+    S->>S: 合并同一 submit 的最多 4 frame
     S->>D: begin_put(temp_key, lease_id, put future)
     D-->>S: CleanupTicket（最多跟踪 64 keys）
-    D->>O: kv_put(temp_key, batch, shared lease)
-    O->>M: PutStart(key, len, PreferredSubCluster)
-    M-->>O: placement + mmap offset
-    O->>O: memcpy batch 到共享 mmap
-    O->>M: PutDone(key, lease_id)
-    M-->>O: commit Ok
-    O-->>D: kv_put Ok
+    D->>K: kv_put(temp_key, batch, shared lease)<br/>可选 PreferredSubCluster
+    K->>M: PutStart(key, len)
+    M-->>K: placement + allocation
+    K->>K: 将 batch 写入选定 Owner allocation
+    K->>M: PutDone(key, lease_id)
+    M-->>K: commit Ok
+    K-->>D: kv_put Ok
     D-->>S: put completion Ok
-    S->>A: DataRef(session, key, offset, frame lengths, generation, seq)
-    A->>A: 校验权限、session、key、nonce 和 topology
-    A->>O: kv_get(temp_key)
-    O-->>A: holder-backed Bytes
+    S->>A: DataRef(session, key, offset, frame lengths, source generation, seq)
+    A->>A: 校验权限、session、source generation、key 和 nonce
+    A->>K: kv_get(temp_key)
+    alt Agent 可直接访问当前 allocation
+        K-->>A: holder-backed Bytes
+    else payload 位于其他 Owner
+        K->>K: Transfer Engine 搬运到 Agent 可访问的 allocation
+        K-->>A: holder-backed payload
+    end
     A->>A: 创建 frame slice 并放入 32 MiB 有界队列
     A-->>S: ACK（已入队）
     S->>D: drop CleanupTicket（释放 borrower）
 
     par Cleanup actor 回收 key
         loop delete 失败时按退避顺序重试
-            D->>O: kv_delete(temp_key)
-            O-->>D: Deleted / NotFound / error
+            D->>K: kv_delete(temp_key)
+            K-->>D: Deleted / NotFound / error
         end
     and Sender 完成当前 batch
         S-->>C: 更新 sent / pending / acked 状态
@@ -625,9 +622,9 @@ sequenceDiagram
 
 `par` 中的三个分支真实并发：key 被删除不会使已取得的 holder 失效。同一 key 的 delete attempt 是顺序重试，不同 key 的 cleanup task 可同时在途。
 
-#### 4.4.3 直接 Raw RPC 时序
+#### 4.4.3 Raw 兜底模式时序
 
-session 打开时没有 KV-ref 候选资格，或者 sender 发送前发现 topology 已失效时，会跳过 KV 请求并直接携带 payload。
+共享 lease 无法建立，或 session 先前的 KV-ref batch 已经失败时，后续 batch 会直接携带 payload。Owner 不同不会进入这条分支。
 
 ```mermaid
 sequenceDiagram
@@ -641,7 +638,7 @@ sequenceDiagram
     G->>C: submit 连续 payload
     C->>C: 拆分 frame 并执行背压
     C->>S: 提交 session 调度票据
-    S->>S: 确认 Raw 模式或 topology 重验失败
+    S->>S: 确认 session 已处于 Raw 兜底模式
     S->>A: Raw / transfer RPC(session, seq, offset, raw_bytes)
     A->>A: 校验并入队，或按 seq 判定为重复
     A-->>S: ACK（已入队或已去重）
@@ -662,25 +659,25 @@ sequenceDiagram
     autonumber
     participant S as Sender Pool
     participant D as KV Cleanup Actor
-    participant O as KV Owner / mmap
+    participant K as Fluxon KV
     participant A as 目标 FS Agent
     participant W as WriteExecutor
 
     alt kv_put 失败或超时
         S->>D: begin_put 并等待 put completion
-        D->>O: kv_put(temp_key, batch, shared lease)
-        O-->>D: error / 响应超时
+        D->>K: kv_put(temp_key, batch, shared lease)
+        K-->>D: error / 响应超时
         D-->>S: error / caller timeout
         S->>D: drop CleanupTicket
-        Note over D,O: actor 将其标记为 CommitUnknown<br/>即使 delete 返回 NotFound 也会周期复查
+        Note over D,K: actor 将其标记为 CommitUnknown<br/>即使 delete 返回 NotFound 也会周期复查
     else kv_put 成功，但 DataRef 未获得成功 ACK
         S->>D: begin_put
-        D->>O: kv_put(temp_key, batch, shared lease)
-        O-->>D: Ok
+        D->>K: kv_put(temp_key, batch, shared lease)
+        K-->>D: Ok
         D-->>S: Ok（Committed）
-        S->>A: DataRef(session, key, offset, frame lengths, generation, seq)
-        A->>O: kv_get(temp_key)
-        O-->>A: holder-backed Bytes / error
+        S->>A: DataRef(session, key, offset, frame lengths, source generation, seq)
+        A->>K: kv_get(temp_key)
+        K-->>A: holder-backed payload / error
         A-->>S: NACK / RPC error
         Note over S,A: 也包括 Agent 已入队但成功 ACK 丢失
         S->>D: drop CleanupTicket
@@ -688,8 +685,8 @@ sequenceDiagram
 
     par Cleanup actor 持续收敛临时 key
         loop 直到 Committed 已回收，或 Controller shutdown
-            D->>O: kv_delete(temp_key)
-            O-->>D: result
+            D->>K: kv_delete(temp_key)
+            K-->>D: result
         end
     and 数据面立即降级
         S->>S: 将 session 永久降级为 Raw
@@ -968,7 +965,7 @@ FS Master 的 Axum HTTP listener 启用 `tcp_nodelay(true)`，即在 TCP 连接�
 - **连续写入**：同一 delivery barrier 之前，payload 必须按连续、无重叠 offset 提交。
 - **准确长度**：`finalize` 将文件设置为实际对象长度，覆盖旧的较长对象时不会留下旧尾部。
 - **完整前缀**：`wait` 和 `finalize` 要求 `0..expected_frames` 的 received/written sequence 形成连续前缀，只观察最大 sequence 不足以证明已交付。
-- **安全引用**：Agent 在 `kv_get` 前校验 token、路径、session、frame 数量与长度、总长度、offset 溢出、Owner generation、nonce 和根据请求重算的临时 key。
+- **安全引用**：Agent 在 `kv_get` 前校验 token、路径、session、frame 数量与长度、总长度、offset 溢出、source node generation、nonce 和根据请求重算的临时 key。
 - **幂等重发**：Agent 根据 sequence 去重；部分 frame 已入队时，重发只补齐剩余 frame。
 - **跨重启防混淆**：Agent session id 由进程实例 UUID 和递增计数器组成，Agent 重启后不会把延迟 frame 投递到恰好复用计数器值的新 session。
 - **临时 key 最终回收**：CleanupTicket drop 不会丢失 key authority；显式 delete 重试与 shutdown 后的 lease TTL 共同构成回收保障。
@@ -1225,7 +1222,7 @@ MQ 也使用单一 `MqFrameworkShutdown` task 共享完成结果。`MpscContext.
 
 ## 11. 总结
 
-FluxonFS S3 写入采用两级选择：小对象通过一次 `put_small_object` RPC 完成父目录创建、覆盖和写入，大对象复用通用 `write-session`；进入 session 后，再根据部署条件选择 KV-ref 或 Raw RPC。KV-ref 通过共享 mmap 和 holder 减少大 payload RPC 与 Agent 侧复制，Raw RPC 保证跨 Owner 和异常场景仍可正确写入。Controller 级共享 lease 将 lease 和 keepalive 开销控制为每 FS Master `O(1)`，cleanup actor 在 put 不确定和 delete 失败时继续持有临时 key 的最终回收权。
+FluxonFS S3 写入只按大小选择常态数据路径：小对象通过一次 `put_small_object` RPC 完成父目录创建、覆盖和写入，大对象进入通用 `write-session` 并以 KV-ref 传递 batch。KV 在同 Owner 时复用共享 mmap，在跨 Owner 或跨机时由 Transfer Engine 完成搬运；FS 无需暴露第二套 Transfer API。Raw RPC 只承担 KV-backed payload 运行失败后的正确性兜底。Controller 级共享 lease 将 lease 和 keepalive 开销控制为每 FS Master `O(1)`，cleanup actor 在 put 不确定和 delete 失败时继续持有临时 key 的最终回收权。
 
 数据面的并发都有明确边界：Gateway 入口顺序提交，Controller 允许窗口内 batch inflight，Agent 按连续 sequence 写入，GET 使用滑动 piece 窗口，keepalive 则在 actor 槽位上有界并发。幂等 sequence、finalize、Controller/Agent holder barrier、framework-owned task registry 和 FS-before-KV pre-shutdown ACK 共同构成可重试的安全关闭语义。
 

@@ -11,7 +11,6 @@ use anyhow::Context;
 use prost::bytes::Bytes;
 use serde_json::json;
 
-use fluxon_commu::{ShareGroupOwnerRef, share_group_owner_ref_from_metadata};
 use fluxon_framework_compiled::shutdown::ViewShutdownExt;
 use fluxon_fs_core::config::{
     FLUXON_FS_COMPONENT_METADATA_KEY, FLUXON_FS_CONFIG_ACCESS_MODEL_JSON_KEY,
@@ -1399,16 +1398,10 @@ async fn async_main(
     agent_mounts: Vec<AgentMount>,
 ) -> anyhow::Result<()> {
     let instance_key = kv_cfg.instance_key.to_string();
-    let startup_member_metadata = HashMap::from([
-        (
-            FLUXON_FS_COMPONENT_METADATA_KEY.to_string(),
-            FluxonFsComponent::Agent.as_metadata_value().to_string(),
-        ),
-        (
-            write_session_rpc::FS_WRITE_SESSION_KV_REF_CAPABILITY_METADATA_KEY.to_string(),
-            "true".to_string(),
-        ),
-    ]);
+    let startup_member_metadata = HashMap::from([(
+        FLUXON_FS_COMPONENT_METADATA_KEY.to_string(),
+        FluxonFsComponent::Agent.as_metadata_value().to_string(),
+    )]);
     let (admin_browse_export_name, admin_browse_export) =
         admin_browse_export_for_agent_instance_key_v1(instance_key.as_str());
     let mut internal_exports: BTreeMap<String, FluxonFsExport> = BTreeMap::new();
@@ -4984,7 +4977,7 @@ fn write_session_data_ref_ack(
     }
 }
 
-fn validate_write_session_data_ref_topology(
+fn validate_write_session_data_ref_source_identity(
     framework: &fluxon_kv::Framework,
     from_node: &str,
     req: &FsWriteSessionDataRefFrame,
@@ -5008,33 +5001,6 @@ fn validate_write_session_data_ref_topology(
         return Err(format!(
             "write_session data-ref source generation mismatch: node={} request={} current={}",
             from_node, req.source_node_start_time, source.node_start_time
-        ));
-    }
-
-    let request_owner = ShareGroupOwnerRef {
-        owner_id: req.owner_id.clone(),
-        owner_start_time: req.owner_start_time,
-    };
-    if request_owner.owner_id.trim().is_empty() {
-        return Err("write_session data-ref owner_id must be non-empty".to_string());
-    }
-    let source_owner = share_group_owner_ref_from_metadata(&source.metadata).ok_or_else(|| {
-        format!(
-            "write_session data-ref source has no complete share-group owner: node={}",
-            from_node
-        )
-    })?;
-    let receiver_owner =
-        share_group_owner_ref_from_metadata(&receiver.metadata).ok_or_else(|| {
-            format!(
-                "write_session data-ref receiver has no complete share-group owner: node={}",
-                receiver.id
-            )
-        })?;
-    if source_owner != request_owner || receiver_owner != request_owner {
-        return Err(format!(
-            "write_session data-ref share-group owner mismatch: request={:?} source={:?} receiver={:?}",
-            request_owner, source_owner, receiver_owner
         ));
     }
 
@@ -5062,18 +5028,6 @@ fn validate_write_session_data_ref_topology(
             from_node, req.source_node_start_time, source_peer_gen.node_start_time
         ));
     }
-    let tier_source_owner = tier_snapshot.share_group_owner(&source_node);
-    let tier_receiver_owner = tier_snapshot.share_group_owner(&receiver_node);
-    if !tier_snapshot.same_share_group(&receiver_node, &source_node)
-        || tier_source_owner != Some(&request_owner)
-        || tier_receiver_owner != Some(&request_owner)
-    {
-        return Err(format!(
-            "write_session data-ref tier share-group mismatch: request={:?} source={:?} receiver={:?}",
-            request_owner, tier_source_owner, tier_receiver_owner
-        ));
-    }
-
     if req.nonce == 0 {
         return Err("write_session data-ref nonce must be non-zero".to_string());
     }
@@ -5205,7 +5159,7 @@ async fn handle_write_session_data_ref_typed(
         Err(detail) => return write_session_data_ref_ack(&req, false, detail),
     };
     if let Err(detail) =
-        validate_write_session_data_ref_topology(framework, from_node.as_ref(), &req)
+        validate_write_session_data_ref_source_identity(framework, from_node.as_ref(), &req)
     {
         return write_session_data_ref_ack(&req, false, detail);
     }
@@ -6515,8 +6469,6 @@ mod tests {
             total_len: 5,
             part_lengths: vec![3, 2],
             source_node_start_time: 101,
-            owner_id: "owner-a".to_string(),
-            owner_start_time: 202,
             lease_id: 303,
             nonce: 404,
             fs_rpc_token: None,

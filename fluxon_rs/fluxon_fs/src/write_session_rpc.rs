@@ -27,9 +27,6 @@ pub const FS_FINALIZE_WRITE_SESSION_REQ_MSG_ID: u32 = 7114;
 pub const FS_FINALIZE_WRITE_SESSION_RESP_MSG_ID: u32 = 7115;
 pub const FS_PUT_SMALL_OBJECT_REQ_MSG_ID: u32 = 7116;
 pub const FS_PUT_SMALL_OBJECT_RESP_MSG_ID: u32 = 7117;
-pub const FS_WRITE_SESSION_KV_REF_CAPABILITY_METADATA_KEY: &str =
-    "fluxon_fs_write_session_kv_ref_v1";
-
 pub(crate) fn write_session_kv_payload_key(
     from_node: &str,
     source_start: i64,
@@ -225,8 +222,6 @@ pub struct FsWriteSessionDataRefFrame {
     pub total_len: u64,
     pub part_lengths: Vec<u32>,
     pub source_node_start_time: i64,
-    pub owner_id: String,
-    pub owner_start_time: i64,
     pub lease_id: u64,
     pub nonce: u128,
     pub fs_rpc_token: Option<String>,
@@ -1196,8 +1191,6 @@ mod tests {
             total_len: 8192,
             part_lengths: vec![4096, 4096],
             source_node_start_time: 101,
-            owner_id: "owner-a".to_string(),
-            owner_start_time: 202,
             lease_id: 303,
             nonce: 404,
             fs_rpc_token: Some("token-a".to_string()),
@@ -1220,8 +1213,6 @@ mod tests {
         assert_eq!(decoded.total_len, frame.total_len);
         assert_eq!(decoded.part_lengths, frame.part_lengths);
         assert_eq!(decoded.source_node_start_time, frame.source_node_start_time);
-        assert_eq!(decoded.owner_id, frame.owner_id);
-        assert_eq!(decoded.owner_start_time, frame.owner_start_time);
         assert_eq!(decoded.lease_id, frame.lease_id);
         assert_eq!(decoded.nonce, frame.nonce);
         assert_eq!(decoded.fs_rpc_token, frame.fs_rpc_token);

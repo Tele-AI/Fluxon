@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use equivalent::Equivalent;
 use fluxon_commu::p2p::RpcTransportPolicy;
-use fluxon_commu::{NodeRole, ShareGroupOwnerRef, share_group_owner_ref_from_metadata};
+use fluxon_commu::{NodeRole, share_group_owner_ref_from_metadata};
 use hashbrown::HashMap;
 use parking_lot::{Condvar, Mutex, RwLock};
 use prost::bytes::{Buf, Bytes, BytesMut};
@@ -348,21 +348,10 @@ struct RemoteWriteSessionClientSendBatch {
 }
 
 #[derive(Debug, Clone)]
-struct RemoteWriteSessionKvSharedConfig {
-    owner: ShareGroupOwnerRef,
-    owner_sub_cluster: String,
+struct RemoteWriteSessionKvPayloadConfig {
     lease_id: u64,
     lease_generation: u64,
     source_node_start_time: i64,
-    target_node_start_time: i64,
-}
-
-#[derive(Debug, Clone)]
-struct RemoteWriteSessionKvSharedCandidate {
-    owner: ShareGroupOwnerRef,
-    owner_sub_cluster: String,
-    source_node_start_time: i64,
-    target_node_start_time: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,32 +582,32 @@ struct RemoteWriteSessionClientEntry {
     fs_rpc_token: Option<String>,
     allow_s3_internal_multipart: bool,
     create_parents: bool,
-    kv_shared: Option<RemoteWriteSessionKvSharedConfig>,
-    kv_shared_enabled: AtomicBool,
+    kv_payload: Option<RemoteWriteSessionKvPayloadConfig>,
+    kv_payload_enabled: AtomicBool,
     peer_sender: Weak<RemoteWriteSessionPeerSender>,
     state: Arc<RemoteWriteSessionClientState>,
 }
 
 impl RemoteWriteSessionClientEntry {
-    fn active_kv_shared(&self) -> Option<RemoteWriteSessionKvSharedConfig> {
-        if !self.kv_shared_enabled.load(Ordering::Acquire) {
+    fn active_kv_payload(&self) -> Option<RemoteWriteSessionKvPayloadConfig> {
+        if !self.kv_payload_enabled.load(Ordering::Acquire) {
             return None;
         }
-        self.kv_shared.clone()
+        self.kv_payload.clone()
     }
 
-    fn downgrade_kv_shared(&self) {
-        self.kv_shared_enabled.store(false, Ordering::Release);
+    fn downgrade_kv_payload(&self) {
+        self.kv_payload_enabled.store(false, Ordering::Release);
     }
 
-    fn downgrade_matching_kv_shared(
+    fn downgrade_matching_kv_payload(
         &self,
         identity: RemoteWriteSessionSharedKvLeaseIdentity,
     ) -> bool {
-        let matches = self.kv_shared.as_ref().is_some_and(|config| {
+        let matches = self.kv_payload.as_ref().is_some_and(|config| {
             config.lease_id == identity.lease_id && config.lease_generation == identity.generation
         });
-        matches && self.kv_shared_enabled.swap(false, Ordering::AcqRel)
+        matches && self.kv_payload_enabled.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -793,7 +782,7 @@ impl RemoteWriteSessionSharedKvLeaseManager {
             .unwrap_or_default();
         let downgraded_sessions = sessions
             .iter()
-            .filter(|session| session.downgrade_matching_kv_shared(identity))
+            .filter(|session| session.downgrade_matching_kv_payload(identity))
             .count();
         match failure {
             LeaseKeepaliveFailure::Operation(err) => tracing::warn!(
@@ -1030,42 +1019,12 @@ fn member_metadata_true(member: &fluxon_commu::ClusterMember, key: &str) -> bool
         .is_some_and(|value| value == "true")
 }
 
-fn remote_write_session_kv_shared_candidate(
-    kv_framework: &KvFramework,
-    target_node_id: &str,
-) -> Option<RemoteWriteSessionKvSharedCandidate> {
+fn remote_write_session_preferred_kv_sub_cluster(kv_framework: &KvFramework) -> Option<String> {
     let cluster_manager_view = kv_framework.cluster_manager_view();
     let cluster_manager = cluster_manager_view.cluster_manager();
     let self_info = cluster_manager.get_self_info();
     let members = cluster_manager.get_members();
-    let target_info = members.iter().find(|member| member.id == target_node_id)?;
-    if !member_metadata_true(
-        target_info,
-        write_session_rpc::FS_WRITE_SESSION_KV_REF_CAPABILITY_METADATA_KEY,
-    ) {
-        return None;
-    }
-
     let self_owner = share_group_owner_ref_from_metadata(&self_info.metadata)?;
-    let target_owner = share_group_owner_ref_from_metadata(&target_info.metadata)?;
-    if self_owner != target_owner {
-        return None;
-    }
-
-    let self_node: NodeID = self_info.id.clone().into();
-    let target_node: NodeID = target_info.id.clone().into();
-    let tier_snapshot = kv_framework.p2p_view().p2p_module().tier_snapshot();
-    if tier_snapshot.self_peer_gen.peer_id != self_node
-        || tier_snapshot.self_peer_gen.node_start_time != self_info.node_start_time
-        || !tier_snapshot.same_share_group(&self_node, &target_node)
-    {
-        return None;
-    }
-    let target_peer_gen = tier_snapshot.peer_gen(&target_node)?;
-    if target_peer_gen.node_start_time != target_info.node_start_time {
-        return None;
-    }
-
     let owner_info = members.iter().find(|member| {
         member.id == self_owner.owner_id && member.node_start_time == self_owner.owner_start_time
     })?;
@@ -1077,8 +1036,8 @@ fn remote_write_session_kv_shared_candidate(
         return None;
     }
 
-    // PreferredSubCluster is local-first only when the source owner is eligible for the
-    // cluster-wide SSD placement scope. Otherwise the KV router may select another owner.
+    // Placement is only an optimization. If the local owner is not eligible for the
+    // cluster-wide SSD scope, omit the preference and let KV choose another owner.
     let cluster_requires_ssd = members
         .iter()
         .filter(|member| member.node_role() == NodeRole::Client)
@@ -1087,27 +1046,7 @@ fn remote_write_session_kv_shared_candidate(
         return None;
     }
 
-    Some(RemoteWriteSessionKvSharedCandidate {
-        owner: self_owner,
-        owner_sub_cluster: owner_sub_cluster.to_string(),
-        source_node_start_time: self_info.node_start_time,
-        target_node_start_time: target_info.node_start_time,
-    })
-}
-
-fn remote_write_session_kv_shared_is_current(
-    kv_framework: &KvFramework,
-    target_node_id: &str,
-    config: &RemoteWriteSessionKvSharedConfig,
-) -> bool {
-    remote_write_session_kv_shared_candidate(kv_framework, target_node_id).is_some_and(
-        |candidate| {
-            candidate.owner == config.owner
-                && candidate.owner_sub_cluster == config.owner_sub_cluster
-                && candidate.source_node_start_time == config.source_node_start_time
-                && candidate.target_node_start_time == config.target_node_start_time
-        },
-    )
+    Some(owner_sub_cluster.to_string())
 }
 
 fn remote_write_session_remote_key(node_id: &str, remote_session_id: &str) -> String {
@@ -1130,7 +1069,7 @@ fn remote_write_session_remove_client_entry(
         removed
     };
     if let Some(entry) = removed.as_ref() {
-        entry.downgrade_kv_shared();
+        entry.downgrade_kv_payload();
     }
     removed
 }
@@ -1153,7 +1092,7 @@ fn remote_write_session_abort_local_entry(
     };
     if let Some(entry) = removed.as_ref() {
         entry.state.fail(detail.to_string());
-        entry.downgrade_kv_shared();
+        entry.downgrade_kv_payload();
     }
     removed
 }
@@ -1172,7 +1111,7 @@ fn remote_write_session_abort_all_local_entries(
     };
     for entry in &removed {
         entry.state.fail(detail.to_string());
-        entry.downgrade_kv_shared();
+        entry.downgrade_kv_payload();
     }
     removed
 }
@@ -1184,7 +1123,7 @@ fn remote_write_session_fail_all_local_entries(
     let entries = sessions.read().values().cloned().collect::<Vec<_>>();
     for entry in &entries {
         entry.state.fail(detail.to_string());
-        entry.downgrade_kv_shared();
+        entry.downgrade_kv_payload();
     }
     entries.len()
 }
@@ -1226,7 +1165,7 @@ fn remote_write_session_should_schedule_locked(
     }
 
     // A send batch may not cross a submit boundary because the batch keeps one contiguous
-    // `Bytes` owner for the KV shared-memory put. Count the batches using the same grouping rules
+    // `Bytes` owner for one KV put. Count the batches using the same grouping rules
     // as `take_next_batch_for_send`; dividing the frame count by the maximum batch size would
     // under-schedule multiple short submits and serialize them behind ACKs.
     let mut batch_count = 0usize;
@@ -1852,123 +1791,117 @@ async fn remote_write_session_send_batch_task(
     }
 
     let mut kv_result_for_resolution = None;
-    if let Some(config) = session.active_kv_shared() {
-        if remote_write_session_kv_shared_is_current(
-            kv_framework.as_ref(),
-            session.node_id.as_str(),
-            &config,
-        ) {
-            let nonce = uuid::Uuid::new_v4().as_u128();
-            let kv_key = write_session_rpc::write_session_kv_payload_key(
-                kv_framework
-                    .cluster_manager_view()
-                    .cluster_manager()
-                    .get_self_info()
-                    .id
-                    .as_str(),
-                config.source_node_start_time,
-                session.remote_session_id.as_str(),
-                config.lease_id,
-                batch.seq_no,
-                nonce,
-            );
-            let mut put_opts = PutOptionalArgs::new();
-            put_opts.0.push(PutOptionalArg::LeaseId(config.lease_id));
-            put_opts.0.push(PutOptionalArg::RejectIfExists);
-            put_opts.0.push(PutOptionalArg::PreferredSubCluster(
-                config.owner_sub_cluster.clone(),
-            ));
-            let put_framework = kv_framework.clone();
-            let put_key = kv_key.clone();
-            let put_data = batch.data.clone();
-            let put = async move {
-                put_framework
-                    .kv_put(put_key.as_str(), put_data.as_ref(), put_opts)
-                    .await
-                    .map_err(|err| format!("KV put failed: {}", err))
-            };
-            let kv_result = match kv_cleanup.begin_put(kv_key.clone(), config.lease_id, put) {
-                Ok(mut cleanup_ticket) => {
-                    let result = async {
-                        cleanup_ticket
-                            .wait_for_put(Duration::from_secs(
-                                REMOTE_WRITE_SESSION_KV_OPERATION_TIMEOUT_SECS,
-                            ))
-                            .await?;
-                        let total_len = u64::try_from(batch.total_bytes).map_err(|_| {
-                            "write-session KV payload length does not fit u64".to_string()
-                        })?;
-                        let ref_frame = write_session_rpc::FsWriteSessionDataRefFrame {
-                            export: session.export_name.clone(),
-                            relpath: session.relpath_rpc.clone(),
-                            session_id: session.remote_session_id.clone(),
-                            seq_no: batch.seq_no,
-                            offset: batch.offset,
-                            kv_key: kv_key.clone(),
-                            total_len,
-                            part_lengths: batch.part_lengths.clone(),
-                            source_node_start_time: config.source_node_start_time,
-                            owner_id: config.owner.owner_id.clone(),
-                            owner_start_time: config.owner.owner_start_time,
-                            lease_id: config.lease_id,
-                            nonce,
-                            fs_rpc_token: session.fs_rpc_token.clone(),
-                            allow_s3_internal_multipart: session.allow_s3_internal_multipart,
-                        };
-                        let ack = write_session_rpc::call_write_session_data_ref(
-                            kv_framework.as_ref(),
-                            session.node_id.clone().into(),
-                            ref_frame,
-                            Some(Duration::from_millis(remote_write_session_rpc_timeout_ms(
-                                batch.total_bytes,
-                            ))),
-                        )
-                        .await
-                        .map_err(|err| format!("KV ref RPC failed: {}", err))?;
-                        if ack.session_id != session.remote_session_id
-                            || ack.seq_no != batch.seq_no
-                            || ack.frame_count != batch.frame_count
-                        {
-                            return Err(format!(
-                                "KV ref ack mismatch: session_id={} got_session_id={} seq_no={} got_seq_no={} expected_frames={} got_frames={}",
-                                session.remote_session_id,
-                                ack.session_id,
-                                batch.seq_no,
-                                ack.seq_no,
-                                batch.frame_count,
-                                ack.frame_count,
-                            ));
-                        }
-                        if !ack.ok {
-                            return Err(if ack.err_detail.trim().is_empty() {
-                                "KV ref RPC returned NACK".to_string()
-                            } else {
-                                format!("KV ref RPC returned NACK: {}", ack.err_detail)
-                            });
-                        }
-                        Ok(ack)
-                    }
-                    .await;
-                    // Dropping the ticket only releases the borrower. The Controller-owned
-                    // cleanup actor remains the sole final-release owner of this key.
-                    drop(cleanup_ticket);
-                    result
-                }
-                Err(detail) => Err(detail),
-            };
-            if let Err(detail) = &kv_result {
-                tracing::warn!(
-                    "write-session KV shared transport failed; retrying batch over raw transport: session_id={} node={} seq_no={} detail={}",
-                    session.remote_session_id,
-                    session.node_id,
-                    batch.seq_no,
-                    detail
-                );
-            }
-            kv_result_for_resolution = Some(kv_result);
-        } else {
-            session.downgrade_kv_shared();
+    if let Some(config) = session.active_kv_payload() {
+        let nonce = uuid::Uuid::new_v4().as_u128();
+        let kv_key = write_session_rpc::write_session_kv_payload_key(
+            kv_framework
+                .cluster_manager_view()
+                .cluster_manager()
+                .get_self_info()
+                .id
+                .as_str(),
+            config.source_node_start_time,
+            session.remote_session_id.as_str(),
+            config.lease_id,
+            batch.seq_no,
+            nonce,
+        );
+        let mut put_opts = PutOptionalArgs::new();
+        put_opts.0.push(PutOptionalArg::LeaseId(config.lease_id));
+        put_opts.0.push(PutOptionalArg::RejectIfExists);
+        if let Some(sub_cluster) =
+            remote_write_session_preferred_kv_sub_cluster(kv_framework.as_ref())
+        {
+            put_opts
+                .0
+                .push(PutOptionalArg::PreferredSubCluster(sub_cluster));
         }
+        let put_framework = kv_framework.clone();
+        let put_key = kv_key.clone();
+        let put_data = batch.data.clone();
+        let put = async move {
+            put_framework
+                .kv_put(put_key.as_str(), put_data.as_ref(), put_opts)
+                .await
+                .map_err(|err| format!("KV put failed: {}", err))
+        };
+        let kv_result = match kv_cleanup.begin_put(kv_key.clone(), config.lease_id, put) {
+            Ok(mut cleanup_ticket) => {
+                let result = async {
+                    cleanup_ticket
+                        .wait_for_put(Duration::from_secs(
+                            REMOTE_WRITE_SESSION_KV_OPERATION_TIMEOUT_SECS,
+                        ))
+                        .await?;
+                    let total_len = u64::try_from(batch.total_bytes).map_err(|_| {
+                        "write-session KV payload length does not fit u64".to_string()
+                    })?;
+                    let ref_frame = write_session_rpc::FsWriteSessionDataRefFrame {
+                        export: session.export_name.clone(),
+                        relpath: session.relpath_rpc.clone(),
+                        session_id: session.remote_session_id.clone(),
+                        seq_no: batch.seq_no,
+                        offset: batch.offset,
+                        kv_key: kv_key.clone(),
+                        total_len,
+                        part_lengths: batch.part_lengths.clone(),
+                        source_node_start_time: config.source_node_start_time,
+                        lease_id: config.lease_id,
+                        nonce,
+                        fs_rpc_token: session.fs_rpc_token.clone(),
+                        allow_s3_internal_multipart: session.allow_s3_internal_multipart,
+                    };
+                    let ack = write_session_rpc::call_write_session_data_ref(
+                        kv_framework.as_ref(),
+                        session.node_id.clone().into(),
+                        ref_frame,
+                        Some(Duration::from_millis(remote_write_session_rpc_timeout_ms(
+                            batch.total_bytes,
+                        ))),
+                    )
+                    .await
+                    .map_err(|err| format!("KV ref RPC failed: {}", err))?;
+                    if ack.session_id != session.remote_session_id
+                        || ack.seq_no != batch.seq_no
+                        || ack.frame_count != batch.frame_count
+                    {
+                        return Err(format!(
+                            "KV ref ack mismatch: session_id={} got_session_id={} seq_no={} got_seq_no={} expected_frames={} got_frames={}",
+                            session.remote_session_id,
+                            ack.session_id,
+                            batch.seq_no,
+                            ack.seq_no,
+                            batch.frame_count,
+                            ack.frame_count,
+                        ));
+                    }
+                    if !ack.ok {
+                        return Err(if ack.err_detail.trim().is_empty() {
+                            "KV ref RPC returned NACK".to_string()
+                        } else {
+                            format!("KV ref RPC returned NACK: {}", ack.err_detail)
+                        });
+                    }
+                    Ok(ack)
+                }
+                .await;
+                // Dropping the ticket only releases the borrower. The Controller-owned
+                // cleanup actor remains the sole final-release owner of this key.
+                drop(cleanup_ticket);
+                result
+            }
+            Err(detail) => Err(detail),
+        };
+        if let Err(detail) = &kv_result {
+            tracing::warn!(
+                "write-session KV-backed payload transport failed; retrying batch over raw transport: session_id={} node={} seq_no={} detail={}",
+                session.remote_session_id,
+                session.node_id,
+                batch.seq_no,
+                detail
+            );
+        }
+        kv_result_for_resolution = Some(kv_result);
     }
 
     let rpc_frame = FsWriteSessionDataFrame {
@@ -1984,7 +1917,7 @@ async fn remote_write_session_send_batch_task(
     let downgrade_session = session.clone();
     remote_write_session_resolve_transport(
         kv_result_for_resolution,
-        move || downgrade_session.downgrade_kv_shared(),
+        move || downgrade_session.downgrade_kv_payload(),
         || async move {
             write_session_rpc::send_write_session_data_bytes(
                 kv_framework.as_ref(),
@@ -2792,12 +2725,10 @@ impl FluxonFsAgent {
         )
     }
 
-    fn remote_write_session_prepare_kv_shared(
+    fn remote_write_session_prepare_kv_payload(
         &self,
         target_node_id: &str,
-    ) -> Option<RemoteWriteSessionKvSharedConfig> {
-        let candidate =
-            remote_write_session_kv_shared_candidate(self.kv_framework.as_ref(), target_node_id)?;
+    ) -> Option<RemoteWriteSessionKvPayloadConfig> {
         let identity = match self.remote_write_session_shared_kv_lease.acquire() {
             Ok(identity) => identity,
             Err(err) => {
@@ -2809,13 +2740,16 @@ impl FluxonFsAgent {
                 return None;
             }
         };
-        Some(RemoteWriteSessionKvSharedConfig {
-            owner: candidate.owner,
-            owner_sub_cluster: candidate.owner_sub_cluster,
+        let source_node_start_time = self
+            .kv_framework
+            .cluster_manager_view()
+            .cluster_manager()
+            .get_self_info()
+            .node_start_time;
+        Some(RemoteWriteSessionKvPayloadConfig {
             lease_id: identity.lease_id,
             lease_generation: identity.generation,
-            source_node_start_time: candidate.source_node_start_time,
-            target_node_start_time: candidate.target_node_start_time,
+            source_node_start_time,
         })
     }
 
@@ -4551,8 +4485,8 @@ impl FluxonFsAgent {
             create_parents,
         )?;
         let client_session_id = self.alloc_remote_write_session_client_token();
-        let kv_shared = self.remote_write_session_prepare_kv_shared(&node_id);
-        let kv_shared_enabled = kv_shared.is_some();
+        let kv_payload = self.remote_write_session_prepare_kv_payload(&node_id);
+        let kv_payload_enabled = kv_payload.is_some();
         let Some(peer_sender) = self.remote_write_peer_sender_get_or_insert(&node_id) else {
             self.remote_abort_provisional_write_session_best_effort(
                 &node_id,
@@ -4575,8 +4509,8 @@ impl FluxonFsAgent {
             fs_rpc_token: ctx.fs_rpc_token,
             allow_s3_internal_multipart: ctx.allow_s3_internal_multipart,
             create_parents,
-            kv_shared,
-            kv_shared_enabled: AtomicBool::new(kv_shared_enabled),
+            kv_payload,
+            kv_payload_enabled: AtomicBool::new(kv_payload_enabled),
             peer_sender: Arc::downgrade(&peer_sender),
             state: state.clone(),
         });
@@ -4586,7 +4520,7 @@ impl FluxonFsAgent {
             entry
                 .state
                 .fail("write-session source stopped while opening a session".to_string());
-            entry.downgrade_kv_shared();
+            entry.downgrade_kv_payload();
             self.remote_abort_provisional_write_session_best_effort(
                 &entry.node_id,
                 &entry.export_name,
@@ -4599,7 +4533,7 @@ impl FluxonFsAgent {
                 detail: "write-session source stopped while opening a session".to_string(),
             });
         }
-        if let Some(config) = entry.kv_shared.as_ref() {
+        if let Some(config) = entry.kv_payload.as_ref() {
             let identity = RemoteWriteSessionSharedKvLeaseIdentity {
                 lease_id: config.lease_id,
                 generation: config.lease_generation,
@@ -4608,7 +4542,7 @@ impl FluxonFsAgent {
                 .remote_write_session_shared_kv_lease
                 .is_current(identity)
             {
-                entry.downgrade_kv_shared();
+                entry.downgrade_kv_payload();
                 tracing::warn!(
                     "write-session shared KV lease changed while opening session; using raw transport: session_id={} node={} lease_id={} generation={}",
                     entry.remote_session_id,
@@ -9890,18 +9824,12 @@ mod tests {
             fs_rpc_token: None,
             allow_s3_internal_multipart: false,
             create_parents: false,
-            kv_shared: Some(RemoteWriteSessionKvSharedConfig {
-                owner: ShareGroupOwnerRef {
-                    owner_id: "owner-a".to_string(),
-                    owner_start_time: 1,
-                },
-                owner_sub_cluster: "sub-cluster-a".to_string(),
+            kv_payload: Some(RemoteWriteSessionKvPayloadConfig {
                 lease_id: identity.lease_id,
                 lease_generation: identity.generation,
                 source_node_start_time: 2,
-                target_node_start_time: 3,
             }),
-            kv_shared_enabled: AtomicBool::new(true),
+            kv_payload_enabled: AtomicBool::new(true),
             peer_sender: Arc::downgrade(&peer_sender),
             state: Arc::new(RemoteWriteSessionClientState::default()),
         })
@@ -10125,16 +10053,16 @@ mod tests {
             LeaseKeepaliveFailure::Operation("stale failure".to_string()),
         );
         assert_eq!(manager.active_identity(), Some(identity));
-        assert!(matching_a.kv_shared_enabled.load(Ordering::Acquire));
-        assert!(matching_b.kv_shared_enabled.load(Ordering::Acquire));
+        assert!(matching_a.kv_payload_enabled.load(Ordering::Acquire));
+        assert!(matching_b.kv_payload_enabled.load(Ordering::Acquire));
 
         manager.handle_keepalive_failure(
             identity,
             LeaseKeepaliveFailure::Operation("test failure".to_string()),
         );
-        assert!(!matching_a.kv_shared_enabled.load(Ordering::Acquire));
-        assert!(!matching_b.kv_shared_enabled.load(Ordering::Acquire));
-        assert!(other_generation.kv_shared_enabled.load(Ordering::Acquire));
+        assert!(!matching_a.kv_payload_enabled.load(Ordering::Acquire));
+        assert!(!matching_b.kv_payload_enabled.load(Ordering::Acquire));
+        assert!(other_generation.kv_payload_enabled.load(Ordering::Acquire));
         assert_eq!(manager.active_identity(), None);
         assert_eq!(keepalive_actor.registered_lease_count(), 0);
         assert_eq!(allocation_calls.load(Ordering::Acquire), 1);
@@ -10173,18 +10101,12 @@ mod tests {
             fs_rpc_token: None,
             allow_s3_internal_multipart: false,
             create_parents: false,
-            kv_shared: Some(RemoteWriteSessionKvSharedConfig {
-                owner: ShareGroupOwnerRef {
-                    owner_id: "owner-a".to_string(),
-                    owner_start_time: 1,
-                },
-                owner_sub_cluster: "sub-cluster-a".to_string(),
+            kv_payload: Some(RemoteWriteSessionKvPayloadConfig {
                 lease_id: lease_identity.lease_id,
                 lease_generation: lease_identity.generation,
                 source_node_start_time: 2,
-                target_node_start_time: 3,
             }),
-            kv_shared_enabled: AtomicBool::new(true),
+            kv_payload_enabled: AtomicBool::new(true),
             peer_sender: Arc::downgrade(&peer_sender),
             state: state.clone(),
         });
@@ -10209,7 +10131,7 @@ mod tests {
 
         assert!(sessions.read().is_empty());
         assert!(sessions_by_remote.read().is_empty());
-        assert!(!removed.kv_shared_enabled.load(Ordering::Acquire));
+        assert!(!removed.kv_payload_enabled.load(Ordering::Acquire));
         assert_eq!(
             keepalive_actor.registered_lease_count(),
             1,
