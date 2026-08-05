@@ -1,147 +1,125 @@
 # Developer - 4 - Publish a Release
 
-This page explains how the current repository publishes a public release. The stable flow is: update public version strings and release-facing text, commit and wait for the commit CI to pass, then create and push a `v<version>` tag. GitHub Actions builds and tests the wheel for that tag, creates the GitHub Release, and publishes the same wheel to PyPI after the complete tag CI succeeds. If the change also touched the README or docs, publish GitHub Pages separately.
+The release has one manual entrypoint: run `create_release_tag` from GitHub Actions. After the exact tag CI succeeds, `manual-release.yml` prepares and reviews all artifacts, then starts GitHub Release, PyPI, and Docker Hub publication jobs in parallel. Local tag pushes and a second manual publish workflow are outside the supported path.
 
 ## Scope
 
 | This page covers | This page does not cover | Why |
 |---|---|---|
-| Publishing install artifacts on GitHub Releases | Dispatching a release onto remote machines | Remote deployment belongs to `deployment/manual_dispatch_release.py` |
-| Publishing the `fluxon-ai` wheel to PyPI | Other Python package indexes | PyPI is the only public index in the current flow |
-| The `publish_release` build entrypoint | The local wheel build internals | Local packaging details live in Developer 1 / 2 |
-| The GitHub Pages doc-site publish entrypoint | testbed / testrunner test flows | The test stack has its own workflow |
+| Creating a release tag through GitHub Actions | Choosing the next version number | Version policy is a maintainer decision |
+| Publishing GitHub Release assets, the `fluxon-ai` PyPI wheel, and the Quick Start Docker image | Other package indexes or image registries | The current public destinations are GitHub, PyPI, and Docker Hub |
+| Deterministic checks, read-only Codex review, and destination approvals | Treating Codex output as a test result | Codex supplies review evidence; deterministic jobs remain authoritative |
+| The GitHub Pages doc-site entrypoint | Dispatching a release onto remote machines | Remote deployment belongs to `deployment/manual_dispatch_release.py` |
 
-## 1. Update version strings and release-facing text first
+## 1. Prepare the version pull request
 
-The repository does not have one single global version file. Before publishing, at least check these public surfaces:
+The repository does not have one global version file. Before publishing, check these public surfaces:
 
 | Public surface | Main files | Notes |
 |---|---|---|
 | Python package version | `fluxon_py/__init__.py` | The repo-root `setup.py` reads the version from here |
-| PyPI distribution name | `setup_and_pack/package_contract.py`, `setup.py` | The distribution is `fluxon-ai`; wheel filenames use the `fluxon_ai` prefix |
-| Rust crate versions | `fluxon_rs/Cargo.toml`, `fluxon_rs/*/Cargo.toml`, `fluxon_rs/setup.py` | Public crate and wheel versions should stay aligned |
-| Quick Start image tag | `examples/fluxon_quick_start/build_image.py`, `examples/fluxon_quick_start/README.md` | The current public image name is `fluxon_quick_start:<version>` |
-| Release workflow artifact names | `.github/workflows/manual-release.yml` | The workflow currently emits `fluxon_quick_start_<version>_docker_image.tar.gz` |
-| GitHub Release notes | `fluxon_release/release_notes/v<version>.md` | The release body is read directly from this versioned file |
-| README release text | `README.md`, `README_CN.md` | Includes the badge, image-tag examples, and developer-doc links |
+| Rust crate versions | `fluxon_rs/Cargo.toml`, `fluxon_rs/*/Cargo.toml`, `fluxon_rs/setup.py` | Release crate and wheel versions must stay aligned |
+| Closed SDK open-surface requirement | `fluxon_rs/fluxon_commu_contract/src/lib.rs`, `fluxon_release/closed_sdk/manifest.json`, and matching SDK libraries | The SDK requirement must match `FLUXON_COMMU_OPEN_SURFACE_VERSION`; this contract version is independent from the public release version |
+| Quick Start image tag | `examples/fluxon_quick_start/build_image.py`, `examples/fluxon_quick_start/README.md` | Docker Hub publishes `hanbaoaaa/fluxon_quick_start:<version>` |
+| GitHub Release notes | `fluxon_release/release_notes/v<version>.md` | The release body comes from the tagged revision |
+| README release text | `README.md`, `README_CN.md` | Includes the badge and versioned Docker examples |
 
-A repo-wide search helps catch the previous public version string:
+Search for release-facing uses of the previous version. Do not mechanically rewrite version-specific test fixtures or YAML examples.
 
 ```bash
 OLD=0.2.1  # replace with the previous release version
-rg -n "$OLD" README.md README_CN.md fluxon_py fluxon_rs examples .github/workflows
+rg -n "$OLD" README.md README_CN.md fluxon_py fluxon_rs examples fluxon_release
 ```
 
-After the version and text updates are ready, push the commit first, then create and push the release tag.
+The closed communication SDK reports its own `sdk_version` and `required_open_surface_version`. The runtime compares the latter with `FLUXON_COMMU_OPEN_SURFACE_VERSION`, rather than the Cargo package version. A release-only version bump leaves this contract unchanged; rebuild and verify the SDK libraries before changing the open-surface constant or generated manifest. The default-branch and tag CI suites include the `fluxon_commu` runtime contract test.
 
-The release notes now use one file per version. The required path pattern is:
-
-```text
-fluxon_release/release_notes/v<version>.md
-```
-
-For example, `v0.2.1` uses:
-
-```text
-fluxon_release/release_notes/v0.2.1.md
-```
-
-If that file is missing, `publish_release` fails fast instead of publishing a release with an incomplete body.
-
-## 2. Push a `v<version>` tag to trigger the release and tag CI
-
-The GitHub Release build entrypoint is `.github/workflows/manual-release.yml`, whose workflow name is `publish_release`. A `v*` tag push also starts `.github/workflows/all_test.yml`, where the complete tag CI builds and tests the wheel prepared for PyPI. `publish_release` retains a `workflow_dispatch` entrypoint for GitHub Release rebuilds. The stable path is:
+Run the local metadata and workflow-contract checks:
 
 ```bash
-git push origin <branch>
-# wait for the commit CI to pass
-git tag v0.2.1
-git push origin v0.2.1
+python3 fluxon_release/resolve_release_meta.py --git-ref refs/tags/v<version>
+python3 -m unittest \
+  setup_and_pack.tests.test_resolve_release_meta \
+  setup_and_pack.tests.test_release_ci_provenance \
+  setup_and_pack.tests.test_release_workflows
 ```
 
-On the GitHub runner it does these steps:
+Merge the version pull request and wait for the exact default-branch commit's `ci_2_virt_node` push run to succeed.
 
-1. Validate that the tag, `fluxon_py/__init__.py`, `examples/fluxon_quick_start/build_image.py`, `fluxon_rs/setup.py`, and the release Cargo manifests all declare the same version.
-2. Validate that `fluxon_release/release_notes/v<version>.md` exists.
-3. Install Python 3.10, Docker, and packaging dependencies.
-4. Build the manylinux builder image.
-5. Generate the CI `pack_fluxonkv_pylib_env.yaml`.
-6. Run `python3 setup_and_pack/pack_release.py --release-dir fluxon_release`.
-7. Run `python3 examples/fluxon_quick_start/build_image.py --mode existing_release --release-dir fluxon_release`.
-8. Upload the workflow artifact.
-9. Create or update the matching GitHub Release and upload the release assets automatically.
+## 2. Configure credentials and environments once
 
-If the tag is `v0.2.1` but the repository still declares `0.2.0` on its public version surfaces, or if `fluxon_release/release_notes/v0.2.1.md` is missing, the workflow fails fast instead of publishing an incomplete release.
+Repository administrators must configure these external controls:
 
-After the workflow finishes, both the GitHub Actions artifact and the GitHub Release assets should contain at least:
+| Control | Required configuration | Purpose |
+|---|---|---|
+| Repository Actions token | No external credential; `create_release_tag` grants the built-in `GITHUB_TOKEN` Actions write and contents write permission | Creates the tag and explicitly dispatches its CI |
+| Codex credentials | Put `OPENAI_API_KEY` and `OPENAI_BASE_URL` in environment `OPENAI_API_KEY` | Runs the read-only readiness review |
+| GitHub Release approval | Configure required reviewers on environment `github-release` | Gates the only job with `contents: write` |
+| PyPI approval | Configure required reviewers on environment `pypi`; bind the PyPI Trusted Publisher to `manual-release.yml` and this environment | Gates OIDC upload of the validated wheel |
+| Docker approval | Configure required reviewers plus `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` on environment `docker-image` | Gates the versioned Docker Hub push |
 
-- `fluxon_release.tar.gz`
-- `fluxon_quick_start_<version>_docker_image.tar.gz`
+Referencing an environment in YAML does not add reviewers. An administrator must configure its protection rules in GitHub settings.
 
-`fluxon_release.tar.gz` contains the `fluxon_release/` directory with the core wheel, `pylib_src.tar.gz`, `install.py`, `ext_images.tar.gz`, and `fluxon_release.sha256`. For the internal packaging layout, see:
+The tag workflow uses the repository's built-in `GITHUB_TOKEN` to create the ref and explicitly dispatch `all_test.yml` at that tag. GitHub permits a `workflow_dispatch` event initiated by this token, so the chain does not rely on a tag-push event. `all_test.yml` accepts branch pushes, pull requests, and explicit dispatches; tag pushes are not a trigger. No external release identity, PAT, or release-tag secret is required.
 
-- [Developer - 1 - Package Core Install Artifacts](<./Developer - 1 - Package Core Install Artifacts.md>)
-- [Developer - 2 - Package Middleware and Images](<./Developer - 2 - Package Middleware and Images.md>)
+## 3. Start the release from GitHub Actions
 
-## 3. Publish the PyPI wheel after the tag CI succeeds
+`.github/workflows/create-release-tag.yml` is the only manual release entrypoint.
 
-The PyPI entrypoint is `.github/workflows/publish-pypi.yml`. It does not respond directly to a tag push. It waits for the `ci_2_virt_node` workflow to finish and proceeds only when the source event is `push`, the CI conclusion is `success`, and the source ref is a `v<version>` tag.
+1. Open GitHub Actions and select `create_release_tag`.
+2. Select the default branch as the workflow ref.
+3. Run the workflow; it has no release parameters.
 
-The publishing flow consumes the tag CI artifact named `fluxon-ci-release-<commit SHA>` and checks that:
+The workflow derives the exact `v<version>` tag from the repository's validated version sources and takes the release body from `fluxon_release/release_notes/v<version>.md`. Before creating the tag, it verifies the tag shape, default-branch ref, tag absence, release metadata, release notes, and a successful default-branch CI run for the exact commit. The built-in token then creates the lightweight tag and explicitly dispatches `all_test.yml` with that tag as its ref.
 
-1. The tag still points to the commit that produced the CI run.
-2. The commit is in the default-branch history.
-3. The artifact contains exactly one `fluxon_ai-*.whl`.
-4. The wheel distribution is `fluxon-ai`, and its version matches the tag.
-5. The wheel tag is the supported `cp38-abi3-manylinux_2_28_x86_64`, and `Requires-Python` is `>=3.10`.
-6. The wheel is below PyPI's default file-size limit and passes `twine check`.
+The dispatched tag CI produces a `release-ci-provenance-<commit SHA>` artifact recording the full ref, ref type, commit, repository, and workflow path. `manual-release.yml` accepts only successful `workflow_dispatch` runs initiated by a Bot actor and rejects a same-named branch or mismatched commit.
 
-The workflow then uploads that same tested wheel through GitHub OIDC and PyPI Trusted Publishing. It does not use a long-lived `PYPI_TOKEN`. Configure these external settings before the first release:
+Do not run `git tag` or push a release tag locally. If a release input is wrong, fix the version pull request and run `create_release_tag` for a new tag.
 
-- PyPI project: `fluxon-ai`
-- GitHub owner / repository: `Tele-AI/Fluxon`
-- Trusted Publisher workflow: `publish-pypi.yml`
-- GitHub environment: `pypi`
+## 4. Prepare and review all destinations
 
-After publication, users install the package with:
+`.github/workflows/manual-release.yml`, whose workflow name is `publish_release`, starts only after successful tag `ci_2_virt_node` completion. Its filename preserves the existing PyPI Trusted Publisher identity; the workflow has no `workflow_dispatch` entrypoint.
+
+The workflow performs these phases:
+
+1. `verify-release` verifies tag-to-CI identity, provenance, default-branch ancestry, version metadata, and release notes.
+2. `pack-release` and `prepare-pypi-wheel` run independently. The first builds `fluxon_release.tar.gz` and the Quick Start image archive; the second validates the exact wheel produced by tag CI and runs `twine check`.
+3. `release-readiness-review` checks release checksums, collects tag CI evidence, includes the validated wheel hash, and runs `openai/codex-action` with `.github/codex/release-readiness-prompt.md` under a read-only permission profile.
+4. After the review succeeds, the three publication jobs become runnable in parallel. Each destination waits on its own protected environment.
+
+Codex can identify inconsistencies and evidence gaps. Its report does not replace tag CI, checksum checks, or environment approval, and its text is not parsed as an automatic authorization.
+
+## 5. Publish three destinations in parallel
+
+| Job | Environment | Published object | Credential boundary |
+|---|---|---|---|
+| `publish-github-release` | `github-release` | `fluxon_release.tar.gz` and `fluxon_quick_start_<version>_docker_image.tar.gz` | This job alone receives `contents: write` |
+| `publish-pypi` | `pypi` | The validated `fluxon_ai-*.whl` from tag CI | This job alone receives `id-token: write`; no `PYPI_TOKEN` is used |
+| `publish-docker-image` | `docker-image` | `hanbaoaaa/fluxon_quick_start:<version>` loaded from the reviewed image archive | Docker Hub credentials exist only in this environment |
+
+The three jobs depend on the same readiness review and do not depend on one another. Approving or retrying one destination does not serialize the others.
+
+The PyPI preparation checks tag identity, default-branch ancestry, distribution and version, the supported `cp38-abi3-manylinux_2_28_x86_64` wheel tag, `Requires-Python >=3.10`, file size, checksum, and `twine check`. Users install it with:
 
 ```bash
 python3 -m pip install fluxon-ai
 ```
 
-The CI gate applies to the exact commit referenced by the tag. Default-branch protection is responsible for requiring checks on changes entering the mainline; the publishing flow does not require every ancestor commit to have never failed an earlier run.
+The Docker job loads the exact reviewed archive, verifies its local image identity, retags it with the canonical Docker Hub repository and release version, and pushes only that versioned tag. It does not update `latest`.
 
-## 4. When to trigger it manually
+## 6. Retry without a second release entrypoint
 
-In the normal path, no manual GitHub Release page work is needed. Once the `v<version>` tag push succeeds, the workflow reads `fluxon_release/release_notes/v<version>.md` and creates or updates the release automatically.
+There is no manual “publish an existing tag” workflow. For transient runner, Codex, approval, or destination-upload failures, use GitHub Actions' rerun-failed-jobs operation on the existing `publish_release` run. If the source tag CI must be reproduced, rerun that tag's `ci_2_virt_node`; its successful completion starts a fresh `publish_release` run.
 
-Use the manual `publish_release` trigger only in cases like these:
+Do not move a published tag. PyPI versions and versioned Docker image tags are treated as immutable release outputs. Any artifact or install-behavior change requires a new version and tag.
 
-- The GitHub runner had a transient failure and an existing tag needs a rebuild.
-- The workflow failed late and the same tag needs the assets uploaded again.
-- You want to validate the release pipeline without minting a new tag.
+## 7. Publish the doc site
 
-For the manual trigger, provide an already existing tag such as `v0.2.1`. That tag must still match the repository public version exactly.
+`.github/workflows/docs-pages.yml` is separate from the three release destinations. It builds `fluxon_release/doc_site/` and deploys GitHub Pages. Verify the matching run when README, install docs, developer docs, or roadmap pages change.
 
-Manually triggering `publish_release` only rebuilds the GitHub Release; it cannot bypass the tag CI to upload to PyPI. PyPI versions are immutable, so a successfully published version remains unchanged and subsequent content uses a new version and tag.
+## 8. Rerun conditions
 
-If a change only edits the GitHub Release text, update `fluxon_release/release_notes/v<version>.md` and rerun `publish_release` manually so the release body and assets stay in sync.
-
-## 5. Publish the doc site
-
-The doc-site release is a separate pipeline from the binary release. The current doc-site workflow is `.github/workflows/docs-pages.yml`:
-
-- It triggers automatically on pushes to `main` / `master` when README, doc content, or doc-site build code changes.
-- It can also be run manually from GitHub Actions.
-- It builds `fluxon_release/doc_site/` and deploys that output to GitHub Pages.
-- It does not upload wheels, `fluxon_release.tar.gz`, or Docker images.
-
-If the release changes the README, install docs, developer docs, or roadmap, publish `docs-pages` as part of the same release pass.
-
-## 6. When to rerun
-
-- Push the matching release tag again, or rerun `publish_release`, after version-string, README badge, image-tag, or release-artifact-name changes.
-- Push the matching release tag again, or rerun `publish_release`, after release-related changes under `setup_and_pack/`, `examples/fluxon_quick_start/`, `fluxon_py/`, or `fluxon_rs/`.
-- If a PyPI job fails before upload, rerun the tag CI or the failed `publish_pypi` workflow. A version that reached PyPI cannot be overwritten.
-- Rerun `docs-pages` after README, `fluxon_doc_cn/`, `fluxon_doc_en/`, or doc-navigation changes.
-- If only the descriptive text on the GitHub Release page changes, no workflow needs to rerun.
+- Fix the version pull request and rerun `create_release_tag` when tag preflight fails; do not bypass it with a local tag.
+- Fix release defects and use a new version when tag CI fails; do not move the failed tag into a different commit.
+- Rerun failed jobs in `publish_release` for transient preparation, Codex, approval, GitHub Release, PyPI, or Docker Hub failures.
+- A version that reached PyPI or Docker Hub must not be overwritten with different content.
+- Rerun `docs-pages` after README, `fluxon_doc_cn/`, `fluxon_doc_en/`, or navigation changes.

@@ -24,7 +24,7 @@ pub use fluxon_commu_closed_sdk_consumer::{
     transfer_engine_update_enabled_rdma_devices, transfer_engine_update_runtime_config,
     watch_cluster_manager_self_rdma_resolved_config,
 };
-use fluxon_commu_contract::ClosedRuntimeError;
+use fluxon_commu_contract::{ClosedRuntimeError, FLUXON_COMMU_OPEN_SURFACE_VERSION};
 pub use fluxon_commu_contract::{ClosedRuntimeHandle, RdmaProbeSnapshot, RdmaRuntimeSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +69,7 @@ impl Display for CurrentProviderContractError {
                 actual_open_surface,
             } => write!(
                 f,
-                "closed SDK requires open surface version {}, but current fluxon_commu version is {}",
+                "closed SDK requires open surface version {}, but the current open contract version is {}",
                 expected_by_sdk, actual_open_surface
             ),
             Self::RuntimeAnchorMismatch {
@@ -116,7 +116,7 @@ pub fn assert_current_provider_contract()
             actual_sdk_boundary_mode: version_info.boundary_mode.clone(),
         });
     }
-    let actual_open_surface = env!("CARGO_PKG_VERSION").to_string();
+    let actual_open_surface = FLUXON_COMMU_OPEN_SURFACE_VERSION.to_string();
     if version_info.required_open_surface_version != actual_open_surface {
         return Err(CurrentProviderContractError::OpenSurfaceVersionMismatch {
             expected_by_sdk: version_info.required_open_surface_version.clone(),
@@ -226,11 +226,16 @@ pub(crate) fn spawn_deferred_drop_runtime_handle(
 #[cfg(test)]
 mod tests {
     use super::assert_current_provider_contract;
+    use fluxon_commu_contract::FLUXON_COMMU_OPEN_SURFACE_VERSION;
 
     #[test]
     fn current_provider_matches_closed_sdk() {
         let snapshot = assert_current_provider_contract()
             .expect("source-backed provider must match closed SDK");
+        assert_eq!(
+            snapshot.version_info.required_open_surface_version,
+            FLUXON_COMMU_OPEN_SURFACE_VERSION
+        );
         assert_eq!(
             snapshot.sdk_runtime_anchor.cluster_manager_size,
             snapshot.provider_runtime_anchor.cluster_manager_size
