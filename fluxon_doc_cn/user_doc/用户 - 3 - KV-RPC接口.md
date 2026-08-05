@@ -607,8 +607,9 @@ zero-contribution external 模式下有一个硬约束：`fluxonkv_spec.etcd_add
 
 稳定的 `network` 配置块统一承载网络策略和传输调优，不负责选择协议。
 `rdma_device_names` 可以固定当前进程使用的 RDMA 设备，多个设备用逗号分隔。
-`tcp_reactor_mode` 控制当前进程中 `tcpthr_reactor_*` 线程的等待方式；不配置时默认使用
-`busy_poll`，需要降低空闲 CPU 占用时可以显式选择 `event_driven`：
+`tcp_reactor_mode` 控制当前进程中 `tcpthr_reactor_*` 线程的等待方式。不配置时，
+zero-contribution external 默认使用 `event_driven`，owner 和 master 默认使用
+`busy_poll`；任何角色都可以显式选择其中一种：
 
 ```yaml
 network:
@@ -622,8 +623,8 @@ network:
 
 | 取值 | 行为与取舍 |
 | --- | --- |
-| `busy_poll`（默认） | reactor 在热窗口内使用零超时 poll，减少唤醒和调度延迟，但会占用更多 CPU。 |
-| `event_driven` | reactor 通过 `mio::Poll` 阻塞等待 socket readiness，并由 `mio::Waker` 响应新命令和发送任务；空闲 CPU 更低，但可能增加少量唤醒和调度延迟。 |
+| `busy_poll`（owner/master 默认） | reactor 在热窗口内使用零超时 poll，减少唤醒和调度延迟，但会占用更多 CPU。 |
+| `event_driven`（external 默认） | reactor 通过 `mio::Poll` 阻塞等待 socket readiness，并由 `mio::Waker` 响应新命令和发送任务；空闲 CPU 更低，但可能增加少量唤醒和调度延迟。 |
 
 该配置是进程级设置，同一进程内的全部 `tcp_thread` P2P 连接共用一个等待模式，不能分别为
 FS RPC 和 KV RPC 选择不同模式。该配置只控制当前进程的 TCP reactor；通信对端使用哪种

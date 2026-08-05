@@ -9,6 +9,7 @@ pub mod path;
 pub mod remote_disk_cache;
 pub mod retry;
 pub mod signature;
+mod write_session_kv_cleanup;
 pub mod write_session_rpc;
 
 pub use framework::{Framework, new_fs_framework};

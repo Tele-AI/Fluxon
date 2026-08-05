@@ -384,8 +384,8 @@ In zero-contribution external mode, `Owner Client`-only fields such as `fluxonkv
 The stable `network` block contains network policy and transport tuning; it does not select the
 protocol. `rdma_device_names` optionally pins the comma-separated RDMA devices used by the
 process. `tcp_reactor_mode` controls how the current process's `tcpthr_reactor_*` threads wait
-for work. It defaults to `busy_poll`; select `event_driven` explicitly when reducing idle CPU usage
-is more important:
+for work. When omitted, zero-contribution external clients default to `event_driven`, while owners
+and masters default to `busy_poll`. Every role can explicitly select either mode:
 
 ```yaml
 network:
@@ -400,8 +400,8 @@ selection or fault-isolation switches should use the separate
 
 | Value | Behavior and tradeoff |
 | --- | --- |
-| `busy_poll` (default) | Uses zero-timeout polling during the hot window. This reduces wake-up and scheduling latency but consumes more CPU. |
-| `event_driven` | Blocks in `mio::Poll` for socket readiness and uses `mio::Waker` for new commands and send work. This lowers idle CPU usage but may add a small amount of wake-up and scheduling latency. |
+| `busy_poll` (owner/master default) | Uses zero-timeout polling during the hot window. This reduces wake-up and scheduling latency but consumes more CPU. |
+| `event_driven` (external default) | Blocks in `mio::Poll` for socket readiness and uses `mio::Waker` for new commands and send work. This lowers idle CPU usage but may add a small amount of wake-up and scheduling latency. |
 
 This is a process-level setting. All `tcp_thread` P2P connections in one process share the same
 wait mode, so FS RPC and KV RPC cannot select different modes inside that process. The setting

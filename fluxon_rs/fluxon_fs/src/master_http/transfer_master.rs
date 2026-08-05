@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use chrono::Utc;
+use fluxon_framework_compiled::shutdown::ViewShutdownExt;
 use fluxon_fs_core::config::{
     FS_AGENT_TRANSFER_SCAN_RPC_PATH, FS_AGENT_TRANSFER_WORKER_RPC_PATH, FluxonFsTransferBatchKind,
     FluxonFsTransferBatchState, FluxonFsTransferDispositionWire, FluxonFsTransferJobState,
@@ -25,7 +26,6 @@ use fluxon_kv::user_api::FluxonUserApi;
 use fluxon_kv::user_api::flat_dict::{FlatDict, FlatValue};
 use fluxon_util::run_async_from_sync::spawn_blocking_allow_sync_async_bridge;
 use parking_lot::Mutex;
-use tokio::runtime::Handle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -1071,6 +1071,7 @@ where
 }
 
 async fn dispatch_scan_assignments_until_full(
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
     runtime_state: Arc<Mutex<TransferScanRuntimeState>>,
@@ -1148,16 +1149,19 @@ async fn dispatch_scan_assignments_until_full(
         let s3_state2 = s3_state.clone();
         let runtime_state2 = runtime_state.clone();
         let scan_agent_id = assignment.src_exporter_id.clone();
-        tokio::spawn(async move {
+        let mut shutdown_waiter = fs_framework.register_shutdown_waiter();
+        crate::framework::spawn_fs_task(&fs_framework, "transfer_scan_launch", async move {
             let scan_unit_id = assignment.scan_unit_id.clone();
-            if let Err(err) = launch_transfer_scan_until_ack_or_superseded(
-                api2.clone(),
-                runtime_state2.clone(),
-                scan_agent_id,
-                assignment.clone(),
-            )
-            .await
-            {
+            let launch_result = tokio::select! {
+                _ = shutdown_waiter.wait() => return,
+                result = launch_transfer_scan_until_ack_or_superseded(
+                    api2.clone(),
+                    runtime_state2.clone(),
+                    scan_agent_id,
+                    assignment.clone(),
+                ) => result,
+            };
+            if let Err(err) = launch_result {
                 tracing::warn!(
                     "transfer scan launch loop exited with error: job_id={} scan_unit_id={} scan_task_id={} err={}",
                     assignment.job_id,
@@ -1176,6 +1180,7 @@ async fn dispatch_scan_assignments_until_full(
 }
 
 async fn run_transfer_scan_scheduler_once(
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
     runtime_state: Arc<Mutex<TransferScanRuntimeState>>,
@@ -1254,6 +1259,7 @@ async fn run_transfer_scan_scheduler_once(
             }
             TransferScanSchedulerAction::DispatchAssignments => {
                 dispatch_scan_assignments_until_full(
+                    fs_framework.clone(),
                     api.clone(),
                     s3_state.clone(),
                     runtime_state.clone(),
@@ -1272,6 +1278,7 @@ async fn run_transfer_scan_scheduler_once(
 }
 
 async fn run_transfer_worker_scheduler_once(
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
 ) -> Result<(), String> {
@@ -1405,40 +1412,47 @@ async fn run_transfer_worker_scheduler_once(
                 };
                 let api2 = api.clone();
                 let s3_state2 = s3_state.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = launch_transfer_worker_until_ack_or_superseded(
-                        api2.clone(),
-                        s3_state2.clone(),
-                        dst_exporter_id.clone(),
-                        assignment.clone(),
-                    )
-                    .await
-                    {
-                        let _ = s3_state2.mark_transfer_worker_attempt_stopped(
-                            assignment.job_id.as_str(),
-                            assignment.batch_id.as_str(),
-                            assignment.worker_id.as_str(),
-                            assignment.worker_task_id.as_str(),
-                            None,
-                            err.as_str(),
-                            Utc::now().timestamp_millis(),
-                        );
-                        s3_state2.note_transfer_failure(
-                            assignment.job_id.as_str(),
-                            Utc::now().timestamp_millis(),
-                            fluxon_fs_s3_gateway::FsTransferFailureScope::WorkerLaunch,
-                            err.as_str(),
-                        );
-                        tracing::warn!(
-                            "transfer worker launch failed: job_id={} batch_id={} worker_id={} worker_task_id={} err={}",
-                            assignment.job_id,
-                            assignment.batch_id,
-                            assignment.worker_id,
-                            assignment.worker_task_id,
-                            err
-                        );
-                    }
-                });
+                let mut shutdown_waiter = fs_framework.register_shutdown_waiter();
+                crate::framework::spawn_fs_task(
+                    &fs_framework,
+                    "transfer_worker_launch",
+                    async move {
+                        let launch_result = tokio::select! {
+                            _ = shutdown_waiter.wait() => return,
+                            result = launch_transfer_worker_until_ack_or_superseded(
+                                api2.clone(),
+                                s3_state2.clone(),
+                                dst_exporter_id.clone(),
+                                assignment.clone(),
+                            ) => result,
+                        };
+                        if let Err(err) = launch_result {
+                            let _ = s3_state2.mark_transfer_worker_attempt_stopped(
+                                assignment.job_id.as_str(),
+                                assignment.batch_id.as_str(),
+                                assignment.worker_id.as_str(),
+                                assignment.worker_task_id.as_str(),
+                                None,
+                                err.as_str(),
+                                Utc::now().timestamp_millis(),
+                            );
+                            s3_state2.note_transfer_failure(
+                                assignment.job_id.as_str(),
+                                Utc::now().timestamp_millis(),
+                                fluxon_fs_s3_gateway::FsTransferFailureScope::WorkerLaunch,
+                                err.as_str(),
+                            );
+                            tracing::warn!(
+                                "transfer worker launch failed: job_id={} batch_id={} worker_id={} worker_task_id={} err={}",
+                                assignment.job_id,
+                                assignment.batch_id,
+                                assignment.worker_id,
+                                assignment.worker_task_id,
+                                err
+                            );
+                        }
+                    },
+                );
             }
         }
     }
@@ -1446,16 +1460,20 @@ async fn run_transfer_worker_scheduler_once(
 }
 
 pub(crate) fn start_transfer_reconcile_actor(
-    rt_handle: Handle,
+    fs_framework: crate::Framework,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
 ) {
-    rt_handle.spawn(async move {
+    let mut shutdown_waiter = fs_framework.register_shutdown_waiter();
+    crate::framework::spawn_fs_task(&fs_framework, "transfer_reconcile", async move {
         loop {
             let now_unix_ms = Utc::now().timestamp_millis();
             if let Err(err) = s3_state.reconcile_transfer_scheduler_state(now_unix_ms) {
                 tracing::warn!("transfer reconcile actor failed: {}", err);
             }
-            tokio::time::sleep(Duration::from_millis(TRANSFER_RECONCILE_INTERVAL_MS)).await;
+            tokio::select! {
+                _ = shutdown_waiter.wait() => return,
+                _ = tokio::time::sleep(Duration::from_millis(TRANSFER_RECONCILE_INTERVAL_MS)) => {}
+            }
         }
     });
 }
@@ -1464,24 +1482,30 @@ pub(crate) fn start_transfer_reconcile_actor(
 // on a periodic idle tick so scan timeouts and newly visible source agents
 // converge even after missed notifications.
 pub(crate) fn start_transfer_scan_scheduler_actor(
-    rt_handle: Handle,
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
     runtime_state: Arc<Mutex<TransferScanRuntimeState>>,
 ) {
     let wake = s3_state.transfer_scan_scheduler_wait_handle();
-    rt_handle.spawn(async move {
+    let mut shutdown_waiter = fs_framework.register_shutdown_waiter();
+    let actor_framework = fs_framework.clone();
+    crate::framework::spawn_fs_task(&fs_framework, "transfer_scan_scheduler", async move {
         loop {
-            if let Err(err) = run_transfer_scan_scheduler_once(
-                api.clone(),
-                s3_state.clone(),
-                runtime_state.clone(),
-            )
-            .await
-            {
+            let reconcile_result = tokio::select! {
+                _ = shutdown_waiter.wait() => return,
+                result = run_transfer_scan_scheduler_once(
+                    actor_framework.clone(),
+                    api.clone(),
+                    s3_state.clone(),
+                    runtime_state.clone(),
+                ) => result,
+            };
+            if let Err(err) = reconcile_result {
                 tracing::warn!("transfer scan scheduler reconcile failed: {}", err);
             }
             tokio::select! {
+                _ = shutdown_waiter.wait() => return,
                 _ = wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(TRANSFER_SCHEDULER_IDLE_SLEEP_MS)) => {}
             }
@@ -1493,18 +1517,28 @@ pub(crate) fn start_transfer_scan_scheduler_actor(
 // on its own cadence so launch acks and heartbeats are not blocked behind a
 // full convergence pass on every wake-up.
 pub(crate) fn start_transfer_worker_scheduler_actor(
-    rt_handle: Handle,
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
 ) {
     let wake = s3_state.transfer_worker_scheduler_wait_handle();
-    rt_handle.spawn(async move {
+    let mut shutdown_waiter = fs_framework.register_shutdown_waiter();
+    let actor_framework = fs_framework.clone();
+    crate::framework::spawn_fs_task(&fs_framework, "transfer_worker_scheduler", async move {
         loop {
-            if let Err(err) = run_transfer_worker_scheduler_once(api.clone(), s3_state.clone()).await
-            {
+            let scheduler_result = tokio::select! {
+                _ = shutdown_waiter.wait() => return,
+                result = run_transfer_worker_scheduler_once(
+                    actor_framework.clone(),
+                    api.clone(),
+                    s3_state.clone(),
+                ) => result,
+            };
+            if let Err(err) = scheduler_result {
                 tracing::warn!("transfer worker scheduler failed: {}", err);
             }
             tokio::select! {
+                _ = shutdown_waiter.wait() => return,
                 _ = wake.notified() => {}
                 _ = tokio::time::sleep(Duration::from_millis(TRANSFER_SCHEDULER_IDLE_SLEEP_MS)) => {}
             }

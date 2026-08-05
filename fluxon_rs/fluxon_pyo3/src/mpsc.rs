@@ -4,25 +4,25 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel as cbchan;
+use fluxon_mq::DeleteResult as CoreDeleteResult;
 use fluxon_mq::consumer::{
     ConsumedPayload as CoreConsumedPayload, MqPayload as CoreMqPayload,
     PayloadResult as CorePayloadResult,
 };
-use fluxon_mq::DeleteResult as CoreDeleteResult;
 use fluxon_mq::{
-    create::{create_mpsc_channel, ChanCreateConfig},
     ChanManager, MpscConsumer as CoreMpscConsumer, MpscError as CoreMpscError,
     MpscProducer as CoreMpscProducer, ShutdownCtl,
+    create::{ChanCreateConfig, create_mpsc_channel},
 };
-use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyString};
 use pyo3::Py;
 use pyo3::PyErr;
+use pyo3::prelude::*;
+use pyo3::types::{PyAny, PyBytes, PyString};
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 // (no local payload buffering)
 
-use crate::flatdict_zerocopy::{decode_flat_dict_to_wrapped_py_object, FlatDictDataOwner};
+use crate::flatdict_zerocopy::{FlatDictDataOwner, decode_flat_dict_to_wrapped_py_object};
 use fluxon_kv::{Framework as KvFramework, KvClientTrait};
 use fluxon_mq::lease_manager::LeaseBackendUid;
 use fluxon_util::lease_manager::GLOBAL_LM;

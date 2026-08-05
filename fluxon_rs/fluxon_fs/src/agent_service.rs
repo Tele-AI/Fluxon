@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -11,7 +11,7 @@ use anyhow::Context;
 use prost::bytes::Bytes;
 use serde_json::json;
 
-use fluxon_framework_compiled::shutdown::ViewShutdownExt;
+use fluxon_framework_compiled::shutdown::{ShutdownWaiter, ViewShutdownExt};
 use fluxon_fs_core::config::{
     FLUXON_FS_COMPONENT_METADATA_KEY, FLUXON_FS_CONFIG_ACCESS_MODEL_JSON_KEY,
     FLUXON_FS_CONTROL_SCHEMA_VERSION, FLUXON_FS_EXPORT_OVERLAY_JSON_KEY,
@@ -31,6 +31,7 @@ use fluxon_fs_core::config::{
 use fluxon_kv::FsMountKind;
 use fluxon_kv::cluster_manager::NodeID;
 use fluxon_kv::config::ClientConfigYaml;
+use fluxon_kv::memholder::{ExternalMemHolder, UserMemHolder};
 use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult};
 use fluxon_kv::user_api::FluxonUserApi;
 use fluxon_kv::user_api::flat_dict::{FlatDict, FlatValue};
@@ -38,10 +39,11 @@ use fluxon_kv::user_api::{
     USER_RPC_DEFAULT_TIMEOUT_MS, decode_flat_dict_bytes, encode_flat_dict_bytes,
 };
 use fluxon_kv::user_rpc::user_rpc_call;
-use fluxon_kv::{ConfigArg, run_client_with_startup_member_metadata};
+use fluxon_kv::{ConfigArg, KvClientTrait, KvGetResult, run_client_with_startup_member_metadata};
 use fluxon_util::fs_statvfs::{
     mount_point_for_abs_dir, normalize_abs_dir_label, statvfs_used_total,
 };
+use fluxon_util::notify_state;
 use parking_lot::{Condvar, Mutex, RwLock};
 use tokio::runtime::Runtime;
 use tokio::sync::Notify;
@@ -51,9 +53,10 @@ use crate::config::FluxonFsExportRoutingMode;
 use crate::config::FluxonFsGlobalConfig;
 use crate::write_session_rpc::{
     self, FsAbortWriteSessionReq, FsAbortWriteSessionResp, FsCloseWriteSessionReq,
-    FsCloseWriteSessionResp, FsOpenWriteSessionReq, FsOpenWriteSessionResp,
+    FsCloseWriteSessionResp, FsFinalizeWriteSessionReq, FsFinalizeWriteSessionResp,
+    FsOpenWriteSessionReq, FsOpenWriteSessionResp, FsPutSmallObjectReq, FsPutSmallObjectResp,
     FsWaitWriteSessionPayloadsReq, FsWaitWriteSessionPayloadsResp, FsWriteSessionChunkReq,
-    FsWriteSessionChunkResp, FsWriteSessionDataFrame,
+    FsWriteSessionChunkResp, FsWriteSessionDataFrame, FsWriteSessionDataRefFrame,
 };
 
 pub(crate) mod transfer_agent;
@@ -67,6 +70,8 @@ const WRITE_SESSION_MAX_QUEUED_BYTES: usize =
 const WRITE_SESSION_IDLE_TIMEOUT_SECS: u64 = 180;
 const WRITE_SESSION_REAP_INTERVAL_SECS: u64 = 30;
 const WRITE_SESSION_CLOSE_WAIT_TIMEOUT_SECS: u64 = 30;
+const WRITE_SESSION_KV_GET_TIMEOUT_SECS: u64 = 10;
+const WRITE_SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 30;
 pub(crate) const TRANSFER_HEARTBEAT_INTERVAL_MS: i64 = 5_000;
 pub(crate) const TRANSFER_STREAM_RPC_TIMEOUT_MS: u64 = 60_000;
 pub(crate) const TRANSFER_WORKER_COORDINATION_RPC_TIMEOUT_MS: u64 = 30_000;
@@ -76,6 +81,93 @@ const AGENT_EXPORT_NAME_KEY: &str = "export_name";
 const S3_INTERNAL_MULTIPART_PAYLOAD_KEY: &str =
     fluxon_fs_core::s3_gateway::FS_S3_INTERNAL_MULTIPART_PAYLOAD_KEY;
 static WRITE_PATH_TRANSIENT_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WriteSessionDataRefPart {
+    seq_no: u64,
+    offset: i64,
+    range: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedWriteSessionDataRef {
+    total_len: usize,
+    parts: Vec<WriteSessionDataRefPart>,
+}
+
+fn validate_write_session_data_ref_shape(
+    req: &FsWriteSessionDataRefFrame,
+) -> Result<ValidatedWriteSessionDataRef, String> {
+    if req.offset < 0 {
+        return Err("write_session data-ref offset must be non-negative".to_string());
+    }
+    if req.part_lengths.is_empty() {
+        return Err("write_session data-ref part_lengths must be non-empty".to_string());
+    }
+    if req.part_lengths.len() > WRITE_SESSION_MAX_INFLIGHT_CHUNKS {
+        return Err(format!(
+            "write_session data-ref has too many parts: got={} max={}",
+            req.part_lengths.len(),
+            WRITE_SESSION_MAX_INFLIGHT_CHUNKS
+        ));
+    }
+
+    let total_len = usize::try_from(req.total_len)
+        .map_err(|_| "write_session data-ref total_len exceeds usize".to_string())?;
+    let mut range_start = 0usize;
+    let mut offset = req.offset;
+    let mut parts = Vec::with_capacity(req.part_lengths.len());
+    for (idx, raw_len) in req.part_lengths.iter().copied().enumerate() {
+        let part_len = raw_len as usize;
+        if part_len == 0 || part_len > WRITE_SESSION_CHUNK_BYTES {
+            return Err(format!(
+                "write_session data-ref invalid part length: index={} len={} max={}",
+                idx, part_len, WRITE_SESSION_CHUNK_BYTES
+            ));
+        }
+        let range_end = range_start
+            .checked_add(part_len)
+            .ok_or_else(|| "write_session data-ref part length sum overflowed usize".to_string())?;
+        let seq_no = req
+            .seq_no
+            .checked_add(idx as u64)
+            .ok_or_else(|| "write_session data-ref sequence overflow".to_string())?;
+        parts.push(WriteSessionDataRefPart {
+            seq_no,
+            offset,
+            range: range_start..range_end,
+        });
+        offset = offset
+            .checked_add(i64::from(raw_len))
+            .ok_or_else(|| "write_session data-ref offset overflow".to_string())?;
+        range_start = range_end;
+    }
+    if range_start != total_len {
+        return Err(format!(
+            "write_session data-ref length mismatch: parts={} total_len={}",
+            range_start, total_len
+        ));
+    }
+    Ok(ValidatedWriteSessionDataRef { total_len, parts })
+}
+
+fn split_write_session_kv_payload(
+    payload: Bytes,
+    validated: &ValidatedWriteSessionDataRef,
+) -> Result<Vec<Bytes>, String> {
+    if payload.len() != validated.total_len {
+        return Err(format!(
+            "write_session data-ref KV payload length mismatch: holder={} expected={}",
+            payload.len(),
+            validated.total_len
+        ));
+    }
+    Ok(validated
+        .parts
+        .iter()
+        .map(|part| payload.slice(part.range.clone()))
+        .collect())
+}
 
 #[derive(Debug, Clone)]
 struct AgentMount {
@@ -347,6 +439,158 @@ pub struct FluxonFsAgentHandle {
     exports: AgentExportsHandle,
     data_plane: AgentDataPlaneHandlers,
     registered_export_rpc_paths: Arc<Mutex<BTreeMap<String, FluxonFsExportRpcPaths>>>,
+    write_sessions: AgentWriteSessionsHandle,
+    write_session_admission: WriteSessionAdmissionHandle,
+}
+
+struct WriteSessionRegistrationGuard {
+    write_sessions: AgentWriteSessionsHandle,
+    admission: WriteSessionAdmissionHandle,
+    armed: bool,
+}
+
+impl WriteSessionRegistrationGuard {
+    fn new(
+        write_sessions: AgentWriteSessionsHandle,
+        admission: WriteSessionAdmissionHandle,
+    ) -> Self {
+        Self {
+            write_sessions,
+            admission,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WriteSessionRegistrationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.admission.stop_accepting();
+        self.write_sessions.abort_all_and_wait_for_writers();
+    }
+}
+
+#[derive(Debug)]
+struct WriteSessionAdmissionState {
+    accepting: bool,
+    in_flight_handlers: usize,
+}
+
+#[derive(Clone)]
+struct WriteSessionAdmissionHandle {
+    state: Arc<Mutex<WriteSessionAdmissionState>>,
+    drained: Arc<Notify>,
+    stopped: Arc<Notify>,
+}
+
+struct WriteSessionAdmissionGuard {
+    admission: WriteSessionAdmissionHandle,
+}
+
+impl WriteSessionAdmissionHandle {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::new_with_accepting(true)
+    }
+
+    fn new_stopped() -> Self {
+        Self::new_with_accepting(false)
+    }
+
+    fn new_with_accepting(accepting: bool) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(WriteSessionAdmissionState {
+                accepting,
+                in_flight_handlers: 0,
+            })),
+            drained: Arc::new(Notify::new()),
+            stopped: Arc::new(Notify::new()),
+        }
+    }
+
+    fn start_accepting(&self) {
+        let mut state = self.state.lock();
+        assert_eq!(
+            state.in_flight_handlers, 0,
+            "write-session admission cannot start with active handlers"
+        );
+        state.accepting = true;
+    }
+
+    fn try_enter_handler(&self) -> Option<WriteSessionAdmissionGuard> {
+        let mut state = self.state.lock();
+        if !state.accepting {
+            return None;
+        }
+        state.in_flight_handlers = state
+            .in_flight_handlers
+            .checked_add(1)
+            .expect("write-session admission counter overflow");
+        Some(WriteSessionAdmissionGuard {
+            admission: self.clone(),
+        })
+    }
+
+    fn stop_accepting(&self) {
+        let changed = {
+            let mut state = self.state.lock();
+            let changed = state.accepting;
+            state.accepting = false;
+            changed
+        };
+        if changed {
+            self.stopped.notify_waiters();
+        }
+    }
+
+    async fn wait_until_stopped(&self) {
+        notify_state::wait_until(&self.stopped, || !self.state.lock().accepting).await;
+    }
+
+    async fn wait_for_handlers(&self) {
+        notify_state::wait_until(&self.drained, || self.state.lock().in_flight_handlers == 0).await;
+    }
+
+    #[cfg(test)]
+    async fn stop_and_wait_for_handlers(&self) {
+        self.stop_accepting();
+        self.wait_for_handlers().await;
+    }
+}
+
+impl Drop for WriteSessionAdmissionGuard {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock();
+        state.in_flight_handlers = state
+            .in_flight_handlers
+            .checked_sub(1)
+            .expect("write-session admission guard underflow");
+        let became_drained = state.in_flight_handlers == 0;
+        drop(state);
+        if became_drained {
+            self.admission.drained.notify_waiters();
+        }
+    }
+}
+
+enum WriteSessionKvPayloadOwner {
+    Owner(Arc<UserMemHolder>),
+    External(Arc<ExternalMemHolder>),
+}
+
+impl AsRef<[u8]> for WriteSessionKvPayloadOwner {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owner(holder) => holder.bytes(),
+            Self::External(holder) => holder.bytes(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -564,6 +808,7 @@ fn configured_write_executor_drain_all() -> bool {
 
 #[derive(Clone)]
 struct AgentWriteSessionsHandle {
+    instance_id: Arc<uuid::Uuid>,
     next_id: Arc<AtomicU64>,
     entries: Arc<Mutex<BTreeMap<String, WriteSessionEntryHandle>>>,
     active_write_paths: ActiveWritePathsHandle,
@@ -572,6 +817,10 @@ struct AgentWriteSessionsHandle {
 impl AgentWriteSessionsHandle {
     fn new() -> Self {
         Self {
+            // The counter alone repeats after an Agent restart. Prefix every session with a
+            // process-instance UUID so a delayed raw/ref frame cannot target a new session that
+            // happens to reuse the same counter, export, and relative path.
+            instance_id: Arc::new(uuid::Uuid::new_v4()),
             next_id: Arc::new(AtomicU64::new(1)),
             entries: Arc::new(Mutex::new(BTreeMap::new())),
             active_write_paths: ActiveWritePathsHandle::new(),
@@ -579,7 +828,11 @@ impl AgentWriteSessionsHandle {
     }
 
     fn alloc_id(&self) -> String {
-        format!("{:016x}", self.next_id.fetch_add(1, Ordering::Relaxed))
+        format!(
+            "{}-{:016x}",
+            self.instance_id.as_simple(),
+            self.next_id.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     fn insert(&self, session_id: String, entry: WriteSessionEntry, file: fs::File) {
@@ -641,6 +894,189 @@ impl AgentWriteSessionsHandle {
         self.active_write_paths
             .release_owned(&state.write_path_key, &state.write_path_owner);
     }
+
+    fn abort_all_and_wait_for_writers(&self) {
+        self.abort_all_and_wait_for_writers_inner(None)
+            .expect("unbounded write-session drain must not time out");
+    }
+
+    fn abort_all_and_wait_for_writers_until(&self, deadline: Instant) -> Result<(), String> {
+        self.abort_all_and_wait_for_writers_inner(Some(deadline))
+    }
+
+    fn abort_all_and_wait_for_writers_inner(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<(), String> {
+        // Keep every entry in the authoritative map until its active writer has actually
+        // released the current chunk. A timed-out sweep can then be retried without losing the
+        // only handle that proves KV-backed payload holders are gone.
+        let entries: Vec<(String, WriteSessionEntryHandle)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|(session_id, entry)| (session_id.clone(), entry.clone()))
+                .collect()
+        };
+
+        let mut discarded_chunks = Vec::with_capacity(entries.len());
+        for (_, entry) in &entries {
+            let mut state = entry.state.lock();
+            state.aborted = true;
+            state.closing = true;
+            discarded_chunks.push(std::mem::take(&mut state.queued_chunks));
+            state.queued_bytes = 0;
+            state.scheduled = false;
+            drop(state);
+            entry.cv.notify_all();
+        }
+        drop(discarded_chunks);
+
+        for (session_id, entry) in &entries {
+            let (write_path_key, write_path_owner) = {
+                let mut state = entry.state.lock();
+                while state.writing {
+                    if let Some(deadline) = deadline {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err(format!(
+                                "timed out waiting for active write-session writer: export={} relpath={}",
+                                state.export_name, state.relpath
+                            ));
+                        }
+                        entry
+                            .cv
+                            .wait_for(&mut state, deadline.saturating_duration_since(now));
+                    } else {
+                        entry.cv.wait(&mut state);
+                    }
+                }
+                (state.write_path_key.clone(), state.write_path_owner.clone())
+            };
+            let removed = {
+                let mut live_entries = self.entries.lock();
+                if live_entries
+                    .get(session_id)
+                    .is_some_and(|live| Arc::ptr_eq(live, entry))
+                {
+                    live_entries.remove(session_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                self.active_write_paths
+                    .release_owned(&write_path_key, &write_path_owner);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn abort_write_session_entry_and_wait_for_writer(entry: &WriteSessionEntryHandle) {
+    let discarded_chunks = {
+        let mut state = entry.state.lock();
+        state.aborted = true;
+        state.closing = true;
+        state.queued_bytes = 0;
+        state.scheduled = false;
+        std::mem::take(&mut state.queued_chunks)
+    };
+    drop(discarded_chunks);
+    entry.cv.notify_all();
+
+    // The active chunk is owned by the writer outside the state mutex. It may be backed by a KV
+    // mmap holder, so the session must remain tracked until the writer drops that chunk and then
+    // publishes writing=false.
+    let mut state = entry.state.lock();
+    while state.writing {
+        entry.cv.wait(&mut state);
+    }
+}
+
+impl FluxonFsAgentHandle {
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        drain_write_sessions_for_shutdown(
+            &self.write_session_admission,
+            &self.write_sessions,
+            Duration::from_secs(WRITE_SESSION_SHUTDOWN_TIMEOUT_SECS),
+        )
+        .await
+    }
+}
+
+async fn abort_write_sessions_for_shutdown_sweep(
+    write_sessions: &AgentWriteSessionsHandle,
+    deadline: Instant,
+    phase: &'static str,
+) -> anyhow::Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(anyhow::anyhow!(
+            "write-session shutdown timed out before {} sweep",
+            phase
+        ));
+    }
+    let write_sessions = write_sessions.clone();
+    match tokio::task::spawn_blocking(move || {
+        write_sessions.abort_all_and_wait_for_writers_until(deadline)
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(detail)) => Err(anyhow::anyhow!(
+            "write-session {} shutdown sweep failed: {}",
+            phase,
+            detail
+        )),
+        Err(err) => Err(anyhow::anyhow!(
+            "write-session {} shutdown task failed: {}",
+            phase,
+            err
+        )),
+    }
+}
+
+async fn drain_write_sessions_for_shutdown(
+    admission: &WriteSessionAdmissionHandle,
+    write_sessions: &AgentWriteSessionsHandle,
+    timeout_duration: Duration,
+) -> anyhow::Result<()> {
+    // Stop new handlers first, then abort existing sessions to wake handlers blocked on queue
+    // backpressure. A second sweep catches an open handler admitted before the stop that inserted
+    // its session after the first sweep. One deadline bounds the complete sequence.
+    admission.stop_accepting();
+    let deadline = Instant::now() + timeout_duration;
+    abort_write_sessions_for_shutdown_sweep(write_sessions, deadline, "initial").await?;
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero()
+        || tokio::time::timeout(remaining, admission.wait_for_handlers())
+            .await
+            .is_err()
+    {
+        return Err(anyhow::anyhow!(
+            "write-session shutdown timed out waiting for admitted handlers"
+        ));
+    }
+
+    abort_write_sessions_for_shutdown_sweep(write_sessions, deadline, "final").await
+}
+
+async fn maybe_shutdown_kv_after_holder_drain<Shutdown, ShutdownFuture>(
+    holder_drain_succeeded: bool,
+    shutdown: Shutdown,
+) -> Option<anyhow::Result<()>>
+where
+    Shutdown: FnOnce() -> ShutdownFuture,
+    ShutdownFuture: std::future::Future<Output = anyhow::Result<()>>,
+{
+    if holder_drain_succeeded {
+        Some(shutdown().await)
+    } else {
+        None
+    }
 }
 
 fn write_session_stored_io_error(e: &std::io::Error) -> WriteSessionStoredIoError {
@@ -663,13 +1099,26 @@ fn write_session_accepts_chunk_while_closing(
 
 fn write_session_pending_expected_frames(state: &WriteSessionEntry) -> bool {
     match state.expected_data_frames {
-        Some(expected) if expected > 0 => state.written_data_frame_seqs.len() < expected as usize,
+        Some(expected) if expected > 0 => {
+            !write_session_frame_prefix_is_complete(&state.written_data_frame_seqs, expected)
+        }
         _ => false,
     }
 }
 
 fn write_session_pending_received_frames(state: &WriteSessionEntry, expected_frames: u64) -> bool {
-    expected_frames > 0 && state.received_data_frame_seqs.len() < expected_frames as usize
+    expected_frames > 0
+        && !write_session_frame_prefix_is_complete(&state.received_data_frame_seqs, expected_frames)
+}
+
+fn write_session_frame_prefix_is_complete(frames: &BTreeSet<u64>, expected_frames: u64) -> bool {
+    let Ok(expected_len) = usize::try_from(expected_frames) else {
+        return false;
+    };
+    // A count of the full [0, expected_frames) range proves continuity because BTreeSet values
+    // are unique. Looking only at the total set length is wrong when out-of-range or out-of-order
+    // frames are present (for example {0, 2, 3} while waiting for two frames).
+    frames.range(..expected_frames).count() == expected_len
 }
 
 fn write_session_merge_expected_frames(current: Option<u64>, incoming: Option<u64>) -> Option<u64> {
@@ -764,6 +1213,11 @@ fn drain_write_session_entry_once(entry_handle: &WriteSessionEntryHandle) -> boo
         (chunk, need_seek)
     };
 
+    let chunk_seq_no = chunk.seq_no;
+    let chunk_offset = chunk.offset;
+    let chunk_len = chunk.data.len();
+    let chunk_is_data_frame = chunk.is_data_frame;
+
     let write_res = {
         let file_lock_started = Instant::now();
         let mut file = entry_handle.file.lock();
@@ -789,6 +1243,9 @@ fn drain_write_session_entry_once(entry_handle: &WriteSessionEntryHandle) -> boo
             (res, file_lock_wait_ns, seek_ns, write_ns)
         }
     };
+    // A KV-backed Bytes keeps its mmap holder alive. Drop the active chunk before publishing
+    // writing=false so shutdown can safely tear down the KV framework after observing the flag.
+    drop(chunk);
 
     let mut requeue = false;
     let state_lock_started = Instant::now();
@@ -808,20 +1265,18 @@ fn drain_write_session_entry_once(entry_handle: &WriteSessionEntryHandle) -> boo
     state.writing = false;
     match write_res {
         Ok(()) => {
-            state.current_pos = chunk.offset.saturating_add(chunk.data.len() as u64);
-            state.timing.bytes_written = state
-                .timing
-                .bytes_written
-                .saturating_add(chunk.data.len() as u64);
+            state.current_pos = chunk_offset.saturating_add(chunk_len as u64);
+            state.timing.bytes_written =
+                state.timing.bytes_written.saturating_add(chunk_len as u64);
             state.timing.chunks_written = state.timing.chunks_written.saturating_add(1);
             state.highest_written_seq = Some(
                 state
                     .highest_written_seq
-                    .map(|prev| prev.max(chunk.seq_no))
-                    .unwrap_or(chunk.seq_no),
+                    .map(|prev| prev.max(chunk_seq_no))
+                    .unwrap_or(chunk_seq_no),
             );
-            if chunk.is_data_frame {
-                state.written_data_frame_seqs.insert(chunk.seq_no);
+            if chunk_is_data_frame {
+                state.written_data_frame_seqs.insert(chunk_seq_no);
             }
             if state.aborted {
                 state.queued_chunks.clear();
@@ -886,7 +1341,7 @@ pub fn run_agent_blocking(config_path: &str, workdir: &str) -> anyhow::Result<()
     let initial_access_model = extract_initial_access_model_from_fluxon_config(&raw)?;
 
     let kv_yaml = extract_kvclient_config_yaml_from_fluxon_config(&raw)?;
-    let mut kv_cfg = kv_yaml.verify().map_err(|e| anyhow::anyhow!("{}", e))?;
+    let kv_cfg = kv_yaml.verify().map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // Ensure external client mode; FS agent is a filesystem RPC server, not a contributing data node.
     let dram = kv_cfg.contribute_to_cluster_pool_size.dram;
@@ -958,86 +1413,159 @@ async fn async_main(
 
     let fs_framework = crate::new_fs_framework(format!("fluxon_fs.agent:{}", instance_key));
 
-    let api_for_reg = Arc::new(
-        FluxonUserApi::new(framework.clone(), rt.handle().clone())
-            .map_err(|e| anyhow::anyhow!("{}", e))?,
-    );
+    let api_for_reg = match FluxonUserApi::new(framework.clone(), rt.handle().clone()) {
+        Ok(api) => Arc::new(api),
+        Err(err) => {
+            let startup_err = anyhow::anyhow!("{}", err);
+            if let Err(shutdown_err) = fs_framework.shutdown().await {
+                tracing::warn!(
+                    "FS framework cleanup after user API initialization failure failed: {}",
+                    shutdown_err
+                );
+            }
+            if let Err(shutdown_err) = framework.shutdown().await {
+                tracing::warn!(
+                    "KV framework cleanup after user API initialization failure failed: {}",
+                    shutdown_err
+                );
+            }
+            return Err(startup_err);
+        }
+    };
     let master_pull_interval_ms = Arc::new(RwLock::new(FS_MASTER_BOOTSTRAP_PULL_INTERVAL_MS));
     let access_model = AgentAccessModelHandle::new(initial_access_model);
-    let agent_handle = register_agent_with_access_model(
+    let agent_handle = match register_agent_with_access_model(
         api_for_reg.clone(),
         &fs_cache,
         internal_exports,
         FLUXON_FS_CONTROL_SCHEMA_VERSION,
         access_model.clone(),
-    )
-    .map_err(|e| anyhow::anyhow!("{}", e))?;
-    start_export_mount_stat_sampler(
         fs_framework.clone(),
-        framework.clone(),
-        agent_handle.exports.clone(),
-    );
-    start_agent_exports_push_actor(
-        fs_framework.clone(),
-        framework.clone(),
-        agent_handle.exports.clone(),
-        master_cfg.clone(),
-        master_pull_interval_ms.clone(),
-    );
-    start_access_model_sync_actor(
-        fs_framework.clone(),
-        framework.clone(),
-        api_for_reg.clone(),
-        access_model,
-        agent_handle.exports.clone(),
-        agent_handle.data_plane.clone(),
-        agent_handle.registered_export_rpc_paths.clone(),
-        master_cfg.clone(),
-        master_pull_interval_ms.clone(),
-    );
-
-    if !agent_mounts.is_empty() {
-        let api_for_agent = FluxonUserApi::new(framework.clone(), rt.handle().clone())
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let agent = crate::agent::FluxonFsAgent::new(
+    ) {
+        Ok(handle) => handle,
+        Err(err) => {
+            let startup_err = anyhow::anyhow!("{}", err);
+            if let Err(shutdown_err) = fs_framework.shutdown().await {
+                tracing::warn!(
+                    "FS framework cleanup after agent registration failure failed: {}",
+                    shutdown_err
+                );
+            }
+            if let Err(shutdown_err) = framework.shutdown().await {
+                tracing::warn!(
+                    "KV framework cleanup after agent registration failure failed: {}",
+                    shutdown_err
+                );
+            }
+            return Err(startup_err);
+        }
+    };
+    let service_result: anyhow::Result<()> = async {
+        start_export_mount_stat_sampler(
             fs_framework.clone(),
             framework.clone(),
-            api_for_agent,
-            rt.handle().clone(),
+            agent_handle.exports.clone(),
         );
-        agent
-            .set_cache_config_yaml(&cache_yaml)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-        agent.set_master_config(master_cfg);
+        start_agent_exports_push_actor(
+            fs_framework.clone(),
+            framework.clone(),
+            agent_handle.exports.clone(),
+            master_cfg.clone(),
+            master_pull_interval_ms.clone(),
+        );
+        start_access_model_sync_actor(
+            fs_framework.clone(),
+            framework.clone(),
+            api_for_reg.clone(),
+            access_model,
+            agent_handle.exports.clone(),
+            agent_handle.data_plane.clone(),
+            agent_handle.registered_export_rpc_paths.clone(),
+            master_cfg.clone(),
+            master_pull_interval_ms.clone(),
+        );
 
-        for m in agent_mounts {
-            agent
-                .mount_remote_dir_async(&m.local_mount_dir_abs, &m.export_name)
-                .await
+        if !agent_mounts.is_empty() {
+            let api_for_agent = FluxonUserApi::new(framework.clone(), rt.handle().clone())
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            tracing::info!(
-                "fluxon_fs agent mounted: export={} local_mount_dir_abs={}",
-                m.export_name,
-                m.local_mount_dir_abs
+            let agent = crate::agent::FluxonFsAgent::new(
+                fs_framework.clone(),
+                framework.clone(),
+                api_for_agent,
+                rt.handle().clone(),
             );
+            agent
+                .set_cache_config_yaml(&cache_yaml)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            agent.set_master_config(master_cfg.clone());
+
+            for m in &agent_mounts {
+                agent
+                    .mount_remote_dir_async(&m.local_mount_dir_abs, &m.export_name)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                tracing::info!(
+                    "fluxon_fs agent mounted: export={} local_mount_dir_abs={}",
+                    m.export_name,
+                    m.local_mount_dir_abs
+                );
+            }
         }
+
+        tracing::info!("fluxon_fs agent ready");
+        fs_framework.wait_shutdown_signal().await;
+        Ok(())
+    }
+    .await;
+
+    // From the point RPC handlers are registered, every exit path must release all KV-backed
+    // chunks before the KV framework can unmap shared memory. Collect each result first so a
+    // startup/mount failure still runs the complete ordered teardown.
+    let agent_shutdown_result = agent_handle
+        .shutdown()
+        .await
+        .with_context(|| "shut down write sessions");
+    let fs_shutdown_result = fs_framework
+        .shutdown()
+        .await
+        .map_err(|e| anyhow::anyhow!("framework shutdown failed: {}", e));
+    let kv_shutdown_result =
+        maybe_shutdown_kv_after_holder_drain(agent_shutdown_result.is_ok(), || async {
+            framework
+                .shutdown()
+                .await
+                .map_err(|e| anyhow::anyhow!("kv framework shutdown failed: {}", e))
+        })
+        .await;
+    if kv_shutdown_result.is_none() {
+        // Fail closed: if the holder drain task panicked or was cancelled, unmapping KV memory
+        // could turn a still-running writer into a use-after-unmap. Leak one Arc deliberately so
+        // the mapping remains alive until process exit, and surface the drain error below.
+        tracing::error!(
+            "write-session holder drain was not proven complete; skipping KV framework shutdown"
+        );
+        std::mem::forget(framework.clone());
     }
 
-    tracing::info!("fluxon_fs agent ready");
-    fs_framework.wait_shutdown_signal().await;
-    fs_framework
-        .shutdown()
-        .await
-        .map_err(|e| anyhow::anyhow!("framework shutdown failed: {}", e))?;
-    framework
-        .shutdown()
-        .await
-        .map_err(|e| anyhow::anyhow!("kv framework shutdown failed: {}", e))?;
+    service_result?;
+    agent_shutdown_result?;
+    fs_shutdown_result?;
+    if let Some(result) = kv_shutdown_result {
+        result?;
+    }
     Ok(())
 }
 
 fn current_master_pull_interval_ms(master_pull_interval_ms: &Arc<RwLock<u64>>) -> u64 {
     *master_pull_interval_ms.read()
+}
+
+async fn wait_for_shutdown_or_delay(shutdown_waiter: &mut ShutdownWaiter, delay: Duration) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown_waiter.wait() => true,
+        _ = tokio::time::sleep(delay) => false,
+    }
 }
 
 fn extract_initial_access_model_from_fluxon_config(
@@ -1060,12 +1588,13 @@ fn start_export_mount_stat_sampler(
     const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
     let poller = ViewShutdownExt::register_shutdown_poller(&fs_framework);
+    let mut shutdown_waiter = ViewShutdownExt::register_shutdown_waiter(&fs_framework);
     let metrics = kv_framework
         .metric_reporter_view()
         .metric_reporter()
         .metrics();
 
-    tokio::spawn(async move {
+    crate::framework::spawn_fs_task(&fs_framework, "export_mount_stat_sampler", async move {
         let mut last_rev: u64 = 0;
         let mut export_root_dirs_abs: Vec<String> = Vec::new();
         loop {
@@ -1109,7 +1638,9 @@ fn start_export_mount_stat_sampler(
                 }
             }
 
-            tokio::time::sleep(SAMPLE_INTERVAL).await;
+            if wait_for_shutdown_or_delay(&mut shutdown_waiter, SAMPLE_INTERVAL).await {
+                return;
+            }
         }
     });
 }
@@ -1124,11 +1655,12 @@ fn start_agent_exports_push_actor(
     const RETRY_LOG_TICKS: u64 = 25;
 
     let poller = ViewShutdownExt::register_shutdown_poller(&fs_framework);
+    let mut shutdown_waiter = ViewShutdownExt::register_shutdown_waiter(&fs_framework);
     let master_id = master_cfg.instance_key.to_string();
     let master_node: NodeID = master_id.clone().into();
     let schema_version = FLUXON_FS_CONTROL_SCHEMA_VERSION;
 
-    tokio::spawn(async move {
+    crate::framework::spawn_fs_task(&fs_framework, "agent_exports_push", async move {
         let mut waited_ticks = 0u64;
         let mut waited_ms = 0u64;
 
@@ -1141,6 +1673,8 @@ fn start_agent_exports_push_actor(
             let pushed = exports.pushed_revision();
             if rev <= pushed {
                 tokio::select! {
+                    biased;
+                    _ = shutdown_waiter.wait() => return,
                     _ = exports.changed.notified() => {}
                     _ = tokio::time::sleep(Duration::from_millis(200)) => {}
                 }
@@ -1167,7 +1701,14 @@ fn start_agent_exports_push_actor(
                         e
                     );
                     let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    if wait_for_shutdown_or_delay(
+                        &mut shutdown_waiter,
+                        Duration::from_millis(interval_ms),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     waited_ticks += 1;
                     waited_ms = waited_ms.saturating_add(interval_ms);
                     continue;
@@ -1195,7 +1736,14 @@ fn start_agent_exports_push_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1231,7 +1779,11 @@ fn start_agent_exports_push_actor(
             }
 
             let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            if wait_for_shutdown_or_delay(&mut shutdown_waiter, Duration::from_millis(interval_ms))
+                .await
+            {
+                return;
+            }
             waited_ms = waited_ms.saturating_add(interval_ms);
         }
     });
@@ -1251,11 +1803,12 @@ fn start_access_model_sync_actor(
     const RETRY_LOG_TICKS: u64 = 25;
 
     let poller = ViewShutdownExt::register_shutdown_poller(&fs_framework);
+    let mut shutdown_waiter = ViewShutdownExt::register_shutdown_waiter(&fs_framework);
     let master_id = master_cfg.instance_key.to_string();
     let master_node: NodeID = master_id.clone().into();
     let schema_version = FLUXON_FS_CONTROL_SCHEMA_VERSION;
 
-    tokio::spawn(async move {
+    crate::framework::spawn_fs_task(&fs_framework, "access_model_sync", async move {
         let mut waited_ticks = 0u64;
         let mut waited_ms = 0u64;
 
@@ -1277,7 +1830,14 @@ fn start_access_model_sync_actor(
                         e
                     );
                     let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    if wait_for_shutdown_or_delay(
+                        &mut shutdown_waiter,
+                        Duration::from_millis(interval_ms),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     waited_ticks += 1;
                     waited_ms = waited_ms.saturating_add(interval_ms);
                     continue;
@@ -1305,7 +1865,14 @@ fn start_access_model_sync_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1320,7 +1887,14 @@ fn start_access_model_sync_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1338,7 +1912,14 @@ fn start_access_model_sync_actor(
                                     );
                                     let interval_ms =
                                         current_master_pull_interval_ms(&master_pull_interval_ms);
-                                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                                    if wait_for_shutdown_or_delay(
+                                        &mut shutdown_waiter,
+                                        Duration::from_millis(interval_ms),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     waited_ticks += 1;
                                     waited_ms = waited_ms.saturating_add(interval_ms);
                                     continue;
@@ -1354,7 +1935,14 @@ fn start_access_model_sync_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1372,7 +1960,14 @@ fn start_access_model_sync_actor(
                                     );
                                     let interval_ms =
                                         current_master_pull_interval_ms(&master_pull_interval_ms);
-                                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                                    if wait_for_shutdown_or_delay(
+                                        &mut shutdown_waiter,
+                                        Duration::from_millis(interval_ms),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     waited_ticks += 1;
                                     waited_ms = waited_ms.saturating_add(interval_ms);
                                     continue;
@@ -1387,7 +1982,14 @@ fn start_access_model_sync_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1414,7 +2016,14 @@ fn start_access_model_sync_actor(
                     }
                     if register_failed {
                         let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-                        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                        if wait_for_shutdown_or_delay(
+                            &mut shutdown_waiter,
+                            Duration::from_millis(interval_ms),
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         waited_ticks += 1;
                         waited_ms = waited_ms.saturating_add(interval_ms);
                         continue;
@@ -1424,7 +2033,14 @@ fn start_access_model_sync_actor(
                     exports.apply_master_overlay(overlay);
                     waited_ticks = 0;
                     waited_ms = 0;
-                    tokio::time::sleep(Duration::from_millis(next_pull_interval_ms)).await;
+                    if wait_for_shutdown_or_delay(
+                        &mut shutdown_waiter,
+                        Duration::from_millis(next_pull_interval_ms),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                 }
                 Err(e) => {
                     waited_ticks += 1;
@@ -1437,7 +2053,14 @@ fn start_access_model_sync_actor(
                         );
                     }
                     let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    if wait_for_shutdown_or_delay(
+                        &mut shutdown_waiter,
+                        Duration::from_millis(interval_ms),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     waited_ms = waited_ms.saturating_add(interval_ms);
                 }
             }
@@ -1723,6 +2346,7 @@ pub fn register_agent(
     api: Arc<FluxonUserApi>,
     cfg: &FluxonFsGlobalConfig,
     schema_version: i64,
+    lifecycle: crate::Framework,
 ) -> KvResult<FluxonFsAgentHandle> {
     register_agent_with_access_model(
         api,
@@ -1730,6 +2354,7 @@ pub fn register_agent(
         BTreeMap::new(),
         schema_version,
         AgentAccessModelHandle::new(None),
+        lifecycle,
     )
 }
 
@@ -1739,6 +2364,7 @@ fn register_agent_with_access_model(
     internal_exports: BTreeMap<String, FluxonFsExport>,
     schema_version: i64,
     access_model: AgentAccessModelHandle,
+    lifecycle: crate::Framework,
 ) -> KvResult<FluxonFsAgentHandle> {
     fn invalid(detail: impl Into<String>) -> KvError {
         KvError::Api(ApiError::InvalidArgument {
@@ -1777,8 +2403,13 @@ fn register_agent_with_access_model(
                 .collect(),
         ));
     let write_sessions = AgentWriteSessionsHandle::new();
+    // Keep write-session admission closed until every fallible registration step succeeds. This
+    // guarantees the synchronous registration-failure guard never has to wait for an async
+    // data-ref handler that may still own KV-backed payload memory.
+    let write_session_admission = WriteSessionAdmissionHandle::new_stopped();
+    let mut registration_guard =
+        WriteSessionRegistrationGuard::new(write_sessions.clone(), write_session_admission.clone());
     let write_executor = WriteExecutorHandle::new(configured_write_executor_worker_count());
-    let rt_handle = api.runtime_handle();
     write_session_rpc::register_callers(api.framework().as_ref());
 
     let data_plane = AgentDataPlaneHandlers {
@@ -1806,7 +2437,11 @@ fn register_agent_with_access_model(
             let ex = exports.clone();
             let access_model = access_model.clone();
             let write_sessions = write_sessions.clone();
+            let admission = write_session_admission.clone();
             Arc::new(move |_from, payload| {
+                let Some(_admission_guard) = admission.try_enter_handler() else {
+                    return Ok(resp_err_busy("write-session admission is stopped"));
+                };
                 Ok(handle_open_write_session(
                     &ex,
                     &access_model,
@@ -1819,7 +2454,11 @@ fn register_agent_with_access_model(
             let access_model = access_model.clone();
             let write_sessions = write_sessions.clone();
             let write_executor = write_executor.clone();
+            let admission = write_session_admission.clone();
             Arc::new(move |_from, payload| {
+                let Some(_admission_guard) = admission.try_enter_handler() else {
+                    return Ok(resp_err_busy("write-session admission is stopped"));
+                };
                 Ok(handle_write_session_chunk(
                     &access_model,
                     &write_sessions,
@@ -1831,7 +2470,11 @@ fn register_agent_with_access_model(
         truncate_write_session: {
             let access_model = access_model.clone();
             let write_sessions = write_sessions.clone();
+            let admission = write_session_admission.clone();
             Arc::new(move |_from, payload| {
+                let Some(_admission_guard) = admission.try_enter_handler() else {
+                    return Ok(resp_err_busy("write-session admission is stopped"));
+                };
                 Ok(handle_truncate_write_session(
                     &access_model,
                     &write_sessions,
@@ -1842,18 +2485,27 @@ fn register_agent_with_access_model(
         close_write_session: {
             let access_model = access_model.clone();
             let write_sessions = write_sessions.clone();
+            let admission = write_session_admission.clone();
             Arc::new(move |_from, payload| {
-                Ok(handle_close_write_session(
+                let Some(_admission_guard) = admission.try_enter_handler() else {
+                    return Ok(resp_err_busy("write-session admission is stopped"));
+                };
+                Ok(handle_finish_write_session(
                     &access_model,
                     &write_sessions,
                     payload,
+                    None,
                 ))
             })
         },
         abort_write_session: {
             let access_model = access_model.clone();
             let write_sessions = write_sessions.clone();
+            let admission = write_session_admission.clone();
             Arc::new(move |_from, payload| {
+                let Some(_admission_guard) = admission.try_enter_handler() else {
+                    return Ok(resp_err_busy("write-session admission is stopped"));
+                };
                 Ok(handle_abort_write_session(
                     &access_model,
                     &write_sessions,
@@ -1954,10 +2606,19 @@ fn register_agent_with_access_model(
         let chunk_access_model = access_model.clone();
         let chunk_write_sessions = write_sessions.clone();
         let chunk_write_executor = write_executor.clone();
+        let chunk_admission = write_session_admission.clone();
         write_session_rpc::register_chunk_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req, data| {
+                let Some(_admission_guard) = chunk_admission.try_enter_handler() else {
+                    return crate::write_session_rpc::FsWriteSessionChunkResp {
+                        ok: false,
+                        err_kind: 0,
+                        err_detail: "write-session admission is stopped".to_string(),
+                        err_errno: libc::EBUSY,
+                    };
+                };
                 handle_write_session_chunk_typed(
                     &chunk_access_model,
                     &chunk_write_sessions,
@@ -1970,10 +2631,20 @@ fn register_agent_with_access_model(
         let chunk_access_model = access_model.clone();
         let chunk_write_sessions = write_sessions.clone();
         let chunk_write_executor = write_executor.clone();
+        let data_admission = write_session_admission.clone();
         write_session_rpc::register_data_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req, data| {
+                let Some(_admission_guard) = data_admission.try_enter_handler() else {
+                    return crate::write_session_rpc::FsWriteSessionDataAck {
+                        session_id: req.session_id,
+                        seq_no: req.seq_no,
+                        frame_count: data.len() as u64,
+                        ok: false,
+                        err_detail: "write-session data admission is stopped".to_string(),
+                    };
+                };
                 handle_write_session_data_typed(
                     &chunk_access_model,
                     &chunk_write_sessions,
@@ -1983,13 +2654,66 @@ fn register_agent_with_access_model(
                 )
             },
         );
+        let ref_framework = api.framework().clone();
+        let ref_access_model = access_model.clone();
+        let ref_write_sessions = write_sessions.clone();
+        let ref_write_executor = write_executor.clone();
+        let ref_admission = write_session_admission.clone();
+        write_session_rpc::register_data_ref_handler(
+            api.framework().as_ref(),
+            lifecycle.clone(),
+            move |from_node, req| {
+                let framework = ref_framework.clone();
+                let access_model = ref_access_model.clone();
+                let write_sessions = ref_write_sessions.clone();
+                let write_executor = ref_write_executor.clone();
+                let admission = ref_admission.clone();
+                async move {
+                    let session_id = req.session_id.clone();
+                    let seq_no = req.seq_no;
+                    let frame_count = req.part_lengths.len() as u64;
+                    let Some(_admission_guard) = admission.try_enter_handler() else {
+                        return crate::write_session_rpc::FsWriteSessionDataAck {
+                            session_id,
+                            seq_no,
+                            frame_count,
+                            ok: false,
+                            err_detail: "write-session data-ref admission is stopped".to_string(),
+                        };
+                    };
+                    handle_write_session_data_ref_typed(
+                        framework.as_ref(),
+                        &access_model,
+                        &write_sessions,
+                        &write_executor,
+                        &admission,
+                        from_node,
+                        req,
+                    )
+                    .await
+                }
+            },
+        );
         let open_exports = exports.clone();
         let open_access_model = access_model.clone();
         let open_write_sessions = write_sessions.clone();
+        let open_admission = write_session_admission.clone();
         write_session_rpc::register_open_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req| {
+                let Some(_admission_guard) = open_admission.try_enter_handler() else {
+                    return crate::write_session_rpc::FsOpenWriteSessionResp {
+                        ok: false,
+                        err_kind: FsAgentRpcErrorKind::Os.as_i64(),
+                        err_detail: "write-session admission is stopped".to_string(),
+                        err_errno: libc::EBUSY,
+                        session_id: String::new(),
+                        size: 0,
+                        mtime_ns: 0,
+                        chunk_bytes: 0,
+                    };
+                };
                 handle_open_write_session_typed(
                     &open_exports,
                     &open_access_model,
@@ -1998,21 +2722,92 @@ fn register_agent_with_access_model(
                 )
             },
         );
+        let put_exports = exports.clone();
+        let put_access_model = access_model.clone();
+        let put_active_write_paths = write_sessions.active_write_paths.clone();
+        let put_admission = write_session_admission.clone();
+        write_session_rpc::register_put_small_object_handler(
+            api.framework().as_ref(),
+            lifecycle.clone(),
+            move |_from, req, data| {
+                let Some(_admission_guard) = put_admission.try_enter_handler() else {
+                    return FsPutSmallObjectResp {
+                        ok: false,
+                        err_kind: FsAgentRpcErrorKind::Os.as_i64(),
+                        err_detail: "write-session admission is stopped".to_string(),
+                        err_errno: libc::EBUSY,
+                        size: 0,
+                        mtime_ns: 0,
+                    };
+                };
+                handle_put_small_object_typed(
+                    &put_exports,
+                    &put_access_model,
+                    &put_active_write_paths,
+                    req,
+                    data,
+                )
+            },
+        );
         let close_access_model = access_model.clone();
         let close_write_sessions = write_sessions.clone();
+        let close_admission = write_session_admission.clone();
         write_session_rpc::register_close_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req| {
+                let Some(_admission_guard) = close_admission.try_enter_handler() else {
+                    return crate::write_session_rpc::FsCloseWriteSessionResp {
+                        ok: false,
+                        err_kind: 0,
+                        err_detail: "write-session admission is stopped".to_string(),
+                        err_errno: libc::EBUSY,
+                        size: 0,
+                        mtime_ns: 0,
+                    };
+                };
                 handle_close_write_session_typed(&close_access_model, &close_write_sessions, req)
+            },
+        );
+        let finalize_access_model = access_model.clone();
+        let finalize_write_sessions = write_sessions.clone();
+        let finalize_admission = write_session_admission.clone();
+        write_session_rpc::register_finalize_handler(
+            api.framework().as_ref(),
+            lifecycle.clone(),
+            move |_from, req| {
+                let Some(_admission_guard) = finalize_admission.try_enter_handler() else {
+                    return crate::write_session_rpc::FsFinalizeWriteSessionResp {
+                        ok: false,
+                        err_kind: 0,
+                        err_detail: "write-session admission is stopped".to_string(),
+                        err_errno: libc::EBUSY,
+                        size: 0,
+                        mtime_ns: 0,
+                    };
+                };
+                handle_finalize_write_session_typed(
+                    &finalize_access_model,
+                    &finalize_write_sessions,
+                    req,
+                )
             },
         );
         let wait_access_model = access_model.clone();
         let wait_write_sessions = write_sessions.clone();
+        let wait_admission = write_session_admission.clone();
         write_session_rpc::register_wait_payloads_handler(
             api.framework().as_ref(),
-            rt_handle.clone(),
+            lifecycle.clone(),
             move |_from, req| {
+                let Some(_admission_guard) = wait_admission.try_enter_handler() else {
+                    return crate::write_session_rpc::FsWaitWriteSessionPayloadsResp {
+                        ok: false,
+                        err_kind: 0,
+                        err_detail: "write-session admission is stopped".to_string(),
+                        err_errno: libc::EBUSY,
+                    };
+                };
                 handle_wait_write_session_payloads_typed(
                     &wait_access_model,
                     &wait_write_sessions,
@@ -2022,10 +2817,19 @@ fn register_agent_with_access_model(
         );
         let abort_access_model = access_model.clone();
         let abort_write_sessions = write_sessions.clone();
+        let abort_admission = write_session_admission.clone();
         write_session_rpc::register_abort_handler(
             api.framework().as_ref(),
-            rt_handle,
+            lifecycle.clone(),
             move |_from, req| {
+                let Some(_admission_guard) = abort_admission.try_enter_handler() else {
+                    return crate::write_session_rpc::FsAbortWriteSessionResp {
+                        ok: false,
+                        err_kind: 0,
+                        err_detail: "write-session admission is stopped".to_string(),
+                        err_errno: libc::EBUSY,
+                    };
+                };
                 handle_abort_write_session_typed(&abort_access_model, &abort_write_sessions, req)
             },
         );
@@ -2368,11 +3172,15 @@ fn register_agent_with_access_model(
 
     {
         let write_sessions = write_sessions.clone();
-        tokio::spawn(async move {
+        let mut shutdown_waiter = lifecycle.register_shutdown_waiter();
+        crate::framework::spawn_fs_task(&lifecycle, "write_session_reaper", async move {
             let idle_for = Duration::from_secs(WRITE_SESSION_IDLE_TIMEOUT_SECS);
             let interval = Duration::from_secs(WRITE_SESSION_REAP_INTERVAL_SECS);
             loop {
-                tokio::time::sleep(interval).await;
+                tokio::select! {
+                    _ = shutdown_waiter.wait() => return,
+                    _ = tokio::time::sleep(interval) => {}
+                }
                 let removed = write_sessions.reap_idle(idle_for);
                 if removed > 0 {
                     tracing::info!(
@@ -2384,10 +3192,15 @@ fn register_agent_with_access_model(
         });
     }
 
+    // No fallible work may be added between opening admission and disarming the failure guard.
+    write_session_admission.start_accepting();
+    registration_guard.disarm();
     Ok(FluxonFsAgentHandle {
         exports,
         data_plane,
         registered_export_rpc_paths,
+        write_sessions,
+        write_session_admission,
     })
 }
 
@@ -2938,7 +3751,6 @@ fn handle_s3_stage_object_to_kv(
     ) {
         return resp;
     }
-
     let exp = match exports.rpc_export(&export) {
         Ok(v) => v,
         Err(e) => return resp_err_kverr(e),
@@ -3473,6 +4285,234 @@ fn handle_read_chunk(
     )]))
 }
 
+fn create_dir_with_s3_parent_mode(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o755);
+    }
+    builder.create(path)
+}
+
+fn ensure_parent_dirs_for_write(
+    access_model: &AgentAccessModelHandle,
+    payload: &FlatDict,
+    export: &str,
+    target_path: &Path,
+    relpath: &str,
+) -> Result<(), FlatDict> {
+    let normalized = relpath.replace('\\', "/");
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    if parts.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut root = target_path;
+    for _ in &parts {
+        let Some(parent) = root.parent() else {
+            return Err(resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+                detail: "resolved object path has no export root".to_string(),
+            })));
+        };
+        root = parent;
+    }
+
+    let mut parent_path = root.to_path_buf();
+    let mut parent_relpath = String::new();
+    for component in &parts[..parts.len() - 1] {
+        if !parent_relpath.is_empty() {
+            parent_relpath.push('/');
+        }
+        parent_relpath.push_str(component);
+        parent_path.push(component);
+
+        if let Err(resp) = authorize_stat_path(access_model, payload, export, &parent_relpath) {
+            return Err(resp);
+        }
+        match fs::metadata(&parent_path) {
+            Ok(md) if md.is_dir() => continue,
+            Ok(_) => {
+                return Err(resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "parent path exists but is not a directory: {}",
+                        parent_relpath
+                    ),
+                })));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(resp_err_io(err)),
+        }
+
+        if let Err(resp) = authorize_relpath_mode(
+            access_model,
+            payload,
+            export,
+            &parent_relpath,
+            access_model_required_mode_for_op(FluxonFsOp::Mkdir),
+        ) {
+            return Err(resp);
+        }
+        match create_dir_with_s3_parent_mode(&parent_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                match fs::metadata(&parent_path) {
+                    Ok(md) if md.is_dir() => {}
+                    Ok(_) => {
+                        return Err(resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+                            detail: format!(
+                                "parent path exists but is not a directory: {}",
+                                parent_relpath
+                            ),
+                        })));
+                    }
+                    Err(err) => return Err(resp_err_io(err)),
+                }
+            }
+            Err(err) => return Err(resp_err_io(err)),
+        }
+    }
+    Ok(())
+}
+
+fn put_small_object_resp_from_flat(resp: FlatDict) -> FsPutSmallObjectResp {
+    FsPutSmallObjectResp {
+        ok: matches!(resp.get("ok"), Some(FlatValue::Bool(true))),
+        err_kind: match resp.get(FS_AGENT_RPC_ERR_KIND_KEY) {
+            Some(FlatValue::Int64(v)) => *v,
+            _ => 0,
+        },
+        err_detail: match resp.get("err") {
+            Some(FlatValue::String(v)) => v.clone(),
+            _ => String::new(),
+        },
+        err_errno: match resp.get("errno") {
+            Some(FlatValue::Int64(v)) => i32::try_from(*v).unwrap_or(libc::EIO),
+            _ => 0,
+        },
+        size: match resp.get("size") {
+            Some(FlatValue::Int64(v)) => *v,
+            _ => 0,
+        },
+        mtime_ns: match resp.get("mtime_ns") {
+            Some(FlatValue::Int64(v)) => *v,
+            _ => 0,
+        },
+    }
+}
+
+fn handle_put_small_object(
+    exports: &AgentExportsHandle,
+    access_model: &AgentAccessModelHandle,
+    active_write_paths: &ActiveWritePathsHandle,
+    payload: FlatDict,
+    data: Bytes,
+) -> FlatDict {
+    let export = match require_str(&payload, "export") {
+        Ok(v) => v,
+        Err(e) => return resp_err_kverr(e),
+    };
+    let relpath = match require_str(&payload, "relpath") {
+        Ok(v) => v,
+        Err(e) => return resp_err_kverr(e),
+    };
+    if let Err(resp) = authorize_relpath_mode(
+        access_model,
+        &payload,
+        &export,
+        &relpath,
+        access_model_required_mode_for_op(FluxonFsOp::WriteChunk),
+    ) {
+        return resp;
+    }
+    if let Err(resp) = authorize_relpath_mode(
+        access_model,
+        &payload,
+        &export,
+        &relpath,
+        access_model_required_mode_for_op(FluxonFsOp::Truncate),
+    ) {
+        return resp;
+    }
+    if data.len() >= fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES {
+        return resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+            detail: "small object must be below the write-session threshold".to_string(),
+        }));
+    }
+    let root_dir_abs = match exports.export_root_dir_abs(&export) {
+        Ok(v) => v,
+        Err(e) => return resp_err_kverr(e),
+    };
+    let p = match safe_join_root(&root_dir_abs, &relpath) {
+        Ok(v) => v,
+        Err(e) => return resp_err_kverr(e),
+    };
+    let write_path_key = write_path_key(&export, &p);
+    let _write_path_guard = match acquire_transient_write_path_guard(
+        active_write_paths,
+        &write_path_key,
+        "put_small_object",
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = ensure_parent_dirs_for_write(access_model, &payload, &export, &p, &relpath) {
+        return resp;
+    }
+    let mut file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&p)
+    {
+        Ok(v) => v,
+        Err(e) => return resp_err_io(e),
+    };
+    if let Err(e) = file.write_all(data.as_ref()) {
+        return resp_err_io(e);
+    }
+    let md = match file.metadata() {
+        Ok(v) => v,
+        Err(e) => return resp_err_io(e),
+    };
+    let (_is_file, _is_dir, size, mtime_ns, _mode) = stat_fields_from_metadata(&md);
+    resp_ok(BTreeMap::from([
+        ("size".to_string(), FlatValue::Int64(size)),
+        ("mtime_ns".to_string(), FlatValue::Int64(mtime_ns)),
+    ]))
+}
+
+fn handle_put_small_object_typed(
+    exports: &AgentExportsHandle,
+    access_model: &AgentAccessModelHandle,
+    active_write_paths: &ActiveWritePathsHandle,
+    req: FsPutSmallObjectReq,
+    data: Bytes,
+) -> FsPutSmallObjectResp {
+    let mut payload = FlatDict::from([
+        ("export".to_string(), FlatValue::String(req.export)),
+        ("relpath".to_string(), FlatValue::String(req.relpath)),
+    ]);
+    insert_typed_request_auth_payload(&mut payload, req.fs_rpc_token);
+    if req.allow_s3_internal_multipart {
+        payload.insert(
+            S3_INTERNAL_MULTIPART_PAYLOAD_KEY.to_string(),
+            FlatValue::Bool(true),
+        );
+    }
+    put_small_object_resp_from_flat(handle_put_small_object(
+        exports,
+        access_model,
+        active_write_paths,
+        payload,
+        data,
+    ))
+}
+
 fn handle_open_write_session(
     exports: &AgentExportsHandle,
     access_model: &AgentAccessModelHandle,
@@ -3504,6 +4544,7 @@ fn handle_open_write_session(
         Ok(v) => v,
         Err(e) => return resp_err_kverr(e),
     };
+    let create_parents = matches!(payload.get("create_parents"), Some(FlatValue::Bool(true)));
     let session_id = write_sessions.alloc_id();
     let write_path_key = write_path_key(&export, &p);
     let write_path_owner = format!("session:{}", session_id);
@@ -3512,6 +4553,15 @@ fn handle_open_write_session(
         .try_acquire_owned(&write_path_key, &write_path_owner)
     {
         return resp_err_busy(active_write_owner_detail(&existing));
+    }
+    if create_parents
+        && let Err(resp) =
+            ensure_parent_dirs_for_write(access_model, &payload, &export, &p, &relpath)
+    {
+        write_sessions
+            .active_write_paths
+            .release_owned(&write_path_key, &write_path_owner);
+        return resp;
     }
     let file = match fs::OpenOptions::new()
         .read(true)
@@ -3599,6 +4649,9 @@ fn handle_open_write_session_typed(
             S3_INTERNAL_MULTIPART_PAYLOAD_KEY.to_string(),
             FlatValue::Bool(true),
         );
+    }
+    if req.create_parents {
+        payload.insert("create_parents".to_string(), FlatValue::Bool(true));
     }
     let resp = handle_open_write_session(exports, access_model, write_sessions, payload);
     FsOpenWriteSessionResp {
@@ -3710,7 +4763,38 @@ fn enqueue_write_session_chunk(
             detail: "write session export/relpath mismatch".to_string(),
         }));
     }
-    let queued_bytes_before = state.queued_bytes;
+    if state.aborted {
+        return resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+            detail: format!("write session aborted: {}", session_id),
+        }));
+    }
+    if !write_session_accepts_chunk_while_closing(&state, seq_no, is_data_frame) {
+        return resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+            detail: format!("write session is closing: {}", session_id),
+        }));
+    }
+    if let Some(err) = state.fatal_error.as_ref() {
+        return resp_err(FsAgentRpcErrorKind::Os, err.detail.clone(), Some(err.errno));
+    }
+    if is_data_frame {
+        if let Some(expected) = state.expected_data_frames {
+            if seq_no >= expected {
+                return resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "write session data frame seq out of range: session={} seq={} expected={}",
+                        session_id, seq_no, expected
+                    ),
+                }));
+            }
+        }
+        if state.written_data_frame_seqs.contains(&seq_no)
+            || state.received_data_frame_seqs.contains(&seq_no)
+        {
+            state.last_touched = Instant::now();
+            entry_handle.cv.notify_all();
+            return resp_ok(BTreeMap::new());
+        }
+    }
     while state.queued_bytes.saturating_add(data.len()) > WRITE_SESSION_MAX_QUEUED_BYTES
         && !state.aborted
         && !state.closing
@@ -3871,17 +4955,17 @@ fn handle_write_session_data_oneway(
         };
         return Err(KvError::Api(ApiError::InvalidArgument { detail }));
     }
-    let mut next_offset = req.offset;
-    for (idx, data) in payloads.into_iter().enumerate() {
-        let data_len = data.len() as i64;
+    let positions = validate_write_session_raw_data_shape(&req, &payloads)
+        .map_err(|detail| KvError::Api(ApiError::InvalidArgument { detail }))?;
+    for ((seq_no, offset), data) in positions.into_iter().zip(payloads) {
         let resp = enqueue_write_session_chunk(
             write_sessions,
             write_executor,
             &req.export,
             &req.relpath,
             &req.session_id,
-            req.seq_no.saturating_add(idx as u64),
-            next_offset,
+            seq_no,
+            offset,
             data,
             true,
         );
@@ -3892,9 +4976,60 @@ fn handle_write_session_data_oneway(
             };
             return Err(KvError::Api(ApiError::InvalidArgument { detail }));
         }
-        next_offset = next_offset.saturating_add(data_len);
     }
     Ok(())
+}
+
+fn validate_write_session_raw_data_shape(
+    req: &FsWriteSessionDataFrame,
+    payloads: &[Bytes],
+) -> Result<Vec<(u64, i64)>, String> {
+    if req.offset < 0 {
+        return Err("write_session raw data offset must be non-negative".to_string());
+    }
+    if payloads.is_empty() {
+        return Err("write_session raw data must contain at least one frame".to_string());
+    }
+    if payloads.len() > WRITE_SESSION_MAX_INFLIGHT_CHUNKS {
+        return Err(format!(
+            "write_session raw data has too many frames: got={} max={}",
+            payloads.len(),
+            WRITE_SESSION_MAX_INFLIGHT_CHUNKS
+        ));
+    }
+
+    let mut positions = Vec::with_capacity(payloads.len());
+    let mut seq_no = req.seq_no;
+    let mut offset = req.offset;
+    for (idx, payload) in payloads.iter().enumerate() {
+        if payload.is_empty() {
+            return Err(format!(
+                "write_session raw data frame must be non-empty: index={}",
+                idx
+            ));
+        }
+        if payload.len() > WRITE_SESSION_CHUNK_BYTES {
+            return Err(format!(
+                "write_session raw data frame too large: index={} got={} max={}",
+                idx,
+                payload.len(),
+                WRITE_SESSION_CHUNK_BYTES
+            ));
+        }
+        positions.push((seq_no, offset));
+        let payload_len = i64::try_from(payload.len())
+            .map_err(|_| "write_session raw data frame length exceeds i64".to_string())?;
+        let next_offset = offset
+            .checked_add(payload_len)
+            .ok_or_else(|| "write_session raw data offset overflow".to_string())?;
+        if idx + 1 < payloads.len() {
+            seq_no = seq_no
+                .checked_add(1)
+                .ok_or_else(|| "write_session raw data frame sequence overflow".to_string())?;
+        }
+        offset = next_offset;
+    }
+    Ok(positions)
 }
 
 fn handle_write_session_data_typed(
@@ -3928,6 +5063,270 @@ fn handle_write_session_data_typed(
             ok: false,
             err_detail: err.to_string(),
         },
+    }
+}
+
+fn write_session_data_ref_ack(
+    req: &FsWriteSessionDataRefFrame,
+    ok: bool,
+    err_detail: impl Into<String>,
+) -> crate::write_session_rpc::FsWriteSessionDataAck {
+    crate::write_session_rpc::FsWriteSessionDataAck {
+        session_id: req.session_id.clone(),
+        seq_no: req.seq_no,
+        frame_count: req.part_lengths.len() as u64,
+        ok,
+        err_detail: err_detail.into(),
+    }
+}
+
+fn validate_write_session_data_ref_source_identity(
+    framework: &fluxon_kv::Framework,
+    from_node: &str,
+    req: &FsWriteSessionDataRefFrame,
+) -> Result<(), String> {
+    let cluster_manager_view = framework.cluster_manager_view();
+    let cluster_manager = cluster_manager_view.cluster_manager();
+    let receiver = cluster_manager.get_self_info();
+    let source = if receiver.id == from_node {
+        receiver.clone()
+    } else {
+        cluster_manager
+            .get_member_info_cached(from_node)
+            .ok_or_else(|| {
+                format!(
+                    "write_session data-ref source is not a current cluster member: node={}",
+                    from_node
+                )
+            })?
+    };
+    if source.node_start_time != req.source_node_start_time {
+        return Err(format!(
+            "write_session data-ref source generation mismatch: node={} request={} current={}",
+            from_node, req.source_node_start_time, source.node_start_time
+        ));
+    }
+
+    let receiver_node: NodeID = receiver.id.clone().into();
+    let source_node: NodeID = from_node.to_string().into();
+    let p2p_view = framework.p2p_view();
+    let tier_snapshot = p2p_view.p2p_module().tier_snapshot();
+    if tier_snapshot.self_peer_gen.peer_id != receiver_node
+        || tier_snapshot.self_peer_gen.node_start_time != receiver.node_start_time
+    {
+        return Err(format!(
+            "write_session data-ref receiver tier generation is stale: node={}",
+            receiver.id
+        ));
+    }
+    let source_peer_gen = tier_snapshot.peer_gen(&source_node).ok_or_else(|| {
+        format!(
+            "write_session data-ref source is absent from the tier snapshot: node={}",
+            from_node
+        )
+    })?;
+    if source_peer_gen.node_start_time != req.source_node_start_time {
+        return Err(format!(
+            "write_session data-ref source tier generation mismatch: node={} request={} tier={}",
+            from_node, req.source_node_start_time, source_peer_gen.node_start_time
+        ));
+    }
+    if req.nonce == 0 {
+        return Err("write_session data-ref nonce must be non-zero".to_string());
+    }
+    let expected_key = write_session_rpc::write_session_kv_payload_key(
+        from_node,
+        req.source_node_start_time,
+        &req.session_id,
+        req.lease_id,
+        req.seq_no,
+        req.nonce,
+    );
+    if req.kv_key != expected_key {
+        return Err(
+            "write_session data-ref KV key does not match the request identity".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_write_session_data_ref_session(
+    write_sessions: &AgentWriteSessionsHandle,
+    req: &FsWriteSessionDataRefFrame,
+    validated: &ValidatedWriteSessionDataRef,
+) -> Result<(), String> {
+    let entry = write_sessions
+        .get(&req.session_id)
+        .ok_or_else(|| format!("unknown write session: {}", req.session_id))?;
+    let state = entry.state.lock();
+    if state.export_name != req.export || state.relpath != req.relpath {
+        return Err("write session export/relpath mismatch".to_string());
+    }
+    if state.aborted {
+        return Err(format!("write session aborted: {}", req.session_id));
+    }
+    if let Some(err) = state.fatal_error.as_ref() {
+        return Err(format!("write session failed: {}", err.detail));
+    }
+    for part in &validated.parts {
+        if !write_session_accepts_chunk_while_closing(&state, part.seq_no, true) {
+            return Err(format!("write session is closing: {}", req.session_id));
+        }
+        if let Some(expected) = state.expected_data_frames {
+            if part.seq_no >= expected {
+                return Err(format!(
+                    "write session data frame seq out of range: session={} seq={} expected={}",
+                    req.session_id, part.seq_no, expected
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_session_kv_payload_bytes(result: KvGetResult) -> Result<Bytes, String> {
+    let owner = match result {
+        KvGetResult::Owner(Some(holder)) => WriteSessionKvPayloadOwner::Owner(holder),
+        KvGetResult::External(Some(holder)) => WriteSessionKvPayloadOwner::External(holder),
+        KvGetResult::Owner(None) | KvGetResult::External(None) => {
+            return Err("write_session data-ref KV payload was not found".to_string());
+        }
+    };
+    Ok(Bytes::from_owner(owner))
+}
+
+async fn await_write_session_kv_get<F>(
+    admission: &WriteSessionAdmissionHandle,
+    timeout_duration: Duration,
+    kv_get: F,
+) -> Result<KvGetResult, String>
+where
+    F: std::future::Future<Output = KvResult<KvGetResult>>,
+{
+    let kv_get = tokio::time::timeout(timeout_duration, kv_get);
+    tokio::select! {
+        biased;
+        _ = admission.wait_until_stopped() => {
+            Err("write_session data-ref stopped during KV get".to_string())
+        }
+        result = kv_get => match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(err)) => Err(format!("write_session data-ref KV get failed: {}", err)),
+            Err(_) => Err(format!(
+                "write_session data-ref KV get timed out after {:?}",
+                timeout_duration
+            )),
+        },
+    }
+}
+
+async fn handle_write_session_data_ref_typed(
+    framework: &fluxon_kv::Framework,
+    access_model: &AgentAccessModelHandle,
+    write_sessions: &AgentWriteSessionsHandle,
+    write_executor: &WriteExecutorHandle,
+    admission: &WriteSessionAdmissionHandle,
+    from_node: NodeID,
+    req: FsWriteSessionDataRefFrame,
+) -> crate::write_session_rpc::FsWriteSessionDataAck {
+    let mut auth_payload = FlatDict::from([
+        ("export".to_string(), FlatValue::String(req.export.clone())),
+        (
+            "relpath".to_string(),
+            FlatValue::String(req.relpath.clone()),
+        ),
+    ]);
+    insert_typed_request_auth_payload(&mut auth_payload, req.fs_rpc_token.clone());
+    if req.allow_s3_internal_multipart {
+        auth_payload.insert(
+            S3_INTERNAL_MULTIPART_PAYLOAD_KEY.to_string(),
+            FlatValue::Bool(true),
+        );
+    }
+    if let Err(resp) = authorize_relpath_mode(
+        access_model,
+        &auth_payload,
+        &req.export,
+        &req.relpath,
+        access_model_required_mode_for_op(FluxonFsOp::WriteChunk),
+    ) {
+        let detail = match resp.get("err") {
+            Some(FlatValue::String(value)) => value.clone(),
+            _ => "write_session data-ref authorization failed".to_string(),
+        };
+        return write_session_data_ref_ack(&req, false, detail);
+    }
+
+    let validated = match validate_write_session_data_ref_shape(&req) {
+        Ok(value) => value,
+        Err(detail) => return write_session_data_ref_ack(&req, false, detail),
+    };
+    if let Err(detail) =
+        validate_write_session_data_ref_source_identity(framework, from_node.as_ref(), &req)
+    {
+        return write_session_data_ref_ack(&req, false, detail);
+    }
+    if let Err(detail) = validate_write_session_data_ref_session(write_sessions, &req, &validated) {
+        return write_session_data_ref_ack(&req, false, detail);
+    }
+
+    let kv_result = match await_write_session_kv_get(
+        admission,
+        Duration::from_secs(WRITE_SESSION_KV_GET_TIMEOUT_SECS),
+        framework.kv_get(&req.kv_key),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(detail) => return write_session_data_ref_ack(&req, false, detail),
+    };
+    let payload = match write_session_kv_payload_bytes(kv_result) {
+        Ok(value) => value,
+        Err(detail) => return write_session_data_ref_ack(&req, false, detail),
+    };
+    let payloads = match split_write_session_kv_payload(payload, &validated) {
+        Ok(value) => value,
+        Err(detail) => return write_session_data_ref_ack(&req, false, detail),
+    };
+
+    let write_sessions = write_sessions.clone();
+    let write_executor = write_executor.clone();
+    let export = req.export.clone();
+    let relpath = req.relpath.clone();
+    let session_id = req.session_id.clone();
+    let parts = validated.parts;
+    let enqueue_result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        for (part, data) in parts.into_iter().zip(payloads) {
+            let resp = enqueue_write_session_chunk(
+                &write_sessions,
+                &write_executor,
+                &export,
+                &relpath,
+                &session_id,
+                part.seq_no,
+                part.offset,
+                data,
+                true,
+            );
+            if !matches!(resp.get("ok"), Some(FlatValue::Bool(true))) {
+                let detail = match resp.get("err") {
+                    Some(FlatValue::String(value)) => value.clone(),
+                    _ => "write_session data-ref enqueue failed".to_string(),
+                };
+                return Err(detail);
+            }
+        }
+        Ok(())
+    })
+    .await;
+    match enqueue_result {
+        Ok(Ok(())) => write_session_data_ref_ack(&req, true, String::new()),
+        Ok(Err(detail)) => write_session_data_ref_ack(&req, false, detail),
+        Err(err) => write_session_data_ref_ack(
+            &req,
+            false,
+            format!("write_session data-ref enqueue task failed: {}", err),
+        ),
     }
 }
 
@@ -4003,10 +5402,11 @@ fn handle_truncate_write_session(
     resp_ok(BTreeMap::new())
 }
 
-fn handle_close_write_session(
+fn handle_finish_write_session(
     access_model: &AgentAccessModelHandle,
     write_sessions: &AgentWriteSessionsHandle,
     payload: FlatDict,
+    final_size: Option<i64>,
 ) -> FlatDict {
     let export = match require_str(&payload, "export") {
         Ok(v) => v,
@@ -4016,14 +5416,24 @@ fn handle_close_write_session(
         Ok(v) => v,
         Err(e) => return resp_err_kverr(e),
     };
+    let required_op = if final_size.is_some() {
+        FluxonFsOp::Truncate
+    } else {
+        FluxonFsOp::WriteChunk
+    };
     if let Err(resp) = authorize_relpath_mode(
         access_model,
         &payload,
         &export,
         &relpath,
-        access_model_required_mode_for_op(FluxonFsOp::WriteChunk),
+        access_model_required_mode_for_op(required_op),
     ) {
         return resp;
+    }
+    if final_size.is_some_and(|size| size < 0) {
+        return resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
+            detail: "final_size must be non-negative".to_string(),
+        }));
     }
     let session_id = match require_str(&payload, "session_id") {
         Ok(v) => v,
@@ -4060,16 +5470,14 @@ fn handle_close_write_session(
         || !state.queued_chunks.is_empty()
         || write_session_pending_expected_frames(&state)
     {
+        if state.aborted || state.fatal_error.is_some() {
+            break;
+        }
         let now = Instant::now();
         if now >= close_deadline {
             let detail = write_session_close_timeout_detail(&session_id, &state);
-            state.aborted = true;
-            state.queued_chunks.clear();
-            state.queued_bytes = 0;
-            state.writing = false;
-            state.scheduled = false;
-            entry_handle.cv.notify_all();
             drop(state);
+            abort_write_session_entry_and_wait_for_writer(&entry_handle);
             let _ = write_sessions.take(&session_id);
             return resp_err_kverr(KvError::Api(ApiError::Unknown { detail }));
         }
@@ -4097,6 +5505,13 @@ fn handle_close_write_session(
     }
     drop(state);
     let file = entry_handle.file.lock();
+    if let Some(final_size) = final_size {
+        if let Err(e) = file.set_len(final_size as u64) {
+            drop(file);
+            let _ = write_sessions.take(&session_id);
+            return resp_err_io(e);
+        }
+    }
     let md = match file.metadata() {
         Ok(v) => v,
         Err(e) => {
@@ -4135,8 +5550,56 @@ fn handle_close_write_session_typed(
             FlatValue::Bool(true),
         );
     }
-    let resp = handle_close_write_session(access_model, write_sessions, payload);
+    let resp = handle_finish_write_session(access_model, write_sessions, payload, None);
     FsCloseWriteSessionResp {
+        ok: matches!(resp.get("ok"), Some(FlatValue::Bool(true))),
+        err_kind: match resp.get(FS_AGENT_RPC_ERR_KIND_KEY) {
+            Some(FlatValue::Int64(v)) => *v,
+            _ => 0,
+        },
+        err_detail: match resp.get("err") {
+            Some(FlatValue::String(v)) => v.clone(),
+            _ => String::new(),
+        },
+        err_errno: match resp.get("errno") {
+            Some(FlatValue::Int64(v)) => i32::try_from(*v).unwrap_or(libc::EIO),
+            _ => 0,
+        },
+        size: match resp.get("size") {
+            Some(FlatValue::Int64(v)) => *v,
+            _ => 0,
+        },
+        mtime_ns: match resp.get("mtime_ns") {
+            Some(FlatValue::Int64(v)) => *v,
+            _ => 0,
+        },
+    }
+}
+
+fn handle_finalize_write_session_typed(
+    access_model: &AgentAccessModelHandle,
+    write_sessions: &AgentWriteSessionsHandle,
+    req: FsFinalizeWriteSessionReq,
+) -> FsFinalizeWriteSessionResp {
+    let final_size = req.final_size;
+    let mut payload = FlatDict::from([
+        ("export".to_string(), FlatValue::String(req.export)),
+        ("relpath".to_string(), FlatValue::String(req.relpath)),
+        ("session_id".to_string(), FlatValue::String(req.session_id)),
+        (
+            "expected_data_frames".to_string(),
+            FlatValue::Int64(i64::try_from(req.expected_data_frames).unwrap_or(i64::MAX)),
+        ),
+    ]);
+    insert_typed_request_auth_payload(&mut payload, req.fs_rpc_token);
+    if req.allow_s3_internal_multipart {
+        payload.insert(
+            S3_INTERNAL_MULTIPART_PAYLOAD_KEY.to_string(),
+            FlatValue::Bool(true),
+        );
+    }
+    let resp = handle_finish_write_session(access_model, write_sessions, payload, Some(final_size));
+    FsFinalizeWriteSessionResp {
         ok: matches!(resp.get("ok"), Some(FlatValue::Bool(true))),
         err_kind: match resp.get(FS_AGENT_RPC_ERR_KIND_KEY) {
             Some(FlatValue::Int64(v)) => *v,
@@ -4166,7 +5629,6 @@ fn handle_wait_write_session_payloads(
     write_sessions: &AgentWriteSessionsHandle,
     payload: FlatDict,
 ) -> FlatDict {
-    let wait_started = Instant::now();
     let export = match require_str(&payload, "export") {
         Ok(v) => v,
         Err(e) => return resp_err_kverr(e),
@@ -4211,8 +5673,9 @@ fn handle_wait_write_session_payloads(
             detail: "write session export/relpath mismatch".to_string(),
         }));
     }
-    state.expected_data_frames =
-        write_session_merge_expected_frames(state.expected_data_frames, Some(expected_data_frames));
+    // This RPC is an intermediate delivery barrier used to free the sender's in-flight window.
+    // It is not the final frame count: only close/finalize may publish that upper bound.
+    // Persisting this watermark in expected_data_frames would reject every later frame.
     state.last_touched = Instant::now();
     let deadline = Instant::now() + Duration::from_secs(WRITE_SESSION_CLOSE_WAIT_TIMEOUT_SECS);
     while write_session_pending_received_frames(&state, expected_data_frames) {
@@ -4302,22 +5765,18 @@ fn handle_abort_write_session(
         Ok(v) => v,
         Err(e) => return resp_err_kverr(e),
     };
-    {
-        let entries = write_sessions.entries.lock();
-        if let Some(existing) = entries.get(&session_id) {
-            let mut state = existing.state.lock();
+    if let Some(existing) = write_sessions.get(&session_id) {
+        {
+            let state = existing.state.lock();
             if state.export_name != export || state.relpath != relpath {
                 return resp_err_kverr(KvError::Api(ApiError::InvalidArgument {
                     detail: "write session export/relpath mismatch".to_string(),
                 }));
             }
-            state.aborted = true;
-            state.queued_chunks.clear();
-            state.queued_bytes = 0;
-            existing.cv.notify_all();
         }
+        abort_write_session_entry_and_wait_for_writer(&existing);
+        let _ = write_sessions.take(&session_id);
     }
-    let _ = write_sessions.take(&session_id);
     resp_ok(BTreeMap::new())
 }
 
@@ -4950,7 +6409,25 @@ mod tests {
         FluxonFsScopeAccessMode, agent_registry_export_for_name_and_root_v1, build_rpc_token,
     };
     use sha2::Digest;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestBytesOwner {
+        data: Vec<u8>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AsRef<[u8]> for TestBytesOwner {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+
+    impl Drop for TestBytesOwner {
+        fn drop(&mut self) {
+            self.dropped.store(true, AtomicOrdering::SeqCst);
+        }
+    }
 
     fn browse_only_access_model() -> FluxonFsRuntimeAccessModel {
         FluxonFsRuntimeAccessModel {
@@ -5084,6 +6561,392 @@ mod tests {
         })
     }
 
+    fn test_write_session_data_ref() -> FsWriteSessionDataRefFrame {
+        FsWriteSessionDataRefFrame {
+            export: "exp".to_string(),
+            relpath: "file.bin".to_string(),
+            session_id: "session-a".to_string(),
+            seq_no: 7,
+            offset: 11,
+            kv_key: "unused-by-shape-tests".to_string(),
+            total_len: 5,
+            part_lengths: vec![3, 2],
+            source_node_start_time: 101,
+            lease_id: 303,
+            nonce: 404,
+            fs_rpc_token: None,
+            allow_s3_internal_multipart: false,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registered_agent_actor_long_delay_wakes_for_framework_shutdown() {
+        let fs_framework = crate::new_fs_framework("agent-actor-shutdown-test");
+        let mut shutdown_waiter = ViewShutdownExt::register_shutdown_waiter(&fs_framework);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        assert!(crate::framework::spawn_fs_task(
+            &fs_framework,
+            "long-delay-test-actor",
+            async move {
+                let _ = started_tx.send(());
+                assert!(
+                    wait_for_shutdown_or_delay(&mut shutdown_waiter, Duration::from_secs(60 * 60))
+                        .await,
+                    "actor delay completed without a shutdown signal"
+                );
+            },
+        ));
+        started_rx.await.expect("test actor must start");
+
+        tokio::time::timeout(Duration::from_secs(1), fs_framework.shutdown())
+            .await
+            .expect("framework shutdown must interrupt a long actor delay")
+            .expect("framework shutdown must succeed");
+    }
+
+    #[test]
+    fn write_session_data_ref_shape_preserves_part_boundaries() {
+        let validated = validate_write_session_data_ref_shape(&test_write_session_data_ref())
+            .expect("valid data-ref shape");
+        assert_eq!(validated.total_len, 5);
+        assert_eq!(
+            validated.parts,
+            vec![
+                WriteSessionDataRefPart {
+                    seq_no: 7,
+                    offset: 11,
+                    range: 0..3,
+                },
+                WriteSessionDataRefPart {
+                    seq_no: 8,
+                    offset: 14,
+                    range: 3..5,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn write_session_data_ref_shape_rejects_invalid_lengths_and_overflow() {
+        let mut req = test_write_session_data_ref();
+        req.part_lengths.clear();
+        assert!(validate_write_session_data_ref_shape(&req).is_err());
+
+        let mut req = test_write_session_data_ref();
+        req.part_lengths = vec![1; WRITE_SESSION_MAX_INFLIGHT_CHUNKS + 1];
+        req.total_len = req.part_lengths.len() as u64;
+        assert!(validate_write_session_data_ref_shape(&req).is_err());
+
+        let mut req = test_write_session_data_ref();
+        req.part_lengths = vec![0];
+        req.total_len = 0;
+        assert!(validate_write_session_data_ref_shape(&req).is_err());
+
+        let mut req = test_write_session_data_ref();
+        req.total_len += 1;
+        assert!(validate_write_session_data_ref_shape(&req).is_err());
+
+        let mut req = test_write_session_data_ref();
+        req.seq_no = u64::MAX;
+        assert!(validate_write_session_data_ref_shape(&req).is_err());
+
+        let mut req = test_write_session_data_ref();
+        req.offset = i64::MAX;
+        assert!(validate_write_session_data_ref_shape(&req).is_err());
+    }
+
+    #[test]
+    fn write_session_raw_data_shape_rejects_invalid_count_and_overflow() {
+        let mut req = FsWriteSessionDataFrame {
+            export: "exp".to_string(),
+            relpath: "file.bin".to_string(),
+            session_id: "session-a".to_string(),
+            seq_no: 7,
+            offset: 11,
+            fs_rpc_token: None,
+            allow_s3_internal_multipart: false,
+        };
+        assert!(validate_write_session_raw_data_shape(&req, &[]).is_err());
+        assert!(
+            validate_write_session_raw_data_shape(
+                &req,
+                &vec![Bytes::from_static(b"x"); WRITE_SESSION_MAX_INFLIGHT_CHUNKS + 1],
+            )
+            .is_err()
+        );
+        assert!(validate_write_session_raw_data_shape(&req, &[Bytes::new()]).is_err());
+
+        req.seq_no = u64::MAX;
+        assert!(
+            validate_write_session_raw_data_shape(
+                &req,
+                &[Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            )
+            .is_err()
+        );
+        req.seq_no = 0;
+        req.offset = i64::MAX;
+        assert!(validate_write_session_raw_data_shape(&req, &[Bytes::from_static(b"a")]).is_err());
+    }
+
+    #[test]
+    fn split_write_session_kv_payload_keeps_owner_until_all_parts_drop() {
+        let validated = validate_write_session_data_ref_shape(&test_write_session_data_ref())
+            .expect("valid data-ref shape");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let payload = Bytes::from_owner(TestBytesOwner {
+            data: b"abcde".to_vec(),
+            dropped: dropped.clone(),
+        });
+        let mut parts = split_write_session_kv_payload(payload, &validated).unwrap();
+        assert_eq!(parts[0].as_ref(), b"abc");
+        assert_eq!(parts[1].as_ref(), b"de");
+        assert!(!dropped.load(AtomicOrdering::SeqCst));
+        drop(parts.pop());
+        assert!(!dropped.load(AtomicOrdering::SeqCst));
+        drop(parts);
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_admission_waits_for_active_handler_and_stays_stopped() {
+        let admission = WriteSessionAdmissionHandle::new();
+        let guard = admission.try_enter_handler().expect("handler admitted");
+        let shutdown_admission = admission.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_admission.stop_and_wait_for_handlers().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("admission shutdown timed out")
+            .expect("admission shutdown task failed");
+        assert!(admission.try_enter_handler().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_admission_stop_cancels_pending_data_ref_kv_get() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, AtomicOrdering::SeqCst);
+            }
+        }
+
+        let admission = WriteSessionAdmissionHandle::new();
+        let guard = admission.try_enter_handler().expect("handler admitted");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let pending_get = {
+            let dropped = dropped.clone();
+            async move {
+                let _probe = DropProbe(dropped);
+                std::future::pending::<KvResult<KvGetResult>>().await
+            }
+        };
+        let stop_admission = admission.clone();
+        let (result, ()) = tokio::join!(
+            await_write_session_kv_get(&admission, Duration::from_secs(30), pending_get),
+            async move {
+                tokio::task::yield_now().await;
+                stop_admission.stop_accepting();
+            }
+        );
+
+        match result {
+            Err(detail) => assert_eq!(detail, "write_session data-ref stopped during KV get"),
+            Ok(_) => panic!("KV get unexpectedly completed"),
+        }
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), admission.wait_for_handlers())
+            .await
+            .expect("handler guard did not drain");
+        assert!(admission.try_enter_handler().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_shutdown_is_bounded_for_stuck_handler() {
+        let admission = WriteSessionAdmissionHandle::new();
+        let guard = admission.try_enter_handler().expect("handler admitted");
+        let sessions = AgentWriteSessionsHandle::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_write_sessions_for_shutdown(&admission, &sessions, Duration::from_millis(50)),
+        )
+        .await
+        .expect("bounded shutdown helper hung");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("timed out waiting for admitted handlers")
+        );
+        assert!(admission.try_enter_handler().is_none());
+        drop(guard);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_session_holder_drain_failure_skips_kv_shutdown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let skipped_calls = calls.clone();
+        let skipped = maybe_shutdown_kv_after_holder_drain(false, move || {
+            skipped_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            async { Ok::<(), anyhow::Error>(()) }
+        })
+        .await;
+        assert!(skipped.is_none());
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
+
+        let called = calls.clone();
+        let result = maybe_shutdown_kv_after_holder_drain(true, move || {
+            called.fetch_add(1, AtomicOrdering::SeqCst);
+            async { Ok::<(), anyhow::Error>(()) }
+        })
+        .await;
+        assert!(matches!(result, Some(Ok(()))));
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn abort_all_write_sessions_drops_queued_payload_owners() {
+        let sessions = AgentWriteSessionsHandle::new();
+        let session_id = sessions.alloc_id();
+        let mut state = test_write_session_entry();
+        let dropped = Arc::new(AtomicBool::new(false));
+        state.queued_chunks.push_back(QueuedWriteChunk {
+            seq_no: 0,
+            offset: 0,
+            data: Bytes::from_owner(TestBytesOwner {
+                data: b"payload".to_vec(),
+                dropped: dropped.clone(),
+            }),
+            is_data_frame: true,
+        });
+        state.queued_bytes = 7;
+        state.scheduled = true;
+        sessions
+            .active_write_paths
+            .try_acquire_owned(&state.write_path_key, &state.write_path_owner)
+            .unwrap();
+        let path = test_temp_dir("fluxon_write_session_abort_all").join("file.bin");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        sessions.insert(session_id, state, file);
+
+        sessions.abort_all_and_wait_for_writers();
+
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+        assert!(sessions.entries.lock().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn registration_failure_guard_stops_admission_and_drops_payload_owners() {
+        let sessions = AgentWriteSessionsHandle::new();
+        let admission = WriteSessionAdmissionHandle::new();
+        let session_id = sessions.alloc_id();
+        let mut state = test_write_session_entry();
+        let dropped = Arc::new(AtomicBool::new(false));
+        state.queued_chunks.push_back(QueuedWriteChunk {
+            seq_no: 0,
+            offset: 0,
+            data: Bytes::from_owner(TestBytesOwner {
+                data: b"payload".to_vec(),
+                dropped: dropped.clone(),
+            }),
+            is_data_frame: true,
+        });
+        state.queued_bytes = 7;
+        let path = test_temp_dir("fluxon_write_session_registration_guard").join("file.bin");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        sessions.insert(session_id, state, file);
+
+        let guard = WriteSessionRegistrationGuard::new(sessions.clone(), admission.clone());
+        drop(guard);
+
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+        assert!(sessions.entries.lock().is_empty());
+        assert!(admission.try_enter_handler().is_none());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn abort_entry_waits_until_active_writer_releases_its_chunk() {
+        let entry = test_write_session_handle(VecDeque::new());
+        entry.state.lock().writing = true;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let abort_entry = entry.clone();
+        let abort_thread = std::thread::spawn(move || {
+            abort_write_session_entry_and_wait_for_writer(&abort_entry);
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "abort returned while the writer still owned an active chunk"
+        );
+        {
+            let mut state = entry.state.lock();
+            state.writing = false;
+        }
+        entry.cv.notify_all();
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("abort did not finish after writer release");
+        abort_thread.join().unwrap();
+        assert!(entry.state.lock().aborted);
+    }
+
+    #[test]
+    fn timed_out_writer_sweep_retains_entry_for_retry() {
+        let sessions = AgentWriteSessionsHandle::new();
+        let session_id = sessions.alloc_id();
+        let mut state = test_write_session_entry();
+        state.writing = true;
+        let path = test_temp_dir("fluxon_write_session_sweep_retry").join("file.bin");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        sessions.insert(session_id.clone(), state, file);
+
+        let first = sessions
+            .abort_all_and_wait_for_writers_until(Instant::now() + Duration::from_millis(20));
+        assert!(first.is_err());
+        let entry = sessions
+            .get(&session_id)
+            .expect("timed-out sweep must retain shutdown authority");
+        {
+            let mut state = entry.state.lock();
+            state.writing = false;
+        }
+        entry.cv.notify_all();
+
+        sessions
+            .abort_all_and_wait_for_writers_until(Instant::now() + Duration::from_secs(1))
+            .expect("retry must observe writer completion");
+        assert!(sessions.entries.lock().is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn authorize_stat_allows_browse_visible_dir() {
         let access_model = AgentAccessModelHandle::new(Some(browse_only_access_model()));
@@ -5109,6 +6972,145 @@ mod tests {
     }
 
     #[test]
+    fn typed_put_small_object_creates_parents_and_replaces_file() {
+        let identity = FluxonFsRequestIdentity {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        };
+        let root = test_temp_dir("fluxon_typed_put_small_object");
+        let exports = test_exports_handle(root.to_str().unwrap());
+        let access_model = AgentAccessModelHandle::new(Some(read_write_access_model()));
+        let active_write_paths = ActiveWritePathsHandle::new();
+        let req = || FsPutSmallObjectReq {
+            export: "exp".to_string(),
+            relpath: "nested/dir/file.bin".to_string(),
+            fs_rpc_token: Some(rpc_token_for(&identity)),
+            allow_s3_internal_multipart: false,
+        };
+
+        let first = handle_put_small_object_typed(
+            &exports,
+            &access_model,
+            &active_write_paths,
+            req(),
+            Bytes::from_static(b"longer-payload"),
+        );
+        assert!(first.ok, "typed put_small_object failed: {:?}", first);
+        let file_path = root.join("nested/dir/file.bin");
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"longer-payload");
+
+        let overwrite = handle_put_small_object_typed(
+            &exports,
+            &access_model,
+            &active_write_paths,
+            req(),
+            Bytes::from_static(b"short"),
+        );
+        assert!(
+            overwrite.ok,
+            "typed put_small_object overwrite failed: {:?}",
+            overwrite
+        );
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"short");
+        assert_eq!(overwrite.size, 5);
+
+        let empty = handle_put_small_object_typed(
+            &exports,
+            &access_model,
+            &active_write_paths,
+            req(),
+            Bytes::new(),
+        );
+        assert!(empty.ok, "empty put_small_object failed: {:?}", empty);
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"");
+        assert_eq!(empty.size, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_put_small_object_preserves_parent_directory_permissions() {
+        let identity = FluxonFsRequestIdentity {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        };
+        let root = test_temp_dir("fluxon_typed_put_small_object_parent_auth");
+        let exports = test_exports_handle(root.to_str().unwrap());
+        let access_model = AgentAccessModelHandle::new(Some(FluxonFsRuntimeAccessModel {
+            users: vec![FluxonFsRuntimeAccessUser {
+                username: "alice".to_string(),
+                can_manage_users: false,
+                rpc_token_secret_sha256_hex: hex::encode(sha2::Sha256::digest(b"pw")),
+            }],
+            scope_access: vec![FluxonFsScopeAccess {
+                export_name: "exp".to_string(),
+                prefix: "tenant/alice/".to_string(),
+                mode: FluxonFsScopeAccessMode::ReadWrite,
+                usernames: vec!["alice".to_string()],
+            }],
+        }));
+        let resp = handle_put_small_object_typed(
+            &exports,
+            &access_model,
+            &ActiveWritePathsHandle::new(),
+            FsPutSmallObjectReq {
+                export: "exp".to_string(),
+                relpath: "tenant/alice/file.bin".to_string(),
+                fs_rpc_token: Some(rpc_token_for(&identity)),
+                allow_s3_internal_multipart: false,
+            },
+            Bytes::from_static(b"data"),
+        );
+        assert!(!resp.ok);
+        assert_eq!(resp.err_kind, FsAgentRpcErrorKind::AccessDenied.as_i64());
+        assert!(!root.join("tenant").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_open_write_session_creates_parents_only_when_requested() {
+        let identity = FluxonFsRequestIdentity {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        };
+        let root = test_temp_dir("fluxon_typed_open_write_session_parents");
+        let exports = test_exports_handle(root.to_str().unwrap());
+        let access_model = AgentAccessModelHandle::new(Some(read_write_access_model()));
+        let write_sessions = AgentWriteSessionsHandle::new();
+
+        let no_create = handle_open_write_session_typed(
+            &exports,
+            &access_model,
+            &write_sessions,
+            FsOpenWriteSessionReq {
+                export: "exp".to_string(),
+                relpath: "nested/dir/file.bin".to_string(),
+                fs_rpc_token: Some(rpc_token_for(&identity)),
+                allow_s3_internal_multipart: false,
+                create_parents: false,
+            },
+        );
+        assert!(!no_create.ok);
+        assert!(!root.join("nested").exists());
+
+        let create = handle_open_write_session_typed(
+            &exports,
+            &access_model,
+            &write_sessions,
+            FsOpenWriteSessionReq {
+                export: "exp".to_string(),
+                relpath: "nested/dir/file.bin".to_string(),
+                fs_rpc_token: Some(rpc_token_for(&identity)),
+                allow_s3_internal_multipart: false,
+                create_parents: true,
+            },
+        );
+        assert!(create.ok, "typed open_write_session failed: {:?}", create);
+        assert!(root.join("nested/dir/file.bin").exists());
+        let _ = write_sessions.take(&create.session_id);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn typed_open_write_session_accepts_fs_rpc_token() {
         let identity = FluxonFsRequestIdentity {
             username: "alice".to_string(),
@@ -5128,6 +7130,7 @@ mod tests {
                 relpath: "dir/file.bin".to_string(),
                 fs_rpc_token: Some(rpc_token_for(&identity)),
                 allow_s3_internal_multipart: false,
+                create_parents: false,
             },
         );
         assert!(resp.ok, "typed open_write_session failed: {:?}", resp);
@@ -5159,12 +7162,78 @@ mod tests {
                 relpath: "dir/file.bin".to_string(),
                 fs_rpc_token: Some(rpc_token_for(&identity)),
                 allow_s3_internal_multipart: false,
+                create_parents: false,
             },
         );
         assert!(resp.ok, "typed open_write_session failed: {:?}", resp);
         assert_eq!(resp.size, 3);
         assert_eq!(std::fs::read(&file_path).unwrap(), b"abc");
         let _ = write_sessions.take(&resp.session_id);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn typed_finalize_write_session_drains_truncates_and_releases_session() {
+        let identity = FluxonFsRequestIdentity {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        };
+        let root = test_temp_dir("fluxon_typed_finalize_write_session");
+        let file_path = root.join("dir/file.bin");
+        std::fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+        let exports = test_exports_handle(root.to_str().unwrap());
+        let access_model = AgentAccessModelHandle::new(Some(read_write_access_model()));
+        let write_sessions = AgentWriteSessionsHandle::new();
+        let open = handle_open_write_session_typed(
+            &exports,
+            &access_model,
+            &write_sessions,
+            FsOpenWriteSessionReq {
+                export: "exp".to_string(),
+                relpath: "dir/file.bin".to_string(),
+                fs_rpc_token: Some(rpc_token_for(&identity)),
+                allow_s3_internal_multipart: false,
+                create_parents: false,
+            },
+        );
+        assert!(open.ok, "typed open_write_session failed: {:?}", open);
+
+        let write_executor = WriteExecutorHandle::new(1);
+        let enqueue = enqueue_write_session_chunk(
+            &write_sessions,
+            &write_executor,
+            "exp",
+            "dir/file.bin",
+            &open.session_id,
+            0,
+            0,
+            Bytes::from_static(b"abcdef"),
+            true,
+        );
+        assert!(matches!(enqueue.get("ok"), Some(FlatValue::Bool(true))));
+
+        let finalized = handle_finalize_write_session_typed(
+            &access_model,
+            &write_sessions,
+            FsFinalizeWriteSessionReq {
+                export: "exp".to_string(),
+                relpath: "dir/file.bin".to_string(),
+                session_id: open.session_id.clone(),
+                expected_data_frames: 1,
+                final_size: 3,
+                fs_rpc_token: Some(rpc_token_for(&identity)),
+                allow_s3_internal_multipart: false,
+            },
+        );
+        assert!(
+            finalized.ok,
+            "typed finalize_write_session failed: {:?}",
+            finalized
+        );
+        assert_eq!(finalized.size, 3);
+        assert_eq!(std::fs::read(&file_path).unwrap(), b"abc");
+        assert!(write_sessions.get(&open.session_id).is_none());
+        assert!(write_sessions.active_write_paths.entries.lock().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5186,14 +7255,23 @@ mod tests {
     }
 
     #[test]
-    fn pending_expected_frames_uses_written_set_not_highest_seq() {
+    fn write_session_pending_expected_frames_requires_contiguous_written_prefix() {
         let mut state = test_write_session_entry();
-        state.expected_data_frames = Some(4);
-        state.highest_written_seq = Some(3);
-        state.written_data_frame_seqs.extend([0, 2, 3]);
+        state.expected_data_frames = Some(3);
+        state.highest_written_seq = Some(100);
+        state.written_data_frame_seqs.extend([0, 1, 100]);
         assert!(write_session_pending_expected_frames(&state));
-        state.written_data_frame_seqs.insert(1);
+        state.written_data_frame_seqs.insert(2);
         assert!(!write_session_pending_expected_frames(&state));
+    }
+
+    #[test]
+    fn write_session_pending_received_frames_requires_contiguous_prefix() {
+        let mut state = test_write_session_entry();
+        state.received_data_frame_seqs.extend([0, 1, 100]);
+        assert!(write_session_pending_received_frames(&state, 3));
+        state.received_data_frame_seqs.insert(2);
+        assert!(!write_session_pending_received_frames(&state, 3));
     }
 
     #[test]
@@ -5211,6 +7289,134 @@ mod tests {
             Some(12)
         );
         assert_eq!(write_session_merge_expected_frames(None, Some(6)), Some(6));
+    }
+
+    #[test]
+    fn write_session_wait_payload_barrier_allows_later_frames() {
+        let sessions = AgentWriteSessionsHandle::new();
+        let session_id = sessions.alloc_id();
+        let mut state = test_write_session_entry();
+        state.received_data_frame_seqs.insert(0);
+        let path = test_temp_dir("fluxon_write_session_wait_watermark").join("file.bin");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        sessions.insert(session_id.clone(), state, file);
+        let identity = FluxonFsRequestIdentity {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        };
+        let access_model = AgentAccessModelHandle::new(Some(read_write_access_model()));
+        let mut payload = payload_for(&identity);
+        payload.extend([
+            ("export".to_string(), FlatValue::String("exp".to_string())),
+            (
+                "relpath".to_string(),
+                FlatValue::String("file.bin".to_string()),
+            ),
+            (
+                "session_id".to_string(),
+                FlatValue::String(session_id.clone()),
+            ),
+            ("expected_data_frames".to_string(), FlatValue::Int64(1)),
+        ]);
+
+        let resp = handle_wait_write_session_payloads(&access_model, &sessions, payload);
+        assert!(matches!(resp.get("ok"), Some(FlatValue::Bool(true))));
+        assert_eq!(
+            sessions
+                .get(&session_id)
+                .unwrap()
+                .state
+                .lock()
+                .expected_data_frames,
+            None
+        );
+        let executor = WriteExecutorHandle {
+            ready: Arc::new(Mutex::new(VecDeque::new())),
+            cv: Arc::new(Condvar::new()),
+            drain_all: false,
+        };
+        let enqueue = enqueue_write_session_chunk(
+            &sessions,
+            &executor,
+            "exp",
+            "file.bin",
+            &session_id,
+            1,
+            1,
+            Bytes::from_static(b"b"),
+            true,
+        );
+        assert!(matches!(enqueue.get("ok"), Some(FlatValue::Bool(true))));
+        assert_eq!(
+            sessions
+                .get(&session_id)
+                .unwrap()
+                .state
+                .lock()
+                .received_data_frame_seqs,
+            BTreeSet::from([0, 1])
+        );
+        let _ = sessions.take(&session_id);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn write_session_ids_do_not_repeat_across_agent_instances() {
+        let first = AgentWriteSessionsHandle::new();
+        let second = AgentWriteSessionsHandle::new();
+        let first_id = first.alloc_id();
+        assert_ne!(first_id, first.alloc_id());
+        assert_ne!(first_id, second.alloc_id());
+    }
+
+    #[test]
+    fn write_session_duplicate_data_frame_is_acked_without_duplicate_enqueue() {
+        let sessions = AgentWriteSessionsHandle::new();
+        let session_id = "session-a".to_string();
+        let state = test_write_session_entry();
+        let path = test_temp_dir("fluxon_write_session_duplicate").join("file.bin");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        sessions.insert(session_id.clone(), state, file);
+        let executor = WriteExecutorHandle {
+            ready: Arc::new(Mutex::new(VecDeque::new())),
+            cv: Arc::new(Condvar::new()),
+            drain_all: false,
+        };
+
+        for _ in 0..2 {
+            let resp = enqueue_write_session_chunk(
+                &sessions,
+                &executor,
+                "exp",
+                "file.bin",
+                &session_id,
+                7,
+                11,
+                Bytes::from_static(b"payload"),
+                true,
+            );
+            assert!(matches!(resp.get("ok"), Some(FlatValue::Bool(true))));
+        }
+
+        let entry = sessions.get(&session_id).unwrap();
+        let state = entry.state.lock();
+        assert_eq!(state.queued_chunks.len(), 1);
+        assert_eq!(state.queued_bytes, 7);
+        assert_eq!(state.received_data_frame_seqs, BTreeSet::from([7]));
+        drop(state);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

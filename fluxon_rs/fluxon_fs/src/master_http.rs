@@ -41,8 +41,8 @@ use fluxon_util::run_async_from_sync::spawn_blocking_allow_sync_async_bridge;
 use fluxon_util::{FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2};
 use futures::future::BoxFuture;
 use parking_lot::Mutex;
+use prost::bytes::Bytes;
 use sha2::{Digest, Sha256};
-use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 
 use crate::agent::{FluxonFsAgent, FsAgentError};
@@ -63,6 +63,7 @@ const ETCD_PREFIX_FS_EXPORT_REGISTRY: &str = "/fluxon_fs_export_registry";
 
 const EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS: u64 = 25;
 const EXPORT_REGISTRY_SYNC_MAX_WAIT_SECS: u64 = 120;
+const S3_WRITE_SESSION_SUBMIT_MULTIPLIER: usize = 4;
 
 fn export_registry_sync_budget_exhausted(waited: Duration) -> bool {
     waited >= Duration::from_secs(EXPORT_REGISTRY_SYNC_MAX_WAIT_SECS)
@@ -195,6 +196,23 @@ impl FsS3BackendAgent {
         e: FsAgentError,
     ) -> fluxon_fs_s3_gateway::S3Error {
         map_fs_agent_error_to_s3_error(export_name.as_ref(), relpath.as_ref(), e)
+    }
+
+    fn write_session_submit_bytes() -> usize {
+        crate::agent::REMOTE_WRITE_SESSION_CHUNK_BYTES
+            .saturating_mul(S3_WRITE_SESSION_SUBMIT_MULTIPLIER)
+            .max(1)
+    }
+
+    fn write_session_max_inflight_chunks(&self) -> usize {
+        let frame_bytes = crate::agent::REMOTE_WRITE_SESSION_CHUNK_BYTES.max(1) as u64;
+        let target_bytes = self
+            .agent
+            .remote_write_session_target_inflight_bytes()
+            .max(frame_bytes);
+        usize::try_from(target_bytes.div_ceil(frame_bytes))
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
 }
 
@@ -412,6 +430,204 @@ impl fluxon_fs_s3_gateway::FsS3Backend for FsS3BackendAgent {
                     rel2.as_ref(),
                     offset,
                     data,
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
+    fn supports_put_small_object(&self) -> bool {
+        true
+    }
+
+    fn put_small_object(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+        data: Bytes,
+    ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        Box::pin(async move {
+            if data.len() >= fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES {
+                return Err(fluxon_fs_s3_gateway::S3Error::InvalidRequest {
+                    detail: "small object must be below the write-session threshold".to_string(),
+                });
+            }
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_put_small_object_by_handle_s3_gateway_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    data,
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
+    fn supports_write_session(&self) -> bool {
+        true
+    }
+
+    fn write_session_preferred_payload_bytes(&self) -> usize {
+        Self::write_session_submit_bytes()
+    }
+
+    fn open_write_session(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+    ) -> BoxFuture<'static, Result<Arc<str>, fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        Box::pin(async move {
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_open_write_session_by_handle_s3_gateway_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok((session_id, _size, _mtime_ns))) => Ok(Arc::from(session_id)),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
+    fn buffer_write_session_payload(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+        session_id: Arc<str>,
+        offset: i64,
+        data: Bytes,
+    ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        let submit_bytes = Self::write_session_submit_bytes();
+        let max_inflight_chunks = self.write_session_max_inflight_chunks();
+        Box::pin(async move {
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let session_id2 = session_id.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_buffer_write_session_payload_by_handle_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    session_id2.as_ref(),
+                    offset,
+                    data,
+                    submit_bytes,
+                    max_inflight_chunks,
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
+    fn finalize_write_session(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+        session_id: Arc<str>,
+        final_size: i64,
+    ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        Box::pin(async move {
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let session_id2 = session_id.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_finalize_write_session_by_handle_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    session_id2.as_ref(),
+                    final_size,
+                    &path_for_err,
+                    request_identity.as_ref(),
+                )
+            })
+            .await;
+            match j {
+                Ok(Ok((_size, _mtime_ns))) => Ok(()),
+                Ok(Err(e)) => Err(this.map_agent_err(export_name, relpath, e)),
+                Err(e) => Err(fluxon_fs_s3_gateway::S3Error::Internal {
+                    detail: format!("spawn_blocking join failed: {}", e),
+                }),
+            }
+        })
+    }
+
+    fn abort_write_session(
+        &self,
+        request_identity: FluxonFsRequestIdentity,
+        export_name: Arc<str>,
+        relpath: Arc<str>,
+        session_id: Arc<str>,
+    ) -> BoxFuture<'static, Result<(), fluxon_fs_s3_gateway::S3Error>> {
+        let this = self.clone();
+        let request_identity = Some(request_identity);
+        Box::pin(async move {
+            let path_for_err = Self::s3_path_for_err(export_name.as_ref(), relpath.as_ref());
+            let export2 = export_name.clone();
+            let rel2 = relpath.clone();
+            let session_id2 = session_id.clone();
+            let agent = this.agent.clone();
+            let j = spawn_blocking_allow_sync_async_bridge(move || {
+                agent.remote_abort_write_session_by_handle_with_identity(
+                    export2.as_ref(),
+                    rel2.as_ref(),
+                    session_id2.as_ref(),
                     &path_for_err,
                     request_identity.as_ref(),
                 )
@@ -965,6 +1181,7 @@ async fn async_main(
         s3_agent_api,
         rt_handle.clone(),
     ));
+    let s3_agent_for_shutdown = s3_agent.clone();
     s3_agent
         .set_cache_config_yaml(&cache_yaml)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -1027,13 +1244,13 @@ async fn async_main(
     let transfer_scan_runtime_state = Arc::new(Mutex::new(TransferScanRuntimeState::default()));
     if s3_state.transfer_feature_enabled() {
         start_transfer_scan_scheduler_actor(
-            rt_handle.clone(),
+            fs_framework.clone(),
             api.clone(),
             s3_state.clone(),
             transfer_scan_runtime_state.clone(),
         );
-        start_transfer_reconcile_actor(rt_handle.clone(), s3_state.clone());
-        start_transfer_worker_scheduler_actor(rt_handle.clone(), api.clone(), s3_state.clone());
+        start_transfer_reconcile_actor(fs_framework.clone(), s3_state.clone());
+        start_transfer_worker_scheduler_actor(fs_framework.clone(), api.clone(), s3_state.clone());
     }
 
     register_fs_master_rpc(
@@ -1045,7 +1262,7 @@ async fn async_main(
         transfer_scan_runtime_state.clone(),
     )?;
     register_mount_registry_rpc(
-        rt_handle.clone(),
+        fs_framework.clone(),
         &cluster_name,
         etcd_pool_entry.clone(),
         api.clone(),
@@ -1053,7 +1270,7 @@ async fn async_main(
     )?;
     register_export_registry_rpc(api.clone(), export_registry.clone())?;
     register_agent_exports_push_rpc(
-        rt_handle.clone(),
+        fs_framework.clone(),
         api.clone(),
         export_registry.clone(),
         cluster_name.clone(),
@@ -1068,9 +1285,8 @@ async fn async_main(
 
     cleanup_legacy_export_registry_keys(&mut etcd, &cluster_name).await?;
     start_export_registry_manager(
-        rt_handle.clone(),
+        fs_framework.clone(),
         api.clone(),
-        kv_framework.clone(),
         export_registry.clone(),
         cluster_name.clone(),
         etcd_pool_entry,
@@ -1119,34 +1335,49 @@ async fn async_main(
         shutdown_waiter.wait().await;
     };
 
+    // Avoid Nagle/delayed-ACK stalls when streaming small S3 response bodies.
     let server = axum::Server::bind(&addr)
+        .tcp_nodelay(true)
         .serve(app.into_make_service())
         .with_graceful_shutdown(shutdown_fut);
     tokio::pin!(server);
 
-    tokio::select! {
-        res = &mut server => {
-            // If the HTTP server ends unexpectedly while the framework is still running,
-            // force a full framework shutdown to stop all background tasks consistently.
-            if poller.is_running() {
-                let _ = fs_framework.shutdown().await;
-            }
-            res.with_context(|| "serve http")?;
-        }
+    let service_result = tokio::select! {
+        res = &mut server => res.with_context(|| "serve http"),
         _ = fs_framework.wait_shutdown_signal() => {
+            s3_agent_for_shutdown
+                .shutdown_write_session_source()
+                .await
+                .map_err(|e| anyhow::anyhow!(
+                    "write-session source shutdown failed: {}",
+                    e
+                ))?;
             fs_framework
                 .shutdown()
                 .await
                 .map_err(|e| anyhow::anyhow!("framework shutdown failed: {}", e))?;
-            server.await.with_context(|| "serve http")?;
+            server.await.with_context(|| "serve http")
         }
+    };
+
+    // If the HTTP server stopped first, drain write-session source tasks before releasing the FS
+    // framework and its KV dependency. The signal branch already performed these two steps.
+    if poller.is_running() {
+        s3_agent_for_shutdown
+            .shutdown_write_session_source()
+            .await
+            .map_err(|e| anyhow::anyhow!("write-session source shutdown failed: {}", e))?;
+        fs_framework
+            .shutdown()
+            .await
+            .map_err(|e| anyhow::anyhow!("framework shutdown failed: {}", e))?;
     }
 
     kv_framework
         .shutdown()
         .await
         .map_err(|e| anyhow::anyhow!("kv framework shutdown failed: {}", e))?;
-    Ok(())
+    service_result
 }
 
 fn extract_kvclient_config_yaml_from_fluxon_config(raw: &str) -> anyhow::Result<ClientConfigYaml> {
@@ -1439,7 +1670,7 @@ fn build_mount_exports_from_registry_locked(
 }
 
 fn register_mount_registry_rpc(
-    rt: Handle,
+    fs_framework: crate::Framework,
     cluster_name: &str,
     etcd_pool_entry: PooledEtcdClient,
     api: Arc<FluxonUserApi>,
@@ -1537,17 +1768,24 @@ fn register_mount_registry_rpc(
             let value2 = value.clone();
             let s3_state2 = s3_state.clone();
             let db_record2 = db_record.clone();
-            rt.spawn_blocking(move || {
-                if let Err(e) = s3_state2.persist_fs_mount_registry_record(&db_record2) {
-                    tracing::warn!(
-                        "mount registry state db upsert failed; external_instance_key={} local_mount_dir_abs={} err={}",
-                        db_record2.external_instance_key,
-                        db_record2.local_mount_dir_abs,
-                        e
-                    );
-                }
-            });
-            rt.spawn(async move {
+            crate::framework::spawn_fs_task(
+                &fs_framework,
+                "mount_registry_state_persist",
+                async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Err(e) = s3_state2.persist_fs_mount_registry_record(&db_record2) {
+                            tracing::warn!(
+                                "mount registry state db upsert failed; external_instance_key={} local_mount_dir_abs={} err={}",
+                                db_record2.external_instance_key,
+                                db_record2.local_mount_dir_abs,
+                                e
+                            );
+                        }
+                    })
+                    .await;
+                },
+            );
+            crate::framework::spawn_fs_task(&fs_framework, "mount_registry_etcd_put", async move {
                 let mut etcd = match etcd_pool_entry.client().await {
                     Ok(v) => v,
                     Err(e) => {
@@ -1661,7 +1899,7 @@ fn register_export_registry_rpc(
 }
 
 fn register_agent_exports_push_rpc(
-    rt: Handle,
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
     export_registry: Arc<Mutex<ExportRegistry>>,
     cluster_name: String,
@@ -1760,7 +1998,7 @@ fn register_agent_exports_push_rpc(
                     })
                 })?;
             spawn_persist_export_registry_snapshot_to_etcd(
-                rt.clone(),
+                fs_framework.clone(),
                 export_registry.clone(),
                 FLUXON_FS_CONTROL_SCHEMA_VERSION,
                 cluster_name.clone(),
@@ -1850,9 +2088,8 @@ struct FsExportRegistryRecordWire {
 }
 
 fn start_export_registry_manager(
-    rt: Handle,
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
-    framework: Arc<fluxon_kv::Framework>,
     export_registry: Arc<Mutex<ExportRegistry>>,
     cluster_name: String,
     etcd_pool_entry: PooledEtcdClient,
@@ -1860,7 +2097,6 @@ fn start_export_registry_manager(
     schema_version: i64,
     pull_interval_ms: u64,
 ) {
-    let poller = framework.register_shutdown_poller();
     let live_agents: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let inflight_sync: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
 
@@ -1877,9 +2113,8 @@ fn start_export_registry_manager(
 
     for agent_id in initial_agents {
         spawn_sync_agent_exports_until_ready(
-            rt.clone(),
+            fs_framework.clone(),
             api.clone(),
-            framework.clone(),
             export_registry.clone(),
             cluster_name.clone(),
             etcd_pool_entry.clone(),
@@ -1893,11 +2128,16 @@ fn start_export_registry_manager(
     }
 
     let mut rx: MembershipEventReceiver = api.membership_listen();
-    tokio::spawn(async move {
-        while poller.is_running() {
-            let ev = match rx.recv().await {
-                Ok(v) => v,
-                Err(_) => return,
+    let mut shutdown_waiter = fs_framework.register_shutdown_waiter();
+    let actor_framework = fs_framework.clone();
+    crate::framework::spawn_fs_task(&fs_framework, "export_registry_manager", async move {
+        loop {
+            let ev = tokio::select! {
+                _ = shutdown_waiter.wait() => return,
+                result = rx.recv() => match result {
+                    Ok(value) => value,
+                    Err(_) => return,
+                },
             };
             match ev {
                 ClusterEvent::MemberJoined(m) | ClusterEvent::MemberUpdated(m) => {
@@ -1909,9 +2149,8 @@ fn start_export_registry_manager(
                         live_agents.lock().insert(agent_id.clone());
                     }
                     spawn_sync_agent_exports_until_ready(
-                        rt.clone(),
+                        actor_framework.clone(),
                         api.clone(),
-                        framework.clone(),
                         export_registry.clone(),
                         cluster_name.clone(),
                         etcd_pool_entry.clone(),
@@ -1930,7 +2169,7 @@ fn start_export_registry_manager(
                     };
                     if was_agent {
                         remove_agent_exports_and_persist_snapshot(
-                            rt.clone(),
+                            actor_framework.clone(),
                             export_registry.clone(),
                             s3_state.clone(),
                             &member_id,
@@ -1953,7 +2192,7 @@ fn is_fs_agent_cluster_member(m: &ClusterMember) -> bool {
 }
 
 fn remove_agent_exports_and_persist_snapshot(
-    rt: Handle,
+    fs_framework: crate::Framework,
     export_registry: Arc<Mutex<ExportRegistry>>,
     s3_state: Arc<fluxon_fs_s3_gateway::GatewayState>,
     agent_instance_key: &str,
@@ -1966,7 +2205,7 @@ fn remove_agent_exports_and_persist_snapshot(
         remove_agent_from_export_registry_locked(&mut reg, agent_instance_key);
     }
     spawn_persist_export_registry_snapshot_to_etcd(
-        rt,
+        fs_framework,
         export_registry,
         schema_version,
         cluster_name.to_string(),
@@ -1982,9 +2221,8 @@ fn remove_agent_exports_and_persist_snapshot(
 }
 
 fn spawn_sync_agent_exports_until_ready(
-    rt: Handle,
+    fs_framework: crate::Framework,
     api: Arc<FluxonUserApi>,
-    framework: Arc<fluxon_kv::Framework>,
     export_registry: Arc<Mutex<ExportRegistry>>,
     cluster_name: String,
     etcd_pool_entry: PooledEtcdClient,
@@ -2003,8 +2241,10 @@ fn spawn_sync_agent_exports_until_ready(
         inflight.insert(agent_id.clone());
     }
 
-    tokio::spawn(async move {
-        let poller = framework.register_shutdown_poller();
+    let poller = fs_framework.register_shutdown_poller();
+    let mut shutdown_waiter = fs_framework.register_shutdown_waiter();
+    let actor_framework = fs_framework.clone();
+    crate::framework::spawn_fs_task(&fs_framework, "sync_agent_exports", async move {
         let retry_interval = Duration::from_millis(pull_interval_ms);
         let mut waited_ticks = 0u64;
         let start = std::time::Instant::now();
@@ -2018,13 +2258,9 @@ fn spawn_sync_agent_exports_until_ready(
                 break;
             }
 
-            let err_for_this_iter: String = match pull_agent_exports_snapshot_once(
-                api.clone(),
-                &agent_id,
-                schema_version,
-            )
-            .await
-            {
+            let pull_result =
+                pull_agent_exports_snapshot_once(api.clone(), &agent_id, schema_version).await;
+            let err_for_this_iter: String = match pull_result {
                 Ok(items) => {
                     let updated_unix_ms = unix_ms_now();
                     let db_records =
@@ -2044,7 +2280,10 @@ fn spawn_sync_agent_exports_until_ready(
                             "apply pulled export snapshot failed: agent_instance_key={} err={}",
                             agent_id, e
                         );
-                        tokio::time::sleep(retry_interval).await;
+                        tokio::select! {
+                            _ = shutdown_waiter.wait() => break,
+                            _ = tokio::time::sleep(retry_interval) => {}
+                        }
                         waited_ticks += 1;
                         if waited_ticks % EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS == 0 {
                             let waited_s = (waited_ticks * pull_interval_ms) / 1000;
@@ -2072,7 +2311,10 @@ fn spawn_sync_agent_exports_until_ready(
                                 "export registry state db replace failed after pull: agent_instance_key={} err={}",
                                 agent_id, e
                             );
-                            tokio::time::sleep(retry_interval).await;
+                            tokio::select! {
+                                _ = shutdown_waiter.wait() => break,
+                                _ = tokio::time::sleep(retry_interval) => {}
+                            }
                             waited_ticks += 1;
                             if waited_ticks % EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS == 0 {
                                 let waited_s = (waited_ticks * pull_interval_ms) / 1000;
@@ -2090,7 +2332,10 @@ fn spawn_sync_agent_exports_until_ready(
                                 "export registry state db replace join failed after pull: agent_instance_key={} err={}",
                                 agent_id, e
                             );
-                            tokio::time::sleep(retry_interval).await;
+                            tokio::select! {
+                                _ = shutdown_waiter.wait() => break,
+                                _ = tokio::time::sleep(retry_interval) => {}
+                            }
                             waited_ticks += 1;
                             if waited_ticks % EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS == 0 {
                                 let waited_s = (waited_ticks * pull_interval_ms) / 1000;
@@ -2105,7 +2350,7 @@ fn spawn_sync_agent_exports_until_ready(
                         }
                     }
                     spawn_persist_export_registry_snapshot_to_etcd(
-                        rt.clone(),
+                        actor_framework.clone(),
                         export_registry.clone(),
                         schema_version,
                         cluster_name.clone(),
@@ -2127,7 +2372,10 @@ fn spawn_sync_agent_exports_until_ready(
                 break;
             }
 
-            tokio::time::sleep(retry_interval).await;
+            tokio::select! {
+                _ = shutdown_waiter.wait() => break,
+                _ = tokio::time::sleep(retry_interval) => {}
+            }
             waited_ticks += 1;
             if waited_ticks % EXPORT_REGISTRY_SYNC_RETRY_LOG_TICKS == 0 {
                 let waited_s = (waited_ticks * pull_interval_ms) / 1000;
@@ -2233,7 +2481,7 @@ fn compact_export_registry_locked(reg: &mut ExportRegistry) {
 }
 
 fn spawn_persist_export_registry_snapshot_to_etcd(
-    rt: Handle,
+    fs_framework: crate::Framework,
     export_registry: Arc<Mutex<ExportRegistry>>,
     schema_version: i64,
     cluster_name: String,
@@ -2264,27 +2512,31 @@ fn spawn_persist_export_registry_snapshot_to_etcd(
     };
 
     let key = export_registry_snapshot_etcd_key(&cluster_name);
-    rt.spawn(async move {
-        let mut etcd = match etcd_pool_entry.client().await {
-            Ok(v) => v,
-            Err(e) => {
+    crate::framework::spawn_fs_task(
+        &fs_framework,
+        "persist_export_registry_snapshot",
+        async move {
+            let mut etcd = match etcd_pool_entry.client().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "export registry snapshot etcd connect failed; key={} err={}",
+                        key,
+                        e
+                    );
+                    return;
+                }
+            };
+            let value = serde_json::to_string(&snapshot).unwrap();
+            if let Err(e) = etcd.put(key.clone(), value, None).await {
                 tracing::warn!(
-                    "export registry snapshot etcd connect failed; key={} err={}",
+                    "export registry snapshot etcd put failed; key={} err={}",
                     key,
                     e
                 );
-                return;
             }
-        };
-        let value = serde_json::to_string(&snapshot).unwrap();
-        if let Err(e) = etcd.put(key.clone(), value, None).await {
-            tracing::warn!(
-                "export registry snapshot etcd put failed; key={} err={}",
-                key,
-                e
-            );
-        }
-    });
+        },
+    );
 }
 
 async fn panel_view_html() -> Response {

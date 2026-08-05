@@ -145,7 +145,7 @@ def _yaml_template():
 instance_key: xxx                      # Unique distributed instance id (str)
 network:                               # Network and transport tuning (dict(optional))
   rdma_device_names:                   # Comma-separated RDMA device names (str(optional))
-  tcp_reactor_mode:                    # busy_poll|event_driven; defaults to busy_poll (str(optional))
+  tcp_reactor_mode:                    # busy_poll|event_driven; external defaults to event_driven, owner/master to busy_poll (str(optional))
 pprof_duration_seconds:                # Dump pprof flamegraph after N seconds (int(optional))
 contribute_to_cluster_pool_size:       # Capacity contributed to cluster pool (dict(optional))
   dram: 1677721600                     # - DRAM contribution (size_bytes(multiple of 16777216))

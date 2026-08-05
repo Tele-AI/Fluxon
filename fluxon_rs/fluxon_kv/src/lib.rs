@@ -865,7 +865,7 @@ fn build_side_transfer_worker_config_yaml(
             subnet_whitelist: None,
             primary_ip_to_extended_ips: None,
             rdma_device_names: side_config.protocol.rdma_device_names,
-            tcp_reactor_mode: side_config.protocol.tcp_thread_reactor,
+            tcp_reactor_mode: Some(side_config.protocol.tcp_thread_reactor),
         }),
         contribute_to_cluster_pool_size: None,
         pprof_duration_seconds: side_config.pprof_duration_seconds,
@@ -2830,7 +2830,7 @@ mod tests {
                 subnet_whitelist: None,
                 primary_ip_to_extended_ips: None,
                 rdma_device_names: None,
-                tcp_reactor_mode: TcpThreadReactorWaitMode::default(),
+                tcp_reactor_mode: Some(TcpThreadReactorWaitMode::default()),
             })
         );
         assert!(side_cfg_yaml.contribute_to_cluster_pool_size.is_none());

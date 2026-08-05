@@ -35,6 +35,10 @@ pub const FS_S3_KV_LAYOUT_VERSION: &str = "v2";
 // - We keep this as a single shared constant to avoid drift across agent/gateway.
 pub const FS_S3_OBJECT_PIECE_BYTES: usize = 1024 * 1024;
 
+// S3 PUT uses one typed RPC for objects below this threshold. Objects reaching
+// the threshold are promoted to the long-lived write-session path.
+pub const FS_S3_WRITE_SESSION_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+
 pub fn is_internal_multipart_relpath(relpath: &str) -> bool {
     let trimmed = relpath.trim_start_matches('/');
     trimmed == FS_S3_MULTIPART_DIR_PREFIX

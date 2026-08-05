@@ -113,9 +113,14 @@ pub enum TcpThreadReactorWaitMode {
     EventDriven,
 }
 
+const DEFAULT_SERVER_TCP_REACTOR_WAIT_MODE: TcpThreadReactorWaitMode =
+    TcpThreadReactorWaitMode::BusyPoll;
+const DEFAULT_EXTERNAL_TCP_REACTOR_WAIT_MODE: TcpThreadReactorWaitMode =
+    TcpThreadReactorWaitMode::EventDriven;
+
 impl Default for TcpThreadReactorWaitMode {
     fn default() -> Self {
-        Self::BusyPoll
+        DEFAULT_SERVER_TCP_REACTOR_WAIT_MODE
     }
 }
 
@@ -400,6 +405,7 @@ fn apply_test_spec_rdma_device_names_to_protocol(
 fn resolve_protocol_config(
     raw: Option<&NetworkConfigYaml>,
     protocol_type: ProtocolType,
+    default_tcp_reactor_mode: TcpThreadReactorWaitMode,
 ) -> KvResult<ProtocolConfig> {
     let raw = raw.cloned().unwrap_or_default();
     let rdma_device_names = match raw.rdma_device_names {
@@ -418,7 +424,7 @@ fn resolve_protocol_config(
     Ok(ProtocolConfig {
         protocol_type,
         rdma_device_names,
-        tcp_thread_reactor: raw.tcp_reactor_mode,
+        tcp_thread_reactor: raw.tcp_reactor_mode.unwrap_or(default_tcp_reactor_mode),
     })
 }
 
@@ -753,8 +759,8 @@ pub struct NetworkConfigYaml {
     pub primary_ip_to_extended_ips: Option<BTreeMap<String, Vec<String>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rdma_device_names: Option<String>,
-    #[serde(default)]
-    pub tcp_reactor_mode: TcpThreadReactorWaitMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_reactor_mode: Option<TcpThreadReactorWaitMode>,
 }
 
 /// Validated internal protocol configuration.
@@ -1375,6 +1381,11 @@ impl ClientConfigYaml {
                         .protocol_type
                         .unwrap_or(DEFAULT_PROTOCOL_TYPE)
                 },
+                if is_external && !is_side_transfer_worker {
+                    DEFAULT_EXTERNAL_TCP_REACTOR_WAIT_MODE
+                } else {
+                    DEFAULT_SERVER_TCP_REACTOR_WAIT_MODE
+                },
             )?,
             test_spec_config.rdma_device_names.as_deref(),
         );
@@ -1879,6 +1890,7 @@ impl MasterConfigYaml {
                 test_spec_config
                     .protocol_type
                     .unwrap_or(DEFAULT_PROTOCOL_TYPE),
+                DEFAULT_SERVER_TCP_REACTOR_WAIT_MODE,
             )?,
             test_spec_config.rdma_device_names.as_deref(),
         );
@@ -2106,6 +2118,10 @@ fluxonkv_spec:
             verified.protocol.rdma_device_names,
             Some("mlx5_0".to_string())
         );
+        assert_eq!(
+            verified.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::EventDriven
+        );
 
         let invalid = ClientConfigYaml::from_str(
             r#"
@@ -2120,6 +2136,65 @@ fluxonkv_spec:
         .unwrap();
         let err = invalid.verify().unwrap_err();
         assert!(format!("{err}").contains("network.rdma_device_names must be a non-empty string"));
+    }
+
+    #[test]
+    fn client_config_applies_role_specific_tcp_reactor_defaults() {
+        let external = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            external.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::EventDriven
+        );
+
+        let owner = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
+  sub_cluster: rack-a
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            owner.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::BusyPoll
+        );
+
+        let explicit_external_busy_poll = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+network:
+  tcp_reactor_mode: busy_poll
+fluxonkv_spec:
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            explicit_external_busy_poll.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::BusyPoll
+        );
     }
 
     #[test]
@@ -2927,6 +3002,28 @@ log_dir: /tmp/test_master_logs
         )
         .unwrap_err();
         assert!(format!("{err}").contains("unknown field `protocol_type`"));
+    }
+
+    #[test]
+    fn master_config_defaults_tcp_reactor_to_busy_poll() {
+        let verified = MasterConfigYaml::from_str(
+            r#"
+instance_key: test_master
+cluster_name: test_cluster
+port: 18080
+etcd_endpoints: ["127.0.0.1:2379"]
+monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            verified.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::BusyPoll
+        );
     }
 
     #[test]

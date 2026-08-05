@@ -1138,6 +1138,7 @@ dependencies = [
  "async-trait",
  "crossbeam-queue",
  "fluxon_util",
+ "futures",
  "limit_thirdparty",
  "parking_lot",
  "paste",

@@ -32,7 +32,64 @@ Built on the unified Rust-based transport and caching foundation, Fluxon exposes
 - **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
 - **FS (`S3`-compatible file, object, and cache acceleration system)**: Unifies multi-form storage so one system can cache key-value, file, and object data, while supporting remote access, `S3` forwarding, and large-scale cross-cluster migration for AI data and model files
 
-## Backgroud
+<a id="contents"></a>
+
+## 🧭 Contents
+
+- [Benchmark](#benchmark)
+- [Background](#background)
+- [Foundation Capabilities](#foundation-capabilities)
+- [Interface Capabilities](#interface-capabilities)
+- [Runtime Requirements](#runtime-requirements)
+- [Quick Start](#quick-start)
+- [Repository Structure](#repository-structure)
+- [Contributing](#contributing)
+- [Contributors](#contributors)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+- [Stargazers over time](#stargazers-over-time)
+
+<a id="benchmark"></a>
+
+## 📊 Benchmark
+
+The benchmark section mainly covers the `RPC`, `KV`, and `FS` data planes, and the related scripts and configurations are primarily under `fluxon_test_stack/`.
+
+### Fluxon RPC Benchmark
+
+The RPC benchmark mainly shows call latency and throughput across different message sizes and concurrency levels, to observe the stability and tail-latency behavior of the service-to-service call path.
+
+![](./pics/fluxon_rpc_bench.png)
+
+### Fluxon KV Benchmark
+
+The `TCP Benchmark` shows that Fluxon outperforms `MooncakeStore` and `Redis` on the two read-heavy workloads `Read-affinity` and `Read-Zipf`. For `put_only`, the current primary constraint remains the inflight metadata deduplication path rather than `Payload` transport.
+
+![](./pics/kv_benchmark_chart.png)
+
+Fluxon KV can also use an owner's local SSD as a runtime backing layer for DRAM replicas. The chart below shows a single-node H100 SSD-pressure experiment measured through CUDA event completion. At c16, Fluxon's hit payload throughput for 4/8/16 MiB payloads was 3.83×/5.61×/6.73× that of the faster of the two Mooncake topologies.
+
+![GPU-ready KV throughput and hit rate across Fluxon and Mooncake SSD configurations](./pics/kv_ssd_gpu_sweep.png)
+
+See the Chinese deep dive, [Fluxon KV SSD Storage: Using Local SSD as a Backing Layer for In-Memory Replicas](https://tele-ai.github.io/Fluxon/cn/blog/blog_2_Fluxon_KV_SSD%E5%AD%98%E5%82%A8%EF%BC%9A%E6%8A%8A%E6%9C%AC%E5%9C%B0SSD%E6%8E%A5%E6%88%90%E5%86%85%E5%AD%98%E5%89%AF%E6%9C%AC%E7%9A%84%E5%9B%9E%E5%A1%AB%E5%B1%82), for the full setup, hit rates, and scope.
+
+### Fluxon FS Benchmark
+
+#### Multi-node FS Python API
+
+The benchmark results show that small-file reads and large-file writes already outperform `Alluxio`, large-file read performance is broadly on par, and small-file write performance still has further room to improve.
+
+![](./pics/fs_benchmark_chart.png)
+
+#### Single-node S3 API
+
+In the reported single-node `rclone v1.60.1` comparison with Alluxio S3 Proxy, FluxonFS led all 18 persisted-PUT and cold-read object-size/concurrency combinations. Hot-read gains were strongest for 4 KiB objects, while medium- and large-object sequential hot-read throughput was generally close.
+
+![FluxonFS S3 persisted PUT, cold-read, and hot-read throughput compared with Alluxio S3 Proxy](./pics/fluxon-s3-throughput-overview.svg)
+
+<a id="background"></a>
+
+## Background
 
 As GPU compute power continues to scale, bottlenecks in AI systems are expanding from individual operators into the data plane. Inference services need cross-node `KV Cache` reuse. Training pipelines need to pass intermediate state across heterogeneous resource pools. Model files and `Checkpoint` data need to move reliably between remote access paths and local caches.
 
@@ -49,22 +106,6 @@ Most existing systems, however, are still specialized components built for narro
 
 
 ![](./pics/fluxon架构图20260423.png)
-
-<a id="contents"></a>
-
-## 🧭 Contents
-
-- [Foundation Capabilities](#foundation-capabilities)
-- [Interface Capabilities](#interface-capabilities)
-- [Benchmark](#benchmark)
-- [Runtime Requirements](#runtime-requirements)
-- [Quick Start](#quick-start)
-- [Repository Structure](#repository-structure)
-- [Contributing](#contributing)
-- [Contributors](#contributors)
-- [Acknowledgements](#acknowledgements)
-- [License](#license)
-- [Stargazers over time](#stargazers-over-time)
 
 <a id="foundation-capabilities"></a>
 
@@ -122,40 +163,6 @@ Fluxon FS is a high-performance, S3-compatible file and object cache for AI data
 - Transparent Python file semantics: preserves the upper-layer `open() / read() / write()` experience as much as possible while reducing system-call and cross-process overhead
 - Specialized optimization for small-file / large-file reads and writes: optimizes concurrency and transport paths by file granularity and read / write path to improve bandwidth utilization and overall throughput
 - Large-scale cross-cluster migration: supports `PB`-scale data migration and keeps caching, transport, and failure recovery in one unified path
-
-<a id="benchmark"></a>
-
-## 📊 Benchmark
-
-The benchmark section mainly covers the `RPC`, `KV`, and `FS` data planes, and the related scripts and configurations are primarily under `fluxon_test_stack/`.
-
-### Fluxon RPC Benchmark
-
-The RPC benchmark mainly shows call latency and throughput across different message sizes and concurrency levels, to observe the stability and tail-latency behavior of the service-to-service call path.
-
-![](./pics/fluxon_rpc_bench.png)
-
-### Fluxon KV Benchmark
-
-The `TCP Benchmark` shows that Fluxon outperforms `MooncakeStore` and `Redis` on the two read-heavy workloads `Read-affinity` and `Read-Zipf`. For `put_only`, the current primary constraint remains the inflight metadata deduplication path rather than `Payload` transport.
-
-![](./pics/kv_benchmark_chart.png)
-
-Fluxon KV can also use an owner's local SSD as a runtime backing layer for DRAM replicas. The chart below shows a single-node H100 SSD-pressure experiment measured through CUDA event completion. At c16, Fluxon's hit payload throughput for 4/8/16 MiB payloads was 3.83×/5.61×/6.73× that of the faster of the two Mooncake topologies.
-
-![GPU-ready KV throughput and hit rate across Fluxon and Mooncake SSD configurations](./pics/kv_ssd_gpu_sweep.png)
-
-See the Chinese deep dive, [Fluxon KV SSD Storage: Using Local SSD as a Backing Layer for In-Memory Replicas](https://tele-ai.github.io/Fluxon/cn/blog/blog_2_Fluxon_KV_SSD%E5%AD%98%E5%82%A8%EF%BC%9A%E6%8A%8A%E6%9C%AC%E5%9C%B0SSD%E6%8E%A5%E6%88%90%E5%86%85%E5%AD%98%E5%89%AF%E6%9C%AC%E7%9A%84%E5%9B%9E%E5%A1%AB%E5%B1%82), for the full setup, hit rates, and scope.
-
-### Fluxon FS Benchmark
-
-The benchmark results show that small-file reads and large-file writes already outperform `Alluxio`, large-file read performance is broadly on par, and small-file write performance still has further room to improve.
-
-![](./pics/fs_benchmark_chart.png)
-
-### Fluxon MQ Benchmark
-
-`MQ` currently focuses mainly on scenario problems and data-plane design. The automated runtime entrypoints are `test_runner.py` and `fluxon_test_stack/`.
 
 <a id="runtime-requirements"></a>
 

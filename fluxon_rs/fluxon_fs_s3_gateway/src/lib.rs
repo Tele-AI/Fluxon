@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, heade
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
 use base64::Engine as _;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, NaiveDateTime, TimeZone as _, Utc};
 use fluxon_fs_core::config::{
     FluxonFsAccessModel, FluxonFsAccessUser, FluxonFsExport, FluxonFsExportRoutingMode,
@@ -256,6 +256,82 @@ pub trait FsS3Backend: Send + Sync {
         offset: i64,
         data: Vec<u8>,
     ) -> BoxFuture<'static, Result<(), S3Error>>;
+    fn supports_put_small_object(&self) -> bool {
+        false
+    }
+    fn put_small_object(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+        _data: Bytes,
+    ) -> BoxFuture<'static, Result<(), S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "put_small_object is not supported by this backend".to_string(),
+            })
+        })
+    }
+    fn supports_write_session(&self) -> bool {
+        false
+    }
+    fn write_session_preferred_payload_bytes(&self) -> usize {
+        FS_RPC_CHUNK_BYTES
+    }
+    fn open_write_session(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+    ) -> BoxFuture<'static, Result<Arc<str>, S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "write session is not supported by this backend".to_string(),
+            })
+        })
+    }
+    fn buffer_write_session_payload(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+        _session_id: Arc<str>,
+        _offset: i64,
+        _data: Bytes,
+    ) -> BoxFuture<'static, Result<(), S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "write session is not supported by this backend".to_string(),
+            })
+        })
+    }
+    fn finalize_write_session(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+        _session_id: Arc<str>,
+        _final_size: i64,
+    ) -> BoxFuture<'static, Result<(), S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "write-session finalize is not supported by this backend".to_string(),
+            })
+        })
+    }
+    fn abort_write_session(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+        _session_id: Arc<str>,
+    ) -> BoxFuture<'static, Result<(), S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "write session is not supported by this backend".to_string(),
+            })
+        })
+    }
     fn truncate(
         &self,
         request_identity: FluxonFsRequestIdentity,
@@ -3492,18 +3568,17 @@ async fn handle_any_authed_impl(
             }
             let bucket_arc: Arc<str> = Arc::from(bucket);
             let rel_arc: Arc<str> = Arc::from(rel.as_str());
-            ensure_parent_dirs(&st, request_identity.clone(), bucket_arc.clone(), &rel).await?;
-            let (etag, size) = put_object_stream_with_sha256_etag(
+            if !(st.backend.supports_put_small_object() && st.backend.supports_write_session()) {
+                ensure_parent_dirs(&st, request_identity.clone(), bucket_arc.clone(), &rel).await?;
+            }
+            let (etag, _size) = put_object_stream_with_sha256_etag(
                 &st,
                 request_identity.clone(),
-                bucket_arc.clone(),
-                rel_arc.clone(),
+                bucket_arc,
+                rel_arc,
                 body,
             )
             .await?;
-            st.backend
-                .truncate(request_identity.clone(), bucket_arc, rel_arc, size)
-                .await?;
             Ok(resp_empty_with_etag(StatusCode::OK, &etag))
         }
         (Method::DELETE, Some(key)) => {
@@ -3833,6 +3908,228 @@ async fn get_object_stream(
     Ok(Body::wrap_stream::<_, Bytes, S3Error>(stream))
 }
 
+struct HybridObjectWriter {
+    backend: Arc<dyn FsS3Backend>,
+    request_identity: FluxonFsRequestIdentity,
+    bucket: Arc<str>,
+    rel: Arc<str>,
+    received_size: i64,
+    pending_offset: i64,
+    pending: BytesMut,
+    session_id: Option<Arc<str>>,
+    session_supported: bool,
+    put_small_object_supported: bool,
+    session_payload_bytes: usize,
+}
+
+impl HybridObjectWriter {
+    fn new(
+        st: &GatewayState,
+        request_identity: FluxonFsRequestIdentity,
+        bucket: Arc<str>,
+        rel: Arc<str>,
+    ) -> Self {
+        let session_supported = st.backend.supports_write_session();
+        let put_small_object_supported = st.backend.supports_put_small_object();
+        let session_payload_bytes = st.backend.write_session_preferred_payload_bytes().max(1);
+        Self {
+            backend: st.backend.clone(),
+            request_identity,
+            bucket,
+            rel,
+            received_size: 0,
+            pending_offset: 0,
+            pending: BytesMut::new(),
+            session_id: None,
+            session_supported,
+            put_small_object_supported,
+            session_payload_bytes,
+        }
+    }
+
+    fn checked_projected_size(&self, data_len: usize) -> Result<i64, S3Error> {
+        let data_len = i64::try_from(data_len).map_err(|_| S3Error::InvalidRequest {
+            detail: "PUT Object body is too large".to_string(),
+        })?;
+        self.received_size
+            .checked_add(data_len)
+            .ok_or_else(|| S3Error::InvalidRequest {
+                detail: "PUT Object body size overflow".to_string(),
+            })
+    }
+
+    async fn open_session(&mut self) -> Result<(), S3Error> {
+        if self.session_id.is_some() {
+            return Ok(());
+        }
+        let session_id = self
+            .backend
+            .open_write_session(
+                self.request_identity.clone(),
+                self.bucket.clone(),
+                self.rel.clone(),
+            )
+            .await?;
+        self.session_id = Some(session_id);
+        Ok(())
+    }
+
+    async fn write_chunk_payload(&self, start_offset: i64, data: &[u8]) -> Result<(), S3Error> {
+        let mut offset = start_offset;
+        for part in data.chunks(FS_RPC_CHUNK_BYTES) {
+            self.backend
+                .write_chunk(
+                    self.request_identity.clone(),
+                    self.bucket.clone(),
+                    self.rel.clone(),
+                    offset,
+                    part.to_vec(),
+                )
+                .await?;
+            offset =
+                offset
+                    .checked_add(part.len() as i64)
+                    .ok_or_else(|| S3Error::InvalidRequest {
+                        detail: "PUT Object offset overflow".to_string(),
+                    })?;
+        }
+        Ok(())
+    }
+
+    async fn flush_session_pending(&mut self, flush_tail: bool) -> Result<(), S3Error> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(());
+        };
+        while self.pending.len() >= self.session_payload_bytes
+            || (flush_tail && !self.pending.is_empty())
+        {
+            let payload_len = if self.pending.len() >= self.session_payload_bytes {
+                self.session_payload_bytes
+            } else {
+                self.pending.len()
+            };
+            let payload = self.pending.split_to(payload_len).freeze();
+            let offset = self.pending_offset;
+            self.backend
+                .buffer_write_session_payload(
+                    self.request_identity.clone(),
+                    self.bucket.clone(),
+                    self.rel.clone(),
+                    session_id.clone(),
+                    offset,
+                    payload,
+                )
+                .await?;
+            self.pending_offset = self
+                .pending_offset
+                .checked_add(payload_len as i64)
+                .ok_or_else(|| S3Error::InvalidRequest {
+                    detail: "PUT Object offset overflow".to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn write(&mut self, data: Bytes) -> Result<(), S3Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let projected_size = self.checked_projected_size(data.len())?;
+
+        // Backends without the optional session contract retain the original
+        // streaming chunk behavior. The live Fluxon backend advertises session
+        // support, while lightweight test/checker backends can keep the default.
+        if !self.session_supported {
+            self.write_chunk_payload(self.received_size, data.as_ref())
+                .await?;
+            self.received_size = projected_size;
+            self.pending_offset = projected_size;
+            return Ok(());
+        }
+
+        let should_promote = self.session_id.is_some()
+            || projected_size >= fs_s3::FS_S3_WRITE_SESSION_THRESHOLD_BYTES as i64;
+        if should_promote {
+            self.open_session().await?;
+        }
+
+        debug_assert_eq!(
+            self.pending_offset
+                .saturating_add(self.pending.len() as i64),
+            self.received_size
+        );
+        self.pending.extend_from_slice(data.as_ref());
+        self.received_size = projected_size;
+        if self.session_id.is_some() {
+            self.flush_session_pending(false).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<i64, S3Error> {
+        if let Some(session_id) = self.session_id.clone() {
+            self.flush_session_pending(true).await?;
+            self.backend
+                .finalize_write_session(
+                    self.request_identity.clone(),
+                    self.bucket.clone(),
+                    self.rel.clone(),
+                    session_id,
+                    self.received_size,
+                )
+                .await?;
+            self.session_id = None;
+            return Ok(self.received_size);
+        }
+
+        if self.session_supported && self.put_small_object_supported {
+            debug_assert_eq!(self.pending_offset, 0);
+            let payload = self.pending.split().freeze();
+            self.backend
+                .put_small_object(
+                    self.request_identity.clone(),
+                    self.bucket.clone(),
+                    self.rel.clone(),
+                    payload,
+                )
+                .await?;
+            self.pending_offset = self.received_size;
+            return Ok(self.received_size);
+        }
+
+        if !self.pending.is_empty() {
+            let payload = self.pending.split().freeze();
+            self.write_chunk_payload(self.pending_offset, payload.as_ref())
+                .await?;
+            self.pending_offset = self.received_size;
+        }
+        self.backend
+            .truncate(
+                self.request_identity.clone(),
+                self.bucket.clone(),
+                self.rel.clone(),
+                self.received_size,
+            )
+            .await?;
+        Ok(self.received_size)
+    }
+
+    async fn abort(&mut self) {
+        let Some(session_id) = self.session_id.take() else {
+            return;
+        };
+        let _ = self
+            .backend
+            .abort_write_session(
+                self.request_identity.clone(),
+                self.bucket.clone(),
+                self.rel.clone(),
+                session_id,
+            )
+            .await;
+    }
+}
+
 async fn put_object_stream_with_sha256_etag(
     st: &GatewayState,
     request_identity: FluxonFsRequestIdentity,
@@ -3841,30 +4138,30 @@ async fn put_object_stream_with_sha256_etag(
     mut body: Body,
 ) -> Result<(String, i64), S3Error> {
     let mut hasher = Sha256::new();
-    let mut off: i64 = 0;
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk.map_err(|e| S3Error::Internal {
-            detail: format!("read request body failed: {}", e),
-        })?;
-        if chunk.is_empty() {
-            continue;
+    let mut writer = HybridObjectWriter::new(st, request_identity, bucket, rel);
+    let write_result: Result<i64, S3Error> = async {
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(|e| S3Error::Internal {
+                detail: format!("read request body failed: {}", e),
+            })?;
+            if chunk.is_empty() {
+                continue;
+            }
+            hasher.update(&chunk);
+            writer.write(chunk).await?;
         }
-        hasher.update(&chunk);
-        for part in chunk.chunks(FS_RPC_CHUNK_BYTES) {
-            st.backend
-                .write_chunk(
-                    request_identity.clone(),
-                    bucket.clone(),
-                    rel.clone(),
-                    off,
-                    part.to_vec(),
-                )
-                .await?;
-            off += part.len() as i64;
-        }
+        writer.finish().await
     }
+    .await;
+    let size = match write_result {
+        Ok(size) => size,
+        Err(err) => {
+            writer.abort().await;
+            return Err(err);
+        }
+    };
     let etag = hex::encode(hasher.finalize());
-    Ok((etag, off))
+    Ok((etag, size))
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -4315,24 +4612,18 @@ async fn multipart_upload_part(
     }
 
     let part_path = multipart_part_path(upload_id, part_number)?;
-    ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), &part_path).await?;
+    if !(st.backend.supports_put_small_object() && st.backend.supports_write_session()) {
+        ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), &part_path).await?;
+    }
     let part_path_arc: Arc<str> = Arc::from(part_path.as_str());
-    let (etag, size) = put_object_stream_with_sha256_etag(
+    let (etag, _size) = put_object_stream_with_sha256_etag(
         st,
         request_identity.clone(),
         bucket.clone(),
-        part_path_arc.clone(),
+        part_path_arc,
         body,
     )
     .await?;
-    st.backend
-        .truncate(
-            request_identity.clone(),
-            bucket.clone(),
-            part_path_arc,
-            size,
-        )
-        .await?;
 
     let etag_path = multipart_part_etag_path(upload_id, part_number)?;
     let etag_path_arc: Arc<str> = Arc::from(etag_path.as_str());
@@ -4613,108 +4904,99 @@ async fn multipart_complete(
         })?;
     let parts = parse_complete_multipart_body(&body_bytes)?;
     let mut out_hasher = Sha256::new();
-    let mut off: i64 = 0;
-    ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), key).await?;
-
-    for p in parts.iter() {
-        let part_path = multipart_part_path(upload_id, p.part_number)?;
-        let etag_path = multipart_part_etag_path(upload_id, p.part_number)?;
-        let etag_path_arc: Arc<str> = Arc::from(etag_path.as_str());
-        let etag_stat = st
-            .backend
-            .stat(
-                request_identity.clone(),
-                bucket.clone(),
-                etag_path_arc.clone(),
-            )
-            .await?;
-        if !etag_stat.exists {
-            return Err(S3Error::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        let n_et = std::cmp::min(etag_stat.size, FS_RPC_CHUNK_BYTES as i64);
-        let etag_bytes = st
-            .backend
-            .read_chunk_cached(
-                request_identity.clone(),
-                bucket.clone(),
-                etag_path_arc,
-                0,
-                n_et,
-                etag_stat.size,
-                etag_stat.mtime_ns,
-            )
-            .await?;
-        let etag_got = String::from_utf8_lossy(&etag_bytes).trim().to_string();
-        if etag_got != p.etag {
-            return Err(S3Error::InvalidRequest {
-                detail: format!(
-                    "etag mismatch for part {}: expected={} got={}",
-                    p.part_number, p.etag, etag_got
-                ),
-            });
-        }
-        let part_path_arc: Arc<str> = Arc::from(part_path.as_str());
-        let st_part = st
-            .backend
-            .stat(
-                request_identity.clone(),
-                bucket.clone(),
-                part_path_arc.clone(),
-            )
-            .await?;
-        if !st_part.exists {
-            return Err(S3Error::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        let mut left = st_part.size;
-        let mut read_off: i64 = 0;
-        while left > 0 {
-            let n = std::cmp::min(left, FS_RPC_CHUNK_BYTES as i64);
-            let chunk = st
+    if !(st.backend.supports_put_small_object() && st.backend.supports_write_session()) {
+        ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), key).await?;
+    }
+    let final_relpath: Arc<str> = Arc::from(key);
+    let mut writer =
+        HybridObjectWriter::new(st, request_identity.clone(), bucket.clone(), final_relpath);
+    let assemble_result: Result<i64, S3Error> = async {
+        for p in parts.iter() {
+            let part_path = multipart_part_path(upload_id, p.part_number)?;
+            let etag_path = multipart_part_etag_path(upload_id, p.part_number)?;
+            let etag_path_arc: Arc<str> = Arc::from(etag_path.as_str());
+            let etag_stat = st
+                .backend
+                .stat(
+                    request_identity.clone(),
+                    bucket.clone(),
+                    etag_path_arc.clone(),
+                )
+                .await?;
+            if !etag_stat.exists {
+                return Err(S3Error::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            let n_et = std::cmp::min(etag_stat.size, FS_RPC_CHUNK_BYTES as i64);
+            let etag_bytes = st
                 .backend
                 .read_chunk_cached(
                     request_identity.clone(),
                     bucket.clone(),
-                    part_path_arc.clone(),
-                    read_off,
-                    n,
-                    st_part.size,
-                    st_part.mtime_ns,
+                    etag_path_arc,
+                    0,
+                    n_et,
+                    etag_stat.size,
+                    etag_stat.mtime_ns,
                 )
                 .await?;
-            if chunk.is_empty() {
-                break;
+            let etag_got = String::from_utf8_lossy(&etag_bytes).trim().to_string();
+            if etag_got != p.etag {
+                return Err(S3Error::InvalidRequest {
+                    detail: format!(
+                        "etag mismatch for part {}: expected={} got={}",
+                        p.part_number, p.etag, etag_got
+                    ),
+                });
             }
-            let nbytes = chunk.len() as i64;
-            out_hasher.update(&chunk);
-            // Chunk the write to satisfy the agent RPC size bound.
-            for part in chunk.chunks(FS_RPC_CHUNK_BYTES) {
-                st.backend
-                    .write_chunk(
+            let part_path_arc: Arc<str> = Arc::from(part_path.as_str());
+            let st_part = st
+                .backend
+                .stat(
+                    request_identity.clone(),
+                    bucket.clone(),
+                    part_path_arc.clone(),
+                )
+                .await?;
+            if !st_part.exists {
+                return Err(S3Error::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            let mut left = st_part.size;
+            let mut read_off: i64 = 0;
+            while left > 0 {
+                let n = std::cmp::min(left, FS_RPC_CHUNK_BYTES as i64);
+                let chunk = st
+                    .backend
+                    .read_chunk_cached(
                         request_identity.clone(),
                         bucket.clone(),
-                        Arc::from(key),
-                        off,
-                        part.to_vec(),
+                        part_path_arc.clone(),
+                        read_off,
+                        n,
+                        st_part.size,
+                        st_part.mtime_ns,
                     )
                     .await?;
-                off += part.len() as i64;
+                if chunk.is_empty() {
+                    break;
+                }
+                let nbytes = chunk.len() as i64;
+                out_hasher.update(&chunk);
+                writer.write(Bytes::from(chunk)).await?;
+                read_off += nbytes;
+                left -= nbytes;
             }
-            read_off += nbytes;
-            left -= nbytes;
         }
+        writer.finish().await
     }
-    st.backend
-        .truncate(
-            request_identity.clone(),
-            bucket.clone(),
-            Arc::from(key),
-            off,
-        )
-        .await?;
+    .await;
+    if let Err(err) = assemble_result {
+        writer.abort().await;
+        return Err(err);
+    }
     let etag = hex::encode(out_hasher.finalize());
     cleanup_upload(st, request_identity, bucket.clone(), upload_id).await?;
     Ok(resp_xml(
@@ -5304,7 +5586,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{self, Child, Command, Stdio};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
     use std::time::Instant;
@@ -5314,13 +5596,15 @@ mod tests {
     use axum::body::HttpBody as _;
     use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
     use axum::routing::any;
+    use bytes::Bytes;
     use chrono::Utc;
     use parking_lot::Mutex;
     use tower::ServiceExt as _;
 
     use super::{
         FS_RPC_CHUNK_BYTES, FsMasterAdminBackend, FsS3Backend, FsTransferCreateJobArg,
-        GatewayAccessConfig, GatewayState, S3Error, encode_transfer_manifest_blob,
+        GatewayAccessConfig, GatewayState, HybridObjectWriter, S3Error,
+        encode_transfer_manifest_blob,
     };
     use crate::transfer::encode_transfer_manifest_blob_with_empty_dirs;
     use fluxon_fs_core::config::{
@@ -5340,6 +5624,7 @@ mod tests {
         FluxonFsTransferWorkerFileResultWire, FluxonFsTransferWorkerResultWire,
         export_rpc_paths_for_export_name_v1, transfer_collect_info_output_relpath,
     };
+    use sha2::{Digest as _, Sha256};
     use std::sync::OnceLock;
     use uuid::Uuid;
 
@@ -5596,14 +5881,36 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct ObjectWriteMetrics {
+        chunk_writes: Vec<(i64, usize)>,
+        regular_truncates: Vec<i64>,
+        small_object_puts: Vec<usize>,
+        session_opens: usize,
+        session_payloads: Vec<(i64, usize)>,
+        session_finalizes: Vec<i64>,
+        session_aborts: usize,
+    }
+
     #[derive(Clone, Default)]
     struct ObjectBackend {
         objects: Arc<Mutex<BTreeMap<(String, String), Vec<u8>>>>,
         directories: Arc<Mutex<BTreeSet<(String, String)>>>,
         rename_count: Arc<AtomicUsize>,
+        write_session_payload_bytes: Option<usize>,
+        write_metrics: Arc<Mutex<ObjectWriteMetrics>>,
+        fail_next_session_payload: Arc<AtomicBool>,
+        next_session_id: Arc<AtomicUsize>,
     }
 
     impl ObjectBackend {
+        fn with_write_session(payload_bytes: usize) -> Self {
+            Self {
+                write_session_payload_bytes: Some(payload_bytes.max(1)),
+                ..Self::default()
+            }
+        }
+
         fn insert(&self, bucket: &str, key: &str, data: &[u8]) {
             self.objects
                 .lock()
@@ -5621,6 +5928,18 @@ mod tests {
                 .lock()
                 .get(&(bucket.to_string(), key.to_string()))
                 .cloned()
+        }
+
+        fn write_metrics(&self) -> ObjectWriteMetrics {
+            self.write_metrics.lock().clone()
+        }
+
+        fn reset_write_metrics(&self) {
+            *self.write_metrics.lock() = ObjectWriteMetrics::default();
+        }
+
+        fn fail_next_session_payload(&self) {
+            self.fail_next_session_payload.store(true, Ordering::SeqCst);
         }
 
         fn has_directory_coverage(&self, bucket: &str, key: &str) -> bool {
@@ -5846,6 +6165,10 @@ mod tests {
                 let offset_usize: usize = offset.try_into().map_err(|_| S3Error::Internal {
                     detail: format!("offset overflow: {}", offset),
                 })?;
+                this.write_metrics
+                    .lock()
+                    .chunk_writes
+                    .push((offset, data.len()));
                 let mut objects = this.objects.lock();
                 let entry = objects.entry((bucket, key)).or_default();
                 let needed =
@@ -5858,6 +6181,131 @@ mod tests {
                     entry.resize(needed, 0);
                 }
                 entry[offset_usize..needed].copy_from_slice(&data);
+                Ok(())
+            })
+        }
+
+        fn supports_put_small_object(&self) -> bool {
+            true
+        }
+
+        fn put_small_object(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            export_name: Arc<str>,
+            relpath: Arc<str>,
+            data: Bytes,
+        ) -> futures::future::BoxFuture<'static, Result<(), S3Error>> {
+            let this = self.clone();
+            let bucket = export_name.to_string();
+            let key = relpath.to_string();
+            Box::pin(async move {
+                this.write_metrics.lock().small_object_puts.push(data.len());
+                this.objects
+                    .lock()
+                    .insert((bucket, key), data.as_ref().to_vec());
+                Ok(())
+            })
+        }
+
+        fn supports_write_session(&self) -> bool {
+            self.write_session_payload_bytes.is_some()
+        }
+
+        fn write_session_preferred_payload_bytes(&self) -> usize {
+            self.write_session_payload_bytes
+                .unwrap_or(FS_RPC_CHUNK_BYTES)
+        }
+
+        fn open_write_session(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            _export_name: Arc<str>,
+            _relpath: Arc<str>,
+        ) -> futures::future::BoxFuture<'static, Result<Arc<str>, S3Error>> {
+            let this = self.clone();
+            Box::pin(async move {
+                this.write_metrics.lock().session_opens += 1;
+                let id = this.next_session_id.fetch_add(1, Ordering::SeqCst) + 1;
+                let session_id: Arc<str> = Arc::from(format!("test-session-{}", id));
+                Ok(session_id)
+            })
+        }
+
+        fn buffer_write_session_payload(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            export_name: Arc<str>,
+            relpath: Arc<str>,
+            _session_id: Arc<str>,
+            offset: i64,
+            data: Bytes,
+        ) -> futures::future::BoxFuture<'static, Result<(), S3Error>> {
+            let this = self.clone();
+            let bucket = export_name.to_string();
+            let key = relpath.to_string();
+            Box::pin(async move {
+                this.write_metrics
+                    .lock()
+                    .session_payloads
+                    .push((offset, data.len()));
+                if this.fail_next_session_payload.swap(false, Ordering::SeqCst) {
+                    return Err(S3Error::Internal {
+                        detail: "injected write-session payload failure".to_string(),
+                    });
+                }
+                let offset_usize: usize = offset.try_into().map_err(|_| S3Error::Internal {
+                    detail: format!("offset overflow: {}", offset),
+                })?;
+                let needed =
+                    offset_usize
+                        .checked_add(data.len())
+                        .ok_or_else(|| S3Error::Internal {
+                            detail: "write overflow".to_string(),
+                        })?;
+                let mut objects = this.objects.lock();
+                let entry = objects.entry((bucket, key)).or_default();
+                if entry.len() < needed {
+                    entry.resize(needed, 0);
+                }
+                entry[offset_usize..needed].copy_from_slice(data.as_ref());
+                Ok(())
+            })
+        }
+
+        fn finalize_write_session(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            export_name: Arc<str>,
+            relpath: Arc<str>,
+            _session_id: Arc<str>,
+            final_size: i64,
+        ) -> futures::future::BoxFuture<'static, Result<(), S3Error>> {
+            let this = self.clone();
+            let bucket = export_name.to_string();
+            let key = relpath.to_string();
+            Box::pin(async move {
+                let size_usize: usize = final_size.try_into().map_err(|_| S3Error::Internal {
+                    detail: format!("size overflow: {}", final_size),
+                })?;
+                this.write_metrics.lock().session_finalizes.push(final_size);
+                let mut objects = this.objects.lock();
+                let entry = objects.entry((bucket, key)).or_default();
+                entry.resize(size_usize, 0);
+                Ok(())
+            })
+        }
+
+        fn abort_write_session(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            _export_name: Arc<str>,
+            _relpath: Arc<str>,
+            _session_id: Arc<str>,
+        ) -> futures::future::BoxFuture<'static, Result<(), S3Error>> {
+            let this = self.clone();
+            Box::pin(async move {
+                this.write_metrics.lock().session_aborts += 1;
                 Ok(())
             })
         }
@@ -5876,6 +6324,7 @@ mod tests {
                 let size_usize: usize = size.try_into().map_err(|_| S3Error::Internal {
                     detail: format!("size overflow: {}", size),
                 })?;
+                this.write_metrics.lock().regular_truncates.push(size);
                 let mut objects = this.objects.lock();
                 let entry = objects.entry((bucket, key)).or_default();
                 entry.resize(size_usize, 0);
@@ -10756,6 +11205,192 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 .unwrap(),
             b"fluxon-rclone-e2e\n".to_vec()
         );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_put_uses_single_small_object_rpc_below_session_threshold() {
+        let threshold = fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES;
+        let data = vec![0x31; threshold - 1];
+        let backend = ObjectBackend::with_write_session(FS_RPC_CHUNK_BYTES * 2);
+        let st = test_state_with_buckets_without_transfer(Arc::new(backend.clone()), &["demo"]);
+
+        let (_etag, size) = super::put_object_stream_with_sha256_etag(
+            &st,
+            test_request_identity(),
+            Arc::from("demo"),
+            Arc::from("small.bin"),
+            Body::from(data.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(size, data.len() as i64);
+        assert_eq!(backend.get("demo", "small.bin"), Some(data));
+        let metrics = backend.write_metrics();
+        assert_eq!(metrics.session_opens, 0);
+        assert!(metrics.session_payloads.is_empty());
+        assert!(metrics.session_finalizes.is_empty());
+        assert_eq!(metrics.session_aborts, 0);
+        assert!(metrics.chunk_writes.is_empty());
+        assert!(metrics.regular_truncates.is_empty());
+        assert_eq!(metrics.small_object_puts, vec![threshold - 1]);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_writer_promotes_at_threshold_and_truncates_short_overwrite() {
+        let threshold = fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES;
+        let session_payload_bytes = FS_RPC_CHUNK_BYTES * 2;
+        let backend = ObjectBackend::with_write_session(session_payload_bytes);
+        backend.insert("demo", "large.bin", &vec![0xee; threshold + 4096]);
+        let st = test_state_with_buckets_without_transfer(Arc::new(backend.clone()), &["demo"]);
+        let mut writer = HybridObjectWriter::new(
+            &st,
+            test_request_identity(),
+            Arc::from("demo"),
+            Arc::from("large.bin"),
+        );
+
+        let mut expected = vec![0x41; threshold - 1];
+        writer.write(Bytes::from(expected.clone())).await.unwrap();
+        assert_eq!(backend.write_metrics().session_opens, 0);
+
+        writer.write(Bytes::from_static(b"B")).await.unwrap();
+        expected.push(b'B');
+        assert_eq!(backend.write_metrics().session_opens, 1);
+
+        let tail = vec![0x43; 123];
+        writer.write(Bytes::from(tail.clone())).await.unwrap();
+        expected.extend_from_slice(&tail);
+        let size = writer.finish().await.unwrap();
+
+        assert_eq!(size, expected.len() as i64);
+        assert_eq!(backend.get("demo", "large.bin"), Some(expected.clone()));
+        let metrics = backend.write_metrics();
+        assert!(metrics.chunk_writes.is_empty());
+        assert!(metrics.regular_truncates.is_empty());
+        assert_eq!(metrics.session_opens, 1);
+        assert_eq!(
+            metrics.session_payloads,
+            vec![
+                (0, session_payload_bytes),
+                (session_payload_bytes as i64, session_payload_bytes),
+                (threshold as i64, 123),
+            ]
+        );
+        assert_eq!(metrics.session_finalizes, vec![expected.len() as i64]);
+        assert_eq!(metrics.session_aborts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_put_aborts_session_after_payload_failure() {
+        let threshold = fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES;
+        let backend = ObjectBackend::with_write_session(threshold);
+        backend.fail_next_session_payload();
+        let st = test_state_with_buckets_without_transfer(Arc::new(backend.clone()), &["demo"]);
+
+        let err = super::put_object_stream_with_sha256_etag(
+            &st,
+            test_request_identity(),
+            Arc::from("demo"),
+            Arc::from("failed.bin"),
+            Body::from(vec![0x55; threshold]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, S3Error::Internal { detail } if detail.contains("injected")));
+        let metrics = backend.write_metrics();
+        assert_eq!(metrics.session_opens, 1);
+        assert_eq!(metrics.session_payloads, vec![(0, threshold)]);
+        assert!(metrics.session_finalizes.is_empty());
+        assert_eq!(metrics.session_aborts, 1);
+    }
+
+    #[tokio::test]
+    async fn test_multipart_complete_uses_hybrid_session_and_preserves_bytes_and_etag() {
+        let threshold = fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES;
+        let backend = ObjectBackend::with_write_session(FS_RPC_CHUNK_BYTES * 2);
+        let st = test_state_with_buckets_without_transfer(Arc::new(backend.clone()), &["demo"]);
+        let request_identity = test_request_identity();
+        let upload_id = super::multipart_create_upload_id(
+            &st,
+            request_identity.clone(),
+            Arc::from("demo"),
+            "joined.bin",
+        )
+        .await
+        .unwrap();
+        let part1 = vec![0x61; threshold / 2];
+        let part2 = vec![0x62; threshold - part1.len()];
+
+        let part1_resp = super::multipart_upload_part(
+            &st,
+            request_identity.clone(),
+            Arc::from("demo"),
+            "joined.bin",
+            &upload_id,
+            1,
+            Body::from(part1.clone()),
+        )
+        .await
+        .unwrap();
+        let etag1 = part1_resp
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        let part2_resp = super::multipart_upload_part(
+            &st,
+            request_identity.clone(),
+            Arc::from("demo"),
+            "joined.bin",
+            &upload_id,
+            2,
+            Body::from(part2.clone()),
+        )
+        .await
+        .unwrap();
+        let etag2 = part2_resp
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        backend.reset_write_metrics();
+
+        let complete_xml = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>\"{}\"</ETag></Part></CompleteMultipartUpload>",
+            etag1, etag2
+        );
+        let complete_resp = super::multipart_complete(
+            &st,
+            request_identity,
+            Arc::from("demo"),
+            "joined.bin",
+            &upload_id,
+            Body::from(complete_xml),
+        )
+        .await
+        .unwrap();
+
+        let mut expected = part1;
+        expected.extend_from_slice(&part2);
+        assert_eq!(backend.get("demo", "joined.bin"), Some(expected.clone()));
+        let expected_etag = hex::encode(Sha256::digest(&expected));
+        let response_body = hyper::body::to_bytes(complete_resp.into_body())
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response_body).contains(&expected_etag));
+        let metrics = backend.write_metrics();
+        assert!(metrics.chunk_writes.is_empty());
+        assert_eq!(metrics.session_opens, 1);
+        assert_eq!(metrics.session_finalizes, vec![threshold as i64]);
+        assert_eq!(metrics.session_aborts, 0);
     }
 
     #[tokio::test]
