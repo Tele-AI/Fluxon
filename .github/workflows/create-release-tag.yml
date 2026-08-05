@@ -1,0 +1,111 @@
+name: create_release_tag
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: create-release-tag
+  cancel-in-progress: false
+
+jobs:
+  create-tag:
+    name: Validate release commit and create tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out selected release commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve release metadata from the repository
+        id: release_meta
+        run: python3 fluxon_release/resolve_release_meta.py --github-output "$GITHUB_OUTPUT"
+
+      - name: Validate release metadata and successful commit CI
+        id: preflight
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES_FILE: ${{ steps.release_meta.outputs.release_notes_file }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo "create_release_tag must run from the default branch: expected refs/heads/$DEFAULT_BRANCH, got $GITHUB_REF" >&2
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          test -f "$RELEASE_NOTES_FILE"
+
+          ci_run_id="$(
+            gh api \
+              --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/all_test.yml/runs" \
+              -f branch="$DEFAULT_BRANCH" \
+              -f event=push \
+              -f status=success \
+              -f per_page=100 |
+              jq -r \
+                --arg branch "$DEFAULT_BRANCH" \
+                --arg sha "$GITHUB_SHA" \
+                '[.workflow_runs[] | select(.head_branch == $branch and .head_sha == $sha)][0].id // empty'
+          )"
+          if [[ -z "$ci_run_id" ]]; then
+            echo "No successful default-branch ci_2_virt_node run found for $GITHUB_SHA" >&2
+            exit 1
+          fi
+
+          echo "ci_run_id=$ci_run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Create release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$RELEASE_TAG" \
+            -f sha="$GITHUB_SHA"
+
+      - name: Start tag CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run all_test.yml --ref "$RELEASE_TAG"
+
+      - name: Write tag summary
+        env:
+          CI_RUN_ID: ${{ steps.preflight.outputs.ci_run_id }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          {
+            echo "## Release tag created"
+            echo
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Validated commit CI: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID"
+            echo "- Tag CI: dispatched by this workflow"
+            echo "- Next: wait for tag CI and release-readiness review."
+          } >> "$GITHUB_STEP_SUMMARY"

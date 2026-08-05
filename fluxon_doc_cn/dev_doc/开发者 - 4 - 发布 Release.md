@@ -1,147 +1,125 @@
 # 开发者 - 4 - 发布 Release
 
-本文说明当前仓库如何发布一个对外 release。当前稳定流程是：先更新公开版本号和文案，然后本地提交、等待 commit CI 通过，再打 `v<version>` tag 并 push；GitHub Actions 会构建和测试 tag 对应的 wheel、创建 GitHub Release，并在 tag CI 全部成功后把同一份 wheel 发布到 PyPI。如果本次改动包含 README 或文档，还要单独发布 GitHub Pages 文档站。
+release 只有一个手动入口：从 GitHub Actions 运行 `create_release_tag`。准确的 tag CI 成功后，`manual-release.yml` 统一准备并审核全部产物，然后并行启动 GitHub Release、PyPI 和 Docker Hub 三个发布 job。本地 push tag 和第二个手动发布 workflow 不属于支持路径。
 
 ## 边界
 
 | 本文覆盖 | 不覆盖 | 说明 |
 |---|---|---|
-| GitHub Releases 上的安装产物发布 | 远端机器上的 release dispatch | 远端部署属于 `deployment/manual_dispatch_release.py` 的范围 |
-| PyPI distribution `fluxon-ai` 的 wheel 发布 | 其他 Python package index | 当前公开 index 只有 PyPI |
-| `publish_release` 的构建入口 | 本地打 wheel 的实现细节 | 本地打包细节见“开发者 - 1 / 2” |
-| GitHub Pages 文档站发布入口 | testbed / testrunner 的测试流程 | 测试栈另有独立流程 |
+| 通过 GitHub Actions 创建 release tag | 决定下一个版本号 | 版本策略由维护者决定 |
+| 发布 GitHub Release 产物、`fluxon-ai` PyPI wheel 和 Quick Start Docker image | 其他 package index 或 image registry | 当前公开目的地是 GitHub、PyPI 和 Docker Hub |
+| 确定性检查、只读 Codex 审核和目的地审批 | 把 Codex 输出当作测试结果 | Codex 提供审核证据，确定性 job 才是权威门禁 |
+| GitHub Pages 文档站入口 | 向远端机器 dispatch release | 远端部署属于 `deployment/manual_dispatch_release.py` |
 
-## 1. 先更新版本号和公开文案
+## 1. 准备版本 PR
 
-当前仓库没有单一的“全局版本号文件”。发布前至少要核对这些公开入口：
+当前仓库没有单一的全局版本文件。发布前要核对这些公开入口：
 
 | 对外对象 | 主要文件 | 说明 |
 |---|---|---|
-| Python 包版本 | `fluxon_py/__init__.py` | 根目录 `setup.py` 会从这里读取版本号 |
-| PyPI distribution 名 | `setup_and_pack/package_contract.py`、`setup.py` | distribution 名是 `fluxon-ai`，wheel 文件名前缀是 `fluxon_ai` |
-| Rust crate 版本 | `fluxon_rs/Cargo.toml`、`fluxon_rs/*/Cargo.toml`、`fluxon_rs/setup.py` | 对外 crate / wheel 版本应保持一致 |
-| Quick Start 镜像标签 | `examples/fluxon_quick_start/build_image.py`、`examples/fluxon_quick_start/README.md` | 镜像名当前是 `fluxon_quick_start:<version>` |
-| Release workflow 产物名 | `.github/workflows/manual-release.yml` | 当前会产出 `fluxon_quick_start_<version>_docker_image.tar.gz` |
-| GitHub Release 文案 | `fluxon_release/release_notes/v<version>.md` | 当前 release 正文直接读取这个版本文件 |
-| README 对外文案 | `README.md`、`README_CN.md` | 包括 badge、镜像标签示例和开发文档入口 |
+| Python 包版本 | `fluxon_py/__init__.py` | 根目录 `setup.py` 从这里读取版本号 |
+| Rust crate 版本 | `fluxon_rs/Cargo.toml`、`fluxon_rs/*/Cargo.toml`、`fluxon_rs/setup.py` | release crate 与 wheel 版本必须一致 |
+| 闭源 SDK open-surface 要求 | `fluxon_rs/fluxon_commu_contract/src/lib.rs`、`fluxon_release/closed_sdk/manifest.json` 和配套 SDK library | SDK 要求必须与 `FLUXON_COMMU_OPEN_SURFACE_VERSION` 一致；该契约版本独立于公开发布版本 |
+| Quick Start image tag | `examples/fluxon_quick_start/build_image.py`、`examples/fluxon_quick_start/README.md` | Docker Hub 发布 `hanbaoaaa/fluxon_quick_start:<version>` |
+| GitHub Release 文案 | `fluxon_release/release_notes/v<version>.md` | release 正文读取 tag 对应 revision |
+| README release 文案 | `README.md`、`README_CN.md` | 包括 badge 和版本化 Docker 示例 |
 
-建议先用一次全文搜索把旧版本号找全：
+先搜索旧版本在公开入口中的使用。不要机械修改用于特定版本行为的测试 fixture 或 YAML 示例。
 
 ```bash
 OLD=0.2.1  # replace with the previous release version
-rg -n "$OLD" README.md README_CN.md fluxon_py fluxon_rs examples .github/workflows
+rg -n "$OLD" README.md README_CN.md fluxon_py fluxon_rs examples fluxon_release
 ```
 
-版本号和文案改完后，先提交并推送 commit，再打 tag 并推送 tag。
+闭源通信 SDK 会分别报告 `sdk_version` 与 `required_open_surface_version`。运行时把后者与 `FLUXON_COMMU_OPEN_SURFACE_VERSION` 对照，不使用 Cargo package version。仅升级发布版本时保持该契约不变；修改 open-surface 常量或生成的 manifest 前必须先重建并验证 SDK library。默认分支和 tag CI suite 都包含 `fluxon_commu` 运行时契约测试。
 
-发布文案当前使用每个版本单独文件。约定路径是：
-
-```text
-fluxon_release/release_notes/v<version>.md
-```
-
-例如 `v0.2.1` 对应：
-
-```text
-fluxon_release/release_notes/v0.2.1.md
-```
-
-如果这个文件不存在，`publish_release` 会直接失败，不会发布一个没有正文的 release。
-
-## 2. Push `v<version>` tag 触发 release 与 tag CI
-
-当前仓库的 GitHub Release 构建入口是 `.github/workflows/manual-release.yml`，workflow 名称是 `publish_release`。`v*` tag push 还会触发 `.github/workflows/all_test.yml`，由完整 tag CI 构建并测试准备发布到 PyPI 的 wheel。`publish_release` 保留了 `workflow_dispatch` 作为 GitHub Release 重建入口。稳定主路径是：
+运行本地元数据与 workflow 契约检查：
 
 ```bash
-git push origin <branch>
-# wait for the commit CI to pass
-git tag v0.2.1
-git push origin v0.2.1
+python3 fluxon_release/resolve_release_meta.py --git-ref refs/tags/v<version>
+python3 -m unittest \
+  setup_and_pack.tests.test_resolve_release_meta \
+  setup_and_pack.tests.test_release_ci_provenance \
+  setup_and_pack.tests.test_release_workflows
 ```
 
-workflow 在 GitHub runner 上会自动完成这些步骤：
+合入版本 PR，等待默认分支上准确 commit 的 `ci_2_virt_node` push run 成功。
 
-1. 校验 tag、`fluxon_py/__init__.py`、`examples/fluxon_quick_start/build_image.py`、`fluxon_rs/setup.py` 和 release 相关 Cargo manifest 的版本号一致。
-2. 校验 `fluxon_release/release_notes/v<version>.md` 存在。
-3. 安装 Python 3.10、Docker 和打包依赖。
-4. 构建 manylinux builder image。
-5. 生成 CI 用的 `pack_fluxonkv_pylib_env.yaml`。
-6. 运行 `python3 setup_and_pack/pack_release.py --release-dir fluxon_release`。
-7. 运行 `python3 examples/fluxon_quick_start/build_image.py --mode existing_release --release-dir fluxon_release`。
-8. 上传 workflow artifact。
-9. 自动创建或更新同名 GitHub Release，并上传 release assets。
+## 2. 一次性配置凭据与 environment
 
-如果 tag 是 `v0.2.1`，但仓库公开版本号仍然是 `0.2.0`，或者 `fluxon_release/release_notes/v0.2.1.md` 不存在，workflow 会直接失败，不会发布一个契约不完整的 release。
+repository admin 必须配置以下外部控制项：
 
-本次 workflow 结束后，GitHub Actions artifact 和 GitHub Release assets 里都应至少包含：
+| 控制项 | 必需配置 | 用途 |
+|---|---|---|
+| repository Actions token | 不需要外部凭据；`create_release_tag` 为内置 `GITHUB_TOKEN` 授予 Actions write 与 contents write 权限 | 创建 tag 并显式 dispatch 对应 CI |
+| Codex 凭据 | 在 environment `OPENAI_API_KEY` 中设置 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL` | 执行只读 readiness 审核 |
+| GitHub Release 审批 | 在 environment `github-release` 配置 required reviewers | 约束唯一持有 `contents: write` 的 job |
+| PyPI 审批 | 在 environment `pypi` 配置 required reviewers；把 PyPI Trusted Publisher 绑定到 `manual-release.yml` 和该 environment | 约束受测 wheel 的 OIDC 上传 |
+| Docker 审批 | 在 environment `docker-image` 配置 required reviewers、`DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN` | 约束版本化 Docker Hub push |
 
-- `fluxon_release.tar.gz`
-- `fluxon_quick_start_<version>_docker_image.tar.gz`
+只在 YAML 中引用 environment 不会自动增加 reviewer。管理员必须在 GitHub 设置中配置 protection rule。
 
-`fluxon_release.tar.gz` 里会带上 `fluxon_release/` 目录，包含 core wheel、`pylib_src.tar.gz`、`install.py`、`ext_images.tar.gz` 和 `fluxon_release.sha256`。这些内部产物的构成细节分别见：
+tag workflow 使用仓库内置 `GITHUB_TOKEN` 创建 ref，并显式在该 tag 上 dispatch `all_test.yml`。GitHub 允许该 token 发起 `workflow_dispatch`，因此链路不依赖 tag-push event。`all_test.yml` 接受 branch push、pull request 和显式 dispatch，不接收 tag push。无需外部发布身份、PAT 或 release-tag secret。
 
-- [开发者 - 1 - 打包核心安装包](./开发者%20-%201%20-%20打包核心安装包.md)
-- [开发者 - 2 - 打包中间件和镜像](./开发者%20-%202%20-%20打包中间件和镜像.md)
+## 3. 从 GitHub Actions 发起 release
 
-## 3. tag CI 成功后发布 PyPI wheel
+`.github/workflows/create-release-tag.yml` 是唯一手动 release 入口。
 
-PyPI 发布入口是 `.github/workflows/publish-pypi.yml`。它不直接响应 tag push，而是等待 workflow `ci_2_virt_node` 完成；只有来源事件是 `push`、CI 结论是 `success`、来源 ref 是 `v<version>` tag 时才会继续。
+1. 打开 GitHub Actions，选择 `create_release_tag`。
+2. workflow ref 选择默认分支。
+3. 直接运行 workflow；该入口没有 release 参数。
 
-发布链路使用 tag CI 的 `fluxon-ci-release-<commit SHA>` artifact，并完成以下检查：
+workflow 从仓库中经过校验的版本来源推导准确的 `v<version>` tag，并从 `fluxon_release/release_notes/v<version>.md` 读取 release 正文。创建 tag 前，workflow 会校验 tag 形式、默认分支 ref、tag 不存在、release 元数据、release notes，以及同一 commit 的默认分支 CI 已成功。随后内置 token 创建 lightweight tag，并以该 tag 为 ref 显式 dispatch `all_test.yml`。
 
-1. tag 当前仍然指向产生该 CI 的 commit。
-2. 该 commit 位于默认分支历史中。
-3. artifact 中只有一个 `fluxon_ai-*.whl`。
-4. wheel 的 distribution 是 `fluxon-ai`，版本与 tag 一致。
-5. wheel 标签是当前支持的 `cp38-abi3-manylinux_2_28_x86_64`，`Requires-Python` 是 `>=3.10`。
-6. wheel 不超过 PyPI 的默认文件大小限制，并通过 `twine check`。
+被 dispatch 的 tag CI 会生成 `release-ci-provenance-<commit SHA>` artifact，记录完整 ref、ref 类型、commit、repository 和 workflow 路径。`manual-release.yml` 只接受 Bot actor 发起且成功的 `workflow_dispatch` run，并拒绝同名 branch 或不匹配 commit。
 
-校验完成后，workflow 使用 GitHub OIDC 和 PyPI Trusted Publishing 上传同一份已测试 wheel，不使用长期 `PYPI_TOKEN`。PyPI 和 GitHub 必须预先配置：
+不要在本地运行 `git tag` 或 push release tag。release 输入有误时，修复版本 PR，并为新 tag 重新运行 `create_release_tag`。
 
-- PyPI project：`fluxon-ai`
-- GitHub owner / repository：`Tele-AI/Fluxon`
-- Trusted Publisher workflow：`publish-pypi.yml`
-- GitHub environment：`pypi`
+## 4. 统一准备并审核三个目的地
 
-发布完成后，用户安装命令是：
+`.github/workflows/manual-release.yml` 的 workflow 名称是 `publish_release`，只在 tag 的 `ci_2_virt_node` 成功后启动。该文件名沿用已有 PyPI Trusted Publisher 身份，workflow 本身不提供 `workflow_dispatch`。
+
+workflow 分为以下阶段：
+
+1. `verify-release` 校验 tag 与 CI 的身份、provenance、默认分支历史、版本元数据和 release notes。
+2. `pack-release` 与 `prepare-pypi-wheel` 相互独立运行。前者构建 `fluxon_release.tar.gz` 与 Quick Start image archive；后者校验 tag CI 产生的准确 wheel，并运行 `twine check`。
+3. `release-readiness-review` 检查 release checksum、采集 tag CI 证据、纳入受测 wheel hash，并使用只读 permission profile 和 `.github/codex/release-readiness-prompt.md` 运行 `openai/codex-action`。
+4. 审核成功后，三个发布 job 同时具备运行条件。每个目的地在自己的受保护 environment 等待。
+
+Codex 可以指出不一致和证据缺口。它不能替代 tag CI、checksum 或 environment 审批，报告文字也不会被解析成自动发布授权。
+
+## 5. 并行发布三个目的地
+
+| Job | Environment | 发布对象 | 凭据边界 |
+|---|---|---|---|
+| `publish-github-release` | `github-release` | `fluxon_release.tar.gz` 与 `fluxon_quick_start_<version>_docker_image.tar.gz` | 只有该 job 获得 `contents: write` |
+| `publish-pypi` | `pypi` | tag CI 产生的受测 `fluxon_ai-*.whl` | 只有该 job 获得 `id-token: write`，不使用 `PYPI_TOKEN` |
+| `publish-docker-image` | `docker-image` | `hanbaoaaa/fluxon_quick_start:<version>` | Docker Hub 凭据只存在于该 environment |
+
+三个 job 依赖同一 readiness review，彼此之间没有依赖。批准或重跑其中一个目的地不会串行化另外两个。
+
+PyPI 准备阶段检查 tag 身份、默认分支历史、distribution 与版本、`cp38-abi3-manylinux_2_28_x86_64` wheel tag、`Requires-Python >=3.10`、文件大小、checksum 和 `twine check`。用户安装命令是：
 
 ```bash
 python3 -m pip install fluxon-ai
 ```
 
-这里的 CI 门禁针对 tag 指向的确切 commit。默认分支保护负责保证进入主线的变更经过所需检查；发布流程不会要求所有历史祖先 commit 从未出现过失败。
+Docker job 会加载准确的受审 image archive，校验本地 image identity，再使用规范 Docker Hub repository 与 release version 重新打 tag，只 push 版本 tag，不更新 `latest`。
 
-## 4. 什么时候需要手动触发
+## 6. 不增加第二个入口的重跑方式
 
-默认情况下，不需要再手动去 GitHub `Releases` 页面建 release。成功 push `v<version>` tag 后，workflow 会自动读取对应的 `fluxon_release/release_notes/v<version>.md`，然后完成这件事。
+仓库不提供“手动发布已有 tag”的 workflow。runner、Codex、审批或目的地上传发生临时失败时，在已有 `publish_release` run 上使用 GitHub Actions 的 rerun failed jobs。如果需要重新产生 tag CI，在该 tag 的 `ci_2_virt_node` 上 rerun；成功后会启动新的 `publish_release` run。
 
-只有下面这些情况，才建议手动触发 `publish_release`：
+不要移动已发布 tag。PyPI version 与版本化 Docker image tag 都按不可变 release 产物处理。产物或安装行为变化时使用新版本和新 tag。
 
-- GitHub runner 临时故障，需要对已存在的 tag 重建产物。
-- 之前的 workflow 在打包后半段失败，需要对同一个 tag 重新上传 assets。
-- 你明确想验证 release workflow，但又不想新建 tag。
+## 7. 发布文档站
 
-手动触发时，需要在 GitHub Actions 页面给出一个已经存在的 tag，例如 `v0.2.1`。这个 tag 仍然必须和仓库里的公开版本号一致。
+`.github/workflows/docs-pages.yml` 与三个 release 目的地分离，用于构建 `fluxon_release/doc_site/` 并部署 GitHub Pages。README、安装文档、开发者文档或 roadmap 改动时，要确认对应 run。
 
-手动触发 `publish_release` 只重建 GitHub Release，不会绕过 tag CI 手动上传 PyPI。PyPI 上的版本不可覆盖；已经成功发布的版本需要保持不变，后续内容使用新版本号和新 tag。
+## 8. 重跑条件
 
-如果只是改 GitHub Release 页面上的说明文字，需要修改对应的 `fluxon_release/release_notes/v<version>.md`，然后手动重跑 `publish_release`，这样既会更新 release 文案，也会重新上传 assets。
-
-## 5. 发布文档站
-
-文档站发布和二进制 release 是两条独立链路。当前文档站 workflow 是 `.github/workflows/docs-pages.yml`：
-
-- 当 README、文档内容或文档站构建代码变更并推到 `main` / `master` 时，会自动触发。
-- 也可以在 GitHub Actions 页面手动触发 `docs-pages`。
-- 该 workflow 会构建 `fluxon_release/doc_site/`，然后部署到 GitHub Pages。
-- 该 workflow 不会上传 wheel、`fluxon_release.tar.gz` 或 Docker image。
-
-如果这次 release 改了 README、安装文档、开发文档或 roadmap，通常要把 `docs-pages` 一起发掉。
-
-## 6. 什么时候重跑
-
-- 版本号、README badge、镜像标签、release 产物名变更后，要重新 push 一个对应版本的 tag，或手动重跑 `publish_release`。
-- `setup_and_pack/`、`examples/fluxon_quick_start/`、`fluxon_py/`、`fluxon_rs/` 的发布相关内容变更后，要重新 push 一个对应版本的 tag，或手动重跑 `publish_release`。
-- PyPI 上传前失败时，可以重跑对应 tag 的 CI 或失败的 `publish_pypi` workflow；已经上传成功的版本不能覆盖。
-- README、`fluxon_doc_cn/`、`fluxon_doc_en/` 或文档站导航变更后，要重跑 `docs-pages`。
-- 只有 GitHub Release 页面上的说明文字改动时，不需要重跑任何 workflow。
+- tag preflight 失败时修复版本 PR 并重跑 `create_release_tag`；不要用本地 tag 绕过。
+- tag CI 因 release 缺陷失败时修复内容并使用新版本；不要把失败 tag 移到其他 commit。
+- preparation、Codex、审批、GitHub Release、PyPI 或 Docker Hub 发生临时失败时，rerun `publish_release` 中的失败 job。
+- 已到达 PyPI 或 Docker Hub 的版本不能用不同内容覆盖。
+- README、`fluxon_doc_cn/`、`fluxon_doc_en/` 或导航变化后重跑 `docs-pages`。

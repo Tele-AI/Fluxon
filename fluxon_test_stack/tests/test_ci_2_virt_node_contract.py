@@ -170,6 +170,16 @@ class TestCi2VirtNodeContract(unittest.TestCase):
 
         self.assertNotIn("ci_top_attention_largescale_mq", all_scenes)
         self.assertEqual(
+            all_scenes[self._CARGO_COMMU_SCENE_ID],
+            {
+                "subject": "rust",
+                "runtime_contract": "rust_self_managed",
+                "scale": "n1_kvowner_dram_3gib",
+                "case_config": False,
+                "scene_config": {},
+            },
+        )
+        self.assertEqual(
             all_scenes[self._FS_S3_RCLONE_SCENE_ID],
             {
                 "subject": "fs",
