@@ -11,7 +11,7 @@ use anyhow::Context;
 use prost::bytes::Bytes;
 use serde_json::json;
 
-use fluxon_framework_compiled::shutdown::ViewShutdownExt;
+use fluxon_framework_compiled::shutdown::{ShutdownWaiter, ViewShutdownExt};
 use fluxon_fs_core::config::{
     FLUXON_FS_COMPONENT_METADATA_KEY, FLUXON_FS_CONFIG_ACCESS_MODEL_JSON_KEY,
     FLUXON_FS_CONTROL_SCHEMA_VERSION, FLUXON_FS_EXPORT_OVERLAY_JSON_KEY,
@@ -1560,6 +1560,14 @@ fn current_master_pull_interval_ms(master_pull_interval_ms: &Arc<RwLock<u64>>) -
     *master_pull_interval_ms.read()
 }
 
+async fn wait_for_shutdown_or_delay(shutdown_waiter: &mut ShutdownWaiter, delay: Duration) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown_waiter.wait() => true,
+        _ = tokio::time::sleep(delay) => false,
+    }
+}
+
 fn extract_initial_access_model_from_fluxon_config(
     raw: &str,
 ) -> anyhow::Result<Option<FluxonFsRuntimeAccessModel>> {
@@ -1580,6 +1588,7 @@ fn start_export_mount_stat_sampler(
     const SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
     let poller = ViewShutdownExt::register_shutdown_poller(&fs_framework);
+    let mut shutdown_waiter = ViewShutdownExt::register_shutdown_waiter(&fs_framework);
     let metrics = kv_framework
         .metric_reporter_view()
         .metric_reporter()
@@ -1629,7 +1638,9 @@ fn start_export_mount_stat_sampler(
                 }
             }
 
-            tokio::time::sleep(SAMPLE_INTERVAL).await;
+            if wait_for_shutdown_or_delay(&mut shutdown_waiter, SAMPLE_INTERVAL).await {
+                return;
+            }
         }
     });
 }
@@ -1644,6 +1655,7 @@ fn start_agent_exports_push_actor(
     const RETRY_LOG_TICKS: u64 = 25;
 
     let poller = ViewShutdownExt::register_shutdown_poller(&fs_framework);
+    let mut shutdown_waiter = ViewShutdownExt::register_shutdown_waiter(&fs_framework);
     let master_id = master_cfg.instance_key.to_string();
     let master_node: NodeID = master_id.clone().into();
     let schema_version = FLUXON_FS_CONTROL_SCHEMA_VERSION;
@@ -1661,6 +1673,8 @@ fn start_agent_exports_push_actor(
             let pushed = exports.pushed_revision();
             if rev <= pushed {
                 tokio::select! {
+                    biased;
+                    _ = shutdown_waiter.wait() => return,
                     _ = exports.changed.notified() => {}
                     _ = tokio::time::sleep(Duration::from_millis(200)) => {}
                 }
@@ -1687,7 +1701,14 @@ fn start_agent_exports_push_actor(
                         e
                     );
                     let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    if wait_for_shutdown_or_delay(
+                        &mut shutdown_waiter,
+                        Duration::from_millis(interval_ms),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     waited_ticks += 1;
                     waited_ms = waited_ms.saturating_add(interval_ms);
                     continue;
@@ -1715,7 +1736,14 @@ fn start_agent_exports_push_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1751,7 +1779,11 @@ fn start_agent_exports_push_actor(
             }
 
             let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+            if wait_for_shutdown_or_delay(&mut shutdown_waiter, Duration::from_millis(interval_ms))
+                .await
+            {
+                return;
+            }
             waited_ms = waited_ms.saturating_add(interval_ms);
         }
     });
@@ -1771,6 +1803,7 @@ fn start_access_model_sync_actor(
     const RETRY_LOG_TICKS: u64 = 25;
 
     let poller = ViewShutdownExt::register_shutdown_poller(&fs_framework);
+    let mut shutdown_waiter = ViewShutdownExt::register_shutdown_waiter(&fs_framework);
     let master_id = master_cfg.instance_key.to_string();
     let master_node: NodeID = master_id.clone().into();
     let schema_version = FLUXON_FS_CONTROL_SCHEMA_VERSION;
@@ -1797,7 +1830,14 @@ fn start_access_model_sync_actor(
                         e
                     );
                     let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    if wait_for_shutdown_or_delay(
+                        &mut shutdown_waiter,
+                        Duration::from_millis(interval_ms),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     waited_ticks += 1;
                     waited_ms = waited_ms.saturating_add(interval_ms);
                     continue;
@@ -1825,7 +1865,14 @@ fn start_access_model_sync_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1840,7 +1887,14 @@ fn start_access_model_sync_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1858,7 +1912,14 @@ fn start_access_model_sync_actor(
                                     );
                                     let interval_ms =
                                         current_master_pull_interval_ms(&master_pull_interval_ms);
-                                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                                    if wait_for_shutdown_or_delay(
+                                        &mut shutdown_waiter,
+                                        Duration::from_millis(interval_ms),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     waited_ticks += 1;
                                     waited_ms = waited_ms.saturating_add(interval_ms);
                                     continue;
@@ -1874,7 +1935,14 @@ fn start_access_model_sync_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1892,7 +1960,14 @@ fn start_access_model_sync_actor(
                                     );
                                     let interval_ms =
                                         current_master_pull_interval_ms(&master_pull_interval_ms);
-                                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                                    if wait_for_shutdown_or_delay(
+                                        &mut shutdown_waiter,
+                                        Duration::from_millis(interval_ms),
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
                                     waited_ticks += 1;
                                     waited_ms = waited_ms.saturating_add(interval_ms);
                                     continue;
@@ -1907,7 +1982,14 @@ fn start_access_model_sync_actor(
                             );
                             let interval_ms =
                                 current_master_pull_interval_ms(&master_pull_interval_ms);
-                            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                            if wait_for_shutdown_or_delay(
+                                &mut shutdown_waiter,
+                                Duration::from_millis(interval_ms),
+                            )
+                            .await
+                            {
+                                return;
+                            }
                             waited_ticks += 1;
                             waited_ms = waited_ms.saturating_add(interval_ms);
                             continue;
@@ -1934,7 +2016,14 @@ fn start_access_model_sync_actor(
                     }
                     if register_failed {
                         let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-                        tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                        if wait_for_shutdown_or_delay(
+                            &mut shutdown_waiter,
+                            Duration::from_millis(interval_ms),
+                        )
+                        .await
+                        {
+                            return;
+                        }
                         waited_ticks += 1;
                         waited_ms = waited_ms.saturating_add(interval_ms);
                         continue;
@@ -1944,7 +2033,14 @@ fn start_access_model_sync_actor(
                     exports.apply_master_overlay(overlay);
                     waited_ticks = 0;
                     waited_ms = 0;
-                    tokio::time::sleep(Duration::from_millis(next_pull_interval_ms)).await;
+                    if wait_for_shutdown_or_delay(
+                        &mut shutdown_waiter,
+                        Duration::from_millis(next_pull_interval_ms),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                 }
                 Err(e) => {
                     waited_ticks += 1;
@@ -1957,7 +2053,14 @@ fn start_access_model_sync_actor(
                         );
                     }
                     let interval_ms = current_master_pull_interval_ms(&master_pull_interval_ms);
-                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    if wait_for_shutdown_or_delay(
+                        &mut shutdown_waiter,
+                        Duration::from_millis(interval_ms),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                     waited_ms = waited_ms.saturating_add(interval_ms);
                 }
             }
@@ -6474,6 +6577,32 @@ mod tests {
             fs_rpc_token: None,
             allow_s3_internal_multipart: false,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registered_agent_actor_long_delay_wakes_for_framework_shutdown() {
+        let fs_framework = crate::new_fs_framework("agent-actor-shutdown-test");
+        let mut shutdown_waiter = ViewShutdownExt::register_shutdown_waiter(&fs_framework);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        assert!(crate::framework::spawn_fs_task(
+            &fs_framework,
+            "long-delay-test-actor",
+            async move {
+                let _ = started_tx.send(());
+                assert!(
+                    wait_for_shutdown_or_delay(&mut shutdown_waiter, Duration::from_secs(60 * 60))
+                        .await,
+                    "actor delay completed without a shutdown signal"
+                );
+            },
+        ));
+        started_rx.await.expect("test actor must start");
+
+        tokio::time::timeout(Duration::from_secs(1), fs_framework.shutdown())
+            .await
+            .expect("framework shutdown must interrupt a long actor delay")
+            .expect("framework shutdown must succeed");
     }
 
     #[test]
