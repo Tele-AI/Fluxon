@@ -164,6 +164,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertNotIn("main-ci-run.json", self.release_source)
         self.assertNotIn("main-ci-jobs.json", self.release_source)
         self.assertIn("openai/codex-action@", self.release_source)
+        codex_step = next(
+            step
+            for step in review["steps"]
+            if str(step.get("uses", "")).startswith("openai/codex-action@")
+        )
+        self.assertEqual(codex_step["with"]["allow-bots"], "true")
         self.assertIn("prompt-file: .github/codex/release-readiness-prompt.md", self.release_source)
         self.assertIn('permission-profile: ":read-only"', self.release_source)
 
