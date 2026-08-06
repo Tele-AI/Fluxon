@@ -15,14 +15,13 @@ concurrency:
 
 jobs:
   verify-release:
-    name: Verify default-branch CI, release tag, and metadata
+    name: Verify release tag and metadata
     if: >-
       github.event.action == 'publish_release' &&
       github.event.sender.type == 'Bot' &&
       github.event.sender.login == 'github-actions[bot]'
     runs-on: ubuntu-latest
     outputs:
-      ci_run_id: ${{ steps.release_ref.outputs.ci_run_id }}
       prerelease: ${{ steps.release_meta.outputs.prerelease }}
       quickstart_archive: ${{ steps.release_meta.outputs.quickstart_archive }}
       quickstart_image: ${{ steps.release_meta.outputs.quickstart_image }}
@@ -35,11 +34,10 @@ jobs:
       - name: Resolve and verify release ref
         id: release_ref
         env:
-          CI_RUN_ID: ${{ github.event.client_payload.ci_run_id }}
-          CI_SHA: ${{ github.event.client_payload.source_sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.client_payload.release_tag }}
+          SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
         shell: bash
         run: |
           set -euo pipefail
@@ -47,29 +45,8 @@ jobs:
             echo "Invalid release tag: $RELEASE_TAG" >&2
             exit 1
           fi
-          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
-            echo "Invalid default-branch CI run ID: $CI_RUN_ID" >&2
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "Invalid release commit SHA: $CI_SHA" >&2
-            exit 1
-          fi
-
-          ci_run_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID")"
-          if ! jq -e \
-            --arg branch "$DEFAULT_BRANCH" \
-            --arg repository "$GITHUB_REPOSITORY" \
-            --arg sha "$CI_SHA" \
-            '.event == "push" and
-             .status == "completed" and
-             .conclusion == "success" and
-             .head_branch == $branch and
-             .head_sha == $sha and
-             .head_repository.full_name == $repository and
-             .path == ".github/workflows/all_test.yml"' \
-            <<<"$ci_run_json" >/dev/null; then
-            echo "Default-branch CI run does not match the release commit: run=$CI_RUN_ID sha=$CI_SHA" >&2
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid release commit SHA: $SOURCE_SHA" >&2
             exit 1
           fi
 
@@ -86,19 +63,18 @@ jobs:
             object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.type')"
             object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')"
           done
-          if [[ "$object_type" != "commit" || "$object_sha" != "$CI_SHA" ]]; then
-            echo "Tag/default-branch-CI commit mismatch: tag=$object_sha ci=$CI_SHA type=$object_type" >&2
+          if [[ "$object_type" != "commit" || "$object_sha" != "$SOURCE_SHA" ]]; then
+            echo "Tag/source commit mismatch: tag=$object_sha source=$SOURCE_SHA type=$object_type" >&2
             exit 1
           fi
 
-          compare_status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$CI_SHA...$DEFAULT_BRANCH" --jq '.status')"
+          compare_status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$SOURCE_SHA...$DEFAULT_BRANCH" --jq '.status')"
           if [[ "$compare_status" != "ahead" && "$compare_status" != "identical" ]]; then
             echo "Tagged commit is not in the default-branch history: status=$compare_status" >&2
             exit 1
           fi
 
-          echo "ci_run_id=$CI_RUN_ID" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$CI_SHA" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Check out tagged release
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -106,25 +82,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ steps.release_ref.outputs.source_sha }}
-
-      - name: Download validated default-branch CI provenance
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: release-ci-provenance-${{ steps.release_ref.outputs.source_sha }}
-          path: ${{ runner.temp }}/release-ci-provenance
-          github-token: ${{ github.token }}
-          run-id: ${{ steps.release_ref.outputs.ci_run_id }}
-
-      - name: Verify default-branch CI provenance
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          SOURCE_SHA: ${{ steps.release_ref.outputs.source_sha }}
-        run: |
-          python3 setup_and_pack/release_ci_provenance.py validate-branch \
-            --path "$RUNNER_TEMP/release-ci-provenance/release-ci-provenance.json" \
-            --expected-repository "$GITHUB_REPOSITORY" \
-            --expected-sha "$SOURCE_SHA" \
-            --expected-branch "$DEFAULT_BRANCH"
 
       - name: Resolve release metadata
         id: release_meta
@@ -148,7 +105,7 @@ jobs:
           fi
 
   pack-release:
-    name: Build GitHub Release and Docker artifacts
+    name: Build release artifacts
     needs: verify-release
     runs-on: ubuntu-latest
     steps:
@@ -217,6 +174,28 @@ jobs:
       - name: Archive release directory
         run: tar czf fluxon_release.tar.gz fluxon_release
 
+      - name: Stage release-built wheel candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(fluxon_release/fluxon_ai-*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one release-built wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/release-wheel-candidate"
+          cp "${wheels[0]}" "$RUNNER_TEMP/release-wheel-candidate/"
+
+      - name: Upload release-built wheel candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-wheel-candidate-${{ needs.verify-release.outputs.source_sha }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          path: ${{ runner.temp }}/release-wheel-candidate/*.whl
+
       - name: Upload release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -227,46 +206,30 @@ jobs:
             ${{ needs.verify-release.outputs.quickstart_archive }}
 
   prepare-pypi-wheel:
-    name: Validate tested PyPI wheel
-    needs: verify-release
+    name: Validate release-built PyPI wheel
+    needs:
+      - verify-release
+      - pack-release
     runs-on: ubuntu-latest
     steps:
-      - name: Check out trusted publishing helpers
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-
-      - name: Check out tagged release metadata
+      - name: Check out tagged release
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           ref: ${{ needs.verify-release.outputs.source_sha }}
-          path: release-source
           persist-credentials: false
 
       - name: Verify tagged repository metadata
         env:
           RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
         run: |
-          python3 release-source/fluxon_release/resolve_release_meta.py \
+          python3 fluxon_release/resolve_release_meta.py \
             --git-ref "refs/tags/$RELEASE_TAG"
 
-      - name: Download tested CI release
+      - name: Download release-built wheel candidate
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
-          name: fluxon-ci-release-${{ needs.verify-release.outputs.source_sha }}
-          path: ${{ runner.temp }}/fluxon-ci-artifact
-          github-token: ${{ github.token }}
-          run-id: ${{ needs.verify-release.outputs.ci_run_id }}
-
-      - name: Extract tested CI release
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/fluxon-pypi-release"
-          tar -xzf "$RUNNER_TEMP/fluxon-ci-artifact/fluxon-ci-release.tar.gz" \
-            -C "$RUNNER_TEMP/fluxon-pypi-release"
-          test -d "$RUNNER_TEMP/fluxon-pypi-release/fluxon_release"
+          name: release-wheel-candidate-${{ needs.verify-release.outputs.source_sha }}
+          path: ${{ runner.temp }}/release-wheel-candidate
 
       - name: Validate wheel contract
         id: wheel
@@ -274,13 +237,13 @@ jobs:
           RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
         run: |
           python3 setup_and_pack/validate_pypi_wheel.py \
-            --release-dir "$RUNNER_TEMP/fluxon-pypi-release/fluxon_release" \
+            --release-dir "$RUNNER_TEMP/release-wheel-candidate" \
             --release-tag "$RELEASE_TAG" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Check wheel metadata rendering
         run: |
-          python3 -m pip install --disable-pip-version-check twine==6.2.0
+          python3 -m pip install --disable-pip-version-check packaging==24.2 twine==6.2.0
           python3 -m twine check "${{ steps.wheel.outputs.wheel_path }}"
 
       - name: Stage validated wheel
@@ -335,19 +298,8 @@ jobs:
           name: pypi-wheel-${{ needs.verify-release.outputs.source_sha }}
           path: release-review/pypi-wheel
 
-      - name: Download validated default-branch CI provenance
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: release-ci-provenance-${{ needs.verify-release.outputs.source_sha }}
-          path: release-review/main-ci-provenance
-          github-token: ${{ github.token }}
-          run-id: ${{ needs.verify-release.outputs.ci_run_id }}
-
       - name: Build deterministic release evidence
         env:
-          CI_RUN_ID: ${{ needs.verify-release.outputs.ci_run_id }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          GH_TOKEN: ${{ github.token }}
           QUICKSTART_ARCHIVE: ${{ needs.verify-release.outputs.quickstart_archive }}
           RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
           SOURCE_SHA: ${{ needs.verify-release.outputs.source_sha }}
@@ -357,24 +309,27 @@ jobs:
           mkdir -p release-review/extracted
           python3 fluxon_release/resolve_release_meta.py \
             --git-ref "refs/tags/$RELEASE_TAG"
-          cp \
-            release-review/main-ci-provenance/release-ci-provenance.json \
-            release-review/main-ci-provenance.json
-          python3 setup_and_pack/release_ci_provenance.py validate-branch \
-            --path release-review/main-ci-provenance.json \
-            --expected-repository "$GITHUB_REPOSITORY" \
-            --expected-sha "$SOURCE_SHA" \
-            --expected-branch "$DEFAULT_BRANCH"
           test -f "fluxon_release/release_notes/$RELEASE_TAG.md"
           test -f fluxon_release.tar.gz
           test -f "$QUICKSTART_ARCHIVE"
 
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID" > release-review/main-ci-run.json
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/jobs?per_page=100" > release-review/main-ci-jobs.json
           sha256sum fluxon_release.tar.gz "$QUICKSTART_ARCHIVE" > release-review/release-artifacts.sha256
           sha256sum release-review/pypi-wheel/*.whl > release-review/pypi-wheel.sha256
           tar -tzf fluxon_release.tar.gz > release-review/fluxon-release-files.txt
           tar -xzf fluxon_release.tar.gz -C release-review/extracted
+          shopt -s nullglob
+          release_wheels=(release-review/extracted/fluxon_release/fluxon_ai-*.whl)
+          pypi_wheels=(release-review/pypi-wheel/fluxon_ai-*.whl)
+          if [[ "${#release_wheels[@]}" -ne 1 || "${#pypi_wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one release wheel and one validated PyPI wheel" >&2
+            exit 1
+          fi
+          cmp "${release_wheels[0]}" "${pypi_wheels[0]}"
+          printf '%s\n' \
+            "release_wheel=${release_wheels[0]}" \
+            "pypi_wheel=${pypi_wheels[0]}" \
+            "sha256=$(sha256sum "${pypi_wheels[0]}" | awk '{print $1}')" \
+            > release-review/release-wheel-identity.txt
           (
             cd release-review/extracted/fluxon_release
             sha256sum --check fluxon_release.sha256
@@ -382,7 +337,7 @@ jobs:
           printf '%s\n' \
             "release_tag=$RELEASE_TAG" \
             "source_sha=$SOURCE_SHA" \
-            "validated_main_ci_run_id=$CI_RUN_ID" \
+            "validation_mode=release_build_without_main_ci" \
             > release-review/release-metadata.txt
 
       - name: Require OpenAI API configuration
