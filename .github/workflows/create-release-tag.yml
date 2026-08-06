@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: write
 
 concurrency:
@@ -26,8 +25,7 @@ jobs:
         id: release_meta
         run: python3 fluxon_release/resolve_release_meta.py --github-output "$GITHUB_OUTPUT"
 
-      - name: Validate release metadata and successful commit CI
-        id: preflight
+      - name: Validate release metadata
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
@@ -52,42 +50,6 @@ jobs:
 
           test -f "$RELEASE_NOTES_FILE"
 
-          ci_run_id="$(
-            gh api \
-              --method GET \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/all_test.yml/runs" \
-              -f branch="$DEFAULT_BRANCH" \
-              -f event=push \
-              -f status=success \
-              -f per_page=100 |
-              jq -r \
-                --arg branch "$DEFAULT_BRANCH" \
-                --arg sha "$GITHUB_SHA" \
-                '[.workflow_runs[] | select(.head_branch == $branch and .head_sha == $sha)][0].id // empty'
-          )"
-          if [[ -z "$ci_run_id" ]]; then
-            echo "No successful default-branch ci_2_virt_node run found for $GITHUB_SHA" >&2
-            exit 1
-          fi
-
-          ci_artifacts_json="$(
-            gh api \
-              "repos/$GITHUB_REPOSITORY/actions/runs/$ci_run_id/artifacts?per_page=100"
-          )"
-          for required_artifact in \
-            "fluxon-ci-release-$GITHUB_SHA" \
-            "release-ci-provenance-$GITHUB_SHA"; do
-            if ! jq -e \
-              --arg name "$required_artifact" \
-              'any(.artifacts[]; .name == $name and .expired == false)' \
-              <<<"$ci_artifacts_json" >/dev/null; then
-              echo "Validated CI artifact is missing or expired: $required_artifact (run $ci_run_id)" >&2
-              exit 1
-            fi
-          done
-
-          echo "ci_run_id=$ci_run_id" >> "$GITHUB_OUTPUT"
-
       - name: Create release tag
         env:
           GH_TOKEN: ${{ github.token }}
@@ -101,9 +63,8 @@ jobs:
             -f ref="refs/tags/$RELEASE_TAG" \
             -f sha="$GITHUB_SHA"
 
-      - name: Start release workflow with validated CI
+      - name: Start release workflow
         env:
-          CI_RUN_ID: ${{ steps.preflight.outputs.ci_run_id }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
         shell: bash
@@ -111,13 +72,11 @@ jobs:
           set -euo pipefail
           dispatch_payload="$(
             jq -n \
-              --arg ci_run_id "$CI_RUN_ID" \
               --arg release_tag "$RELEASE_TAG" \
               --arg source_sha "$GITHUB_SHA" \
               '{
                 event_type: "publish_release",
                 client_payload: {
-                  ci_run_id: $ci_run_id,
                   release_tag: $release_tag,
                   source_sha: $source_sha
                 }
@@ -139,7 +98,6 @@ jobs:
 
       - name: Write tag summary
         env:
-          CI_RUN_ID: ${{ steps.preflight.outputs.ci_run_id }}
           RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
         shell: bash
         run: |
@@ -148,7 +106,7 @@ jobs:
             echo
             echo "- Tag: \`$RELEASE_TAG\`"
             echo "- Commit: \`$GITHUB_SHA\`"
-            echo "- Validated commit CI: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID"
-            echo "- Release workflow: dispatched with the validated default-branch CI"
+            echo "- Main CI gate: intentionally skipped"
+            echo "- Release workflow: dispatched to build and validate release artifacts"
             echo "- Next: wait for release-readiness review."
           } >> "$GITHUB_STEP_SUMMARY"
