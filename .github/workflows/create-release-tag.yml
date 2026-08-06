@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: write
+  actions: read
   contents: write
 
 concurrency:
@@ -70,6 +70,22 @@ jobs:
             exit 1
           fi
 
+          ci_artifacts_json="$(
+            gh api \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$ci_run_id/artifacts?per_page=100"
+          )"
+          for required_artifact in \
+            "fluxon-ci-release-$GITHUB_SHA" \
+            "release-ci-provenance-$GITHUB_SHA"; do
+            if ! jq -e \
+              --arg name "$required_artifact" \
+              'any(.artifacts[]; .name == $name and .expired == false)' \
+              <<<"$ci_artifacts_json" >/dev/null; then
+              echo "Validated CI artifact is missing or expired: $required_artifact (run $ci_run_id)" >&2
+              exit 1
+            fi
+          done
+
           echo "ci_run_id=$ci_run_id" >> "$GITHUB_OUTPUT"
 
       - name: Create release tag
@@ -85,14 +101,41 @@ jobs:
             -f ref="refs/tags/$RELEASE_TAG" \
             -f sha="$GITHUB_SHA"
 
-      - name: Start tag CI
+      - name: Start release workflow with validated CI
         env:
+          CI_RUN_ID: ${{ steps.preflight.outputs.ci_run_id }}
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
         shell: bash
         run: |
           set -euo pipefail
-          gh workflow run all_test.yml --ref "$RELEASE_TAG"
+          dispatch_payload="$(
+            jq -n \
+              --arg ci_run_id "$CI_RUN_ID" \
+              --arg release_tag "$RELEASE_TAG" \
+              --arg source_sha "$GITHUB_SHA" \
+              '{
+                event_type: "publish_release",
+                client_payload: {
+                  ci_run_id: $ci_run_id,
+                  release_tag: $release_tag,
+                  source_sha: $source_sha
+                }
+              }'
+          )"
+          for attempt in 1 2 3; do
+            if gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/dispatches" \
+              --input - <<<"$dispatch_payload"; then
+              exit 0
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              echo "Failed to dispatch publish_release after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep "$((attempt * 2))"
+          done
 
       - name: Write tag summary
         env:
@@ -106,6 +149,6 @@ jobs:
             echo "- Tag: \`$RELEASE_TAG\`"
             echo "- Commit: \`$GITHUB_SHA\`"
             echo "- Validated commit CI: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID"
-            echo "- Tag CI: dispatched by this workflow"
-            echo "- Next: wait for tag CI and release-readiness review."
+            echo "- Release workflow: dispatched with the validated default-branch CI"
+            echo "- Next: wait for release-readiness review."
           } >> "$GITHUB_STEP_SUMMARY"

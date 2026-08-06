@@ -1,26 +1,25 @@
 name: publish_release
 
 on:
-  workflow_run:
-    workflows:
-      - ci_2_virt_node
+  repository_dispatch:
     types:
-      - completed
+      - publish_release
 
 permissions:
   actions: read
   contents: read
 
+concurrency:
+  group: publish-release-${{ github.event.client_payload.release_tag }}
+  cancel-in-progress: false
+
 jobs:
   verify-release:
-    name: Verify tag CI and release metadata
+    name: Verify default-branch CI, release tag, and metadata
     if: >-
-      github.event.workflow_run.event == 'workflow_dispatch' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.actor.type == 'Bot' &&
-      github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.path == '.github/workflows/all_test.yml' &&
-      startsWith(github.event.workflow_run.head_branch, 'v')
+      github.event.action == 'publish_release' &&
+      github.event.sender.type == 'Bot' &&
+      github.event.sender.login == 'github-actions[bot]'
     runs-on: ubuntu-latest
     outputs:
       ci_run_id: ${{ steps.release_ref.outputs.ci_run_id }}
@@ -36,16 +35,41 @@ jobs:
       - name: Resolve and verify release ref
         id: release_ref
         env:
-          CI_RUN_ID: ${{ github.event.workflow_run.id }}
-          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_RUN_ID: ${{ github.event.client_payload.ci_run_id }}
+          CI_SHA: ${{ github.event.client_payload.source_sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          RELEASE_TAG: ${{ github.event.client_payload.release_tag }}
         shell: bash
         run: |
           set -euo pipefail
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$ ]]; then
             echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ ! "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid default-branch CI run ID: $CI_RUN_ID" >&2
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid release commit SHA: $CI_SHA" >&2
+            exit 1
+          fi
+
+          ci_run_json="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID")"
+          if ! jq -e \
+            --arg branch "$DEFAULT_BRANCH" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg sha "$CI_SHA" \
+            '.event == "push" and
+             .status == "completed" and
+             .conclusion == "success" and
+             .head_branch == $branch and
+             .head_sha == $sha and
+             .head_repository.full_name == $repository and
+             .path == ".github/workflows/all_test.yml"' \
+            <<<"$ci_run_json" >/dev/null; then
+            echo "Default-branch CI run does not match the release commit: run=$CI_RUN_ID sha=$CI_SHA" >&2
             exit 1
           fi
 
@@ -63,7 +87,7 @@ jobs:
             object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')"
           done
           if [[ "$object_type" != "commit" || "$object_sha" != "$CI_SHA" ]]; then
-            echo "Tag/CI commit mismatch: tag=$object_sha ci=$CI_SHA type=$object_type" >&2
+            echo "Tag/default-branch-CI commit mismatch: tag=$object_sha ci=$CI_SHA type=$object_type" >&2
             exit 1
           fi
 
@@ -83,7 +107,7 @@ jobs:
           persist-credentials: false
           ref: ${{ steps.release_ref.outputs.source_sha }}
 
-      - name: Download tag CI provenance
+      - name: Download validated default-branch CI provenance
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: release-ci-provenance-${{ steps.release_ref.outputs.source_sha }}
@@ -91,21 +115,21 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ steps.release_ref.outputs.ci_run_id }}
 
-      - name: Verify tag CI provenance
+      - name: Verify default-branch CI provenance
         env:
-          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           SOURCE_SHA: ${{ steps.release_ref.outputs.source_sha }}
         run: |
-          python3 setup_and_pack/release_ci_provenance.py validate-tag \
+          python3 setup_and_pack/release_ci_provenance.py validate-branch \
             --path "$RUNNER_TEMP/release-ci-provenance/release-ci-provenance.json" \
             --expected-repository "$GITHUB_REPOSITORY" \
             --expected-sha "$SOURCE_SHA" \
-            --expected-tag "$RELEASE_TAG"
+            --expected-branch "$DEFAULT_BRANCH"
 
       - name: Resolve release metadata
         id: release_meta
         env:
-          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          RELEASE_TAG: ${{ github.event.client_payload.release_tag }}
         run: |
           python3 fluxon_release/resolve_release_meta.py \
             --git-ref "refs/tags/$RELEASE_TAG" \
@@ -311,17 +335,18 @@ jobs:
           name: pypi-wheel-${{ needs.verify-release.outputs.source_sha }}
           path: release-review/pypi-wheel
 
-      - name: Download tag CI provenance
+      - name: Download validated default-branch CI provenance
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: release-ci-provenance-${{ needs.verify-release.outputs.source_sha }}
-          path: release-review/tag-ci-provenance
+          path: release-review/main-ci-provenance
           github-token: ${{ github.token }}
           run-id: ${{ needs.verify-release.outputs.ci_run_id }}
 
       - name: Build deterministic release evidence
         env:
           CI_RUN_ID: ${{ needs.verify-release.outputs.ci_run_id }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ github.token }}
           QUICKSTART_ARCHIVE: ${{ needs.verify-release.outputs.quickstart_archive }}
           RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
@@ -333,19 +358,19 @@ jobs:
           python3 fluxon_release/resolve_release_meta.py \
             --git-ref "refs/tags/$RELEASE_TAG"
           cp \
-            release-review/tag-ci-provenance/release-ci-provenance.json \
-            release-review/tag-ci-provenance.json
-          python3 setup_and_pack/release_ci_provenance.py validate-tag \
-            --path release-review/tag-ci-provenance.json \
+            release-review/main-ci-provenance/release-ci-provenance.json \
+            release-review/main-ci-provenance.json
+          python3 setup_and_pack/release_ci_provenance.py validate-branch \
+            --path release-review/main-ci-provenance.json \
             --expected-repository "$GITHUB_REPOSITORY" \
             --expected-sha "$SOURCE_SHA" \
-            --expected-tag "$RELEASE_TAG"
+            --expected-branch "$DEFAULT_BRANCH"
           test -f "fluxon_release/release_notes/$RELEASE_TAG.md"
           test -f fluxon_release.tar.gz
           test -f "$QUICKSTART_ARCHIVE"
 
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID" > release-review/tag-ci-run.json
-          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/jobs?per_page=100" > release-review/tag-ci-jobs.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID" > release-review/main-ci-run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/jobs?per_page=100" > release-review/main-ci-jobs.json
           sha256sum fluxon_release.tar.gz "$QUICKSTART_ARCHIVE" > release-review/release-artifacts.sha256
           sha256sum release-review/pypi-wheel/*.whl > release-review/pypi-wheel.sha256
           tar -tzf fluxon_release.tar.gz > release-review/fluxon-release-files.txt
@@ -357,7 +382,7 @@ jobs:
           printf '%s\n' \
             "release_tag=$RELEASE_TAG" \
             "source_sha=$SOURCE_SHA" \
-            "tag_ci_run_id=$CI_RUN_ID" \
+            "validated_main_ci_run_id=$CI_RUN_ID" \
             > release-review/release-metadata.txt
 
       - name: Require OpenAI API configuration
