@@ -49,7 +49,6 @@ jobs:
           fi
 
           test -f "$RELEASE_NOTES_FILE"
-
       - name: Create release tag
         env:
           GH_TOKEN: ${{ github.token }}
