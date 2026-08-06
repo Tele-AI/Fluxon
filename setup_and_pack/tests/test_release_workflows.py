@@ -25,9 +25,13 @@ class ReleaseWorkflowTest(unittest.TestCase):
         trigger = self.create_tag["on"]
         self.assertEqual(list(trigger), ["workflow_dispatch"])
         self.assertEqual(trigger["workflow_dispatch"], "")
-        self.assertEqual(self.create_tag["permissions"], {"actions": "write", "contents": "write"})
+        self.assertEqual(self.create_tag["permissions"], {"actions": "read", "contents": "write"})
 
-        self.assertEqual(list(self.release["on"]), ["workflow_run"])
+        self.assertEqual(list(self.release["on"]), ["repository_dispatch"])
+        self.assertEqual(
+            self.release["on"]["repository_dispatch"]["types"],
+            ["publish_release"],
+        )
         self.assertFalse((REPO_ROOT / ".github" / "workflows" / "release.yml").exists())
         self.assertFalse((REPO_ROOT / ".github" / "workflows" / "publish-pypi.yml").exists())
         self.assertNotIn("git tag", self.create_tag_source)
@@ -44,31 +48,40 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn('test -f "$RELEASE_NOTES_FILE"', self.create_tag_source)
         self.assertIn("actions/workflows/all_test.yml/runs", self.create_tag_source)
         self.assertIn(".head_branch == $branch and .head_sha == $sha", self.create_tag_source)
+        self.assertIn('"fluxon-ci-release-$GITHUB_SHA"', self.create_tag_source)
+        self.assertIn('"release-ci-provenance-$GITHUB_SHA"', self.create_tag_source)
+        self.assertIn(".expired == false", self.create_tag_source)
 
-    def test_tag_is_created_and_ci_is_dispatched_with_github_token(self) -> None:
+    def test_tag_is_created_and_release_is_dispatched_with_github_token(self) -> None:
         self.assertNotIn("secrets.", self.create_tag_source)
         self.assertNotIn("vars.", self.create_tag_source)
         self.assertEqual(self.create_tag_source.count("GH_TOKEN: ${{ github.token }}"), 3)
         self.assertIn('"repos/$GITHUB_REPOSITORY/git/refs"', self.create_tag_source)
-        self.assertIn('gh workflow run all_test.yml --ref "$RELEASE_TAG"', self.create_tag_source)
+        self.assertIn('"repos/$GITHUB_REPOSITORY/dispatches"', self.create_tag_source)
+        self.assertIn('event_type: "publish_release"', self.create_tag_source)
+        self.assertIn("ci_run_id: $ci_run_id", self.create_tag_source)
+        self.assertIn("release_tag: $release_tag", self.create_tag_source)
+        self.assertIn("source_sha: $source_sha", self.create_tag_source)
+        self.assertNotIn("gh workflow run all_test.yml", self.create_tag_source)
 
-    def test_unified_release_waits_for_successful_tag_ci(self) -> None:
-        trigger = self.release["on"]["workflow_run"]
-        self.assertEqual(trigger["workflows"], ["ci_2_virt_node"])
-        self.assertEqual(trigger["types"], ["completed"])
-
+    def test_unified_release_revalidates_dispatched_default_branch_ci(self) -> None:
         verify = self.release["jobs"]["verify-release"]
         condition = verify["if"]
-        self.assertIn("workflow_run.event == 'workflow_dispatch'", condition)
-        self.assertIn("workflow_run.conclusion == 'success'", condition)
-        self.assertIn("workflow_run.actor.type == 'Bot'", condition)
-        self.assertIn("workflow_run.head_repository.full_name == github.repository", condition)
-        self.assertIn("workflow_run.path == '.github/workflows/all_test.yml'", condition)
-        self.assertIn("startsWith(github.event.workflow_run.head_branch, 'v')", condition)
-        self.assertIn("Tag/CI commit mismatch", self.release_source)
+        self.assertIn("github.event.action == 'publish_release'", condition)
+        self.assertIn("github.event.sender.type == 'Bot'", condition)
+        self.assertIn("github.event.sender.login == 'github-actions[bot]'", condition)
+        self.assertIn("github.event.client_payload.ci_run_id", self.release_source)
+        self.assertIn("github.event.client_payload.release_tag", self.release_source)
+        self.assertIn("github.event.client_payload.source_sha", self.release_source)
+        self.assertIn('.event == "push"', self.release_source)
+        self.assertIn('.conclusion == "success"', self.release_source)
+        self.assertIn('.head_branch == $branch', self.release_source)
+        self.assertIn('.head_sha == $sha', self.release_source)
+        self.assertIn('.path == ".github/workflows/all_test.yml"', self.release_source)
+        self.assertIn("Tag/default-branch-CI commit mismatch", self.release_source)
         self.assertIn("Tagged commit is not in the default-branch history", self.release_source)
 
-    def test_release_paths_require_exact_tag_ci_provenance(self) -> None:
+    def test_release_paths_require_exact_default_branch_ci_provenance(self) -> None:
         self.assertIn("release_ci_provenance.py write", self.all_test_source)
         all_test = yaml.load(self.all_test_source, Loader=yaml.BaseLoader)
         self.assertEqual(all_test["on"]["push"]["branches"], ["**"])
@@ -78,9 +91,10 @@ class ReleaseWorkflowTest(unittest.TestCase):
             self.all_test_source,
         )
         self.assertIn("release-ci-provenance-${{ github.sha }}", self.all_test_source)
-        self.assertGreaterEqual(self.release_source.count("release_ci_provenance.py validate-tag"), 2)
+        self.assertGreaterEqual(self.release_source.count("release_ci_provenance.py validate-branch"), 2)
         self.assertIn('--expected-sha "$SOURCE_SHA"', self.release_source)
-        self.assertIn('--expected-tag "$RELEASE_TAG"', self.release_source)
+        self.assertIn('--expected-branch "$DEFAULT_BRANCH"', self.release_source)
+        self.assertNotIn("release_ci_provenance.py validate-tag", self.release_source)
 
     def test_three_publications_are_parallel_after_one_review(self) -> None:
         jobs = self.release["jobs"]
@@ -116,6 +130,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
     def test_pypi_publishes_only_the_validated_short_lived_artifact(self) -> None:
         jobs = self.release["jobs"]
+        all_test = yaml.load(self.all_test_source, Loader=yaml.BaseLoader)
+        package_steps = all_test["jobs"]["package-wheel"]["steps"]
+        ci_upload_step = next(step for step in package_steps if step.get("name") == "Upload Fluxon CI release")
+        self.assertEqual(ci_upload_step["with"]["retention-days"], "14")
+        provenance_upload_step = next(
+            step for step in package_steps if step.get("name") == "Upload release CI provenance"
+        )
+        self.assertEqual(provenance_upload_step["with"]["retention-days"], "14")
+
         prepare_steps = jobs["prepare-pypi-wheel"]["steps"]
         upload_step = next(step for step in prepare_steps if step.get("name") == "Upload validated PyPI wheel")
         self.assertEqual(upload_step["with"]["retention-days"], "3")
@@ -131,8 +154,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual(review["environment"], "OPENAI_API_KEY")
         self.assertIn("sha256sum --check fluxon_release.sha256", self.release_source)
         self.assertIn("pypi-wheel.sha256", self.release_source)
-        self.assertIn("tag-ci-run.json", self.release_source)
-        self.assertIn("tag-ci-jobs.json", self.release_source)
+        self.assertIn("main-ci-run.json", self.release_source)
+        self.assertIn("main-ci-jobs.json", self.release_source)
         self.assertIn("openai/codex-action@", self.release_source)
         self.assertIn("prompt-file: .github/codex/release-readiness-prompt.md", self.release_source)
         self.assertIn('permission-profile: ":read-only"', self.release_source)

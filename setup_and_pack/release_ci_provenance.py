@@ -71,19 +71,19 @@ def load_provenance(path: Path) -> dict[str, object]:
     return payload
 
 
-def validate_tag_provenance(
+def validate_branch_provenance(
     path: Path,
     *,
     expected_repository: str,
     expected_sha: str,
-    expected_tag: str,
+    expected_branch: str,
 ) -> dict[str, object]:
     payload = load_provenance(path)
     expected = build_provenance(
         repository=expected_repository,
-        ref=f"refs/tags/{expected_tag}",
-        ref_name=expected_tag,
-        ref_type="tag",
+        ref=f"refs/heads/{expected_branch}",
+        ref_name=expected_branch,
+        ref_type="branch",
         sha=expected_sha,
     )
     if payload != expected:
@@ -103,11 +103,14 @@ def _parse_args() -> argparse.Namespace:
     write.add_argument("--ref-type", choices=("branch", "tag"), required=True)
     write.add_argument("--sha", required=True)
 
-    validate = subparsers.add_parser("validate-tag", help="Require provenance for an exact tag and commit")
+    validate = subparsers.add_parser(
+        "validate-branch",
+        help="Require provenance for an exact branch and commit",
+    )
     validate.add_argument("--path", type=Path, required=True)
     validate.add_argument("--expected-repository", required=True)
     validate.add_argument("--expected-sha", required=True)
-    validate.add_argument("--expected-tag", required=True)
+    validate.add_argument("--expected-branch", required=True)
     return parser.parse_args()
 
 
@@ -125,11 +128,11 @@ def main() -> int:
         print(f"Wrote release CI provenance: {args.output}")
         return 0
 
-    payload = validate_tag_provenance(
+    payload = validate_branch_provenance(
         args.path,
         expected_repository=args.expected_repository,
         expected_sha=args.expected_sha,
-        expected_tag=args.expected_tag,
+        expected_branch=args.expected_branch,
     )
     print(
         "Validated release CI provenance: "

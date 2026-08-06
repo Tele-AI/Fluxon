@@ -107,7 +107,7 @@ jobs:
         with:
           name: fluxon-ci-release-${{ github.sha }}
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 14
           compression-level: 0
           path: ${{ runner.temp }}/fluxon-ci-release.tar.gz
 
