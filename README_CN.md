@@ -9,7 +9,7 @@
 [![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#运行要求)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#运行要求)
 [![Rust](https://img.shields.io/badge/Rust-1.93.0-000000)](./fluxon_rs/rust-toolchain.toml)
-[![Latest](https://img.shields.io/badge/Latest-v0.2.2-f28500)](./fluxon_release)
+[![Latest](https://img.shields.io/badge/Latest-v0.2.3-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#接口能力)
 
 <details>
@@ -198,7 +198,7 @@ python3 -m pip install fluxon-py
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.2 \
+  hanbaoaaa/fluxon_quick_start:0.2.3 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -231,7 +231,7 @@ del demo:hello
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.2 \
+  hanbaoaaa/fluxon_quick_start:0.2.3 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -262,7 +262,7 @@ exit
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.2 \
+  hanbaoaaa/fluxon_quick_start:0.2.3 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \

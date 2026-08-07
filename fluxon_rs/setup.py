@@ -36,7 +36,7 @@ def find_libs():
 
 setup(
     name="fluxon_pyo3",
-    version="0.2.2",
+    version="0.2.3",
     description="for export fluxonkv core to python layer",
     long_description=open("README.md").read() if os.path.exists("README.md") else "",
     long_description_content_type="text/markdown",

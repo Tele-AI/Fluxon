@@ -207,7 +207,7 @@ docker run -d --name fluxon-s3 `
   --mount "type=bind,src=C:\fluxon-s3\data,dst=/data" `
   --mount "type=bind,src=C:\fluxon-s3\state,dst=/state" `
   --entrypoint python3 `
-  "hanbaoaaa/fluxon_quick_start:0.2.2" `
+  "hanbaoaaa/fluxon_quick_start:0.2.3" `
   -c "
 from fluxon_py.quick_start import serve_s3_single_node
 
