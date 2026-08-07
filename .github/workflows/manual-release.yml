@@ -179,7 +179,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          wheels=(fluxon_release/fluxon_ai-*.whl)
+          wheels=(fluxon_release/fluxon_py-*.whl)
           if [[ "${#wheels[@]}" -ne 1 ]]; then
             echo "Expected exactly one release-built wheel, found ${#wheels[@]}" >&2
             exit 1
@@ -318,8 +318,8 @@ jobs:
           tar -tzf fluxon_release.tar.gz > release-review/fluxon-release-files.txt
           tar -xzf fluxon_release.tar.gz -C release-review/extracted
           shopt -s nullglob
-          release_wheels=(release-review/extracted/fluxon_release/fluxon_ai-*.whl)
-          pypi_wheels=(release-review/pypi-wheel/fluxon_ai-*.whl)
+          release_wheels=(release-review/extracted/fluxon_release/fluxon_py-*.whl)
+          pypi_wheels=(release-review/pypi-wheel/fluxon_py-*.whl)
           if [[ "${#release_wheels[@]}" -ne 1 || "${#pypi_wheels[@]}" -ne 1 ]]; then
             echo "Expected exactly one release wheel and one validated PyPI wheel" >&2
             exit 1
@@ -452,7 +452,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/fluxon-ai/
+      url: https://pypi.org/project/fluxon-py/
     permissions:
       actions: read
       contents: read

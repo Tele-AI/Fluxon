@@ -15,21 +15,21 @@ from setup_and_pack.validate_pypi_wheel import validate_release_wheel
 
 class ValidatePyPIWheelTest(unittest.TestCase):
     def test_distribution_and_wheel_names_are_canonical(self) -> None:
-        self.assertEqual(PYTHON_DISTRIBUTION_NAME, "fluxon-ai")
-        self.assertEqual(PYTHON_WHEEL_DISTRIBUTION, "fluxon_ai")
-        self.assertEqual(RELEASE_WHEEL_GLOB, "fluxon_ai-*.whl")
+        self.assertEqual(PYTHON_DISTRIBUTION_NAME, "fluxon-py")
+        self.assertEqual(PYTHON_WHEEL_DISTRIBUTION, "fluxon_py")
+        self.assertEqual(RELEASE_WHEEL_GLOB, "fluxon_py-*.whl")
 
     def _write_wheel(
         self,
         release_dir: Path,
         *,
-        filename: str = "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
-        metadata_name: str = "fluxon-ai",
+        filename: str = "fluxon_py-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl",
+        metadata_name: str = "fluxon-py",
         metadata_version: str = "0.2.1",
         requires_python: str = ">=3.10",
     ) -> Path:
         wheel_path = release_dir / filename
-        dist_info = f"fluxon_ai-{metadata_version}.dist-info"
+        dist_info = f"fluxon_py-{metadata_version}.dist-info"
         with zipfile.ZipFile(wheel_path, "w") as archive:
             archive.writestr(
                 f"{dist_info}/METADATA",
@@ -57,7 +57,7 @@ class ValidatePyPIWheelTest(unittest.TestCase):
             validated = validate_release_wheel(release_dir=release_dir, release_tag="v0.2.1")
 
             self.assertEqual(validated.path, str(wheel_path.resolve()))
-            self.assertEqual(validated.distribution, "fluxon-ai")
+            self.assertEqual(validated.distribution, "fluxon-py")
             self.assertEqual(validated.version, "0.2.1")
             self.assertEqual(len(validated.sha256), 64)
 
@@ -83,7 +83,7 @@ class ValidatePyPIWheelTest(unittest.TestCase):
             self._write_wheel(release_dir)
             self._write_wheel(
                 release_dir,
-                filename="fluxon_ai-0.2.2-cp38-abi3-manylinux_2_28_x86_64.whl",
+                filename="fluxon_py-0.2.2-cp38-abi3-manylinux_2_28_x86_64.whl",
                 metadata_version="0.2.2",
             )
 
@@ -95,7 +95,7 @@ class ValidatePyPIWheelTest(unittest.TestCase):
             release_dir = Path(tmpdir)
             self._write_wheel(
                 release_dir,
-                filename="fluxon_ai-0.2.1-py3-none-any.whl",
+                filename="fluxon_py-0.2.1-py3-none-any.whl",
             )
 
             with self.assertRaisesRegex(RuntimeError, "unexpected release wheel compatibility tag"):

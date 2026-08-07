@@ -189,7 +189,7 @@ Fluxon FS 是一款面向 AI 数据与模型文件、兼容 `S3` 的高性能文
 对于接入已有服务平面的 Linux x86_64 Python 进程，可以直接安装公开 distribution：
 
 ```bash
-python3 -m pip install fluxon-ai
+python3 -m pip install fluxon-py
 ```
 
 该 distribution 安装的 import 包仍然是 `fluxon_py`。服务平面运行时和完整 release bundle 继续通过 GitHub Releases 提供。

@@ -1195,7 +1195,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_py-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
             _ENTRY._write_yaml(
                 workdir / "start_test_bed" / "apply" / "deployconf.with_release_manifest_sha256.yaml",
@@ -1283,7 +1283,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             _ENTRY._write_yaml(suite_path, suite_cfg)
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_py-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
 
             argv = [
@@ -1351,7 +1351,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_py-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
 
             argv = [
@@ -1405,7 +1405,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_py-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
             calls: list[tuple[list[str], dict[str, str] | None]] = []
 
@@ -1473,7 +1473,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "custom_release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_py-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
             calls: list[tuple[list[str], dict[str, str] | None]] = []
 
@@ -1527,7 +1527,7 @@ class TestCi2VirtNodeContract(unittest.TestCase):
             hostworkdir = root / "hostworkdir"
             release_dir = root / "release"
             release_dir.mkdir(parents=True, exist_ok=True)
-            wheel_path = release_dir / "fluxon_ai-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            wheel_path = release_dir / "fluxon_py-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
             wheel_path.write_text("", encoding="utf-8")
             calls: list[tuple[list[str], dict[str, str] | None]] = []
 

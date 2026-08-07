@@ -192,7 +192,7 @@ Quick Start is the shortest path to try Fluxon. For formal installation, deploym
 For a Linux x86_64 Python process that connects to an existing service plane, install the public distribution directly:
 
 ```bash
-python3 -m pip install fluxon-ai
+python3 -m pip install fluxon-py
 ```
 
 The distribution installs the `fluxon_py` import package. Service-plane runtimes and the complete release bundle remain available from GitHub Releases.

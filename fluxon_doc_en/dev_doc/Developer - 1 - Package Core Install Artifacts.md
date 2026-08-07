@@ -4,7 +4,7 @@ This page only covers how `setup_and_pack/pack_release.py` gathers the core inst
 
 ## Artifacts
 
-- `fluxon_release/fluxon_ai-*.whl`
+- `fluxon_release/fluxon_py-*.whl`
 - `fluxon_release/pylib_src.tar.gz`
 - `fluxon_release/install.py`
 - `fluxon_release/ext_images.tar.gz`
@@ -22,7 +22,7 @@ python3 setup_and_pack/pack_release.py --release-dir ./fluxon_release
 - The default output directory is `<repo_root>/fluxon_release/`
 - The public packaging flow does not require a manual `transport backend` argument
 - `pack_release.py` automatically chains into `setup_and_pack/pack_release_ext.py`
-- The Python and PyO3 wheels are built separately, then merged into the single top-level `fluxon_ai-*.whl`
+- The Python and PyO3 wheels are built separately, then merged into the single top-level `fluxon_py-*.whl`
 - Core artifacts and external runtime artifacts are written into the same release directory
 
 ## Repackage When
