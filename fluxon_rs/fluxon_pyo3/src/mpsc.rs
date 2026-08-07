@@ -177,6 +177,7 @@ fn finalize_payload_result(
 #[pyclass]
 pub struct MpscContext {
     endpoints: Vec<String>,
+    etcd_rpc_max_retries: u32,
     kv_backend_uid: LeaseBackendUid,
     kv_framework: Arc<KvFramework>,
     kv_runtime: Handle,
@@ -204,9 +205,11 @@ impl MpscContext {
         kv_client: Py<crate::KvClient>,
     ) -> PyResult<Self> {
         let kv_client_ref = kv_client.borrow(py);
+        let etcd_rpc_max_retries = kv_client_ref.config.fluxonkv_spec.etcd_rpc_max_retries;
         let mq_context = crate::new_fluxon_mq_context(&kv_client_ref)?;
         Ok(Self {
             endpoints: etcd_endpoints,
+            etcd_rpc_max_retries,
             kv_backend_uid: mq_context.kv_lease_backend,
             kv_framework: mq_context.kv_framework.clone(),
             kv_runtime: mq_context.runtime.clone(),
@@ -255,6 +258,7 @@ impl MpscContext {
         };
 
         let endpoints = self.endpoints.clone();
+        let etcd_rpc_max_retries = self.etcd_rpc_max_retries;
         let kv_backend_uid = self.kv_backend_uid.clone();
         let self_info = self
             .kv_framework
@@ -316,6 +320,7 @@ impl MpscContext {
                                         leases.global,
                                         leases.member,
                                         leases.payload,
+                                        etcd_rpc_max_retries,
                                         rth.clone(),
                                         shutdown_for_core.clone(),
                                     ),
@@ -328,6 +333,7 @@ impl MpscContext {
                                     endpoints.clone(),
                                     kv_backend_uid.clone(),
                                     id,
+                                    etcd_rpc_max_retries,
                                     rth.clone(),
                                 )
                                 .await
@@ -344,6 +350,7 @@ impl MpscContext {
                                 capacity: cap,
                                 ttl_seconds,
                                 weight,
+                                etcd_rpc_max_retries,
                                 override_global_lease_id,
                                 override_member_lease_id,
                                 override_payload_lease_id,
@@ -444,6 +451,7 @@ impl MpscContext {
         };
 
         let endpoints = self.endpoints.clone();
+        let etcd_rpc_max_retries = self.etcd_rpc_max_retries;
         let kv_backend_uid = self.kv_backend_uid.clone();
         let shutdown = ShutdownCtl::new();
         let shutdown_for_core = shutdown.clone();
@@ -496,6 +504,7 @@ impl MpscContext {
                                     leases.global,
                                     leases.member,
                                     leases.payload,
+                                    etcd_rpc_max_retries,
                                     rth.clone(),
                                     shutdown_for_core.clone(),
                                 )
@@ -507,6 +516,7 @@ impl MpscContext {
                                     endpoints.clone(),
                                     kv_backend_uid.clone(),
                                     id,
+                                    etcd_rpc_max_retries,
                                     rth.clone(),
                                 )
                                 .await
@@ -525,6 +535,7 @@ impl MpscContext {
                                 // weight is producer-only; consumer path
                                 // does not configure or use it.
                                 weight: None,
+                                etcd_rpc_max_retries,
                                 override_global_lease_id,
                                 override_member_lease_id,
                                 override_payload_lease_id,

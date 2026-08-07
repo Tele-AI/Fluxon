@@ -48,6 +48,7 @@ pub struct ClientSegPoolNewArg {
     pub large_file_paths: crate::config::LargeFilePaths,
     pub cluster_name: String,
     pub etcd_addresses: Vec<String>,
+    pub etcd_rpc_max_retries: u32,
     pub attach_existing_meta: Option<SharedJsonMeta>,
     pub side_transfer_worker: bool,
     pub require_transfer_rpc_fast_path_ready_timeout: Option<Duration>,
@@ -62,6 +63,8 @@ pub struct SharedJsonMeta {
     pub sub_cluster: Option<String>,
     pub cluster_name: String,
     pub etcd_addresses: Vec<String>,
+    #[serde(default = "crate::config::default_etcd_rpc_max_retries")]
+    pub etcd_rpc_max_retries: u32,
     pub share_mem_path: String,
     pub large_file_paths: crate::config::LargeFilePaths,
     pub protocol_version: String,
@@ -209,6 +212,7 @@ pub struct ClientSegPoolInner {
     // Redundant fields written to shared.json for external bootstrap and strict validation.
     cluster_name: String,
     etcd_addresses: Vec<String>,
+    etcd_rpc_max_retries: u32,
     require_transfer_rpc_fast_path_ready_timeout: Option<Duration>,
 
     /// Whether we've already notified external by writing memory.file after readiness
@@ -284,6 +288,7 @@ mod range_guard_tests {
             attach_owner_ref: None,
             cluster_name: String::new(),
             etcd_addresses: Vec::new(),
+            etcd_rpc_max_retries: crate::config::default_etcd_rpc_max_retries(),
             require_transfer_rpc_fast_path_ready_timeout: None,
             ready_notified: AtomicBool::new(false),
         })
@@ -357,6 +362,7 @@ impl ClientSegPool {
         let large_file_paths = arg.large_file_paths;
         let cluster_name = arg.cluster_name;
         let etcd_addresses = arg.etcd_addresses;
+        let etcd_rpc_max_retries = arg.etcd_rpc_max_retries;
         let attach_existing_meta = arg.attach_existing_meta;
         let side_transfer_worker = arg.side_transfer_worker;
         let require_transfer_rpc_fast_path_ready_timeout =
@@ -453,6 +459,7 @@ impl ClientSegPool {
                 attach_owner_ref,
                 cluster_name: cluster_name.clone(),
                 etcd_addresses: etcd_addresses.clone(),
+                etcd_rpc_max_retries,
                 require_transfer_rpc_fast_path_ready_timeout,
                 ready_notified: AtomicBool::new(false),
             };
@@ -469,6 +476,7 @@ impl ClientSegPool {
                 attach_owner_ref,
                 cluster_name: cluster_name.clone(),
                 etcd_addresses: etcd_addresses.clone(),
+                etcd_rpc_max_retries,
                 require_transfer_rpc_fast_path_ready_timeout,
                 ready_notified: AtomicBool::new(false),
             };
@@ -619,6 +627,7 @@ impl ClientSegPool {
             attach_owner_ref,
             cluster_name,
             etcd_addresses,
+            etcd_rpc_max_retries,
             require_transfer_rpc_fast_path_ready_timeout,
             ready_notified: AtomicBool::new(false),
         };
@@ -1258,6 +1267,7 @@ impl ClientSegPool {
 
             cluster_name: inner.cluster_name.clone(),
             etcd_addresses: inner.etcd_addresses.clone(),
+            etcd_rpc_max_retries: inner.etcd_rpc_max_retries,
             share_mem_path: share_mem_canonical,
             large_file_paths: inner.large_file_paths.clone(),
 

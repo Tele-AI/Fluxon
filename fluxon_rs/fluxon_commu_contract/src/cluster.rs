@@ -1,6 +1,7 @@
 use crate::config::NetworkConfig;
 use bitcode::{Decode, Encode};
 use etcd_client::{Client, GetOptions};
+use fluxon_util::etcd::retry_etcd_rpc;
 use fluxon_util::prefix_scan::{
     PrefixScanAction, prefix_scan_key_after, prefix_scan_range_end_exclusive,
 };
@@ -36,6 +37,23 @@ where
 pub async fn scan_etcd_prefix_paginated<E, F>(
     client: &mut Client,
     prefix: &str,
+    on_kv: F,
+) -> Result<(), EtcdPrefixScanError<E>>
+where
+    E: std::fmt::Display + std::fmt::Debug,
+    F: FnMut(&[u8], &[u8]) -> Result<EtcdPrefixScanAction, E>,
+{
+    scan_etcd_prefix_paginated_with_retry(client, prefix, 0, on_kv).await
+}
+
+/// Scans an etcd prefix page by page and retries transient page-range failures.
+///
+/// A page is delivered to `on_kv` only after its Range RPC succeeds, so retrying
+/// the RPC never invokes the callback twice for the same failed attempt.
+pub async fn scan_etcd_prefix_paginated_with_retry<E, F>(
+    client: &mut Client,
+    prefix: &str,
+    max_retries: u32,
     mut on_kv: F,
 ) -> Result<(), EtcdPrefixScanError<E>>
 where
@@ -46,21 +64,29 @@ where
     let mut start_key = prefix.as_bytes().to_vec();
 
     loop {
-        let resp = client
-            .get(
-                start_key.clone(),
-                Some(
-                    GetOptions::new()
-                        .with_range(range_end.clone())
-                        .with_limit(ETCD_PREFIX_SCAN_PAGE_LIMIT),
-                ),
-            )
-            .await
-            .map_err(|source| EtcdPrefixScanError::Get {
-                prefix: prefix.to_string(),
-                start_key: start_key.clone(),
-                source,
-            })?;
+        let resp = retry_etcd_rpc(max_retries, "prefix_range", || {
+            let mut attempt_client = client.clone();
+            let attempt_start_key = start_key.clone();
+            let attempt_range_end = range_end.clone();
+            async move {
+                attempt_client
+                    .get(
+                        attempt_start_key,
+                        Some(
+                            GetOptions::new()
+                                .with_range(attempt_range_end)
+                                .with_limit(ETCD_PREFIX_SCAN_PAGE_LIMIT),
+                        ),
+                    )
+                    .await
+            }
+        })
+        .await
+        .map_err(|source| EtcdPrefixScanError::Get {
+            prefix: prefix.to_string(),
+            start_key: start_key.clone(),
+            source,
+        })?;
 
         if resp.kvs().is_empty() {
             break;

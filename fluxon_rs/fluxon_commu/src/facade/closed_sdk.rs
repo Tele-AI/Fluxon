@@ -45,6 +45,11 @@ pub enum CurrentProviderContractError {
         expected_by_sdk: String,
         actual_open_surface: String,
     },
+    VersionFieldMismatch {
+        field: &'static str,
+        expected_by_open: u32,
+        actual_sdk: u32,
+    },
     RuntimeAnchorMismatch {
         field: &'static str,
         expected_by_sdk: usize,
@@ -71,6 +76,15 @@ impl Display for CurrentProviderContractError {
                 f,
                 "closed SDK requires open surface version {}, but the current open contract version is {}",
                 expected_by_sdk, actual_open_surface
+            ),
+            Self::VersionFieldMismatch {
+                field,
+                expected_by_open,
+                actual_sdk,
+            } => write!(
+                f,
+                "closed SDK {} mismatch: open expects {}, sdk advertises {}",
+                field, expected_by_open, actual_sdk
             ),
             Self::RuntimeAnchorMismatch {
                 field,
@@ -109,6 +123,20 @@ pub fn assert_current_provider_contract()
     assert_abi_compatible()?;
 
     let version_info = query_version()?;
+    if version_info.abi_version != FLUXON_COMMU_CLOSED_ABI_VERSION {
+        return Err(CurrentProviderContractError::VersionFieldMismatch {
+            field: "ABI version",
+            expected_by_open: FLUXON_COMMU_CLOSED_ABI_VERSION,
+            actual_sdk: version_info.abi_version,
+        });
+    }
+    if version_info.sdk_schema_version != FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION {
+        return Err(CurrentProviderContractError::VersionFieldMismatch {
+            field: "schema version",
+            expected_by_open: FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION,
+            actual_sdk: version_info.sdk_schema_version,
+        });
+    }
     let expected_boundary_mode = crate::provider::CURRENT_PROVIDER_BOUNDARY_MODE;
     if version_info.boundary_mode != expected_boundary_mode {
         return Err(CurrentProviderContractError::BoundaryModeMismatch {
@@ -225,7 +253,10 @@ pub(crate) fn spawn_deferred_drop_runtime_handle(
 
 #[cfg(test)]
 mod tests {
-    use super::assert_current_provider_contract;
+    use super::{
+        FLUXON_COMMU_CLOSED_ABI_VERSION, FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION, abi_version,
+        assert_current_provider_contract, sdk_schema_version,
+    };
     use fluxon_commu_contract::FLUXON_COMMU_OPEN_SURFACE_VERSION;
 
     #[test]
@@ -236,6 +267,16 @@ mod tests {
             snapshot.version_info.required_open_surface_version,
             FLUXON_COMMU_OPEN_SURFACE_VERSION
         );
+        assert_eq!(
+            snapshot.version_info.abi_version,
+            FLUXON_COMMU_CLOSED_ABI_VERSION
+        );
+        assert_eq!(
+            snapshot.version_info.sdk_schema_version,
+            FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION
+        );
+        assert_eq!(abi_version(), FLUXON_COMMU_CLOSED_ABI_VERSION);
+        assert_eq!(sdk_schema_version(), FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION);
         assert_eq!(
             snapshot.sdk_runtime_anchor.cluster_manager_size,
             snapshot.provider_runtime_anchor.cluster_manager_size

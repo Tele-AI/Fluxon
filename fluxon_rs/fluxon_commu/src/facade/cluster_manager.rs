@@ -648,6 +648,7 @@ impl ClusterManager {
 
     pub async fn new(
         etcd_endpoints: Vec<String>,
+        etcd_rpc_max_retries: u32,
         cluster_name: String,
         instance_name: Option<String>,
         port: Option<u16>,
@@ -659,6 +660,7 @@ impl ClusterManager {
     ) -> crate::ClusterResult<Self> {
         Self::construct(ClusterManagerNewArg {
             etcd_endpoints,
+            etcd_rpc_max_retries,
             cluster_name,
             instance_name,
             port,

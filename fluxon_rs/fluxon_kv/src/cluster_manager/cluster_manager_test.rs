@@ -189,6 +189,7 @@ async fn test_cluster_manager_basic_functionality() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("test-member-1".to_string()),
             port: Some(8080),
@@ -264,6 +265,7 @@ async fn test_cluster_manager_watch_functionality() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("test-member-1".to_string()),
             port: Some(8080),
@@ -303,6 +305,7 @@ async fn test_cluster_manager_watch_functionality() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("test-member-2".to_string()),
             port: Some(8081),
@@ -369,6 +372,7 @@ async fn test_cluster_manager_lease_management() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("test-member-1".to_string()),
             port: Some(8080),
@@ -433,6 +437,7 @@ async fn test_cluster_manager_multiple_members() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("test-member-1".to_string()),
             port: Some(8080),
@@ -464,6 +469,7 @@ async fn test_cluster_manager_multiple_members() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("test-member-2".to_string()),
             port: Some(8081),
@@ -495,6 +501,7 @@ async fn test_cluster_manager_multiple_members() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("test-member-3".to_string()),
             port: Some(8082),
@@ -581,6 +588,7 @@ async fn test_cluster_manager_concurrent_operations() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("test-member-concurrent".to_string()),
             port: Some(8080),
@@ -651,6 +659,7 @@ async fn test_cluster_manager_duplicate_instance_name() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("duplicate-member".to_string()),
             port: Some(9000),
@@ -681,6 +690,7 @@ async fn test_cluster_manager_duplicate_instance_name() {
         },
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: get_etcd_endpoints(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster_name.to_string(),
             instance_name: Some("duplicate-member".to_string()),
             port: Some(9001),

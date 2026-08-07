@@ -26,7 +26,7 @@ pub use closed_sdk::{
 pub use cluster::{
     ClusterError, ClusterEvent, ClusterMember, ClusterResult, ETCD_PREFIX_SCAN_PAGE_LIMIT,
     EtcdPrefixScanAction, EtcdPrefixScanError, NodeID, NodeIDStr, NodeIDString, NodeRole,
-    scan_etcd_prefix_paginated,
+    scan_etcd_prefix_paginated, scan_etcd_prefix_paginated_with_retry,
 };
 pub use cluster_manager::{
     ClusterManager, ClusterManagerNewArg, ClusterManagerRdmaControlInit,

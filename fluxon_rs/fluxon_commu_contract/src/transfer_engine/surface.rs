@@ -47,6 +47,8 @@ pub enum TransferBackendActivationMode {
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct ClientTransferEngineNewArg {
     pub metadata_uri: String,
+    /// Number of transient unary etcd RPC retries after the initial attempt.
+    pub etcd_rpc_max_retries: u32,
     pub instance_name: String,
     pub transfer_engine: TransferEngineType,
     pub enable_transfer_rpc_fast_path: bool,

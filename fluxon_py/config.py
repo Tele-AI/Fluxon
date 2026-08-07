@@ -26,6 +26,7 @@ def debug_print(*args):
 _YAML_KEY_TYPES = (str, int, float, bool)
 _YAML_SCALAR_TYPES = (str, int, float, bool, type(None))
 _U64_MAX = 2**64 - 1
+_U32_MAX = 2**32 - 1
 _SIZE_BYTE_UNITS = {
     "": 1,
     "b": 1,
@@ -195,6 +196,7 @@ mooncake_spec:                         # mooncake 特定配置 (dict(optional))
   
 fluxonkv_spec:                        # fluxon kv specific config (dict(optional))
   etcd_addresses:                     # Etcd address list ((None|['{str}:{int}']))
+  etcd_rpc_max_retries:               # Retry count after the first etcd RPC attempt (int(optional))
   cluster_name:                       # Cluster name (str)
   share_mem_path:                     # Shared bundle path for mmap.file/shared.json/peer metadata (str)
   large_file_paths:                   # Owner-mode ordered large-file roots (['{str}'](optional))
@@ -535,6 +537,7 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
     if is_zero_contribution:
         forbidden_spec_keys = [
             "etcd_addresses",
+            "etcd_rpc_max_retries",
             "redis_compat",
             "sub_cluster",
             "large_file_paths",
@@ -558,6 +561,17 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
     etcd_addresses = spec.get("etcd_addresses")
     if not isinstance(etcd_addresses, list) or len(etcd_addresses) == 0:
         raise ValueError("fluxonkv_spec.etcd_addresses must be a non-empty list")
+
+    if "etcd_rpc_max_retries" in spec:
+        etcd_rpc_max_retries = spec["etcd_rpc_max_retries"]
+        if isinstance(etcd_rpc_max_retries, bool) or not isinstance(
+            etcd_rpc_max_retries, int
+        ):
+            raise ValueError("fluxonkv_spec.etcd_rpc_max_retries must be an int")
+        if not 0 <= etcd_rpc_max_retries <= _U32_MAX:
+            raise ValueError(
+                f"fluxonkv_spec.etcd_rpc_max_retries must be in 0..={_U32_MAX}"
+            )
 
     if "sub_cluster" not in spec:
         raise ValueError("fluxonkv_spec.sub_cluster is required for owner mode")

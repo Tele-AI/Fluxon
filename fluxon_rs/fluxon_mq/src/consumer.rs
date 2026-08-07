@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use etcd_client as etcd;
-use fluxon_commu::{scan_etcd_prefix_paginated, EtcdPrefixScanAction, EtcdPrefixScanError};
+use fluxon_commu::{
+    scan_etcd_prefix_paginated_with_retry, EtcdPrefixScanAction, EtcdPrefixScanError,
+};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{poll_fn, Future};
@@ -29,7 +31,7 @@ use fluxon_observability::keys::{
 };
 use fluxon_observability::metrics_actor::MetricsHandle as ObserveMetricsHandle;
 use fluxon_util::etcd::{
-    run_prefix_watch_loop, EtcdPrefixWatchLoopControl, OwnedEtcdWatchEvent,
+    retry_etcd_rpc, run_prefix_watch_loop, EtcdPrefixWatchLoopControl, OwnedEtcdWatchEvent,
     OwnedEtcdWatchEventKind, ETCD_PREFIX_WATCH_RESTART_SLEEP,
 };
 use fluxon_util::lease_manager::LeaseManager;
@@ -39,12 +41,13 @@ use crate::error::MpscError;
 use crate::keys;
 use crate::lifecycle::spawn_named;
 use crate::manager::{
-    get_chan_meta, ChanManager, ChanMemberMeta, ChanRole, CONSUME_OFFSET_BEGIN,
+    get_chan_meta_with_retry, ChanManager, ChanMemberMeta, ChanRole, CONSUME_OFFSET_BEGIN,
     PRODUCE_OFFSET_BEGIN,
 };
 use crate::nonblocking_monitor::{
     spawn_nonblocking_monitor, NonblockingMonitorHandle, NonblockingMonitorKind,
 };
+use crate::offset_commit::{MonotonicOffsetCommit, OffsetCommitProgress};
 use crate::shutdown::ShutdownCtl;
 use crate::LifecycleView;
 use tracing::{debug, info, warn};
@@ -71,6 +74,200 @@ fn map_prefix_scan_error(err: EtcdPrefixScanError<MpscError>) -> MpscError {
         EtcdPrefixScanError::Get { source, .. } => MpscError::Etcd(source),
         EtcdPrefixScanError::Callback(source) => source,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConsumerMembershipGeneration {
+    value: Vec<u8>,
+    lease_id: i64,
+    mod_revision: i64,
+}
+
+fn consumer_membership_get_generation(
+    txn_res: &etcd::TxnResponse,
+    key: &str,
+    operation: &str,
+) -> Result<Option<ConsumerMembershipGeneration>, MpscError> {
+    let responses = txn_res.op_responses();
+    let [etcd::TxnOpResponse::Get(get)] = responses.as_slice() else {
+        return Err(MpscError::Internal(format!(
+            "{} readback returned an invalid response shape: operations={}",
+            operation,
+            responses.len()
+        )));
+    };
+    if get.kvs().len() > 1 {
+        return Err(MpscError::Internal(format!(
+            "{} readback returned duplicate exact keys",
+            operation
+        )));
+    }
+    let Some(kv) = get.kvs().first() else {
+        return Ok(None);
+    };
+    if kv.key() != key.as_bytes() {
+        return Err(MpscError::Internal(format!(
+            "{} readback returned an unexpected key for {}",
+            operation, key
+        )));
+    }
+    Ok(Some(ConsumerMembershipGeneration {
+        value: kv.value().to_vec(),
+        lease_id: kv.lease(),
+        mod_revision: kv.mod_revision(),
+    }))
+}
+
+fn consumer_membership_generation_from_publish(
+    txn_res: &etcd::TxnResponse,
+    value: &[u8],
+    lease_id: i64,
+    operation: &str,
+) -> Result<ConsumerMembershipGeneration, MpscError> {
+    let mod_revision = txn_res
+        .header()
+        .ok_or_else(|| MpscError::Internal(format!("{} response has no header", operation)))?
+        .revision();
+    if mod_revision <= 0 {
+        return Err(MpscError::Internal(format!(
+            "{} returned invalid revision {}",
+            operation, mod_revision
+        )));
+    }
+    Ok(ConsumerMembershipGeneration {
+        value: value.to_vec(),
+        lease_id,
+        mod_revision,
+    })
+}
+
+fn reconcile_consumer_membership_bind_observation(
+    current: Option<ConsumerMembershipGeneration>,
+    key: &str,
+    value: &[u8],
+    lease_id: i64,
+) -> Result<ConsumerMembershipGeneration, MpscError> {
+    match current {
+        Some(current) if current.value == value && current.lease_id == lease_id => Ok(current),
+        Some(_) => Err(MpscError::Internal(format!(
+            "consumer membership key {} already exists with conflicting state",
+            key
+        ))),
+        None => Err(MpscError::Internal(format!(
+            "consumer membership key {} disappeared while reconciling bind",
+            key
+        ))),
+    }
+}
+
+fn reconcile_consumer_membership_update_observation(
+    current: Option<ConsumerMembershipGeneration>,
+    key: &str,
+    previous: &ConsumerMembershipGeneration,
+    value: &[u8],
+    lease_id: i64,
+) -> Result<ConsumerMembershipGeneration, MpscError> {
+    match current {
+        Some(current)
+            if current.value == value
+                && current.lease_id == lease_id
+                && current.mod_revision > previous.mod_revision =>
+        {
+            Ok(current)
+        }
+        Some(_) => Err(MpscError::Internal(format!(
+            "consumer membership key {} changed concurrently while syncing kvclient_sub_cluster",
+            key
+        ))),
+        None => Err(MpscError::Internal(format!(
+            "consumer membership key {} missing while syncing kvclient_sub_cluster",
+            key
+        ))),
+    }
+}
+
+async fn publish_consumer_membership(
+    client: &mut etcd::Client,
+    key: &str,
+    value: &[u8],
+    lease_id: i64,
+    max_retries: u32,
+) -> Result<ConsumerMembershipGeneration, MpscError> {
+    let txn_res = retry_etcd_rpc(max_retries, "mq_bind_consumer_membership", || {
+        let mut attempt_client = client.clone();
+        let compare = etcd::Compare::create_revision(key, etcd::CompareOp::Equal, 0);
+        let put = etcd::TxnOp::put(
+            key,
+            value,
+            Some(etcd::PutOptions::new().with_lease(lease_id)),
+        );
+        let txn = etcd::Txn::new()
+            .when(vec![compare])
+            .and_then(vec![put])
+            .or_else(vec![etcd::TxnOp::get(key, None)]);
+        async move { attempt_client.txn(txn).await }
+    })
+    .await?;
+
+    if txn_res.succeeded() {
+        return consumer_membership_generation_from_publish(
+            &txn_res,
+            value,
+            lease_id,
+            "consumer membership bind",
+        );
+    }
+    reconcile_consumer_membership_bind_observation(
+        consumer_membership_get_generation(&txn_res, key, "consumer membership bind")?,
+        key,
+        value,
+        lease_id,
+    )
+}
+
+async fn update_consumer_membership(
+    client: &mut etcd::Client,
+    key: &str,
+    previous: &ConsumerMembershipGeneration,
+    value: &[u8],
+    lease_id: i64,
+    max_retries: u32,
+) -> Result<ConsumerMembershipGeneration, MpscError> {
+    let txn_res = retry_etcd_rpc(max_retries, "mq_update_consumer_membership", || {
+        let mut attempt_client = client.clone();
+        let compares = vec![
+            etcd::Compare::mod_revision(key, etcd::CompareOp::Equal, previous.mod_revision),
+            etcd::Compare::lease(key, etcd::CompareOp::Equal, previous.lease_id),
+            etcd::Compare::value(key, etcd::CompareOp::Equal, previous.value.clone()),
+        ];
+        let put = etcd::TxnOp::put(
+            key,
+            value,
+            Some(etcd::PutOptions::new().with_lease(lease_id)),
+        );
+        let txn = etcd::Txn::new()
+            .when(compares)
+            .and_then(vec![put])
+            .or_else(vec![etcd::TxnOp::get(key, None)]);
+        async move { attempt_client.txn(txn).await }
+    })
+    .await?;
+
+    if txn_res.succeeded() {
+        return consumer_membership_generation_from_publish(
+            &txn_res,
+            value,
+            lease_id,
+            "consumer membership update",
+        );
+    }
+    reconcile_consumer_membership_update_observation(
+        consumer_membership_get_generation(&txn_res, key, "consumer membership update")?,
+        key,
+        previous,
+        value,
+        lease_id,
+    )
 }
 
 fn merge_monotonic_offset(cached: i64, probed: Option<i64>) -> i64 {
@@ -929,6 +1126,7 @@ enum ConsumerCmd {
 pub struct MpscConsumer {
     chan_id: i64,
     consumer_idx: String,
+    membership_generation: ConsumerMembershipGeneration,
     instance_id: usize,
     kvclient_sub_cluster: Option<String>,
     external_client_id: Option<String>,
@@ -1466,12 +1664,13 @@ impl MpscConsumer {
         }
 
         let chan_id = chan_mgr.chan_id;
+        let etcd_rpc_max_retries = chan_mgr.etcd_rpc_max_retries();
         let lease_manager = chan_mgr.lease_manager.clone();
         let mut client = chan_mgr.etcd_client();
 
         // 1) Ensure channel meta exists
         let mut meta_client = chan_mgr.etcd_client();
-        let _meta = get_chan_meta(&mut meta_client, chan_id)
+        let _meta = get_chan_meta_with_retry(&mut meta_client, chan_id, etcd_rpc_max_retries)
             .await
             .with_context(|| format!("channel meta not found for chan_id={}", chan_id))?;
 
@@ -1493,15 +1692,17 @@ impl MpscConsumer {
         // at least one ChanManager instance keeps the long lease alive.
         let mut idx_client = client.clone();
         let allocator_lease_id = chan_mgr.global_long_lease.id() as i64;
-        let consumer_idx =
-            register_consumer_idx(&mut idx_client, chan_id, allocator_lease_id).await?;
+        let consumer_idx = register_consumer_idx(
+            &mut idx_client,
+            chan_id,
+            allocator_lease_id,
+            etcd_rpc_max_retries,
+        )
+        .await?;
 
         // 4) Bind consumer membership key under member lease, storing
         // ChanMemberMeta as JSON for future introspection.
         let consumer_key = keys::etcd_consumer_key(chan_id, &consumer_idx);
-        let compare =
-            etcd::Compare::create_revision(consumer_key.clone(), etcd::CompareOp::Equal, 0);
-
         let member_meta = ChanMemberMeta {
             member_id: consumer_idx.clone(),
             role: ChanRole::Consumer,
@@ -1511,19 +1712,15 @@ impl MpscConsumer {
         let meta_bytes = serde_json::to_vec(&member_meta)
             .map_err(|e| MpscError::Internal(format!("serialize ChanMemberMeta failed: {}", e)))?;
 
-        let put_op = etcd::TxnOp::put(
-            consumer_key.clone(),
-            meta_bytes,
-            Some(etcd::PutOptions::new().with_lease(member_lease_id)),
-        );
-        let txn = etcd::Txn::new().when(vec![compare]).and_then(vec![put_op]);
-        let txn_res = client
-            .txn(txn)
-            .await
-            .with_context(|| format!("failed to bind consumer membership key {}", consumer_key))?;
-        if !txn_res.succeeded() {
-            anyhow::bail!("consumer membership key {} already exists", consumer_key);
-        }
+        let membership_generation = publish_consumer_membership(
+            &mut client,
+            &consumer_key,
+            &meta_bytes,
+            member_lease_id,
+            etcd_rpc_max_retries,
+        )
+        .await
+        .with_context(|| format!("failed to bind consumer membership key {}", consumer_key))?;
 
         // 5) 创建预取 actor，并通过共享队列与之协作。
         // actor 自身负责启动 producer member metadata 的 watch；
@@ -1548,6 +1745,7 @@ impl MpscConsumer {
             shutdown.clone(),
             category,
             global_lease_id,
+            etcd_rpc_max_retries,
         );
         let nonblocking_monitor = spawn_nonblocking_monitor(
             &lifecycle,
@@ -1563,6 +1761,7 @@ impl MpscConsumer {
         Ok(Self {
             chan_id,
             consumer_idx,
+            membership_generation,
             instance_id: commit_seq.instance_id,
             kvclient_sub_cluster,
             external_client_id,
@@ -1662,23 +1861,18 @@ impl MpscConsumer {
 
         let member_lease_id = self.chan_mgr.member_lease_id();
         let consumer_key = keys::etcd_consumer_key(self.chan_id, &self.consumer_idx);
-        let compare =
-            etcd::Compare::create_revision(consumer_key.clone(), etcd::CompareOp::Greater, 0);
-        let put_op = etcd::TxnOp::put(
-            consumer_key.clone(),
-            meta_bytes,
-            Some(etcd::PutOptions::new().with_lease(member_lease_id)),
-        );
-        let txn = etcd::Txn::new().when(vec![compare]).and_then(vec![put_op]);
         let mut client = self.chan_mgr.etcd_client();
-        let txn_res = client.txn(txn).await?;
-        if !txn_res.succeeded() {
-            return Err(MpscError::Internal(format!(
-                "consumer membership key {} missing while syncing kvclient_sub_cluster",
-                consumer_key
-            )));
-        }
+        let membership_generation = update_consumer_membership(
+            &mut client,
+            &consumer_key,
+            &self.membership_generation,
+            &meta_bytes,
+            member_lease_id,
+            self.chan_mgr.etcd_rpc_max_retries(),
+        )
+        .await?;
 
+        self.membership_generation = membership_generation;
         self.kvclient_sub_cluster = kvclient_sub_cluster;
         Ok(())
     }
@@ -2090,9 +2284,10 @@ impl MpscConsumer {
 
         let next_consume_offset = consume_offset + 1;
         let key = keys::etcd_consume_offset_one_producer_key(chan_id, producer_id);
-        let next_consume_offset_str = next_consume_offset.to_string();
         let begin = Instant::now();
         let mut attempts: usize = 0;
+        let mut offset_commit =
+            MonotonicOffsetCommit::new(key.clone(), next_consume_offset, global_lease_id);
 
         loop {
             if shutdown.is_closed() {
@@ -2104,12 +2299,8 @@ impl MpscConsumer {
 
             attempts += 1;
             let attempt_begin = Instant::now();
-            let put = client.put(
-                key.clone(),
-                next_consume_offset_str.clone(),
-                Some(etcd::PutOptions::new().with_lease(global_lease_id)),
-            );
-            tokio::pin!(put);
+            let commit = offset_commit.attempt(&mut client);
+            tokio::pin!(commit);
             let mut first_poll_at = None;
             let put_res = tokio::select! {
                 biased;
@@ -2125,13 +2316,13 @@ impl MpscConsumer {
                         if first_poll_at.is_none() {
                             first_poll_at = Some(Instant::now());
                         }
-                        put.as_mut().poll(cx)
+                        commit.as_mut().poll(cx)
                     }),
                 ) => res,
             };
 
             match put_res {
-                Ok(Ok(_)) => {
+                Ok(Ok(OffsetCommitProgress::Complete)) => {
                     let total_elapsed = begin.elapsed();
                     let attempt_end = Instant::now();
                     let attempt_elapsed = attempt_end.duration_since(attempt_begin);
@@ -2161,6 +2352,17 @@ impl MpscConsumer {
                         first_poll_delay_ns,
                         first_poll_to_ready_ns,
                     });
+                }
+                Ok(Ok(OffsetCommitProgress::Retry(_))) => {
+                    warn!(
+                        "[MpscConsumer commit] consume-offset generation changed before fenced commit: chan_id={} seq={} producer_id={} consume_offset={} next_consume_offset={} attempt={}",
+                        chan_id,
+                        seq,
+                        producer_id,
+                        consume_offset,
+                        next_consume_offset,
+                        attempts,
+                    );
                 }
                 Ok(Err(e)) => {
                     warn!(
@@ -2347,9 +2549,10 @@ async fn load_producer_meta_watch_snapshot(
     client: &mut etcd::Client,
     chan_id: i64,
     prefix: &str,
+    max_retries: u32,
 ) -> Result<HashSet<String>, MpscError> {
     let mut meta_set = HashSet::new();
-    scan_etcd_prefix_paginated(client, prefix, |key, _value| {
+    scan_etcd_prefix_paginated_with_retry(client, prefix, max_retries, |key, _value| {
         match std::str::from_utf8(key) {
             Ok(key_str) => {
                 if let Some(idx) = keys::parse_etcd_producer_key(key_str) {
@@ -2376,10 +2579,11 @@ async fn refresh_producer_meta_watch_snapshot(
     prefix: &str,
     meta_tx: &mpsc::Sender<HashSet<String>>,
     shutdown: &ShutdownCtl,
+    max_retries: u32,
 ) -> EtcdPrefixWatchLoopControl {
     let meta_set = match tokio::select! {
         biased;
-        res = load_producer_meta_watch_snapshot(client, chan_id, prefix) => res,
+        res = load_producer_meta_watch_snapshot(client, chan_id, prefix, max_retries) => res,
         _ = shutdown.wait_closed() => return EtcdPrefixWatchLoopControl::Stop,
     } {
         Ok(meta_set) => meta_set,
@@ -2466,10 +2670,11 @@ async fn load_produce_offset_watch_snapshot(
     client: &mut etcd::Client,
     chan_id: i64,
     prefix: &str,
+    max_retries: u32,
 ) -> Result<Vec<ProducerOffsetUpdate>, MpscError> {
     let watch_observed_at = Instant::now();
     let mut updates = Vec::new();
-    scan_etcd_prefix_paginated(client, prefix, |key, value| {
+    scan_etcd_prefix_paginated_with_retry(client, prefix, max_retries, |key, value| {
         let key_str = match std::str::from_utf8(key) {
             Ok(v) => v,
             Err(e) => {
@@ -2551,10 +2756,11 @@ async fn refresh_produce_offset_watch_snapshot(
     prefix: &str,
     produce_offset_tx: &mpsc::Sender<Vec<ProducerOffsetUpdate>>,
     shutdown: &ShutdownCtl,
+    max_retries: u32,
 ) -> EtcdPrefixWatchLoopControl {
     let updates = match tokio::select! {
         biased;
-        res = load_produce_offset_watch_snapshot(client, chan_id, prefix) => res,
+        res = load_produce_offset_watch_snapshot(client, chan_id, prefix, max_retries) => res,
         _ = shutdown.wait_closed() => return EtcdPrefixWatchLoopControl::Stop,
     } {
         Ok(updates) => updates,
@@ -2576,6 +2782,7 @@ struct ConsumerActor {
     instance_id: usize,
     lease_manager: LeaseManager,
     client: etcd::Client,
+    etcd_rpc_max_retries: u32,
     producer_selector: ProducerSelectorForConsumer,
     /// payload 回调，由上层通过 ConsumerCmd::SetCallback 设置.
     payload_cb: Option<PayloadCallback>,
@@ -3010,6 +3217,7 @@ impl ConsumerActor {
         shutdown: ShutdownCtl,
         category: MqCategory,
         global_lease_id: i64,
+        etcd_rpc_max_retries: u32,
     ) -> (
         mpsc::Sender<ConsumerCmd>,
         mpsc::Receiver<InflightItem>,
@@ -3019,7 +3227,8 @@ impl ConsumerActor {
         CommitSequencer,
     ) {
         let instance_id = NEXT_CONSUMER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
-        let producer_selector = ProducerSelectorForConsumer::new(client.clone(), Some(chan_id));
+        let producer_selector =
+            ProducerSelectorForConsumer::new(client.clone(), Some(chan_id), etcd_rpc_max_retries);
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (meta_tx, meta_rx) = mpsc::channel(8);
         let (produce_offset_tx, produce_offset_rx) = mpsc::channel(128);
@@ -3036,6 +3245,7 @@ impl ConsumerActor {
             instance_id,
             lease_manager: lease_manager.clone(),
             client: client.clone(),
+            etcd_rpc_max_retries,
             producer_selector,
             payload_cb: None,
             prefetch_offset_map: HashMap::new(),
@@ -3084,6 +3294,7 @@ impl ConsumerActor {
             meta_tx,
             lifecycle.clone(),
             shutdown.clone(),
+            etcd_rpc_max_retries,
         );
         ConsumerActor::spawn_produce_offset_watch(
             client,
@@ -3091,6 +3302,7 @@ impl ConsumerActor {
             produce_offset_tx,
             lifecycle,
             shutdown,
+            etcd_rpc_max_retries,
         );
 
         (
@@ -3109,6 +3321,7 @@ impl ConsumerActor {
         meta_tx: mpsc::Sender<HashSet<String>>,
         lifecycle: LifecycleView,
         shutdown: ShutdownCtl,
+        max_retries: u32,
     ) {
         spawn_named(
             &lifecycle,
@@ -3147,6 +3360,7 @@ impl ConsumerActor {
                                 &prefix,
                                 &meta_tx,
                                 &shutdown,
+                                max_retries,
                             )
                             .await
                         }
@@ -3163,6 +3377,7 @@ impl ConsumerActor {
                                 &prefix,
                                 &meta_tx,
                                 &shutdown,
+                                max_retries,
                             )
                             .await
                         }
@@ -3179,6 +3394,7 @@ impl ConsumerActor {
         produce_offset_tx: mpsc::Sender<Vec<ProducerOffsetUpdate>>,
         lifecycle: LifecycleView,
         shutdown: ShutdownCtl,
+        max_retries: u32,
     ) {
         spawn_named(
             &lifecycle,
@@ -3218,6 +3434,7 @@ impl ConsumerActor {
                                 &prefix,
                                 &produce_offset_tx,
                                 &shutdown,
+                                max_retries,
                             )
                             .await
                         }
@@ -3501,6 +3718,7 @@ impl ConsumerActor {
             let cached_consume_offset = self.cached_consume_offset(&producer_id);
             let client = self.client.clone();
             let chan_id = self.chan_id;
+            let max_retries = self.etcd_rpc_max_retries;
             probe_join_set.spawn(async move {
                 ConsumerActor::probe_single_producer_offsets_with_cache(
                     client,
@@ -3508,6 +3726,7 @@ impl ConsumerActor {
                     producer_id,
                     cached_produce_offset,
                     cached_consume_offset,
+                    max_retries,
                 )
                 .await
             });
@@ -3622,11 +3841,17 @@ impl ConsumerActor {
     }
 
     async fn get_single_offset_optional_with_client(
-        mut client: etcd::Client,
+        client: etcd::Client,
         key: String,
         offset_name: &'static str,
+        max_retries: u32,
     ) -> Result<Option<i64>, MpscError> {
-        let resp = client.get(key.clone(), None).await?;
+        let resp = retry_etcd_rpc(max_retries, "mq_get_offset", || {
+            let mut attempt_client = client.clone();
+            let attempt_key = key.clone();
+            async move { attempt_client.get(attempt_key, None).await }
+        })
+        .await?;
         let Some(kv) = resp.kvs().first() else {
             return Ok(None);
         };
@@ -3650,17 +3875,20 @@ impl ConsumerActor {
         producer_id: String,
         cached_produce_offset: i64,
         cached_consume_offset: i64,
+        max_retries: u32,
     ) -> Result<(String, SingleProducerOffsets), MpscError> {
         let (produce_offset_opt, consume_offset_opt) = tokio::try_join!(
             ConsumerActor::get_single_offset_optional_with_client(
                 client.clone(),
                 keys::etcd_produce_offset_one_producer_key(chan_id, &producer_id),
                 "produce_offset_of_all_producer",
+                max_retries,
             ),
             ConsumerActor::get_single_offset_optional_with_client(
                 client,
                 keys::etcd_consume_offset_one_producer_key(chan_id, &producer_id),
                 "consume_offset_of_all_producer",
+                max_retries,
             ),
         )?;
         let produce_offset = merge_monotonic_offset(cached_produce_offset, produce_offset_opt);
@@ -3678,24 +3906,29 @@ impl ConsumerActor {
         let mut client = self.client.clone();
         let prefix = keys::etcd_produce_offset_all_producer_prefix(self.chan_id);
         let mut result = HashMap::new();
-        scan_etcd_prefix_paginated(&mut client, &prefix, |key, value| {
-            let key = std::str::from_utf8(key).map_err(|e| {
-                MpscError::Internal(format!("invalid utf-8 key in produce_offset: {}", e))
-            })?;
-            if let Some(idx) = key.split('/').last() {
-                let val_str = std::str::from_utf8(value).map_err(|e| {
-                    MpscError::Internal(format!("invalid utf-8 value in produce_offset: {}", e))
+        scan_etcd_prefix_paginated_with_retry(
+            &mut client,
+            &prefix,
+            self.etcd_rpc_max_retries,
+            |key, value| {
+                let key = std::str::from_utf8(key).map_err(|e| {
+                    MpscError::Internal(format!("invalid utf-8 key in produce_offset: {}", e))
                 })?;
-                let offset: i64 = val_str.parse().map_err(|e| {
-                    MpscError::Internal(format!(
-                        "invalid offset '{}' in produce_offset: {}",
-                        val_str, e
-                    ))
-                })?;
-                result.insert(idx.to_string(), offset);
-            }
-            Ok::<EtcdPrefixScanAction, MpscError>(EtcdPrefixScanAction::Continue)
-        })
+                if let Some(idx) = key.split('/').last() {
+                    let val_str = std::str::from_utf8(value).map_err(|e| {
+                        MpscError::Internal(format!("invalid utf-8 value in produce_offset: {}", e))
+                    })?;
+                    let offset: i64 = val_str.parse().map_err(|e| {
+                        MpscError::Internal(format!(
+                            "invalid offset '{}' in produce_offset: {}",
+                            val_str, e
+                        ))
+                    })?;
+                    result.insert(idx.to_string(), offset);
+                }
+                Ok::<EtcdPrefixScanAction, MpscError>(EtcdPrefixScanAction::Continue)
+            },
+        )
         .await
         .map_err(map_prefix_scan_error)?;
         Ok(result)
@@ -3705,24 +3938,29 @@ impl ConsumerActor {
         let mut client = self.client.clone();
         let prefix = keys::etcd_consume_offset_all_producer_prefix(self.chan_id);
         let mut result = HashMap::new();
-        scan_etcd_prefix_paginated(&mut client, &prefix, |key, value| {
-            let key = std::str::from_utf8(key).map_err(|e| {
-                MpscError::Internal(format!("invalid utf-8 key in consume_offset: {}", e))
-            })?;
-            if let Some(idx) = key.split('/').last() {
-                let val_str = std::str::from_utf8(value).map_err(|e| {
-                    MpscError::Internal(format!("invalid utf-8 value in consume_offset: {}", e))
+        scan_etcd_prefix_paginated_with_retry(
+            &mut client,
+            &prefix,
+            self.etcd_rpc_max_retries,
+            |key, value| {
+                let key = std::str::from_utf8(key).map_err(|e| {
+                    MpscError::Internal(format!("invalid utf-8 key in consume_offset: {}", e))
                 })?;
-                let offset: i64 = val_str.parse().map_err(|e| {
-                    MpscError::Internal(format!(
-                        "invalid offset '{}' in consume_offset: {}",
-                        val_str, e
-                    ))
-                })?;
-                result.insert(idx.to_string(), offset);
-            }
-            Ok::<EtcdPrefixScanAction, MpscError>(EtcdPrefixScanAction::Continue)
-        })
+                if let Some(idx) = key.split('/').last() {
+                    let val_str = std::str::from_utf8(value).map_err(|e| {
+                        MpscError::Internal(format!("invalid utf-8 value in consume_offset: {}", e))
+                    })?;
+                    let offset: i64 = val_str.parse().map_err(|e| {
+                        MpscError::Internal(format!(
+                            "invalid offset '{}' in consume_offset: {}",
+                            val_str, e
+                        ))
+                    })?;
+                    result.insert(idx.to_string(), offset);
+                }
+                Ok::<EtcdPrefixScanAction, MpscError>(EtcdPrefixScanAction::Continue)
+            },
+        )
         .await
         .map_err(map_prefix_scan_error)?;
         Ok(result)
@@ -3741,15 +3979,20 @@ impl ConsumerActor {
         let mut client = self.client.clone();
         let prefix = keys::etcd_producer_key_prefix(self.chan_id);
         let mut meta_set = HashSet::new();
-        scan_etcd_prefix_paginated(&mut client, &prefix, |key, _value| {
-            let key_str = std::str::from_utf8(key).map_err(|e| {
-                MpscError::Internal(format!("invalid utf-8 key in producer meta: {}", e))
-            })?;
-            if let Some(idx) = keys::parse_etcd_producer_key(key_str) {
-                meta_set.insert(idx);
-            }
-            Ok::<EtcdPrefixScanAction, MpscError>(EtcdPrefixScanAction::Continue)
-        })
+        scan_etcd_prefix_paginated_with_retry(
+            &mut client,
+            &prefix,
+            self.etcd_rpc_max_retries,
+            |key, _value| {
+                let key_str = std::str::from_utf8(key).map_err(|e| {
+                    MpscError::Internal(format!("invalid utf-8 key in producer meta: {}", e))
+                })?;
+                if let Some(idx) = keys::parse_etcd_producer_key(key_str) {
+                    meta_set.insert(idx);
+                }
+                Ok::<EtcdPrefixScanAction, MpscError>(EtcdPrefixScanAction::Continue)
+            },
+        )
         .await
         .map_err(map_prefix_scan_error)?;
         self.producer_meta_cache = meta_set;
@@ -3762,8 +4005,10 @@ impl ConsumerActor {
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_monotonic_offset, merge_offset_cache_monotonic, CommitSequencer, MpscError,
-        OffsetSnapshotState, ShutdownCtl,
+        merge_monotonic_offset, merge_offset_cache_monotonic,
+        reconcile_consumer_membership_bind_observation,
+        reconcile_consumer_membership_update_observation, CommitSequencer,
+        ConsumerMembershipGeneration, MpscError, OffsetSnapshotState, ShutdownCtl,
     };
     use std::collections::HashMap;
     use std::time::Duration;
@@ -3778,6 +4023,73 @@ mod tests {
         sequencer.mark_commit_begin(seq);
         sequencer.mark_ready_to_advance(seq);
         sequencer.mark_popped(seq);
+    }
+
+    fn membership_generation(
+        value: &[u8],
+        lease_id: i64,
+        mod_revision: i64,
+    ) -> ConsumerMembershipGeneration {
+        ConsumerMembershipGeneration {
+            value: value.to_vec(),
+            lease_id,
+            mod_revision,
+        }
+    }
+
+    #[test]
+    fn consumer_bind_reconciliation_accepts_only_owned_value_and_lease() {
+        let owned = membership_generation(b"new", 11, 42);
+        assert_eq!(
+            reconcile_consumer_membership_bind_observation(
+                Some(owned.clone()),
+                "member",
+                b"new",
+                11,
+            )
+            .unwrap(),
+            owned
+        );
+        assert!(reconcile_consumer_membership_bind_observation(
+            Some(membership_generation(b"new", 12, 43)),
+            "member",
+            b"new",
+            11,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn consumer_update_reconciliation_requires_a_new_owned_generation() {
+        let previous = membership_generation(b"old", 11, 42);
+        let committed = membership_generation(b"new", 11, 43);
+        assert_eq!(
+            reconcile_consumer_membership_update_observation(
+                Some(committed.clone()),
+                "member",
+                &previous,
+                b"new",
+                11,
+            )
+            .unwrap(),
+            committed
+        );
+        assert!(reconcile_consumer_membership_update_observation(
+            Some(membership_generation(b"new", 11, 42)),
+            "member",
+            &previous,
+            b"new",
+            11,
+        )
+        .is_err());
+        assert!(reconcile_consumer_membership_update_observation(
+            Some(membership_generation(b"other", 11, 44)),
+            "member",
+            &previous,
+            b"new",
+            11,
+        )
+        .is_err());
     }
 
     #[test]
@@ -4008,10 +4320,11 @@ pub struct ProducerSelectorForConsumer {
     tomb_first_ts: HashMap<String, Instant>,
     client: etcd::Client,
     chan_id: Option<i64>,
+    etcd_rpc_max_retries: u32,
 }
 
 impl ProducerSelectorForConsumer {
-    pub fn new(client: etcd::Client, chan_id: Option<i64>) -> Self {
+    pub fn new(client: etcd::Client, chan_id: Option<i64>, etcd_rpc_max_retries: u32) -> Self {
         Self {
             producers: Vec::new(),
             producer_weight_map: HashMap::new(),
@@ -4020,6 +4333,7 @@ impl ProducerSelectorForConsumer {
             tomb_first_ts: HashMap::new(),
             client,
             chan_id,
+            etcd_rpc_max_retries,
         }
     }
 
@@ -4195,7 +4509,14 @@ impl ProducerSelectorForConsumer {
             None => return 1,
         };
         let weight_key = keys::etcd_producer_weight_key(chan_id, producer_idx);
-        match self.client.get(weight_key.clone(), None).await {
+        let client = self.client.clone();
+        match retry_etcd_rpc(self.etcd_rpc_max_retries, "mq_get_producer_weight", || {
+            let mut attempt_client = client.clone();
+            let attempt_key = weight_key.clone();
+            async move { attempt_client.get(attempt_key, None).await }
+        })
+        .await
+        {
             Ok(resp) => {
                 if let Some(kv) = resp.kvs().first() {
                     if let Ok(txt) = std::str::from_utf8(kv.value()) {
@@ -4233,6 +4554,7 @@ async fn register_consumer_idx(
     client: &mut etcd::Client,
     chan_id: i64,
     lease_id: i64,
+    max_retries: u32,
 ) -> Result<String, MpscError> {
     use fluxon_util::etcd::DistributeIdAllocator;
 
@@ -4241,7 +4563,8 @@ async fn register_consumer_idx(
     // consumers. This avoids the fixed 0..1000 range and keeps
     // allocation monotonic per channel.
     let prefix = format!("channels/{}/consumers", chan_id);
-    let allocator = DistributeIdAllocator::new(client.clone(), prefix, lease_id);
+    let allocator =
+        DistributeIdAllocator::new_with_retry(client.clone(), prefix, lease_id, max_retries);
 
     allocator
         .allocate_id()

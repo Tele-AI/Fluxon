@@ -1,5 +1,8 @@
 use etcd_client as etcd;
-use fluxon_util::etcd::{PooledEtcdClient, etcd_clients_pool};
+use fluxon_util::etcd::{
+    DEFAULT_ETCD_RPC_MAX_RETRIES, PooledEtcdClient, etcd_clients_pool, is_transient_etcd_error,
+    retry_etcd_rpc,
+};
 use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
@@ -48,23 +51,10 @@ fn normalize_raw_endpoints(endpoints: Vec<String>, component: &str) -> PyResult<
     Ok(normalized)
 }
 
-fn is_reconnectable_etcd_error(err: &etcd::Error) -> bool {
-    is_reconnectable_etcd_error_text(&format!("{:?}", err))
-}
-
-fn is_reconnectable_etcd_error_text(msg: &str) -> bool {
-    let msg = msg.to_ascii_lowercase();
-    msg.contains("unavailable")
-        || msg.contains("connection")
-        || msg.contains("transport")
-        || msg.contains("timed out")
-        || msg.contains("timeout")
-        || msg.contains("broken pipe")
-        || msg.contains("closed")
-}
-
 async fn run_etcd_op<T, F, Fut>(
     pool_entry: PooledEtcdClient,
+    max_retries: u32,
+    operation: &'static str,
     context: String,
     mut op: F,
 ) -> anyhow::Result<T>
@@ -72,44 +62,232 @@ where
     F: FnMut(etcd::Client) -> Fut,
     Fut: Future<Output = Result<T, etcd::Error>>,
 {
-    let mut last_err = None;
-    for attempt in 1..=2 {
-        let snapshot = pool_entry.snapshot().await?;
-        match op(snapshot.client()).await {
-            Ok(value) => return Ok(value),
-            Err(err) => {
-                let should_retry = attempt == 1 && is_reconnectable_etcd_error(&err);
-                last_err = Some(err);
-                if should_retry {
-                    snapshot.invalidate().await;
-                    continue;
-                }
-                let err = last_err.take().expect("etcd error must be recorded");
-                return Err(anyhow::anyhow!("{}: {:?}", context, err));
-            }
+    let snapshot = pool_entry.snapshot().await?;
+    let result = retry_etcd_rpc(max_retries, operation, || op(snapshot.client())).await;
+
+    if let Err(error) = &result {
+        if is_transient_etcd_error(error) {
+            snapshot.invalidate().await;
         }
     }
 
-    let err = last_err.expect("etcd retry loop must record the last error");
-    Err(anyhow::anyhow!("{}: {:?}", context, err))
+    result.map_err(|error| anyhow::anyhow!("{}: {:?}", context, error))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EtcdKeyGeneration {
+    value: Vec<u8>,
+    lease_id: i64,
+    mod_revision: i64,
+}
+
+impl EtcdKeyGeneration {
+    fn from_kv(kv: &etcd::KeyValue, expected_key: &str) -> anyhow::Result<Self> {
+        if kv.key() != expected_key.as_bytes() {
+            anyhow::bail!(
+                "etcd exact-key read returned an unexpected key: expected={} actual={:?}",
+                expected_key,
+                kv.key()
+            );
+        }
+        Ok(Self {
+            value: kv.value().to_vec(),
+            lease_id: kv.lease(),
+            mod_revision: kv.mod_revision(),
+        })
+    }
+
+    fn matches_value_and_lease(&self, value: &[u8], lease_id: Option<i64>) -> bool {
+        self.value == value && self.lease_id == lease_id.unwrap_or(0)
+    }
+}
+
+fn exact_generation_from_get(
+    response: &etcd::GetResponse,
+    key: &str,
+) -> anyhow::Result<Option<EtcdKeyGeneration>> {
+    if response.kvs().len() > 1 {
+        anyhow::bail!(
+            "etcd exact-key read returned duplicate keys: key={} count={}",
+            key,
+            response.kvs().len()
+        );
+    }
+    response
+        .kvs()
+        .first()
+        .map(|kv| EtcdKeyGeneration::from_kv(kv, key))
+        .transpose()
+}
+
+fn exact_generation_from_txn_readback(
+    response: &etcd::TxnResponse,
+    key: &str,
+) -> anyhow::Result<Option<EtcdKeyGeneration>> {
+    let responses = response.op_responses();
+    let [etcd::TxnOpResponse::Get(get_response)] = responses.as_slice() else {
+        anyhow::bail!(
+            "etcd conditional mutation returned an invalid readback shape: key={} operations={}",
+            key,
+            responses.len()
+        );
+    };
+    exact_generation_from_get(get_response, key)
+}
+
+fn generation_compares(key: &str, generation: Option<&EtcdKeyGeneration>) -> Vec<etcd::Compare> {
+    match generation {
+        Some(generation) => vec![
+            etcd::Compare::mod_revision(key, etcd::CompareOp::Equal, generation.mod_revision),
+            etcd::Compare::lease(key, etcd::CompareOp::Equal, generation.lease_id),
+            etcd::Compare::value(key, etcd::CompareOp::Equal, generation.value.clone()),
+        ],
+        None => vec![etcd::Compare::create_revision(
+            key,
+            etcd::CompareOp::Equal,
+            0,
+        )],
+    }
+}
+
+async fn get_exact_generation(
+    pool_entry: PooledEtcdClient,
+    max_retries: u32,
+    key: &str,
+    operation: &'static str,
+) -> anyhow::Result<Option<EtcdKeyGeneration>> {
+    let key_for_op = key.to_string();
+    let response = run_etcd_op(
+        pool_entry,
+        max_retries,
+        operation,
+        format!("etcd generation read failed for key={}", key),
+        move |mut client| {
+            let key = key_for_op.clone();
+            async move { client.get(key, None).await }
+        },
+    )
+    .await?;
+    exact_generation_from_get(&response, key)
+}
+
+async fn put_with_generation_fence(
+    pool_entry: PooledEtcdClient,
+    max_retries: u32,
+    key: String,
+    value: Vec<u8>,
+    lease_id: Option<i64>,
+) -> anyhow::Result<()> {
+    let observed =
+        get_exact_generation(pool_entry.clone(), max_retries, &key, "put_generation_read").await?;
+    let txn = etcd::Txn::new()
+        .when(generation_compares(&key, observed.as_ref()))
+        .and_then(vec![etcd::TxnOp::put(
+            key.clone(),
+            value.clone(),
+            lease_id.map(|id| etcd::PutOptions::new().with_lease(id)),
+        )])
+        .or_else(vec![etcd::TxnOp::get(key.clone(), None)]);
+
+    let response = run_etcd_op(
+        pool_entry,
+        max_retries,
+        "put",
+        format!("etcd conditional put failed for key={}", key),
+        move |mut client| {
+            let txn = txn.clone();
+            async move { client.txn(txn).await }
+        },
+    )
+    .await?;
+    if response.succeeded() {
+        return Ok(());
+    }
+
+    match exact_generation_from_txn_readback(&response, &key)? {
+        Some(current) if current.matches_value_and_lease(&value, lease_id) => Ok(()),
+        Some(current) => anyhow::bail!(
+            "etcd conditional put for key={} encountered a concurrent generation; preserving current mod_revision={} lease_id={}",
+            key,
+            current.mod_revision,
+            current.lease_id
+        ),
+        None => anyhow::bail!(
+            "etcd conditional put for key={} was not committed and the key is absent",
+            key
+        ),
+    }
+}
+
+async fn delete_with_generation_fence(
+    pool_entry: PooledEtcdClient,
+    max_retries: u32,
+    key: String,
+) -> anyhow::Result<bool> {
+    let Some(observed) = get_exact_generation(
+        pool_entry.clone(),
+        max_retries,
+        &key,
+        "delete_generation_read",
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+
+    let txn = etcd::Txn::new()
+        .when(generation_compares(&key, Some(&observed)))
+        .and_then(vec![etcd::TxnOp::delete(key.clone(), None)])
+        .or_else(vec![etcd::TxnOp::get(key.clone(), None)]);
+    let response = run_etcd_op(
+        pool_entry,
+        max_retries,
+        "delete",
+        format!("etcd conditional delete failed for key={}", key),
+        move |mut client| {
+            let txn = txn.clone();
+            async move { client.txn(txn).await }
+        },
+    )
+    .await?;
+    if response.succeeded() {
+        return Ok(true);
+    }
+
+    match exact_generation_from_txn_readback(&response, &key)? {
+        None => Ok(true),
+        Some(current) if current == observed => anyhow::bail!(
+            "etcd conditional delete for key={} failed while the observed generation still exists",
+            key
+        ),
+        Some(current) => anyhow::bail!(
+            "etcd conditional delete for key={} encountered a concurrent generation; preserving current mod_revision={} lease_id={}",
+            key,
+            current.mod_revision,
+            current.lease_id
+        ),
+    }
 }
 
 #[pyclass(name = "EtcdKvClient")]
 pub struct PyEtcdKvClient {
     rt: Arc<Runtime>,
     endpoints: Vec<String>,
+    etcd_rpc_max_retries: u32,
     pool_entry: PooledEtcdClient,
 }
 
 #[pymethods]
 impl PyEtcdKvClient {
     #[new]
-    fn new(endpoints: Vec<String>) -> PyResult<Self> {
+    #[pyo3(signature = (endpoints, etcd_rpc_max_retries=None))]
+    fn new(endpoints: Vec<String>, etcd_rpc_max_retries: Option<u32>) -> PyResult<Self> {
         let endpoints = normalize_raw_endpoints(endpoints, "EtcdKvClient")?;
         let pool_entry = etcd_clients_pool().acquire(endpoints.clone());
         Ok(Self {
             rt: crate::mpsc::get_global_runtime(),
             endpoints,
+            etcd_rpc_max_retries: etcd_rpc_max_retries.unwrap_or(DEFAULT_ETCD_RPC_MAX_RETRIES),
             pool_entry,
         })
     }
@@ -122,12 +300,15 @@ impl PyEtcdKvClient {
         }
 
         let pool_entry = self.pool_entry.clone();
+        let etcd_rpc_max_retries = self.etcd_rpc_max_retries;
         let key_for_op = key.clone();
         let value = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
                     let resp = run_etcd_op(
                         pool_entry,
+                        etcd_rpc_max_retries,
+                        "get",
                         format!("etcd get failed for key={}", key),
                         move |mut client| {
                             let key = key_for_op.clone();
@@ -155,12 +336,15 @@ impl PyEtcdKvClient {
         }
 
         let pool_entry = self.pool_entry.clone();
+        let etcd_rpc_max_retries = self.etcd_rpc_max_retries;
         let prefix_for_op = prefix.clone();
         let rows = py
             .allow_threads(|| {
                 self.rt.run_async_from_sync(async move {
                     let resp = run_etcd_op(
                         pool_entry,
+                        etcd_rpc_max_retries,
+                        "get_prefix",
                         format!("etcd get_prefix failed for prefix={}", prefix),
                         move |mut client| {
                             let prefix = prefix_for_op.clone();
@@ -221,23 +405,38 @@ impl PyEtcdKvClient {
         }
 
         let pool_entry = self.pool_entry.clone();
-        let key_for_op = key.clone();
+        let etcd_rpc_max_retries = self.etcd_rpc_max_retries;
         let value = value.as_ref().to_vec();
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
-                run_etcd_op(
-                    pool_entry,
-                    format!("etcd put failed for key={}", key),
-                    move |mut client| {
-                        let key = key_for_op.clone();
-                        let value = value.clone();
-                        async move {
-                            let opts = lease_id.map(|id| etcd::PutOptions::new().with_lease(id));
-                            client.put(key, value, opts).await.map(|_| ())
-                        }
-                    },
-                )
-                .await?;
+                if etcd_rpc_max_retries == 0 {
+                    let key_for_op = key.clone();
+                    run_etcd_op(
+                        pool_entry,
+                        0,
+                        "put",
+                        format!("etcd put failed for key={}", key),
+                        move |mut client| {
+                            let key = key_for_op.clone();
+                            let value = value.clone();
+                            async move {
+                                let opts =
+                                    lease_id.map(|id| etcd::PutOptions::new().with_lease(id));
+                                client.put(key, value, opts).await.map(|_| ())
+                            }
+                        },
+                    )
+                    .await?;
+                } else {
+                    put_with_generation_fence(
+                        pool_entry,
+                        etcd_rpc_max_retries,
+                        key,
+                        value,
+                        lease_id,
+                    )
+                    .await?;
+                }
                 Ok::<(), anyhow::Error>(())
             })
         })
@@ -254,23 +453,30 @@ impl PyEtcdKvClient {
         }
 
         let pool_entry = self.pool_entry.clone();
-        let key_for_op = key.clone();
+        let etcd_rpc_max_retries = self.etcd_rpc_max_retries;
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
-                run_etcd_op(
-                    pool_entry,
-                    format!("etcd delete failed for key={}", key),
-                    move |mut client| {
-                        let key = key_for_op.clone();
-                        async move {
-                            client
-                                .delete(key, None)
-                                .await
-                                .map(|resp| resp.deleted() > 0)
-                        }
-                    },
-                )
-                .await
+                if etcd_rpc_max_retries == 0 {
+                    let key_for_op = key.clone();
+                    run_etcd_op(
+                        pool_entry,
+                        0,
+                        "delete",
+                        format!("etcd delete failed for key={}", key),
+                        move |mut client| {
+                            let key = key_for_op.clone();
+                            async move {
+                                client
+                                    .delete(key, None)
+                                    .await
+                                    .map(|resp| resp.deleted() > 0)
+                            }
+                        },
+                    )
+                    .await
+                } else {
+                    delete_with_generation_fence(pool_entry, etcd_rpc_max_retries, key).await
+                }
             })
         })
         .map_err(|e| anyhow::anyhow!("runtime bridge failed in EtcdKvClient.delete: {}", e))
@@ -289,8 +495,12 @@ impl PyEtcdKvClient {
         let prefix_for_op = prefix.clone();
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
+                // A range delete cannot be replayed without risking deletion of a new
+                // generation and changing the returned count after an uncertain response.
                 run_etcd_op(
                     pool_entry,
+                    0,
+                    "delete_prefix",
                     format!("etcd delete_prefix failed for prefix={}", prefix),
                     move |mut client| {
                         let prefix = prefix_for_op.clone();
@@ -319,10 +529,13 @@ impl PyEtcdKvClient {
         }
 
         let pool_entry = self.pool_entry.clone();
+        let etcd_rpc_max_retries = self.etcd_rpc_max_retries;
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
                 run_etcd_op(
                     pool_entry,
+                    etcd_rpc_max_retries,
+                    "lease_time_to_live",
                     format!("etcd lease_ttl failed for lease_id={}", lease_id),
                     move |mut client| async move {
                         client
@@ -348,12 +561,21 @@ impl PyEtcdKvClient {
         }
 
         let pool_entry = self.pool_entry.clone();
+        let etcd_rpc_max_retries = self.etcd_rpc_max_retries;
         py.allow_threads(|| {
             self.rt.run_async_from_sync(async move {
                 run_etcd_op(
                     pool_entry,
+                    etcd_rpc_max_retries,
+                    "lease_revoke",
                     format!("etcd revoke_lease failed for lease_id={}", lease_id),
-                    move |mut client| async move { client.lease_revoke(lease_id).await.map(|_| ()) },
+                    move |mut client| async move {
+                        match client.lease_revoke(lease_id).await {
+                            Ok(_) => Ok(()),
+                            Err(error) if is_lease_not_found_error(&error) => Ok(()),
+                            Err(error) => Err(error),
+                        }
+                    },
                 )
                 .await
             })
@@ -364,7 +586,10 @@ impl PyEtcdKvClient {
     }
 
     fn __repr__(&self) -> String {
-        format!("<EtcdKvClient endpoints={:?}>", self.endpoints)
+        format!(
+            "<EtcdKvClient endpoints={:?} etcd_rpc_max_retries={}>",
+            self.endpoints, self.etcd_rpc_max_retries
+        )
     }
 }
 
@@ -675,8 +900,12 @@ mod tests {
 
     #[test]
     fn etcd_kv_client_constructor_normalizes_raw_endpoints() {
-        let client = PyEtcdKvClient::new(vec!["127.0.0.1:2379".to_string()]).unwrap();
+        let client = PyEtcdKvClient::new(vec!["127.0.0.1:2379".to_string()], None).unwrap();
         assert_eq!(client.endpoints, vec!["http://127.0.0.1:2379"]);
+        assert_eq!(client.etcd_rpc_max_retries, DEFAULT_ETCD_RPC_MAX_RETRIES);
+
+        let no_retry = PyEtcdKvClient::new(vec!["127.0.0.1:2379".to_string()], Some(0)).unwrap();
+        assert_eq!(no_retry.etcd_rpc_max_retries, 0);
     }
 
     #[test]
@@ -705,21 +934,5 @@ mod tests {
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn reconnectable_error_text_matches_transient_transport_failures() {
-        assert!(is_reconnectable_etcd_error_text("StatusCode::UNAVAILABLE"));
-        assert!(is_reconnectable_etcd_error_text(
-            "etcdserver: request timed out"
-        ));
-        assert!(is_reconnectable_etcd_error_text("transport error"));
-        assert!(is_reconnectable_etcd_error_text("connection closed"));
-        assert!(is_reconnectable_etcd_error_text("broken pipe"));
-
-        assert!(!is_reconnectable_etcd_error_text(
-            "requested lease not found"
-        ));
-        assert!(!is_reconnectable_etcd_error_text("permission denied"));
     }
 }

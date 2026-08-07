@@ -20,6 +20,7 @@ moka = { workspace = true }
 parking_lot = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["time", "rt", "macros"] }
+tonic = { workspace = true }
 limit_thirdparty = { path = "../limit_thirdparty" }
 prometheus = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

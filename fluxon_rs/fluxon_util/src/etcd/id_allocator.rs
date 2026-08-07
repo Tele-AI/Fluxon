@@ -1,6 +1,38 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
-use etcd_client::{Client, Compare, CompareOp, PutOptions, Txn, TxnOp};
-use tracing::debug;
+use etcd_client::{
+    Client, Compare, CompareOp, GetResponse, PutOptions, Txn, TxnOp, TxnOpResponse, TxnResponse,
+};
+use tracing::{debug, warn};
+
+use super::{is_transient_etcd_error, retry_etcd_rpc};
+
+const MAX_CAS_CONFLICTS: u32 = 100;
+const UNCERTAIN_RPC_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CounterGeneration {
+    value: Vec<u8>,
+    lease_id: i64,
+    mod_revision: i64,
+}
+
+impl CounterGeneration {
+    fn from_kv(kv: &etcd_client::KeyValue, expected_key: &str) -> Result<Self> {
+        if kv.key() != expected_key.as_bytes() {
+            return Err(anyhow!(
+                "dist_id readback returned unexpected key for {}",
+                expected_key
+            ));
+        }
+        Ok(Self {
+            value: kv.value().to_vec(),
+            lease_id: kv.lease(),
+            mod_revision: kv.mod_revision(),
+        })
+    }
+}
 
 /// Distributed ID allocator backed by etcd.
 ///
@@ -15,109 +47,306 @@ pub struct DistributeIdAllocator {
     client: Client,
     prefix: String,
     lease_id: Option<i64>,
+    rpc_max_retries: u32,
 }
 
 impl DistributeIdAllocator {
-    /// Create a new allocator with the given etcd client, prefix and
-    /// associated lease id.
+    /// Create an allocator without automatic unary RPC retries.
     pub fn new(client: Client, prefix: impl Into<String>, lease_id: i64) -> Self {
+        Self::new_with_retry(client, prefix, lease_id, 0)
+    }
+
+    /// Create an allocator with transient unary RPC retries.
+    pub fn new_with_retry(
+        client: Client,
+        prefix: impl Into<String>,
+        lease_id: i64,
+        rpc_max_retries: u32,
+    ) -> Self {
         Self {
             client,
             prefix: prefix.into(),
             lease_id: Some(lease_id),
+            rpc_max_retries,
         }
     }
 
-    /// Create a new allocator whose counter key is intentionally not bound to
-    /// any etcd lease.
+    /// Create an unleased allocator without automatic unary RPC retries.
     ///
     /// This mode is required for process-global monotonic counters such as the
     /// top-level MPSC `chan_id` allocator. Binding that counter to a short-lived
     /// lease would let the key disappear during an idle window and later restart
     /// from `1`, which can collide with still-existing historical metadata.
     pub fn new_without_lease(client: Client, prefix: impl Into<String>) -> Self {
+        Self::new_without_lease_with_retry(client, prefix, 0)
+    }
+
+    /// Create an unleased allocator with transient unary RPC retries.
+    pub fn new_without_lease_with_retry(
+        client: Client,
+        prefix: impl Into<String>,
+        rpc_max_retries: u32,
+    ) -> Self {
         Self {
             client,
             prefix: prefix.into(),
             lease_id: None,
+            rpc_max_retries,
         }
     }
 
-    /// Allocate the next ID (starting from 1) using etcd transactions.
+    /// Allocate the next ID (starting from 1) using generation-fenced CAS.
     ///
-    /// This mirrors the Python logic:
-    /// - Read current value once.
-    /// - Try up to 100 times with compare-and-set on the value.
+    /// The 100-attempt bound applies only to ordinary CAS competition. A
+    /// transient response makes that candidate ambiguous, so it is permanently
+    /// skipped and the configured RPC retry budget is used to read a fresh
+    /// generation before attempting a larger candidate.
     pub async fn allocate_id(&self) -> Result<i64> {
         let key = format!("dist_id_allocator/{}", self.prefix);
-        let mut client = self.client.clone();
+        let client = self.client.clone();
+        let mut generation = read_counter_generation(&client, &key, self.rpc_max_retries).await?;
+        let mut minimum_counter_value = 0_i64;
+        let mut cas_conflicts = 0_u32;
+        let mut rpc_retries_used = 0_u32;
 
-        // Initial read of the current value (if any)
-        let resp = client
-            .get(key.clone(), None)
-            .await
-            .with_context(|| format!("failed to get dist_id key {key}"))?;
-        let mut old_value_v: Option<Vec<u8>> = resp.kvs().first().map(|kv| kv.value().to_vec());
+        while cas_conflicts < MAX_CAS_CONFLICTS {
+            let candidate = next_candidate(generation.as_ref(), minimum_counter_value)?;
+            let txn = allocator_cas_txn(&key, generation.as_ref(), candidate, self.lease_id);
+            let mut attempt_client = client.clone();
 
-        for _ in 0..100 {
-            // Parse current value as integer; default to 0 on any error
-            let mut old_value_int: i64 = 0;
-            if let Some(ref v) = old_value_v {
-                if let Ok(s) = std::str::from_utf8(v) {
-                    if let Ok(parsed) = s.parse::<i64>() {
-                        old_value_int = parsed;
+            match attempt_client.txn(txn).await {
+                Ok(txn_res) if txn_res.succeeded() => {
+                    debug!("updated dist_id key {} to value {}", key, candidate);
+                    return Ok(candidate);
+                }
+                Ok(txn_res) => {
+                    // A false compare means this candidate was not allocated by
+                    // this call. Keep it below the next candidate even if the
+                    // competing generation disappears before readback.
+                    minimum_counter_value = minimum_counter_value.max(candidate);
+                    generation = allocator_cas_readback(&txn_res, &key)?;
+                    cas_conflicts += 1;
+                }
+                Err(error) if is_transient_etcd_error(&error) => {
+                    if rpc_retries_used >= self.rpc_max_retries {
+                        return Err(anyhow!(
+                            "dist_id CAS for key {} remained uncertain after {} retries: {}",
+                            key,
+                            rpc_retries_used,
+                            error
+                        ));
                     }
+
+                    // The server may have committed `candidate`. Never return it
+                    // after losing the response: another allocator may have won
+                    // the same value. Recover an authoritative generation and
+                    // require the next CAS to publish a strictly larger value.
+                    minimum_counter_value = minimum_counter_value.max(candidate);
+                    rpc_retries_used += 1;
+                    warn!(
+                        dist_id_key = %key,
+                        candidate,
+                        retry = rpc_retries_used,
+                        max_retries = self.rpc_max_retries,
+                        error = %error,
+                        "dist_id CAS response was uncertain; abandoning candidate"
+                    );
+                    tokio::time::sleep(UNCERTAIN_RPC_RETRY_DELAY).await;
+                    generation = loop {
+                        match read_counter_generation(&client, &key, 0).await {
+                            Ok(generation) => break generation,
+                            Err(read_error)
+                                if is_transient_counter_read_error(&read_error)
+                                    && rpc_retries_used < self.rpc_max_retries =>
+                            {
+                                rpc_retries_used += 1;
+                                warn!(
+                                    dist_id_key = %key,
+                                    retry = rpc_retries_used,
+                                    max_retries = self.rpc_max_retries,
+                                    error = %read_error,
+                                    "dist_id uncertainty recovery Get failed; retrying"
+                                );
+                                tokio::time::sleep(UNCERTAIN_RPC_RETRY_DELAY).await;
+                            }
+                            Err(read_error) => return Err(read_error),
+                        }
+                    };
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "transaction failed when updating dist_id key {}: {}",
+                        key,
+                        error
+                    ));
                 }
             }
-
-            if old_value_v.is_none() {
-                // First-time create: only succeed if key does not exist
-                let compare = Compare::create_revision(key.clone(), CompareOp::Equal, 0);
-                let put_op = match self.lease_id {
-                    Some(lease_id) => {
-                        let put_opts = PutOptions::new().with_lease(lease_id);
-                        TxnOp::put(key.clone(), "1", Some(put_opts))
-                    }
-                    None => TxnOp::put(key.clone(), "1", None),
-                };
-                let txn = Txn::new().when(vec![compare]).and_then(vec![put_op]);
-                let txn_res = client.txn(txn).await.with_context(|| {
-                    format!("transaction failed when creating dist_id key {key}")
-                })?;
-                if txn_res.succeeded() {
-                    debug!("created dist_id key {} with value 1", key);
-                    return Ok(1);
-                }
-            } else {
-                // Compare-and-set on existing value
-                let expected = old_value_v.clone().unwrap_or_default();
-                let compare = Compare::value(key.clone(), CompareOp::Equal, expected);
-                let new_int = old_value_int + 1;
-                let put_op = match self.lease_id {
-                    Some(lease_id) => {
-                        let put_opts = PutOptions::new().with_lease(lease_id);
-                        TxnOp::put(key.clone(), new_int.to_string(), Some(put_opts))
-                    }
-                    None => TxnOp::put(key.clone(), new_int.to_string(), None),
-                };
-                let txn = Txn::new().when(vec![compare]).and_then(vec![put_op]);
-                let txn_res = client.txn(txn).await.with_context(|| {
-                    format!("transaction failed when updating dist_id key {key}")
-                })?;
-                if txn_res.succeeded() {
-                    debug!("updated dist_id key {} to value {}", key, new_int);
-                    return Ok(new_int);
-                }
-            }
-
-            // On failure, advance our local guess and try again, just like Python.
-            let next_int = old_value_int + 1;
-            old_value_v = Some(next_int.to_string().into_bytes());
         }
 
         Err(anyhow!(
-            "DistributeIdAllocator with prefix {} failed to allocate id after 100 retries",
-            self.prefix
+            "DistributeIdAllocator with prefix {} failed after {} CAS conflicts",
+            self.prefix,
+            MAX_CAS_CONFLICTS
         ))
+    }
+}
+
+async fn read_counter_generation(
+    client: &Client,
+    key: &str,
+    max_retries: u32,
+) -> Result<Option<CounterGeneration>> {
+    let resp = retry_etcd_rpc(max_retries, "get_dist_id_counter", || {
+        let mut attempt_client = client.clone();
+        let attempt_key = key.to_string();
+        async move { attempt_client.get(attempt_key, None).await }
+    })
+    .await
+    .with_context(|| format!("failed to get dist_id key {key}"))?;
+    counter_generation_from_get(&resp, key)
+}
+
+fn counter_generation_from_get(resp: &GetResponse, key: &str) -> Result<Option<CounterGeneration>> {
+    if resp.kvs().len() > 1 {
+        return Err(anyhow!(
+            "dist_id Get returned duplicate exact keys for {}",
+            key
+        ));
+    }
+    resp.kvs()
+        .first()
+        .map(|kv| CounterGeneration::from_kv(kv, key))
+        .transpose()
+}
+
+fn allocator_cas_txn(
+    key: &str,
+    generation: Option<&CounterGeneration>,
+    candidate: i64,
+    lease_id: Option<i64>,
+) -> Txn {
+    let compares = match generation {
+        Some(generation) => vec![
+            Compare::mod_revision(key, CompareOp::Equal, generation.mod_revision),
+            Compare::lease(key, CompareOp::Equal, generation.lease_id),
+            Compare::value(key, CompareOp::Equal, generation.value.clone()),
+        ],
+        None => vec![Compare::create_revision(key, CompareOp::Equal, 0)],
+    };
+    let put = match lease_id {
+        Some(lease_id) => TxnOp::put(
+            key,
+            candidate.to_string(),
+            Some(PutOptions::new().with_lease(lease_id)),
+        ),
+        None => TxnOp::put(key, candidate.to_string(), None),
+    };
+    Txn::new()
+        .when(compares)
+        .and_then(vec![put])
+        .or_else(vec![TxnOp::get(key, None)])
+}
+
+fn allocator_cas_readback(txn_res: &TxnResponse, key: &str) -> Result<Option<CounterGeneration>> {
+    let responses = txn_res.op_responses();
+    let [TxnOpResponse::Get(get)] = responses.as_slice() else {
+        return Err(anyhow!(
+            "dist_id CAS readback returned invalid response shape for key {}: operations={}",
+            key,
+            responses.len()
+        ));
+    };
+    if get.kvs().len() > 1 {
+        return Err(anyhow!(
+            "dist_id CAS readback returned duplicate exact keys for {}",
+            key
+        ));
+    }
+    get.kvs()
+        .first()
+        .map(|kv| CounterGeneration::from_kv(kv, key))
+        .transpose()
+}
+
+fn next_candidate(
+    generation: Option<&CounterGeneration>,
+    minimum_counter_value: i64,
+) -> Result<i64> {
+    // Preserve the historical behavior of repairing a malformed counter from
+    // zero, while the exact generation fence still prevents overwriting a
+    // concurrently changed value.
+    let observed = generation
+        .and_then(|generation| std::str::from_utf8(&generation.value).ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let base = observed.max(minimum_counter_value);
+    base.checked_add(1)
+        .ok_or_else(|| anyhow!("dist_id counter overflow at {}", base))
+}
+
+fn is_transient_counter_read_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<etcd_client::Error>()
+            .is_some_and(is_transient_etcd_error)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Context;
+    use tonic::Status;
+
+    use super::{CounterGeneration, is_transient_counter_read_error, next_candidate};
+
+    fn generation(value: i64, mod_revision: i64) -> CounterGeneration {
+        CounterGeneration {
+            value: value.to_string().into_bytes(),
+            lease_id: 11,
+            mod_revision,
+        }
+    }
+
+    #[test]
+    fn ordinary_candidate_advances_observed_counter() {
+        assert_eq!(next_candidate(Some(&generation(41, 7)), 0).unwrap(), 42);
+        assert_eq!(next_candidate(None, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn uncertain_candidate_is_always_left_as_a_gap() {
+        let uncertain_candidate = 42;
+        assert_eq!(next_candidate(None, uncertain_candidate).unwrap(), 43);
+        assert_eq!(
+            next_candidate(Some(&generation(41, 7)), uncertain_candidate).unwrap(),
+            43
+        );
+        assert_eq!(
+            next_candidate(Some(&generation(42, 8)), uncertain_candidate).unwrap(),
+            43
+        );
+        assert_eq!(
+            next_candidate(Some(&generation(50, 9)), uncertain_candidate).unwrap(),
+            51
+        );
+    }
+
+    #[test]
+    fn malformed_counter_is_repaired_without_bypassing_generation_fence() {
+        let malformed = CounterGeneration {
+            value: b"invalid".to_vec(),
+            lease_id: 11,
+            mod_revision: 9,
+        };
+        assert_eq!(next_candidate(Some(&malformed), 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn recovery_detects_transient_etcd_error_through_context() {
+        let result: Result<(), etcd_client::Error> = Err(etcd_client::Error::GRpcStatus(
+            Status::unavailable("temporary"),
+        ));
+        let error = result.context("recovery Get failed").unwrap_err();
+        assert!(is_transient_counter_read_error(&error));
     }
 }
