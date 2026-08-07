@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -22,6 +23,7 @@ def main() -> None:
 
 
 from fluxon_py.runtime.process_runner import (  # noqa: E402
+    _build_runtime_subprocess_env,
     build_runtime_singleton_spec,
     register_ctrlc_callback,
     _stop_existing_processes_if_running,
@@ -63,6 +65,13 @@ class TestProcessRunner(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = _new_test_dir("process_runner")
         self.addCleanup(lambda: shutil.rmtree(self._tmp, ignore_errors=False))
+
+    def test_build_runtime_subprocess_env_prepends_repo_root(self) -> None:
+        with mock.patch.dict(os.environ, {"PYTHONPATH": "/tmp/custom"}, clear=True):
+            env = _build_runtime_subprocess_env()
+
+        self.assertEqual(env["PYTHONPATH"], f"{REPO_ROOT}:/tmp/custom")
+        self.assertEqual(env["PYTHONUNBUFFERED"], "1")
 
     def test_register_ctrlc_callback_runs_outside_signal_frame(self) -> None:
         script_path = self._tmp / "ctrlc_callback.py"
