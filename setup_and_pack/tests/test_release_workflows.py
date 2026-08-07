@@ -101,6 +101,10 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
         self.assertEqual(jobs["publish-github-release"]["environment"]["name"], "github-release")
         self.assertEqual(jobs["publish-pypi"]["environment"]["name"], "pypi")
+        self.assertEqual(
+            jobs["publish-pypi"]["environment"]["url"],
+            "https://pypi.org/project/fluxon-py/",
+        )
         self.assertEqual(jobs["publish-docker-image"]["environment"]["name"], "docker-image")
 
     def test_destination_credentials_and_permissions_are_scoped(self) -> None:

@@ -7,7 +7,7 @@ The release has one manual entrypoint: run `create_release_tag` from GitHub Acti
 | This page covers | This page does not cover | Why |
 |---|---|---|
 | Creating a release tag through GitHub Actions | Choosing the next version number | Version policy is a maintainer decision |
-| Publishing GitHub Release assets, the `fluxon-ai` PyPI wheel, and the Quick Start Docker image | Other package indexes or image registries | The current public destinations are GitHub, PyPI, and Docker Hub |
+| Publishing GitHub Release assets, the `fluxon-py` PyPI wheel, and the Quick Start Docker image | Other package indexes or image registries | The current public destinations are GitHub, PyPI, and Docker Hub |
 | Deterministic artifact checks, read-only Codex review, and destination approvals | Functional or integration testing | The release path does not run main CI, and Codex output is not a test result |
 | The GitHub Pages doc-site entrypoint | Dispatching a release onto remote machines | Remote deployment belongs to `deployment/manual_dispatch_release.py` |
 
@@ -92,7 +92,7 @@ Codex can identify inconsistencies and evidence gaps. It must disclose that main
 | Job | Environment | Published object | Credential boundary |
 |---|---|---|---|
 | `publish-github-release` | `github-release` | `fluxon_release.tar.gz` and `fluxon_quick_start_<version>_docker_image.tar.gz` | This job alone receives `contents: write` |
-| `publish-pypi` | `pypi` | The `fluxon_ai-*.whl` built in the release workflow and checked against the package contract | This job alone receives `id-token: write`; no `PYPI_TOKEN` is used |
+| `publish-pypi` | `pypi` | The `fluxon_py-*.whl` built in the release workflow and checked against the package contract | This job alone receives `id-token: write`; no `PYPI_TOKEN` is used |
 | `publish-docker-image` | `docker-image` | `hanbaoaaa/fluxon_quick_start:<version>` loaded from the reviewed image archive | Docker Hub credentials exist only in this environment |
 
 The three jobs depend on the same readiness review and do not depend on one another. Approving or retrying one destination does not serialize the others.
@@ -100,7 +100,7 @@ The three jobs depend on the same readiness review and do not depend on one anot
 The PyPI preparation checks tag identity, default-branch ancestry, distribution and version, the supported `cp38-abi3-manylinux_2_28_x86_64` wheel tag, `Requires-Python >=3.10`, file size, checksum, and `twine check`. Users install it with:
 
 ```bash
-python3 -m pip install fluxon-ai
+python3 -m pip install fluxon-py
 ```
 
 The Docker job loads the exact reviewed archive, verifies its local image identity, retags it with the canonical Docker Hub repository and release version, and pushes only that versioned tag. It does not update `latest`.

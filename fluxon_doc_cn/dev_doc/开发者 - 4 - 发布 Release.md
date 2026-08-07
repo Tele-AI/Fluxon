@@ -7,7 +7,7 @@ release 只有一个手动入口：从 GitHub Actions 运行 `create_release_tag
 | 本文覆盖 | 不覆盖 | 说明 |
 |---|---|---|
 | 通过 GitHub Actions 创建 release tag | 决定下一个版本号 | 版本策略由维护者决定 |
-| 发布 GitHub Release 产物、`fluxon-ai` PyPI wheel 和 Quick Start Docker image | 其他 package index 或 image registry | 当前公开目的地是 GitHub、PyPI 和 Docker Hub |
+| 发布 GitHub Release 产物、`fluxon-py` PyPI wheel 和 Quick Start Docker image | 其他 package index 或 image registry | 当前公开目的地是 GitHub、PyPI 和 Docker Hub |
 | 产物确定性检查、只读 Codex 审核和目的地审批 | 功能测试或集成测试 | 发布路径不运行 main CI；Codex 输出也不是测试结果 |
 | GitHub Pages 文档站入口 | 向远端机器 dispatch release | 远端部署属于 `deployment/manual_dispatch_release.py` |
 
@@ -92,7 +92,7 @@ Codex 可以指出不一致和证据缺口。它必须明确披露 main CI 被�
 | Job | Environment | 发布对象 | 凭据边界 |
 |---|---|---|---|
 | `publish-github-release` | `github-release` | `fluxon_release.tar.gz` 与 `fluxon_quick_start_<version>_docker_image.tar.gz` | 只有该 job 获得 `contents: write` |
-| `publish-pypi` | `pypi` | 发布 workflow 现场构建并通过包契约校验的 `fluxon_ai-*.whl` | 只有该 job 获得 `id-token: write`，不使用 `PYPI_TOKEN` |
+| `publish-pypi` | `pypi` | 发布 workflow 现场构建并通过包契约校验的 `fluxon_py-*.whl` | 只有该 job 获得 `id-token: write`，不使用 `PYPI_TOKEN` |
 | `publish-docker-image` | `docker-image` | `hanbaoaaa/fluxon_quick_start:<version>` | Docker Hub 凭据只存在于该 environment |
 
 三个 job 依赖同一 readiness review，彼此之间没有依赖。批准或重跑其中一个目的地不会串行化另外两个。
@@ -100,7 +100,7 @@ Codex 可以指出不一致和证据缺口。它必须明确披露 main CI 被�
 PyPI 准备阶段检查 tag 身份、默认分支历史、distribution 与版本、`cp38-abi3-manylinux_2_28_x86_64` wheel tag、`Requires-Python >=3.10`、文件大小、checksum 和 `twine check`。用户安装命令是：
 
 ```bash
-python3 -m pip install fluxon-ai
+python3 -m pip install fluxon-py
 ```
 
 Docker job 会加载准确的受审 image archive，校验本地 image identity，再使用规范 Docker Hub repository 与 release version 重新打 tag，只 push 版本 tag，不更新 `latest`。
