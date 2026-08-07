@@ -22,6 +22,7 @@ from ..config import _to_plain_yaml_obj
 
 RuntimeConfigInput = Path | Mapping[str, Any]
 FORCE_KILL_WAIT_SECONDS = 10.0
+_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -517,6 +518,7 @@ def _start_runtime_process(
 ) -> subprocess.Popen[bytes]:
     popen_kwargs: dict[str, Any] = {
         "preexec_fn": build_parent_death_sigterm_preexec(expected_parent_pid=os.getpid()),
+        "env": _build_runtime_subprocess_env(),
     }
     if cwd is not None:
         popen_kwargs["cwd"] = str(cwd)
@@ -536,6 +538,22 @@ def _start_runtime_process(
         log_file.close()
 
     return proc
+
+
+def _build_runtime_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    package_root = str(_PACKAGE_ROOT)
+    pythonpath_parts: list[str] = [package_root]
+    if existing_pythonpath:
+        for entry in existing_pythonpath.split(os.pathsep):
+            stripped = entry.strip()
+            if not stripped or stripped == package_root:
+                continue
+            pythonpath_parts.append(stripped)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
 
 
 def _set_parent_death_sigterm(*, expected_parent_pid: int) -> None:
