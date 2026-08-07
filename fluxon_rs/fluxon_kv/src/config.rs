@@ -11,6 +11,10 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+pub(crate) fn default_etcd_rpc_max_retries() -> u32 {
+    fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES
+}
+
 /// YAML wrapper to distinguish between:
 /// - key missing: `Option::None`
 /// - key present with null: `Some(YamlNullable::Null)`
@@ -660,6 +664,8 @@ pub struct MasterConfigYaml {
     pub port: Option<u16>,
     pub etcd_endpoints: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub etcd_rpc_max_retries: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub monitoring: Option<MonitoringConfigYaml>, // monitoring config (prometheus base url, optional remote write, optional otlp_log_api)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfigYaml>,
@@ -679,6 +685,7 @@ pub struct MasterConfig {
     pub cluster_name: String,
     pub port: Option<u16>,
     pub etcd_endpoints: Vec<String>,
+    pub etcd_rpc_max_retries: u32,
     pub protocol: ProtocolConfig,
     pub transfer_engine: TransferEngineType,
     pub enable_transfer_rpc_fast_path: bool,
@@ -704,6 +711,8 @@ pub struct ContributeToClusterPoolSizeYaml {
 pub struct FluxonKvSpecYaml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etcd_addresses: Option<YamlNullable<Vec<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub etcd_rpc_max_retries: Option<YamlNullable<u32>>,
     pub cluster_name: String,
     pub share_mem_path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -785,6 +794,7 @@ pub struct ContributeToClusterPoolSize {
 #[derive(Debug, Clone)]
 pub struct FluxonKvSpec {
     pub etcd_addresses: Vec<String>,
+    pub etcd_rpc_max_retries: u32,
     pub cluster_name: String,
     pub p2p_listen_port: Option<u16>,
     pub transfer_engine: TransferEngineType,
@@ -1346,6 +1356,12 @@ impl ClientConfigYaml {
                 }
                 .into_kverror());
             }
+            if self.fluxonkv_spec.etcd_rpc_max_retries.is_some() {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "fluxonkv_spec.etcd_rpc_max_retries is forbidden in zero-contribution mode (it is inherited from owner shared.json)".to_string(),
+                }
+                .into_kverror());
+            }
             if self.fluxonkv_spec.large_file_paths.is_some() {
                 return Err(ConfigError::InvalidClientConfig {
                     detail: "fluxonkv_spec.large_file_paths is forbidden in zero-contribution mode (it is inherited from owner shared.json)".to_string(),
@@ -1485,6 +1501,18 @@ impl ClientConfigYaml {
 
         let fluxonkv_spec = FluxonKvSpec {
             etcd_addresses: etcd_endpoints,
+            etcd_rpc_max_retries: match self.fluxonkv_spec.etcd_rpc_max_retries {
+                None => default_etcd_rpc_max_retries(),
+                Some(YamlNullable::Value(value)) => value,
+                Some(YamlNullable::Null) => {
+                    return Err(ConfigError::InvalidClientConfig {
+                        detail:
+                            "fluxonkv_spec.etcd_rpc_max_retries must be an integer when provided"
+                                .to_string(),
+                    }
+                    .into_kverror());
+                }
+            },
             cluster_name: self.fluxonkv_spec.cluster_name,
             p2p_listen_port: self.fluxonkv_spec.p2p_listen_port,
             transfer_engine,
@@ -1901,6 +1929,9 @@ impl MasterConfigYaml {
             cluster_name: self.cluster_name,
             port: self.port,
             etcd_endpoints: self.etcd_endpoints,
+            etcd_rpc_max_retries: self
+                .etcd_rpc_max_retries
+                .unwrap_or_else(default_etcd_rpc_max_retries),
             protocol,
             transfer_engine,
             enable_transfer_rpc_fast_path: resolve_enable_transfer_rpc_fast_path(
@@ -2982,6 +3013,99 @@ test_spec_config:
         )
         .unwrap_err();
         assert!(format!("{err}").contains("unknown field `legacy_transfer_backend`"));
+    }
+
+    #[test]
+    fn client_config_etcd_rpc_retries_default_and_explicit_values() {
+        let owner_yaml = |retry_line: &str| {
+            format!(
+                r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {{}}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+{retry_line}  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner
+  large_file_paths: [/tmp/test_owner_large]
+  sub_cluster: rack-a
+"#
+            )
+        };
+
+        let defaulted = ClientConfigYaml::from_str(&owner_yaml(""))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(defaulted.fluxonkv_spec.etcd_rpc_max_retries, 2);
+
+        let disabled = ClientConfigYaml::from_str(&owner_yaml("  etcd_rpc_max_retries: 0\n"))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(disabled.fluxonkv_spec.etcd_rpc_max_retries, 0);
+
+        let overridden = ClientConfigYaml::from_str(&owner_yaml("  etcd_rpc_max_retries: 7\n"))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(overridden.fluxonkv_spec.etcd_rpc_max_retries, 7);
+    }
+
+    #[test]
+    fn zero_contribution_config_rejects_etcd_rpc_retry_override() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_external
+fluxonkv_spec:
+  etcd_rpc_max_retries: 0
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_external
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        assert!(
+            format!("{err}").contains(
+                "fluxonkv_spec.etcd_rpc_max_retries is forbidden in zero-contribution mode"
+            )
+        );
+    }
+
+    #[test]
+    fn master_config_etcd_rpc_retries_default_and_explicit_values() {
+        let master_yaml = |retry_line: &str| {
+            format!(
+                r#"
+instance_key: test_master
+cluster_name: test_cluster
+port: 18080
+etcd_endpoints: ["127.0.0.1:2379"]
+{retry_line}monitoring:
+  prometheus_base_url: "http://127.0.0.1:4000/v1/prometheus"
+log_dir: /tmp/test_master_logs
+"#
+            )
+        };
+
+        let defaulted = MasterConfigYaml::from_str(&master_yaml(""))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(defaulted.etcd_rpc_max_retries, 2);
+
+        let disabled = MasterConfigYaml::from_str(&master_yaml("etcd_rpc_max_retries: 0\n"))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(disabled.etcd_rpc_max_retries, 0);
+
+        let overridden = MasterConfigYaml::from_str(&master_yaml("etcd_rpc_max_retries: 9\n"))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(overridden.etcd_rpc_max_retries, 9);
     }
 
     #[test]

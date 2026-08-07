@@ -1071,6 +1071,7 @@ fn new_master_launch(
             cluster_name: round.cluster_name.clone(),
             port,
             etcd_endpoints: vec![etcd.clone()],
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             protocol,
             transfer_engine,
             enable_transfer_rpc_fast_path,
@@ -1127,6 +1128,7 @@ fn build_client_launch(
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: fluxonkv_etcd_addresses,
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: round.cluster_name.clone(),
             p2p_listen_port: None,
             transfer_engine: options

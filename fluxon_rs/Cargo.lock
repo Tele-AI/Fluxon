@@ -1321,7 +1321,6 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
- "tonic 0.10.2",
  "tracing",
 ]
 
@@ -1461,6 +1460,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tonic 0.10.2",
  "tracing",
  "tracing-appender",
  "tracing-log 0.1.4",

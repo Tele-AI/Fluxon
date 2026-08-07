@@ -1,12 +1,9 @@
 use crate::keys;
+use etcd_client as etcd;
+use fluxon_util::etcd::retry_etcd_rpc;
+use fluxon_util::lease_manager::{GeneralLease, LeaseBackendUid, LeaseManager};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::debug;
-
-use anyhow::Context;
-use etcd_client as etcd;
-use fluxon_util::etcd::DistributeIdAllocator;
-use fluxon_util::lease_manager::{GeneralLease, LeaseBackendUid, LeaseManager};
 
 /// Initial produce offset when no messages have been produced.
 pub const PRODUCE_OFFSET_BEGIN: i64 = -1;
@@ -14,6 +11,10 @@ pub const PRODUCE_OFFSET_BEGIN: i64 = -1;
 pub const CONSUME_OFFSET_BEGIN: i64 = 0;
 /// Minimum supported TTL for MQ metadata/member leases.
 pub const MIN_TTL_SECONDS: i64 = 90;
+
+pub(crate) const fn etcd_rpc_attempt_limit(max_retries: u32) -> u64 {
+    max_retries as u64 + 1
+}
 
 /// Channel type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,12 +122,43 @@ pub enum MpscError {
     InvalidUtf8 { chan_id: i64 },
 }
 
-/// Helper result for channel meta that also carries the etcd version
-/// of the meta key. 版本用于在后续步骤中做事务校验，确保在
-/// 使用 meta 构造 ChanManager 期间，该 meta 没有被删除或修改。
+/// Channel metadata plus its exact etcd generation.
+///
+/// The raw value, lease and modification revision fence bootstrap checks and
+/// hard-failure cleanup so a replay cannot validate or delete a newer key.
+#[derive(Debug, Clone)]
 pub struct ChanMetaWithVersion {
     pub meta: ChanGlobalMeta,
     pub version: i64,
+    pub mod_revision: i64,
+    pub lease_id: i64,
+    pub raw_value: Vec<u8>,
+}
+
+fn chan_meta_from_get_response(
+    resp: &etcd::GetResponse,
+    chan_id: i64,
+) -> Result<ChanMetaWithVersion, MpscError> {
+    let kv = match resp.kvs().first() {
+        Some(kv) => kv,
+        None => return Err(MpscError::ChanMetaNotFound(chan_id)),
+    };
+    let raw_value = kv.value().to_vec();
+    let meta: ChanGlobalMeta = serde_json::from_slice(&raw_value)
+        .map_err(|source| MpscError::InvalidChanMeta { chan_id, source })?;
+    if meta.ttl_seconds < MIN_TTL_SECONDS {
+        return Err(MpscError::InvalidTtl {
+            chan_id,
+            ttl_seconds: meta.ttl_seconds,
+        });
+    }
+    Ok(ChanMetaWithVersion {
+        meta,
+        version: kv.version(),
+        mod_revision: kv.mod_revision(),
+        lease_id: kv.lease(),
+        raw_value,
+    })
 }
 
 /// Get channel meta and its etcd version for the given channel id.
@@ -140,22 +172,23 @@ pub async fn get_chan_meta_with_version(
 ) -> Result<ChanMetaWithVersion, MpscError> {
     let key = keys::etcd_meta_key(chan_id);
     let resp = client.get(key, None).await?;
-    let kvs = resp.kvs();
-    let kv = match kvs.first() {
-        Some(kv) => kv,
-        None => return Err(MpscError::ChanMetaNotFound(chan_id)),
-    };
-    let value = kv.value();
-    let meta: ChanGlobalMeta = serde_json::from_slice(value)
-        .map_err(|source| MpscError::InvalidChanMeta { chan_id, source })?;
-    if meta.ttl_seconds < MIN_TTL_SECONDS {
-        return Err(MpscError::InvalidTtl {
-            chan_id,
-            ttl_seconds: meta.ttl_seconds,
-        });
-    }
-    let version = kv.version();
-    Ok(ChanMetaWithVersion { meta, version })
+    chan_meta_from_get_response(&resp, chan_id)
+}
+
+/// Get channel metadata with configured retries for transient unary RPC failures.
+pub async fn get_chan_meta_with_version_with_retry(
+    client: &mut etcd::Client,
+    chan_id: i64,
+    max_retries: u32,
+) -> Result<ChanMetaWithVersion, MpscError> {
+    let key = keys::etcd_meta_key(chan_id);
+    let resp = retry_etcd_rpc(max_retries, "mq_get_channel_meta", || {
+        let mut attempt_client = client.clone();
+        let attempt_key = key.clone();
+        async move { attempt_client.get(attempt_key, None).await }
+    })
+    .await?;
+    chan_meta_from_get_response(&resp, chan_id)
 }
 
 /// Get channel meta for the given channel id, without exposing etcd
@@ -166,6 +199,17 @@ pub async fn get_chan_meta(
     chan_id: i64,
 ) -> Result<ChanGlobalMeta, MpscError> {
     let ChanMetaWithVersion { meta, .. } = get_chan_meta_with_version(client, chan_id).await?;
+    Ok(meta)
+}
+
+/// Get channel metadata with configured retries for transient unary RPC failures.
+pub async fn get_chan_meta_with_retry(
+    client: &mut etcd::Client,
+    chan_id: i64,
+    max_retries: u32,
+) -> Result<ChanGlobalMeta, MpscError> {
+    let ChanMetaWithVersion { meta, .. } =
+        get_chan_meta_with_version_with_retry(client, chan_id, max_retries).await?;
     Ok(meta)
 }
 
@@ -206,6 +250,7 @@ pub struct ChanManager {
     /// 决定好 payload lease id，并通过 LeaseManager 注册
     /// 对应的 kvclient keepalive；此处始终持有一个有效句柄。
     pub payload_lease: GeneralLease,
+    pub(crate) etcd_rpc_max_retries: u32,
     pub(crate) etcd_client: etcd::Client,
 }
 
@@ -226,5 +271,22 @@ impl ChanManager {
     /// 时应复用该 lease，而不是额外创建新的 lease。
     pub fn member_lease_id(&self) -> i64 {
         self.member_lease.id() as i64
+    }
+
+    /// Number of unary etcd retries after the initial attempt.
+    pub fn etcd_rpc_max_retries(&self) -> u32 {
+        self.etcd_rpc_max_retries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::etcd_rpc_attempt_limit;
+
+    #[test]
+    fn retry_limit_counts_attempts_without_usize_overflow() {
+        assert_eq!(etcd_rpc_attempt_limit(0), 1);
+        assert_eq!(etcd_rpc_attempt_limit(2), 3);
+        assert_eq!(etcd_rpc_attempt_limit(u32::MAX), u64::from(u32::MAX) + 1);
     }
 }

@@ -239,6 +239,7 @@ async fn main() -> Result<()> {
         cluster_example_arg: ClusterExampleNewArg::new(Arc::clone(&shutdown)),
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints,
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: args.cluster_name.clone(),
             instance_name: Some(args.instance_name.clone()),
             port: Some(args.port),

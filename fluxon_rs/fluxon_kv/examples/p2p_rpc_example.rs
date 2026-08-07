@@ -359,6 +359,7 @@ async fn main() -> AnyResult<()> {
     let chat_arg = ChatModuleNewArg::new(node_name.to_string());
     let cluster_manager_arg = ClusterManagerNewArg {
         etcd_endpoints: vec![args.etcd_endpoint],
+        etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
         cluster_name: args.cluster_name,
         instance_name: Some(args.instance_name.clone()),
         port: None, // Port is now discovered automatically

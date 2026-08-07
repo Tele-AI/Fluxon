@@ -31,6 +31,7 @@ fn new_master_config(
         cluster_name: cluster.to_string(),
         port,
         etcd_endpoints: vec![etcd.to_string()],
+        etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
             rdma_device_names: None,
@@ -81,6 +82,7 @@ fn new_client_config(
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: vec![etcd.to_string()],
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster.to_string(),
             p2p_listen_port: None,
             transfer_engine: TransferEngineType::Closed,
@@ -126,6 +128,7 @@ fn new_zero_contribution_client_config(
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),
+            etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
             cluster_name: cluster.to_string(),
             p2p_listen_port: None,
             transfer_engine: TransferEngineType::P2p,

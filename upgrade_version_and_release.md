@@ -43,7 +43,7 @@ flowchart LR
 - `fluxon_rs/Cargo.toml` 的 workspace 版本
 - `fluxon_rs/Cargo.toml` 中每个 workspace member 对应的 `Cargo.toml`
 
-公开发布版本与闭源通信 SDK 契约版本相互独立。本轮 `sdk_version` 与 open-surface 契约均保留 `0.2.1`：`fluxon_rs/fluxon_commu_contract/src/lib.rs` 的 `FLUXON_COMMU_OPEN_SURFACE_VERSION` 是公开契约版本的唯一来源，release resolver 会把它与 SDK manifest 的 `required_open_surface_version` 对照，运行时再与 SDK 二进制导出的值对照。只有 open surface 本身发生不兼容变化时才升级该常量；升级前必须重建并验证 SDK 二进制，再更新随二进制生成的 manifest，不能只修改 JSON。
+公开发布版本与闭源通信 SDK 契约版本相互独立。本轮 `ClusterManagerNewArg` 的 bitcode payload 发生不兼容变化，因此 `sdk_version` 与 open-surface 契约同步升级为 `0.2.2`：`fluxon_rs/fluxon_commu_contract/src/lib.rs` 的 `FLUXON_COMMU_OPEN_SURFACE_VERSION` 是公开契约版本的唯一来源，release resolver 会把它与 SDK manifest 的 `required_open_surface_version` 对照，运行时再与 SDK 二进制导出的值对照。只有 open surface 本身发生不兼容变化时才升级该常量；升级前必须重建并验证 SDK 二进制，再更新随二进制生成的 manifest，不能只修改 JSON。
 
 同时新增 `fluxon_release/release_notes/v<version>.md`，并同步更新 `README.md`、`README_CN.md` 和 Quick Start 公开示例。仓库中的 YAML 默认是示例，不为版本升级直接改写。
 

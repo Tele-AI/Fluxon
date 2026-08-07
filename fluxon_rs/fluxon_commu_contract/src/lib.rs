@@ -1,7 +1,7 @@
 extern crate self as fluxon_commu_contract;
 
 /// Version of the open contract consumed by the closed communication SDK.
-pub const FLUXON_COMMU_OPEN_SURFACE_VERSION: &str = "0.2.1";
+pub const FLUXON_COMMU_OPEN_SURFACE_VERSION: &str = "0.2.2";
 
 pub mod closed_runtime;
 pub mod cluster;

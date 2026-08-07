@@ -816,6 +816,7 @@ fn build_side_transfer_worker_config(
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),
+            etcd_rpc_max_retries: owner_config.fluxonkv_spec.etcd_rpc_max_retries,
             cluster_name: owner_config.cluster_name.clone(),
             p2p_listen_port,
             transfer_engine: TransferEngineType::P2p,
@@ -871,6 +872,7 @@ fn build_side_transfer_worker_config_yaml(
         pprof_duration_seconds: side_config.pprof_duration_seconds,
         fluxonkv_spec: crate::config::FluxonKvSpecYaml {
             etcd_addresses: None,
+            etcd_rpc_max_retries: None,
             cluster_name: side_config.cluster_name,
             share_mem_path: side_config.share_mem_path,
             large_file_paths: None,
@@ -1402,6 +1404,10 @@ async fn finish_framework_init(
     ))
 }
 
+fn etcd_metadata_uri(endpoints: &[String]) -> String {
+    endpoints.join(",")
+}
+
 async fn run_master_impl(
     config_arg: ConfigArg<MasterConfig>,
     test_overrides: Option<MasterRunTestOverrides>,
@@ -1507,6 +1513,7 @@ async fn run_master_impl(
     let init_args = InitArgsMaster {
         cluster_manager_arg: ClusterManagerNewArg {
             etcd_endpoints: config.etcd_endpoints.clone(),
+            etcd_rpc_max_retries: config.etcd_rpc_max_retries,
             cluster_name: config.cluster_name.clone(),
             instance_name: Some(config.instance_key.clone()),
             port: None,
@@ -1527,7 +1534,8 @@ async fn run_master_impl(
             config.test_spec_config.user_rpc_sync_handler_thread_count,
         ),
         client_transfer_engine_arg: ClientTransferEngineNewArg {
-            metadata_uri: config.etcd_endpoints[0].clone(),
+            metadata_uri: etcd_metadata_uri(&config.etcd_endpoints),
+            etcd_rpc_max_retries: config.etcd_rpc_max_retries,
             instance_name: config.instance_key.clone(),
             enable_transfer_rpc_fast_path: config.enable_transfer_rpc_fast_path,
             rpc_port: 12345,
@@ -1650,6 +1658,7 @@ async fn bootstrap_zero_contribution_client_config(config: ClientConfig) -> KvRe
     let mut final_config = config;
     final_config.etcd_addresses_raw = metadata.meta.etcd_addresses.clone();
     final_config.fluxonkv_spec.etcd_addresses = metadata.etcd_endpoints;
+    final_config.fluxonkv_spec.etcd_rpc_max_retries = metadata.meta.etcd_rpc_max_retries;
     final_config.fluxonkv_spec.sub_cluster = metadata.meta.sub_cluster.clone();
     final_config.share_mem_path = metadata.share_mem_path;
     final_config.large_file_paths = metadata.meta.large_file_paths;
@@ -2021,6 +2030,7 @@ async fn run_client_impl(
         let init_args = InitArgsExternal {
             cluster_manager_arg: ClusterManagerNewArg {
                 etcd_endpoints: config.fluxonkv_spec.etcd_addresses.clone(),
+                etcd_rpc_max_retries: config.fluxonkv_spec.etcd_rpc_max_retries,
                 cluster_name: config.cluster_name.clone(),
                 instance_name: Some(config.instance_key.clone()),
                 port: None,
@@ -2096,6 +2106,7 @@ async fn run_client_impl(
         let init_args = InitArgsOwner {
             cluster_manager_arg: ClusterManagerNewArg {
                 etcd_endpoints: config.fluxonkv_spec.etcd_addresses.clone(),
+                etcd_rpc_max_retries: config.fluxonkv_spec.etcd_rpc_max_retries,
                 cluster_name: config.cluster_name.clone(),
                 instance_name: Some(config.instance_key.clone()),
                 port: None,
@@ -2134,6 +2145,7 @@ async fn run_client_impl(
                 large_file_paths: config.large_file_paths.clone(),
                 cluster_name: config.cluster_name.clone(),
                 etcd_addresses: config.etcd_addresses_raw.clone(),
+                etcd_rpc_max_retries: config.fluxonkv_spec.etcd_rpc_max_retries,
                 attach_existing_meta: if is_side_transfer_worker {
                     Some(bootstrapped_shared_meta.clone().ok_or_else(|| {
                         anyhow::anyhow!(
@@ -2150,7 +2162,8 @@ async fn run_client_impl(
                     .map(Duration::from_secs),
             },
             client_transfer_engine_arg: ClientTransferEngineNewArg {
-                metadata_uri: config.fluxonkv_spec.etcd_addresses[0].clone(),
+                metadata_uri: etcd_metadata_uri(&config.fluxonkv_spec.etcd_addresses),
+                etcd_rpc_max_retries: config.fluxonkv_spec.etcd_rpc_max_retries,
                 instance_name: config.instance_key.clone(),
                 enable_transfer_rpc_fast_path: config.fluxonkv_spec.enable_transfer_rpc_fast_path,
                 rpc_port: 12345,
@@ -2524,6 +2537,17 @@ mod tests {
     use std::path::Path;
     use uuid::Uuid;
 
+    #[test]
+    fn etcd_metadata_uri_keeps_all_configured_endpoints() {
+        assert_eq!(
+            etcd_metadata_uri(&[
+                "http://etcd-a:2379".to_string(),
+                "http://etcd-b:2379".to_string(),
+            ]),
+            "http://etcd-a:2379,http://etcd-b:2379"
+        );
+    }
+
     fn new_test_dir(prefix: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("{}_{}", prefix, Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
@@ -2548,6 +2572,7 @@ mod tests {
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: vec!["http://127.0.0.1:2379".to_string()],
+                etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
                 cluster_name: "test_cluster".to_string(),
                 p2p_listen_port: Some(41000),
                 transfer_engine: TransferEngineType::P2p,
@@ -2866,6 +2891,7 @@ mod tests {
             sub_cluster: Some("owner-sub".to_string()),
             cluster_name: "test_cluster".to_string(),
             etcd_addresses: vec!["127.0.0.1:2379".to_string()],
+            etcd_rpc_max_retries: 7,
             share_mem_path: std::fs::canonicalize(&share_mem_root)
                 .unwrap()
                 .to_string_lossy()
@@ -2879,6 +2905,7 @@ mod tests {
         };
         let shared_meta_json = serde_json::to_string(&shared_meta).unwrap();
         assert!(shared_meta_json.contains("\"large_file_paths\":["));
+        assert!(shared_meta_json.contains("\"etcd_rpc_max_retries\":7"));
         assert!(!shared_meta_json.contains("root_paths"));
         std::fs::write(
             share_mem_root.join("shared.json"),
@@ -2903,6 +2930,7 @@ mod tests {
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: Vec::new(),
+                etcd_rpc_max_retries: fluxon_util::etcd::DEFAULT_ETCD_RPC_MAX_RETRIES,
                 cluster_name: "test_cluster".to_string(),
                 p2p_listen_port: Some(41001),
                 transfer_engine: TransferEngineType::P2p,
@@ -2930,6 +2958,7 @@ mod tests {
             bootstrapped.fluxonkv_spec.etcd_addresses,
             vec!["http://127.0.0.1:2379".to_string()]
         );
+        assert_eq!(bootstrapped.fluxonkv_spec.etcd_rpc_max_retries, 7);
     }
 
     #[test]

@@ -1,13 +1,13 @@
 pub mod consumer;
 pub mod create;
 pub mod error;
-mod etcd_retry;
 pub mod framework;
 pub mod keys;
 pub mod lease_manager;
 pub mod lifecycle;
 pub mod manager;
 pub mod nonblocking_monitor;
+mod offset_commit;
 pub mod producer;
 pub mod shutdown;
 

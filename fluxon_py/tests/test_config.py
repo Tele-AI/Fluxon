@@ -46,6 +46,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("load_from_file", _run_test_load_from_file),
         ("to_yaml_str_roundtrip", _run_test_to_yaml_str_roundtrip),
         ("fluxonkv_sub_cluster_config", test_fluxonkv_sub_cluster_config),
+        ("fluxonkv_etcd_rpc_max_retries", test_fluxonkv_etcd_rpc_max_retries),
         ("fluxonkv_owner_requires_sub_cluster", test_fluxonkv_owner_requires_sub_cluster),
         ("fluxonkv_owner_requires_large_file_paths", test_fluxonkv_owner_requires_large_file_paths),
         ("fluxonkv_large_limit_size_contract", test_fluxonkv_large_limit_size_contract),
@@ -182,6 +183,46 @@ def test_fluxonkv_sub_cluster_config():
         print("✅ PASS: test_fluxonkv_sub_cluster_config")
     except Exception as e:
         print(f"❌ FAIL: test_fluxonkv_sub_cluster_config - {e}")
+
+
+def test_fluxonkv_etcd_rpc_max_retries():
+    """Ensure owner retry overrides accept zero and external configs inherit the value."""
+    try:
+        owner = _owner_fluxonkv_base_config(tag="etcd_rpc_retries")
+        owner["fluxonkv_spec"]["etcd_rpc_max_retries"] = 0
+        loaded = yaml.safe_load(
+            FluxonKvClientConfig(owner).to_fluxon_kv_client_config_yaml_str()
+        )
+        assert loaded["fluxonkv_spec"]["etcd_rpc_max_retries"] == 0
+
+        for invalid_value in (None, True, -1, 2**32):
+            invalid = _owner_fluxonkv_base_config(tag="etcd_rpc_retries_invalid")
+            invalid["fluxonkv_spec"]["etcd_rpc_max_retries"] = invalid_value
+            try:
+                FluxonKvClientConfig(invalid)
+                raise AssertionError(
+                    f"invalid etcd_rpc_max_retries accepted: {invalid_value!r}"
+                )
+            except ValueError:
+                pass
+
+        external = {
+            "instance_key": "test_external",
+            "fluxonkv_spec": {
+                "cluster_name": "test_cluster",
+                "share_mem_path": "/tmp/kvcache_shared_memory/test",
+                "etcd_rpc_max_retries": 0,
+            },
+        }
+        try:
+            FluxonKvClientConfig(external)
+            raise AssertionError("external etcd retry override should be rejected")
+        except ValueError:
+            pass
+
+        print("✅ PASS: test_fluxonkv_etcd_rpc_max_retries")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_etcd_rpc_max_retries - {e}")
 
 
 def test_fluxon_pyo3_import_authority():

@@ -1,6 +1,7 @@
 pub use crate::cluster::{
     ClusterError, ClusterEvent, ClusterMember, ClusterResult, EtcdPrefixScanAction, NodeID,
     NodeIDStr, NodeIDString, NodeRole, scan_etcd_prefix_paginated,
+    scan_etcd_prefix_paginated_with_retry,
 };
 pub use crate::config::NetworkConfig;
 pub use crate::member_metadata::{
@@ -80,6 +81,7 @@ impl IpcBandwidthAttributorHandle {
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct ClusterManagerNewArg {
     pub etcd_endpoints: Vec<String>,
+    pub etcd_rpc_max_retries: u32,
     pub cluster_name: String,
     pub instance_name: Option<String>,
     pub port: Option<u16>,

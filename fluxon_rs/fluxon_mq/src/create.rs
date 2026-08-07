@@ -2,31 +2,138 @@ use anyhow::Context;
 use etcd_client as etcd;
 use std::time::Duration;
 
-use fluxon_util::etcd::{etcd_clients_pool, get_cluster_lease_id, DistributeIdAllocator};
+use fluxon_util::etcd::{
+    etcd_clients_pool, get_cluster_lease_id_with_retry, is_transient_etcd_error, retry_etcd_rpc,
+    DistributeIdAllocator,
+};
 use fluxon_util::lease_manager::{
     record_register_by as lm_record_register_by, registered_etcd_client, LeaseBackendUid,
     LeaseManager, LeaseRegisterKind,
 };
 
 use crate::error::MpscError;
-use crate::etcd_retry::is_transient_etcd_error;
 use crate::keys;
 use crate::manager::{
-    get_chan_meta_with_version, ChanGlobalMeta, ChanManager, ChanMetaWithVersion,
-    MpscError as ManagerMpscError,
+    etcd_rpc_attempt_limit, get_chan_meta_with_version, get_chan_meta_with_version_with_retry,
+    ChanGlobalMeta, ChanManager, ChanMetaWithVersion, MpscError as ManagerMpscError,
 };
 use crate::shutdown::ShutdownCtl;
 
 const MPMC_SUBCHANNEL_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
-const MPMC_SUBCHANNEL_METADATA_ATTEMPTS: usize = 3;
 const MPMC_SUBCHANNEL_METADATA_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredEtcdGeneration {
+    value: Vec<u8>,
+    lease_id: i64,
+    mod_revision: i64,
+}
+
+impl StoredEtcdGeneration {
+    fn from_kv(kv: &etcd::KeyValue, expected_key: &str) -> anyhow::Result<Self> {
+        if kv.key() != expected_key.as_bytes() {
+            anyhow::bail!(
+                "etcd readback returned an unexpected key for {}",
+                expected_key
+            );
+        }
+        Ok(Self {
+            value: kv.value().to_vec(),
+            lease_id: kv.lease(),
+            mod_revision: kv.mod_revision(),
+        })
+    }
+}
+
+fn txn_single_get_generation(
+    txn_res: &etcd::TxnResponse,
+    key: &str,
+    operation: &str,
+) -> anyhow::Result<Option<StoredEtcdGeneration>> {
+    let responses = txn_res.op_responses();
+    let [etcd::TxnOpResponse::Get(get)] = responses.as_slice() else {
+        anyhow::bail!(
+            "{} readback returned an invalid response shape: operations={}",
+            operation,
+            responses.len()
+        );
+    };
+    if get.kvs().len() > 1 {
+        anyhow::bail!("{} readback returned duplicate exact keys", operation);
+    }
+    get.kvs()
+        .first()
+        .map(|kv| StoredEtcdGeneration::from_kv(kv, key))
+        .transpose()
+}
+
+fn exact_meta_compares(key: &str, meta: &ChanMetaWithVersion) -> Vec<etcd::Compare> {
+    vec![
+        etcd::Compare::mod_revision(key, etcd::CompareOp::Equal, meta.mod_revision),
+        etcd::Compare::lease(key, etcd::CompareOp::Equal, meta.lease_id),
+        etcd::Compare::value(key, etcd::CompareOp::Equal, meta.raw_value.clone()),
+    ]
+}
+
+fn reconcile_channel_meta_cleanup_observation(
+    observed: Option<StoredEtcdGeneration>,
+    expected: &StoredEtcdGeneration,
+) -> anyhow::Result<Option<i64>> {
+    match observed {
+        None => Ok(None),
+        Some(current) if &current != expected => Ok(Some(current.mod_revision)),
+        Some(_) => anyhow::bail!(
+            "channel meta cleanup compare was false although the exact generation still exists"
+        ),
+    }
+}
+
+async fn cleanup_exact_channel_meta(
+    client: &mut etcd::Client,
+    key: &str,
+    meta: &ChanMetaWithVersion,
+    max_retries: u32,
+) -> anyhow::Result<()> {
+    let txn_res = retry_etcd_rpc(max_retries, "mq_cleanup_channel_meta", || {
+        let mut attempt_client = client.clone();
+        let txn = etcd::Txn::new()
+            .when(exact_meta_compares(key, meta))
+            .and_then(vec![etcd::TxnOp::delete(key, None)])
+            .or_else(vec![etcd::TxnOp::get(key, None)]);
+        async move { attempt_client.txn(txn).await }
+    })
+    .await?;
+    if txn_res.succeeded() {
+        return Ok(());
+    }
+
+    let observed = txn_single_get_generation(&txn_res, key, "channel meta cleanup")?;
+    let expected = StoredEtcdGeneration {
+        value: meta.raw_value.clone(),
+        lease_id: meta.lease_id,
+        mod_revision: meta.mod_revision,
+    };
+    if let Some(current_mod_revision) =
+        reconcile_channel_meta_cleanup_observation(observed, &expected)?
+    {
+        tracing::warn!(
+            meta_key = key,
+            expected_mod_revision = expected.mod_revision,
+            current_mod_revision,
+            "channel meta cleanup skipped a different generation"
+        );
+    }
+    Ok(())
+}
 
 async fn load_mpmc_subchannel_metadata(
     client: &mut etcd::Client,
     chan_id: i64,
     shutdown: &ShutdownCtl,
+    etcd_rpc_max_retries: u32,
 ) -> anyhow::Result<ChanMetaWithVersion> {
-    for attempt in 1..=MPMC_SUBCHANNEL_METADATA_ATTEMPTS {
+    let max_attempts = etcd_rpc_attempt_limit(etcd_rpc_max_retries);
+    for attempt in 1..=max_attempts {
         let attempt_started = std::time::Instant::now();
         let result = tokio::select! {
             biased;
@@ -61,7 +168,7 @@ async fn load_mpmc_subchannel_metadata(
             ),
         };
 
-        if attempt == MPMC_SUBCHANNEL_METADATA_ATTEMPTS {
+        if attempt == max_attempts {
             anyhow::bail!(
                 "get_chan_meta failed after {} attempts for chan_id={}: {}",
                 attempt,
@@ -73,7 +180,7 @@ async fn load_mpmc_subchannel_metadata(
         tracing::warn!(
             chan_id,
             attempt,
-            max_attempts = MPMC_SUBCHANNEL_METADATA_ATTEMPTS,
+            max_attempts,
             elapsed_ms = attempt_started.elapsed().as_millis(),
             reason = %retry_reason,
             "Retrying MPMC subchannel metadata read"
@@ -98,6 +205,8 @@ pub struct ChanCreateConfig {
     pub capacity: i64,
     pub ttl_seconds: i64,
     pub weight: Option<i64>,
+    /// Number of unary etcd retries after the initial attempt.
+    pub etcd_rpc_max_retries: u32,
     /// Optional override for the channel-level global lease id.
     ///
     /// When present, `create_mpsc_channel` will reuse this lease id
@@ -158,7 +267,11 @@ pub async fn create_mpsc_channel(
     // This top-level counter must remain monotonic across idle windows, so its
     // etcd key must not be tied to a short-lived lease. Old Python behavior
     // intentionally left this key unleased for the same reason.
-    let allocator = DistributeIdAllocator::new_without_lease(client.clone(), "channels");
+    let allocator = DistributeIdAllocator::new_without_lease_with_retry(
+        client.clone(),
+        "channels",
+        cfg.etcd_rpc_max_retries,
+    );
     let chan_id = allocator
         .allocate_id()
         .await
@@ -171,10 +284,11 @@ pub async fn create_mpsc_channel(
     // `/channels/{chan_id}/next_producer_id` alive.
     let global_lease_id = match cfg.override_global_lease_id {
         Some(id) => id,
-        None => get_cluster_lease_id(
+        None => get_cluster_lease_id_with_retry(
             &mut client,
             &format!("channels/{}", chan_id),
             cfg.ttl_seconds,
+            cfg.etcd_rpc_max_retries,
         )
         .await
         .map_err(|e| MpscError::Internal(format!("get_cluster_lease_id(meta) failed: {}", e)))?,
@@ -184,10 +298,11 @@ pub async fn create_mpsc_channel(
     // allocator; this follows the design in `mpsc.md` where every
     // global chan owns a long-lived lease to guard id allocation
     // against short-term stale reads.
-    let global_long_lease_id = get_cluster_lease_id(
+    let global_long_lease_id = get_cluster_lease_id_with_retry(
         &mut client,
         &format!("id_allocator/channels/{}", chan_id),
         30 * 60,
+        cfg.etcd_rpc_max_retries,
     )
     .await
     .map_err(|e| {
@@ -352,26 +467,43 @@ pub async fn create_mpsc_channel(
 
     let meta_key = keys::etcd_meta_key(chan_id);
 
-    let compare = etcd::Compare::create_revision(meta_key.clone(), etcd::CompareOp::Equal, 0);
-    let put_meta = etcd::TxnOp::put(
-        meta_key.clone(),
-        meta_bytes,
-        Some(etcd::PutOptions::new().with_lease(global_lease_id)),
-    );
-    let txn = etcd::Txn::new()
-        .when(vec![compare])
-        .and_then(vec![put_meta]);
-    let txn_res = client
-        .txn(txn)
-        .await
-        .with_context(|| format!("failed to write meta for chan_id={}", chan_id))
-        .map_err(|e| MpscError::Internal(e.to_string()))?;
+    let txn_res = retry_etcd_rpc(cfg.etcd_rpc_max_retries, "mq_create_channel_meta", || {
+        let mut attempt_client = client.clone();
+        let compare = etcd::Compare::create_revision(meta_key.clone(), etcd::CompareOp::Equal, 0);
+        let put_meta = etcd::TxnOp::put(
+            meta_key.clone(),
+            meta_bytes.clone(),
+            Some(etcd::PutOptions::new().with_lease(global_lease_id)),
+        );
+        let txn = etcd::Txn::new()
+            .when(vec![compare])
+            .and_then(vec![put_meta])
+            .or_else(vec![etcd::TxnOp::get(meta_key.clone(), None)]);
+        async move { attempt_client.txn(txn).await }
+    })
+    .await
+    .with_context(|| format!("failed to write meta for chan_id={}", chan_id))
+    .map_err(|e| MpscError::Internal(e.to_string()))?;
 
     if !txn_res.succeeded() {
-        return Err(MpscError::Internal(format!(
-            "meta key already exists for chan_id={}",
-            chan_id
-        )));
+        let observed = txn_single_get_generation(&txn_res, &meta_key, "channel meta publish")
+            .map_err(|e| MpscError::Internal(e.to_string()))?;
+        match observed {
+            Some(current) if current.value == meta_bytes && current.lease_id == global_lease_id => {
+            }
+            Some(_) => {
+                return Err(MpscError::Internal(format!(
+                    "meta key already exists with conflicting state for chan_id={}",
+                    chan_id
+                )));
+            }
+            None => {
+                return Err(MpscError::Internal(format!(
+                    "meta key disappeared while reconciling create for chan_id={}",
+                    chan_id
+                )));
+            }
+        }
     }
 
     let etcd_client = client;
@@ -385,6 +517,7 @@ pub async fn create_mpsc_channel(
         global_lease: global_lease_handle,
         global_long_lease: global_long_lease_handle,
         payload_lease: payload_lease_handle,
+        etcd_rpc_max_retries: cfg.etcd_rpc_max_retries,
         etcd_client,
     })
 }
@@ -404,6 +537,7 @@ impl ChanManager {
         override_global_lease_id: i64,
         override_member_lease_id: i64,
         override_payload_lease_id: i64,
+        etcd_rpc_max_retries: u32,
         rt_handle: tokio::runtime::Handle,
         shutdown: ShutdownCtl,
     ) -> anyhow::Result<Self> {
@@ -415,8 +549,13 @@ impl ChanManager {
             )
         })?;
         let mut meta_client = client.clone();
-        let meta_with_ver =
-            load_mpmc_subchannel_metadata(&mut meta_client, chan_id, &shutdown).await?;
+        let meta_with_ver = load_mpmc_subchannel_metadata(
+            &mut meta_client,
+            chan_id,
+            &shutdown,
+            etcd_rpc_max_retries,
+        )
+        .await?;
         let meta = meta_with_ver.meta;
 
         if meta.global_lease_id != override_global_lease_id {
@@ -541,6 +680,7 @@ impl ChanManager {
             global_lease,
             global_long_lease,
             payload_lease,
+            etcd_rpc_max_retries,
             etcd_client: client,
         })
     }
@@ -554,6 +694,7 @@ impl ChanManager {
         etcd_endpoints: Vec<String>,
         kv_backend_uid: LeaseBackendUid,
         chan_id: i64,
+        etcd_rpc_max_retries: u32,
         rt_handle: tokio::runtime::Handle,
     ) -> anyhow::Result<Self> {
         fn is_hard_lease_failure(err: &anyhow::Error) -> bool {
@@ -573,11 +714,13 @@ impl ChanManager {
             .await
             .map_err(|e| anyhow::anyhow!("connect etcd failed: {}", e))?;
         let mut meta_client = client.clone();
-        let meta_with_ver = get_chan_meta_with_version(&mut meta_client, chan_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("get_chan_meta failed for chan_id={}: {}", chan_id, e))?;
-        let meta = meta_with_ver.meta;
-        let meta_version = meta_with_ver.version;
+        let meta_with_ver =
+            get_chan_meta_with_version_with_retry(&mut meta_client, chan_id, etcd_rpc_max_retries)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("get_chan_meta failed for chan_id={}: {}", chan_id, e)
+                })?;
+        let meta = meta_with_ver.meta.clone();
         let meta_key = keys::etcd_meta_key(chan_id);
 
         // 2) 恢复 global lease handle：直接使用元数据中记录的
@@ -596,8 +739,12 @@ impl ChanManager {
             Err(e) => {
                 if is_hard_lease_failure(&e) {
                     let mut cleanup_client = client.clone();
-                    cleanup_client
-                        .delete(meta_key.clone(), None)
+                    cleanup_exact_channel_meta(
+                        &mut cleanup_client,
+                        &meta_key,
+                        &meta_with_ver,
+                        etcd_rpc_max_retries,
+                    )
                         .await
                         .map_err(|de| anyhow::anyhow!(
                             "hard lease failure detected; failed to delete meta_key={} for chan_id={}: delete_err={}, cause={}",
@@ -632,8 +779,12 @@ impl ChanManager {
             Err(e) => {
                 if is_hard_lease_failure(&e) {
                     let mut cleanup_client = client.clone();
-                    cleanup_client
-                        .delete(meta_key.clone(), None)
+                    cleanup_exact_channel_meta(
+                        &mut cleanup_client,
+                        &meta_key,
+                        &meta_with_ver,
+                        etcd_rpc_max_retries,
+                    )
                         .await
                         .map_err(|de| anyhow::anyhow!(
                             "hard lease failure detected; failed to delete meta_key={} for chan_id={}: delete_err={}, cause={}",
@@ -671,17 +822,24 @@ impl ChanManager {
         // get_chan_meta 读取到 meta 到这里期间，该 meta 没有被
         // 删除或更新。如果校验失败，则直接返回错误，由上层
         // 决定是否重试。
-        let compare =
-            etcd::Compare::version(meta_key.clone(), etcd::CompareOp::Equal, meta_version);
-        let get_op = etcd::TxnOp::get(meta_key.clone(), None);
-        let txn = etcd::Txn::new().when(vec![compare]).and_then(vec![get_op]);
-        let txn_res = client2.txn(txn).await.map_err(|e| {
-            anyhow::anyhow!("meta version check failed for chan_id={}: {}", chan_id, e)
-        })?;
+        let txn_res = retry_etcd_rpc(etcd_rpc_max_retries, "mq_check_channel_meta", || {
+            let mut attempt_client = client2.clone();
+            let get_op = etcd::TxnOp::get(meta_key.clone(), None);
+            let txn = etcd::Txn::new()
+                .when(exact_meta_compares(&meta_key, &meta_with_ver))
+                .and_then(vec![get_op])
+                .or_else(vec![etcd::TxnOp::get(meta_key.clone(), None)]);
+            async move { attempt_client.txn(txn).await }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("meta version check failed for chan_id={}: {}", chan_id, e))?;
         if !txn_res.succeeded() {
+            let observed =
+                txn_single_get_generation(&txn_res, &meta_key, "channel meta bootstrap check")?;
             anyhow::bail!(
-                "channel meta changed or deleted during ChanManager bootstrap, chan_id={}",
-                chan_id
+                "channel meta changed or deleted during ChanManager bootstrap, chan_id={}, current_mod_revision={:?}",
+                chan_id,
+                observed.map(|generation| generation.mod_revision)
             );
         }
 
@@ -759,7 +917,42 @@ impl ChanManager {
             global_lease,
             global_long_lease,
             payload_lease,
+            etcd_rpc_max_retries,
             etcd_client: client,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reconcile_channel_meta_cleanup_observation, StoredEtcdGeneration};
+
+    fn generation(mod_revision: i64) -> StoredEtcdGeneration {
+        StoredEtcdGeneration {
+            value: b"meta".to_vec(),
+            lease_id: 11,
+            mod_revision,
+        }
+    }
+
+    #[test]
+    fn hard_failure_cleanup_accepts_absent_or_newer_generation() {
+        let expected = generation(42);
+        assert_eq!(
+            reconcile_channel_meta_cleanup_observation(None, &expected).unwrap(),
+            None
+        );
+        assert_eq!(
+            reconcile_channel_meta_cleanup_observation(Some(generation(43)), &expected).unwrap(),
+            Some(43)
+        );
+    }
+
+    #[test]
+    fn hard_failure_cleanup_rejects_false_compare_for_exact_generation() {
+        let expected = generation(42);
+        assert!(
+            reconcile_channel_meta_cleanup_observation(Some(expected.clone()), &expected).is_err()
+        );
     }
 }
