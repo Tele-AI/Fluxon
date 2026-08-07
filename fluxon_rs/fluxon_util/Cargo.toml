@@ -1,6 +1,6 @@
 [package]
 name = "fluxon_util"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 authors = ["Your Name <your.email@example.com>"]
 description = "Utility crate with macros and helper functions"
