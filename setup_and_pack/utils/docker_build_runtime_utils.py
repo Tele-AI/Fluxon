@@ -550,7 +550,7 @@ def build_docker_run_cmd(
     """Build a `docker run` command (without executing it).
 
     Args:
-        image: Image name (with tag), e.g. "fluxon_quick_start:0.2.3".
+        image: Image name (with tag), e.g. "fluxon_quick_start:0.2.4".
         name: Container name (`--name`).
         remove: Auto-remove on exit (`--rm`).
         detach: Run detached (`-d`).

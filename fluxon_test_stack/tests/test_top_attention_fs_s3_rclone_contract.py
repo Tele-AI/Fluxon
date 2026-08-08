@@ -129,14 +129,30 @@ class TestTopAttentionFsS3RcloneContract(unittest.TestCase):
             },
         )
 
-    def test_complex_fixture_stays_below_one_s3_list_page(self) -> None:
+    def test_complex_fixture_stays_below_one_s3_list_page_and_forces_multipart(self) -> None:
         files = _E2E._build_complex_fixture_files()
 
         self.assertEqual(len(files), 405)
         self.assertLess(len(files), 1000)
         self.assertEqual(sum(relpath.startswith("fanout/") for relpath in files), 400)
         self.assertIn("deep/l1/l2/l3/l4/l5/l6/l7/l8/final.bin", files)
-        self.assertEqual(len(files["blobs/medium-8m.bin"]), 8 * 1024 * 1024)
+        multipart_size = len(files["blobs/multipart-12m.bin"])
+        self.assertEqual(multipart_size, _E2E.RCLONE_MULTIPART_FIXTURE_SIZE_BYTES)
+        self.assertGreater(multipart_size, _E2E.RCLONE_MULTIPART_CHUNK_SIZE_BYTES)
+        self.assertEqual(
+            (multipart_size + _E2E.RCLONE_MULTIPART_CHUNK_SIZE_BYTES - 1)
+            // _E2E.RCLONE_MULTIPART_CHUNK_SIZE_BYTES,
+            3,
+        )
+        self.assertEqual(
+            _E2E.RCLONE_MULTIPART_COPY_FLAGS,
+            (
+                "--s3-upload-cutoff",
+                "5Mi",
+                "--s3-chunk-size",
+                "5Mi",
+            ),
+        )
         self.assertTrue(all(" " not in relpath for relpath in files))
 
     def test_main_runs_direct_e2e_with_pinned_image(self) -> None:

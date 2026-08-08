@@ -9,7 +9,7 @@ An AI-native distributed data plane that supports high performance RPC, KV Cache
 [![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#runtime-requirements)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#runtime-requirements)
 [![Rust](https://img.shields.io/badge/Rust-1.93.0-000000)](./fluxon_rs/rust-toolchain.toml)
-[![Latest](https://img.shields.io/badge/Latest-v0.2.3-f28500)](./fluxon_release)
+[![Latest](https://img.shields.io/badge/Latest-v0.2.4-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#interface-capabilities)
 
 <details>
@@ -201,7 +201,7 @@ The distribution installs the `fluxon_py` import package. Service-plane runtimes
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.3 \
+  hanbaoaaa/fluxon_quick_start:0.2.4 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -234,7 +234,7 @@ Related interface docs:
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.3 \
+  hanbaoaaa/fluxon_quick_start:0.2.4 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -265,7 +265,7 @@ Related interface docs:
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.3 \
+  hanbaoaaa/fluxon_quick_start:0.2.4 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \

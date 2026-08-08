@@ -1,6 +1,6 @@
 [package]
 name = "fluxon_fs_s3_gateway"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 
 [dependencies]
@@ -22,6 +22,7 @@ hmac = "0.12"
 hex = "0.4"
 chrono = { workspace = true }
 uuid = { workspace = true }
+quick-xml = "0.26"
 base64 = "0.21"
 urlencoding = "2"
 parking_lot = { workspace = true }

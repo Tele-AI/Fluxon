@@ -22,7 +22,7 @@ from setup_and_pack.package_contract import RELEASE_WHEEL_GLOB
 SCRIPTS_DIR = REPO_ROOT / "setup_and_pack"
 DOCKERFILE_PATH = SCRIPT_DIR / "Dockerfile"
 IMAGE_NAME = "fluxon_quick_start"
-IMAGE_TAG = "0.2.3"
+IMAGE_TAG = "0.2.4"
 
 # Binaries to copy from ext_images into quick_start bin/.
 EXT_BINARIES = ("etcd/etcd", "etcd/etcdctl", "greptime/greptime")
