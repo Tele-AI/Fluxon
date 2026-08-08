@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_cli"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "askama",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_commu"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_commu_closed_sdk_consumer"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_commu_contract"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_framework"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "fluxon_framework_compiled",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_framework_compiled"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "crossbeam-queue",
@@ -1151,7 +1151,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_fs"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_fs_core"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "base64 0.21.7",
  "hex",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_fs_s3_gateway"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "askama",
@@ -1225,6 +1225,7 @@ dependencies = [
  "hyper 0.14.32",
  "parking_lot",
  "postcard",
+ "quick-xml",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1243,7 +1244,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_kv"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1303,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_mq"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1327,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_observability"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1348,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_ops"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "askama",
@@ -1378,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_proxy"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1392,14 +1393,14 @@ dependencies = [
 
 [[package]]
 name = "fluxon_proxy_proto"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "bitcode",
 ]
 
 [[package]]
 name = "fluxon_pyo3"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1435,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_util"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2741,7 +2742,7 @@ dependencies = [
 
 [[package]]
 name = "limit_thirdparty"
-version = "0.2.2"
+version = "0.2.4"
 dependencies = [
  "tokio",
 ]

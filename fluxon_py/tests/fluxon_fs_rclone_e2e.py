@@ -28,6 +28,18 @@ RCLONE_CONFIG_CONTAINER_PATH = f"{RCLONE_CONTAINER_WORKDIR}/rclone.conf"
 RCLONE_COMMAND_TIMEOUT_SECS = 120
 RCLONE_COMPLEX_COPY_TIMEOUT_SECS = 600
 RCLONE_LIST_READY_TIMEOUT_SECS = 180.0
+# rclone v1.60.1 defaults to a 200 MiB upload cutoff. Keep this test
+# independent of that default so the fixture always exercises multipart.
+RCLONE_MULTIPART_UPLOAD_CUTOFF = "5Mi"
+RCLONE_MULTIPART_CHUNK_SIZE = "5Mi"
+RCLONE_MULTIPART_CHUNK_SIZE_BYTES = 5 * 1024 * 1024
+RCLONE_MULTIPART_FIXTURE_SIZE_BYTES = 12 * 1024 * 1024
+RCLONE_MULTIPART_COPY_FLAGS = (
+    "--s3-upload-cutoff",
+    RCLONE_MULTIPART_UPLOAD_CUTOFF,
+    "--s3-chunk-size",
+    RCLONE_MULTIPART_CHUNK_SIZE,
+)
 COMPLEX_GROUP_COUNT = 8
 COMPLEX_FILES_PER_GROUP = 50
 COMPLEX_EXPECTED_FILE_COUNT = 405
@@ -239,7 +251,8 @@ def _build_complex_fixture_files() -> dict[str, bytes]:
             "configs/dev/app.yaml": b"environment: dev\n",
             "configs/prod/app.yaml": b"environment: prod\n",
             "blobs/small.bin": bytes(range(64)),
-            "blobs/medium-8m.bin": bytes(range(256)) * (8 * 1024 * 1024 // 256),
+            "blobs/multipart-12m.bin": bytes(range(256))
+            * (RCLONE_MULTIPART_FIXTURE_SIZE_BYTES // 256),
         }
     )
     assert len(files) == COMPLEX_EXPECTED_FILE_COUNT
@@ -338,6 +351,7 @@ def run_e2e(*, image_ref: str) -> None:
             work_root=work_root,
             args=[
                 "copy",
+                *RCLONE_MULTIPART_COPY_FLAGS,
                 f"{RCLONE_CONTAINER_WORKDIR}/complex-source",
                 complex_remote_root,
             ],

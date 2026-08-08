@@ -11,7 +11,7 @@ It does not replace the formal service-plane, KV, MQ, or FS interface docs.
   - unified quick-start entrypoint
 - `build_image.py`
   - quick-start image build entrypoint
-- `fluxon_quick_start:0.2.3`
+- `fluxon_quick_start:0.2.4`
   - quick-start Docker image
 
 ## Runtime Modes
@@ -86,7 +86,7 @@ Python environment can already import both `fluxon_py` and `fluxon_pyo3`.
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.3 \
+  fluxon_quick_start:0.2.4 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -119,7 +119,7 @@ del demo:hello
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.3 \
+  fluxon_quick_start:0.2.4 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -155,7 +155,7 @@ The background consumer keeps printing received messages.
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.3 \
+  fluxon_quick_start:0.2.4 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \

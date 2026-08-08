@@ -78,15 +78,64 @@ fn ui_normalize_as_user(as_user: Option<String>) -> Option<String> {
     Some(t.to_string())
 }
 
+fn ui_initial_credentials_redirect(headers: &HeaderMap, st: &GatewayState) -> Response {
+    let proxy_href = headers
+        .get(HDR_ORIGINAL_URI)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let path = value.split_once('?').map(|(path, _)| path).unwrap_or(value);
+            path.find("/ui/")
+                .or_else(|| path.strip_suffix("/ui").map(|_| path.len() - "/ui".len()))
+                .map(|index| {
+                    format!(
+                        "{}/ui/account/password/",
+                        path[..index].trim_end_matches('/')
+                    )
+                })
+        });
+    let href = proxy_href.unwrap_or_else(|| {
+        format!(
+            "{}/ui/account/password/",
+            st.external_base_path.trim_end_matches('/')
+        )
+    });
+    let mut resp = Response::new(boxed(Body::empty()));
+    *resp.status_mut() = StatusCode::SEE_OTHER;
+    let location =
+        HeaderValue::from_str(&href).unwrap_or_else(|_| HeaderValue::from_static("/ui/account/password/"));
+    resp.headers_mut().insert(header::LOCATION, location);
+    resp
+}
+
 fn ui_require_identity(
     headers: &HeaderMap,
     st: &GatewayState,
     as_user: Option<String>,
 ) -> Result<UiIdentity, Response> {
+    ui_require_identity_inner(headers, st, as_user, false)
+}
+
+fn ui_require_identity_for_credentials(
+    headers: &HeaderMap,
+    st: &GatewayState,
+    as_user: Option<String>,
+) -> Result<UiIdentity, Response> {
+    ui_require_identity_inner(headers, st, as_user, true)
+}
+
+fn ui_require_identity_inner(
+    headers: &HeaderMap,
+    st: &GatewayState,
+    as_user: Option<String>,
+    allow_initial_credentials_change: bool,
+) -> Result<UiIdentity, Response> {
     let viewer = match ui_basic_auth_account(headers, st) {
         Some(v) => v,
         None => return Err(ui_basic_auth_required()),
     };
+    if st.initial_credentials_change_required() && !allow_initial_credentials_change {
+        return Err(ui_initial_credentials_redirect(headers, st));
+    }
 
     let as_user = ui_normalize_as_user(as_user);
     let Some(as_username) = as_user.clone() else {
