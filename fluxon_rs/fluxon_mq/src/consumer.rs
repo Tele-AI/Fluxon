@@ -47,7 +47,9 @@ use crate::manager::{
 use crate::nonblocking_monitor::{
     spawn_nonblocking_monitor, NonblockingMonitorHandle, NonblockingMonitorKind,
 };
-use crate::offset_commit::{MonotonicOffsetCommit, OffsetCommitProgress};
+use crate::offset_commit::{
+    MonotonicOffsetCommit, OffsetCommitProgress, OffsetGeneration, OffsetObservation,
+};
 use crate::shutdown::ShutdownCtl;
 use crate::LifecycleView;
 use tracing::{debug, info, warn};
@@ -403,6 +405,7 @@ impl CommitSequencerFailure {
 struct CommitSequencerState {
     next_seq: usize,
     failure: Option<CommitSequencerFailure>,
+    consume_offset_generations: HashMap<String, OffsetGeneration>,
 }
 
 #[derive(Clone)]
@@ -420,6 +423,7 @@ impl CommitSequencer {
             state: Arc::new(Mutex::new(CommitSequencerState {
                 next_seq: 0,
                 failure: None,
+                consume_offset_generations: HashMap::new(),
             })),
             notify: Arc::new(Notify::new()),
             progress: Arc::new(Mutex::new(HashMap::new())),
@@ -468,6 +472,24 @@ impl CommitSequencer {
             Some(failure) => Err(failure.as_error()),
             None => Ok(()),
         }
+    }
+
+    fn consume_offset_observation(&self, producer_id: &str) -> Option<OffsetObservation> {
+        self.state
+            .lock()
+            .unwrap()
+            .consume_offset_generations
+            .get(producer_id)
+            .cloned()
+            .map(OffsetObservation::Present)
+    }
+
+    fn record_consume_offset_generation(&self, producer_id: &str, generation: OffsetGeneration) {
+        self.state
+            .lock()
+            .unwrap()
+            .consume_offset_generations
+            .insert(producer_id.to_string(), generation);
     }
 
     fn is_failed(&self) -> bool {
@@ -968,6 +990,11 @@ struct CommitOffsetPutTraceNs {
     total_latency_ns: u128,
     first_poll_delay_ns: u128,
     first_poll_to_ready_ns: u128,
+}
+
+struct CommitOffsetResult {
+    trace: CommitOffsetPutTraceNs,
+    generation: OffsetGeneration,
 }
 
 struct SelectNextMessageTrace {
@@ -2279,15 +2306,20 @@ impl MpscConsumer {
         consume_offset: i64,
         seq: usize,
         shutdown: ShutdownCtl,
-    ) -> Result<CommitOffsetPutTraceNs, MpscError> {
+        initial_observation: Option<OffsetObservation>,
+    ) -> Result<CommitOffsetResult, MpscError> {
         use tokio::time::sleep;
 
         let next_consume_offset = consume_offset + 1;
         let key = keys::etcd_consume_offset_one_producer_key(chan_id, producer_id);
         let begin = Instant::now();
         let mut attempts: usize = 0;
-        let mut offset_commit =
-            MonotonicOffsetCommit::new(key.clone(), next_consume_offset, global_lease_id);
+        let mut offset_commit = MonotonicOffsetCommit::new(
+            key.clone(),
+            next_consume_offset,
+            global_lease_id,
+            initial_observation,
+        )?;
 
         loop {
             if shutdown.is_closed() {
@@ -2322,7 +2354,7 @@ impl MpscConsumer {
             };
 
             match put_res {
-                Ok(Ok(OffsetCommitProgress::Complete)) => {
+                Ok(Ok(OffsetCommitProgress::Complete(generation))) => {
                     let total_elapsed = begin.elapsed();
                     let attempt_end = Instant::now();
                     let attempt_elapsed = attempt_end.duration_since(attempt_begin);
@@ -2347,10 +2379,13 @@ impl MpscConsumer {
                             first_poll_to_ready_ns / 1_000_000,
                         );
                     }
-                    return Ok(CommitOffsetPutTraceNs {
-                        total_latency_ns: total_elapsed.as_nanos(),
-                        first_poll_delay_ns,
-                        first_poll_to_ready_ns,
+                    return Ok(CommitOffsetResult {
+                        trace: CommitOffsetPutTraceNs {
+                            total_latency_ns: total_elapsed.as_nanos(),
+                            first_poll_delay_ns,
+                            first_poll_to_ready_ns,
+                        },
+                        generation,
                     });
                 }
                 Ok(Ok(OffsetCommitProgress::Retry(_))) => {
@@ -2469,7 +2504,8 @@ impl MpscConsumer {
 
             stage.store(3, Ordering::Relaxed);
             commit_seq.mark_commit_begin(seq);
-            let put_trace = MpscConsumer::commit_consume_offset(
+            let initial_observation = commit_seq.consume_offset_observation(&fetched.producer_id);
+            let commit_result = MpscConsumer::commit_consume_offset(
                 client,
                 chan_id,
                 global_lease_id,
@@ -2477,11 +2513,14 @@ impl MpscConsumer {
                 fetched.consume_offset,
                 seq,
                 shutdown.clone(),
+                initial_observation,
             )
             .await?;
-            fetched.etcd_put_latency_ns = put_trace.total_latency_ns;
-            fetched.etcd_put_first_poll_delay_ns = put_trace.first_poll_delay_ns;
-            fetched.etcd_put_first_poll_to_ready_ns = put_trace.first_poll_to_ready_ns;
+            fetched.etcd_put_latency_ns = commit_result.trace.total_latency_ns;
+            fetched.etcd_put_first_poll_delay_ns = commit_result.trace.first_poll_delay_ns;
+            fetched.etcd_put_first_poll_to_ready_ns = commit_result.trace.first_poll_to_ready_ns;
+            commit_seq
+                .record_consume_offset_generation(&fetched.producer_id, commit_result.generation);
 
             stage.store(4, Ordering::Relaxed);
             commit_seq.mark_ready_to_advance(seq);
@@ -4010,6 +4049,7 @@ mod tests {
         reconcile_consumer_membership_update_observation, CommitSequencer,
         ConsumerMembershipGeneration, MpscError, OffsetSnapshotState, ShutdownCtl,
     };
+    use crate::offset_commit::{OffsetGeneration, OffsetObservation};
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -4141,6 +4181,27 @@ mod tests {
         assert!(!state.needs_refresh());
         assert_eq!(produce_cache.get("producer_a"), Some(&4));
         assert_eq!(consume_cache.get("producer_a"), Some(&5));
+    }
+
+    #[test]
+    fn commit_sequencer_caches_offset_generations_per_producer() {
+        let sequencer = CommitSequencer::new(7);
+        assert_eq!(sequencer.consume_offset_observation("producer_a"), None);
+
+        let first = OffsetGeneration::committed(41, 11, 101).unwrap();
+        sequencer.record_consume_offset_generation("producer_a", first.clone());
+        assert_eq!(
+            sequencer.consume_offset_observation("producer_a"),
+            Some(OffsetObservation::Present(first))
+        );
+        assert_eq!(sequencer.consume_offset_observation("producer_b"), None);
+
+        let next = OffsetGeneration::committed(42, 11, 102).unwrap();
+        sequencer.record_consume_offset_generation("producer_a", next.clone());
+        assert_eq!(
+            sequencer.consume_offset_observation("producer_a"),
+            Some(OffsetObservation::Present(next))
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

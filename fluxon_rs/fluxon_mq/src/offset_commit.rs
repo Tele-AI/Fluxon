@@ -38,46 +38,85 @@ impl OffsetGeneration {
             mod_revision: kv.mod_revision(),
         })
     }
+
+    pub(crate) fn committed(
+        offset: i64,
+        lease_id: i64,
+        mod_revision: i64,
+    ) -> Result<Self, MpscError> {
+        if mod_revision <= 0 {
+            return Err(MpscError::Internal(format!(
+                "offset commit returned invalid revision {}",
+                mod_revision
+            )));
+        }
+        Ok(Self {
+            value: offset.to_string().into_bytes(),
+            offset,
+            lease_id,
+            mod_revision,
+        })
+    }
+
+    fn from_successful_txn(
+        response: &etcd::TxnResponse,
+        offset: i64,
+        lease_id: i64,
+    ) -> Result<Self, MpscError> {
+        let mod_revision = response
+            .header()
+            .ok_or_else(|| MpscError::Internal("offset commit response has no header".to_string()))?
+            .revision();
+        Self::committed(offset, lease_id, mod_revision)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum OffsetObservation {
+    Absent,
+    Present(OffsetGeneration),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OffsetCommitProgress {
-    Complete,
-    Retry(Option<OffsetGeneration>),
+    Complete(OffsetGeneration),
+    Retry(OffsetObservation),
 }
 
 fn reconcile_offset_observation(
     target: i64,
     expected_lease_id: i64,
-    observed: Option<OffsetGeneration>,
+    observed: OffsetObservation,
 ) -> Result<OffsetCommitProgress, MpscError> {
     match observed {
-        Some(generation) if generation.lease_id != expected_lease_id => {
+        OffsetObservation::Present(generation) if generation.lease_id != expected_lease_id => {
             Err(MpscError::Internal(format!(
                 "offset generation lease mismatch: expected={} actual={} offset={}",
                 expected_lease_id, generation.lease_id, generation.offset
             )))
         }
-        Some(generation) if generation.offset >= target => Ok(OffsetCommitProgress::Complete),
-        generation => Ok(OffsetCommitProgress::Retry(generation)),
+        OffsetObservation::Present(generation) if generation.offset >= target => {
+            Ok(OffsetCommitProgress::Complete(generation))
+        }
+        observation => Ok(OffsetCommitProgress::Retry(observation)),
     }
 }
 
 #[derive(Clone)]
 struct FencedOffsetTxn {
-    generation: Option<OffsetGeneration>,
+    observation: OffsetObservation,
     txn: etcd::Txn,
 }
 
 impl FencedOffsetTxn {
-    fn new(key: &str, target: i64, lease_id: i64, generation: Option<OffsetGeneration>) -> Self {
-        let compares = match generation.as_ref() {
-            Some(generation) => vec![
+    fn new(key: &str, target: i64, lease_id: i64, observation: OffsetObservation) -> Self {
+        let compares = match &observation {
+            OffsetObservation::Present(generation) => vec![
                 etcd::Compare::mod_revision(key, etcd::CompareOp::Equal, generation.mod_revision),
                 etcd::Compare::lease(key, etcd::CompareOp::Equal, generation.lease_id),
                 etcd::Compare::value(key, etcd::CompareOp::Equal, generation.value.clone()),
             ],
-            None => vec![etcd::Compare::create_revision(
+            OffsetObservation::Absent => vec![etcd::Compare::create_revision(
                 key,
                 etcd::CompareOp::Equal,
                 0,
@@ -92,113 +131,161 @@ impl FencedOffsetTxn {
             .when(compares)
             .and_then(vec![put])
             .or_else(vec![etcd::TxnOp::get(key, None)]);
-        Self { generation, txn }
+        Self { observation, txn }
     }
 
-    fn still_matches(&self, observed: Option<&OffsetGeneration>) -> bool {
-        self.generation.as_ref() == observed
+    fn still_matches(&self, observed: &OffsetObservation) -> bool {
+        &self.observation == observed
     }
+}
+
+enum OffsetCommitState {
+    NeedObservation,
+    Ready(FencedOffsetTxn),
+    Complete(OffsetGeneration),
 }
 
 /// Generation-fenced monotonic offset commit state.
 ///
-/// A failed or timed-out mutation attempt leaves `fenced_txn` unchanged, so the
-/// caller can replay the same transaction. Once another generation is observed,
+/// A failed or timed-out mutation attempt leaves the ready transaction unchanged,
+/// so the caller can replay the same fence. Once another generation is observed,
 /// the next attempt is fenced against that exact generation instead.
 pub(crate) struct MonotonicOffsetCommit {
     key: String,
     target: i64,
     lease_id: i64,
-    fenced_txn: Option<FencedOffsetTxn>,
+    state: OffsetCommitState,
 }
 
 impl MonotonicOffsetCommit {
-    pub(crate) fn new(key: String, target: i64, lease_id: i64) -> Self {
-        Self {
+    pub(crate) fn new(
+        key: String,
+        target: i64,
+        lease_id: i64,
+        initial_observation: Option<OffsetObservation>,
+    ) -> Result<Self, MpscError> {
+        let mut commit = Self {
             key,
             target,
             lease_id,
-            fenced_txn: None,
+            state: OffsetCommitState::NeedObservation,
+        };
+        if let Some(observation) = initial_observation {
+            commit.seed_cached_observation(observation)?;
         }
+        Ok(commit)
+    }
+
+    fn seed_cached_observation(&mut self, observation: OffsetObservation) -> Result<(), MpscError> {
+        match reconcile_offset_observation(self.target, self.lease_id, observation)? {
+            OffsetCommitProgress::Complete(_) => {
+                // A cache can seed a compare, but cannot prove that an already
+                // satisfied generation still exists at the time of this call.
+                self.state = OffsetCommitState::NeedObservation;
+            }
+            OffsetCommitProgress::Retry(observation) => {
+                self.state = OffsetCommitState::Ready(FencedOffsetTxn::new(
+                    &self.key,
+                    self.target,
+                    self.lease_id,
+                    observation,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn install_observation(
+        &mut self,
+        observation: OffsetObservation,
+    ) -> Result<OffsetCommitProgress, MpscError> {
+        let progress = reconcile_offset_observation(self.target, self.lease_id, observation)?;
+        self.state = match &progress {
+            OffsetCommitProgress::Complete(generation) => {
+                OffsetCommitState::Complete(generation.clone())
+            }
+            OffsetCommitProgress::Retry(observation) => OffsetCommitState::Ready(
+                FencedOffsetTxn::new(&self.key, self.target, self.lease_id, observation.clone()),
+            ),
+        };
+        Ok(progress)
     }
 
     /// Performs one bounded convergence attempt.
     ///
-    /// The first call reads the exact generation before issuing the mutation.
-    /// Later calls replay the retained fenced transaction unless a successful
-    /// else-Get proves that a different, lower generation must be advanced.
+    /// Without an initial observation, the first call reads the exact generation
+    /// before issuing the mutation. Later calls replay the retained fenced
+    /// transaction unless a successful else-Get proves that the state changed.
     pub(crate) async fn attempt(
         &mut self,
         client: &mut etcd::Client,
     ) -> Result<OffsetCommitProgress, MpscError> {
-        if self.fenced_txn.is_none() {
+        if matches!(self.state, OffsetCommitState::NeedObservation) {
             let response = client.get(self.key.clone(), None).await?;
-            let observed = exact_generation_from_get(&response, &self.key)?;
-            match reconcile_offset_observation(self.target, self.lease_id, observed)? {
-                OffsetCommitProgress::Complete => return Ok(OffsetCommitProgress::Complete),
-                OffsetCommitProgress::Retry(generation) => {
-                    self.fenced_txn = Some(FencedOffsetTxn::new(
-                        &self.key,
-                        self.target,
-                        self.lease_id,
-                        generation,
-                    ));
-                }
+            let observed = exact_observation_from_get(&response, &self.key)?;
+            if let progress @ OffsetCommitProgress::Complete(_) =
+                self.install_observation(observed)?
+            {
+                return Ok(progress);
             }
         }
 
-        let fenced = self
-            .fenced_txn
-            .as_ref()
-            .expect("offset commit must have a fenced transaction")
-            .clone();
+        let fenced = match &self.state {
+            OffsetCommitState::Ready(fenced) => fenced.clone(),
+            OffsetCommitState::Complete(generation) => {
+                return Ok(OffsetCommitProgress::Complete(generation.clone()));
+            }
+            OffsetCommitState::NeedObservation => {
+                unreachable!("offset commit must have an observation after its initial read")
+            }
+        };
         let response = client.txn(fenced.txn.clone()).await?;
         if response.succeeded() {
-            return Ok(OffsetCommitProgress::Complete);
+            let generation =
+                OffsetGeneration::from_successful_txn(&response, self.target, self.lease_id)?;
+            self.state = OffsetCommitState::Complete(generation.clone());
+            return Ok(OffsetCommitProgress::Complete(generation));
         }
 
-        let observed = exact_generation_from_txn_readback(&response, &self.key)?;
-        if fenced.still_matches(observed.as_ref()) {
+        let observed = exact_observation_from_txn_readback(&response, &self.key)?;
+        if fenced.still_matches(&observed) {
             return Err(MpscError::Internal(format!(
                 "offset transaction compare was false although generation still matches key {}",
                 self.key
             )));
         }
 
-        let progress = reconcile_offset_observation(self.target, self.lease_id, observed)?;
-        if let OffsetCommitProgress::Retry(generation) = &progress {
-            self.fenced_txn = Some(FencedOffsetTxn::new(
-                &self.key,
-                self.target,
-                self.lease_id,
-                generation.clone(),
-            ));
-        }
-        Ok(progress)
+        self.install_observation(observed)
     }
 }
 
-fn exact_generation_from_get(
+fn exact_observation_from_get(
     response: &etcd::GetResponse,
     key: &str,
-) -> Result<Option<OffsetGeneration>, MpscError> {
+) -> Result<OffsetObservation, MpscError> {
     if response.kvs().len() > 1 {
         return Err(MpscError::Internal(format!(
             "exact offset read returned duplicate keys for {}",
             key
         )));
     }
-    response
-        .kvs()
-        .first()
-        .map(|kv| OffsetGeneration::from_kv(kv, key))
-        .transpose()
+    Ok(
+        match response
+            .kvs()
+            .first()
+            .map(|kv| OffsetGeneration::from_kv(kv, key))
+            .transpose()?
+        {
+            Some(generation) => OffsetObservation::Present(generation),
+            None => OffsetObservation::Absent,
+        },
+    )
 }
 
-fn exact_generation_from_txn_readback(
+fn exact_observation_from_txn_readback(
     response: &etcd::TxnResponse,
     key: &str,
-) -> Result<Option<OffsetGeneration>, MpscError> {
+) -> Result<OffsetObservation, MpscError> {
     let responses = response.op_responses();
     let [etcd::TxnOpResponse::Get(get)] = responses.as_slice() else {
         return Err(MpscError::Internal(format!(
@@ -207,13 +294,14 @@ fn exact_generation_from_txn_readback(
             responses.len()
         )));
     };
-    exact_generation_from_get(get, key)
+    exact_observation_from_get(get, key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        reconcile_offset_observation, FencedOffsetTxn, OffsetCommitProgress, OffsetGeneration,
+        reconcile_offset_observation, FencedOffsetTxn, MonotonicOffsetCommit, OffsetCommitProgress,
+        OffsetCommitState, OffsetGeneration, OffsetObservation,
     };
 
     fn generation(offset: i64, mod_revision: i64) -> OffsetGeneration {
@@ -229,20 +317,31 @@ mod tests {
     fn lower_offset_never_counts_as_converged() {
         let current = generation(40, 7);
         assert_eq!(
-            reconcile_offset_observation(41, 11, Some(current.clone())).unwrap(),
-            OffsetCommitProgress::Retry(Some(current))
+            reconcile_offset_observation(41, 11, OffsetObservation::Present(current.clone()))
+                .unwrap(),
+            OffsetCommitProgress::Retry(OffsetObservation::Present(current))
         );
     }
 
     #[test]
     fn equal_or_higher_offset_is_already_converged() {
         assert_eq!(
-            reconcile_offset_observation(41, 11, Some(generation(41, 7))).unwrap(),
-            OffsetCommitProgress::Complete
+            reconcile_offset_observation(41, 11, OffsetObservation::Present(generation(41, 7)))
+                .unwrap(),
+            OffsetCommitProgress::Complete(generation(41, 7))
         );
         assert_eq!(
-            reconcile_offset_observation(41, 11, Some(generation(42, 8))).unwrap(),
-            OffsetCommitProgress::Complete
+            reconcile_offset_observation(41, 11, OffsetObservation::Present(generation(42, 8)))
+                .unwrap(),
+            OffsetCommitProgress::Complete(generation(42, 8))
+        );
+    }
+
+    #[test]
+    fn absent_offset_requires_a_create_fenced_commit() {
+        assert_eq!(
+            reconcile_offset_observation(41, 11, OffsetObservation::Absent).unwrap(),
+            OffsetCommitProgress::Retry(OffsetObservation::Absent)
         );
     }
 
@@ -250,7 +349,8 @@ mod tests {
     fn lower_offset_with_foreign_lease_fails_closed() {
         let mut foreign = generation(40, 7);
         foreign.lease_id = 12;
-        let error = reconcile_offset_observation(41, 11, Some(foreign)).unwrap_err();
+        let error =
+            reconcile_offset_observation(41, 11, OffsetObservation::Present(foreign)).unwrap_err();
         assert!(error.to_string().contains("lease mismatch"));
     }
 
@@ -258,18 +358,45 @@ mod tests {
     fn higher_offset_with_foreign_lease_fails_closed() {
         let mut foreign = generation(42, 8);
         foreign.lease_id = 12;
-        let error = reconcile_offset_observation(41, 11, Some(foreign)).unwrap_err();
+        let error =
+            reconcile_offset_observation(41, 11, OffsetObservation::Present(foreign)).unwrap_err();
         assert!(error.to_string().contains("lease mismatch"));
     }
 
     #[test]
     fn old_transaction_fence_does_not_match_a_new_generation() {
         let old = generation(40, 7);
-        let fenced = FencedOffsetTxn::new("offset", 41, 11, Some(old.clone()));
-        assert!(fenced.still_matches(Some(&old)));
+        let fenced =
+            FencedOffsetTxn::new("offset", 41, 11, OffsetObservation::Present(old.clone()));
+        assert!(fenced.still_matches(&OffsetObservation::Present(old)));
 
         let newer = generation(41, 8);
-        assert!(!fenced.still_matches(Some(&newer)));
-        assert!(!fenced.still_matches(None));
+        assert!(!fenced.still_matches(&OffsetObservation::Present(newer)));
+        assert!(!fenced.still_matches(&OffsetObservation::Absent));
+    }
+
+    #[test]
+    fn known_absence_seeds_a_fenced_txn_without_an_initial_read() {
+        let commit = MonotonicOffsetCommit::new(
+            "offset".to_string(),
+            41,
+            11,
+            Some(OffsetObservation::Absent),
+        )
+        .unwrap();
+        assert!(matches!(commit.state, OffsetCommitState::Ready(_)));
+    }
+
+    #[test]
+    fn cached_current_generation_requires_current_readback() {
+        let current = generation(41, 7);
+        let commit = MonotonicOffsetCommit::new(
+            "offset".to_string(),
+            41,
+            11,
+            Some(OffsetObservation::Present(current.clone())),
+        )
+        .unwrap();
+        assert!(matches!(commit.state, OffsetCommitState::NeedObservation));
     }
 }

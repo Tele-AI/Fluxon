@@ -31,7 +31,7 @@ use crate::manager::{
 use crate::nonblocking_monitor::{
     spawn_nonblocking_monitor, NonblockingMonitorHandle, NonblockingMonitorKind,
 };
-use crate::offset_commit::{MonotonicOffsetCommit, OffsetCommitProgress};
+use crate::offset_commit::{MonotonicOffsetCommit, OffsetCommitProgress, OffsetObservation};
 use crate::shutdown::ShutdownCtl;
 use crate::LifecycleView;
 use tokio::sync::watch;
@@ -75,13 +75,13 @@ fn producer_membership_txn(
     weight_key: &str,
     weight_value: &str,
     global_lease_id: i64,
+    produce_offset_key: &str,
 ) -> etcd::Txn {
     etcd::Txn::new()
-        .when(vec![etcd::Compare::create_revision(
-            key,
-            etcd::CompareOp::Equal,
-            0,
-        )])
+        .when(vec![
+            etcd::Compare::create_revision(key, etcd::CompareOp::Equal, 0),
+            etcd::Compare::create_revision(produce_offset_key, etcd::CompareOp::Equal, 0),
+        ])
         .and_then(vec![
             etcd::TxnOp::put(
                 key,
@@ -97,6 +97,7 @@ fn producer_membership_txn(
         .or_else(vec![
             etcd::TxnOp::get(key, None),
             etcd::TxnOp::get(weight_key, None),
+            etcd::TxnOp::get(produce_offset_key, None),
         ])
 }
 
@@ -131,13 +132,66 @@ struct ProducerMembershipGeneration {
     weight: EtcdKeyGeneration,
 }
 
+struct ProducerMembershipPublication {
+    generation: ProducerMembershipGeneration,
+    produce_offset_observation: OffsetObservation,
+}
+
 enum ProducerMembershipReadback {
     Absent,
-    Owned(ProducerMembershipGeneration),
+    Owned(ProducerMembershipPublication),
     Conflicting {
         member_count: usize,
         weight_count: usize,
+        produce_offset_count: usize,
     },
+}
+
+fn producer_membership_get_state(
+    txn_res: &etcd::TxnResponse,
+    key: &str,
+    weight_key: &str,
+    produce_offset_key: &str,
+) -> Result<(
+    Option<EtcdKeyGeneration>,
+    Option<EtcdKeyGeneration>,
+    Option<EtcdKeyGeneration>,
+)> {
+    let responses = txn_res.op_responses();
+    let [etcd::TxnOpResponse::Get(member_get), etcd::TxnOpResponse::Get(weight_get), etcd::TxnOpResponse::Get(produce_offset_get)] =
+        responses.as_slice()
+    else {
+        anyhow::bail!(
+            "producer membership readback returned an invalid response shape: operations={}",
+            responses.len()
+        );
+    };
+
+    let member_kvs = member_get.kvs();
+    let weight_kvs = weight_get.kvs();
+    let produce_offset_kvs = produce_offset_get.kvs();
+    if member_kvs.len() > 1 || weight_kvs.len() > 1 || produce_offset_kvs.len() > 1 {
+        anyhow::bail!(
+            "producer membership readback returned duplicate exact keys: member_count={} weight_count={} produce_offset_count={}",
+            member_kvs.len(),
+            weight_kvs.len(),
+            produce_offset_kvs.len()
+        );
+    }
+
+    let member = member_kvs
+        .first()
+        .map(|kv| EtcdKeyGeneration::from_kv(kv, key))
+        .transpose()?;
+    let weight = weight_kvs
+        .first()
+        .map(|kv| EtcdKeyGeneration::from_kv(kv, weight_key))
+        .transpose()?;
+    let produce_offset = produce_offset_kvs
+        .first()
+        .map(|kv| EtcdKeyGeneration::from_kv(kv, produce_offset_key))
+        .transpose()?;
+    Ok((member, weight, produce_offset))
 }
 
 fn producer_membership_get_pair(
@@ -150,26 +204,24 @@ fn producer_membership_get_pair(
         responses.as_slice()
     else {
         anyhow::bail!(
-            "producer membership readback returned an invalid response shape: operations={}",
+            "producer membership cleanup readback returned an invalid response shape: operations={}",
             responses.len()
         );
     };
-
-    let member_kvs = member_get.kvs();
-    let weight_kvs = weight_get.kvs();
-    if member_kvs.len() > 1 || weight_kvs.len() > 1 {
+    if member_get.kvs().len() > 1 || weight_get.kvs().len() > 1 {
         anyhow::bail!(
-            "producer membership readback returned duplicate exact keys: member_count={} weight_count={}",
-            member_kvs.len(),
-            weight_kvs.len()
+            "producer membership cleanup readback returned duplicate exact keys: member_count={} weight_count={}",
+            member_get.kvs().len(),
+            weight_get.kvs().len()
         );
     }
-
-    let member = member_kvs
+    let member = member_get
+        .kvs()
         .first()
         .map(|kv| EtcdKeyGeneration::from_kv(kv, key))
         .transpose()?;
-    let weight = weight_kvs
+    let weight = weight_get
+        .kvs()
         .first()
         .map(|kv| EtcdKeyGeneration::from_kv(kv, weight_key))
         .transpose()?;
@@ -184,23 +236,29 @@ fn classify_producer_membership_readback(
     weight_key: &str,
     weight_value: &str,
     global_lease_id: i64,
+    produce_offset_key: &str,
 ) -> Result<ProducerMembershipReadback> {
-    let (member, weight) = producer_membership_get_pair(txn_res, key, weight_key)?;
-    match (member, weight) {
-        (None, None) => Ok(ProducerMembershipReadback::Absent),
-        (Some(member), Some(weight))
+    let (member, weight, produce_offset) =
+        producer_membership_get_state(txn_res, key, weight_key, produce_offset_key)?;
+    match (member, weight, produce_offset) {
+        (None, None, None) => Ok(ProducerMembershipReadback::Absent),
+        (Some(member), Some(weight), None)
             if member.value == member_meta_bytes
                 && member.lease_id == member_lease_id
                 && weight.value == weight_value.as_bytes()
                 && weight.lease_id == global_lease_id =>
         {
             Ok(ProducerMembershipReadback::Owned(
-                ProducerMembershipGeneration { member, weight },
+                ProducerMembershipPublication {
+                    generation: ProducerMembershipGeneration { member, weight },
+                    produce_offset_observation: OffsetObservation::Absent,
+                },
             ))
         }
-        (member, weight) => Ok(ProducerMembershipReadback::Conflicting {
+        (member, weight, produce_offset) => Ok(ProducerMembershipReadback::Conflicting {
             member_count: usize::from(member.is_some()),
             weight_count: usize::from(weight.is_some()),
+            produce_offset_count: usize::from(produce_offset.is_some()),
         }),
     }
 }
@@ -213,7 +271,7 @@ fn published_producer_membership_generation(
     weight_key: &str,
     weight_value: &str,
     global_lease_id: i64,
-) -> Result<ProducerMembershipGeneration> {
+) -> Result<ProducerMembershipPublication> {
     let mod_revision = txn_res
         .header()
         .ok_or_else(|| anyhow::anyhow!("producer membership publish response has no header"))?
@@ -224,19 +282,22 @@ fn published_producer_membership_generation(
             mod_revision
         );
     }
-    Ok(ProducerMembershipGeneration {
-        member: EtcdKeyGeneration {
-            key: key.to_string(),
-            value: member_meta_bytes.to_vec(),
-            lease_id: member_lease_id,
-            mod_revision,
+    Ok(ProducerMembershipPublication {
+        generation: ProducerMembershipGeneration {
+            member: EtcdKeyGeneration {
+                key: key.to_string(),
+                value: member_meta_bytes.to_vec(),
+                lease_id: member_lease_id,
+                mod_revision,
+            },
+            weight: EtcdKeyGeneration {
+                key: weight_key.to_string(),
+                value: weight_value.as_bytes().to_vec(),
+                lease_id: global_lease_id,
+                mod_revision,
+            },
         },
-        weight: EtcdKeyGeneration {
-            key: weight_key.to_string(),
-            value: weight_value.as_bytes().to_vec(),
-            lease_id: global_lease_id,
-            mod_revision,
-        },
+        produce_offset_observation: OffsetObservation::Absent,
     })
 }
 
@@ -363,9 +424,10 @@ async fn publish_producer_membership(
     weight_key: &str,
     weight_value: &str,
     global_lease_id: i64,
+    produce_offset_key: &str,
     etcd_rpc_max_retries: u32,
     shutdown: &ShutdownCtl,
-) -> Result<ProducerMembershipGeneration> {
+) -> Result<ProducerMembershipPublication> {
     let mut last_error = String::new();
     let mut request_started = false;
     let max_attempts = etcd_rpc_attempt_limit(etcd_rpc_max_retries);
@@ -392,6 +454,7 @@ async fn publish_producer_membership(
             weight_key,
             weight_value,
             global_lease_id,
+            produce_offset_key,
         );
         let retryable =
             match tokio::time::timeout(PRODUCER_MEMBERSHIP_RPC_TIMEOUT, client.txn(txn)).await {
@@ -414,8 +477,11 @@ async fn publish_producer_membership(
                     weight_key,
                     weight_value,
                     global_lease_id,
+                    produce_offset_key,
                 ) {
-                    Ok(ProducerMembershipReadback::Owned(generation)) => return Ok(generation),
+                    Ok(ProducerMembershipReadback::Owned(publication)) => {
+                        return Ok(publication);
+                    }
                     Ok(ProducerMembershipReadback::Absent) => {
                         last_error = "membership disappeared while reconciling a retry".to_string();
                         true
@@ -423,10 +489,12 @@ async fn publish_producer_membership(
                     Ok(ProducerMembershipReadback::Conflicting {
                         member_count,
                         weight_count,
+                        produce_offset_count,
                     }) => anyhow::bail!(
-                        "producer membership key already exists with conflicting state: member_count={} weight_count={}",
+                        "producer membership or produce offset key already exists with conflicting state: member_count={} weight_count={} produce_offset_count={}",
                         member_count,
-                        weight_count
+                        weight_count,
+                        produce_offset_count,
                     ),
                     Err(error) => return Err(error),
                 },
@@ -486,6 +554,7 @@ pub struct MpscProducer {
     /// `produce_offset` and relies on the invariant that a given
     /// producer handle is single-writer.
     next_msg_id: i64,
+    produce_offset_observation: OffsetObservation,
     /// Shared shutdown controller used by higher layers (via PyO3
     /// handle) to signal that this producer should stop retrying and
     /// exit ongoing operations as soon as possible.
@@ -604,8 +673,12 @@ impl MpscProducer {
         let weight = weight.unwrap_or(1);
         let weight_value = weight.to_string();
         let weight_key = keys::etcd_producer_weight_key(chan_id, &producer_idx);
+        let produce_offset_key = keys::etcd_produce_offset_one_producer_key(chan_id, &producer_idx);
         let global_lease_id = chan_mgr.global_lease.id() as i64;
-        let membership_generation = publish_producer_membership(
+        let ProducerMembershipPublication {
+            generation: membership_generation,
+            produce_offset_observation,
+        } = publish_producer_membership(
             &mut client,
             &key,
             &member_meta_bytes,
@@ -613,6 +686,7 @@ impl MpscProducer {
             &weight_key,
             &weight_value,
             global_lease_id,
+            &produce_offset_key,
             etcd_rpc_max_retries,
             &shutdown,
         )
@@ -665,6 +739,7 @@ impl MpscProducer {
             chan_mgr,
             // First id = PRODUCE_OFFSET_BEGIN + 1
             next_msg_id: PRODUCE_OFFSET_BEGIN + 1,
+            produce_offset_observation,
             // shutdown 控制器由上层（例如 PyO3 层）构造并注入，
             // 这里直接复用同一个实例，以便 handle/重试循环
             // 共享关闭信号。
@@ -889,8 +964,12 @@ impl MpscProducer {
         let offset_put_begin = Instant::now();
         let max_attempts = etcd_rpc_attempt_limit(self.chan_mgr.etcd_rpc_max_retries());
         let mut committed_attempt = 0u64;
-        let mut offset_commit =
-            MonotonicOffsetCommit::new(offset_key.clone(), next_id, global_lease_id);
+        let mut offset_commit = MonotonicOffsetCommit::new(
+            offset_key.clone(),
+            next_id,
+            global_lease_id,
+            Some(self.produce_offset_observation.clone()),
+        )?;
         for attempt in 1..=max_attempts {
             let result = tokio::select! {
                 biased;
@@ -907,7 +986,8 @@ impl MpscProducer {
             };
 
             let retry_reason = match result {
-                Ok(Ok(OffsetCommitProgress::Complete)) => {
+                Ok(Ok(OffsetCommitProgress::Complete(generation))) => {
+                    self.produce_offset_observation = OffsetObservation::Present(generation);
                     committed_attempt = attempt;
                     break;
                 }
