@@ -147,6 +147,8 @@ struct UiAdminHomeMainTemplate {
 struct UiAccountPasswordMainTemplate {
     show_error: bool,
     error_msg: String,
+    require_initial_change: bool,
+    current_username: String,
 }
 
 #[derive(Template)]
@@ -1921,6 +1923,7 @@ async fn ui_admin_fs_master_export_remove(
 
 #[derive(serde::Deserialize)]
 struct UiAccountPasswordForm {
+    new_username: String,
     current_password: String,
     new_password: String,
     confirm_new_password: String,
@@ -1942,7 +1945,7 @@ fn ui_render_account_password_page(
             UiCrumbView {
                 href: String::new(),
                 has_href: false,
-                label: "Change Password".to_string(),
+                label: "Change Credentials".to_string(),
                 current: true,
             },
         ],
@@ -1961,6 +1964,9 @@ fn ui_render_account_password_page(
     let main = render_template(&UiAccountPasswordMainTemplate {
         show_error: error_msg.is_some(),
         error_msg: error_msg.unwrap_or("").to_string(),
+        require_initial_change: st
+            .account_requires_credentials_change(identity.viewer_username()),
+        current_username: identity.viewer_username().to_string(),
     });
 
     let home_href = ui_href_with_as("../../", identity.as_user.as_deref());
@@ -1971,13 +1977,13 @@ fn ui_render_account_password_page(
     let user_actions_html = ui_user_actions_html(identity, &account_password_href, &admin_manage_href, "./");
 
     ui_page_html(
-        "Change Password",
+        "Change Credentials",
         &home_href,
         &buckets_href,
         &transfers_href,
         "buckets",
         &crumbs,
-        "Change Password",
+        "Change Credentials",
         Some(&subtitle),
         None,
         &user_actions_html,
@@ -1990,7 +1996,7 @@ async fn ui_account_password_page(
     headers: HeaderMap,
     axum::extract::Query(q): axum::extract::Query<UiAsQuery>,
 ) -> Response {
-    let identity = match ui_require_identity(&headers, &st, q.as_user) {
+    let identity = match ui_require_identity_for_credentials_change(&headers, &st, q.as_user) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -2003,7 +2009,8 @@ async fn ui_account_password_save(
     axum::extract::Query(q): axum::extract::Query<UiAsQuery>,
     Form(f): Form<UiAccountPasswordForm>,
 ) -> Response {
-    let identity = match ui_require_identity(&headers, &st, q.as_user.clone()) {
+    let identity =
+        match ui_require_identity_for_credentials_change(&headers, &st, q.as_user.clone()) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -2015,23 +2022,24 @@ async fn ui_account_password_save(
         return resp;
     }
 
-    let new_password = f.new_password.trim().to_string();
-    if new_password.is_empty() {
-        let html = ui_render_account_password_page(&st, &identity, Some("new_password must be non-empty"));
-        let mut resp = Html(html).into_response();
-        *resp.status_mut() = StatusCode::BAD_REQUEST;
-        return resp;
-    }
-    if f.new_password != new_password {
-        let html = ui_render_account_password_page(
-            &st,
-            &identity,
-            Some("new_password must not have leading/trailing whitespace"),
-        );
-        let mut resp = Html(html).into_response();
-        *resp.status_mut() = StatusCode::BAD_REQUEST;
-        return resp;
-    }
+    let new_username = match ui_validate_username_for_basic_auth(&f.new_username) {
+        Ok(value) => value,
+        Err(err) => {
+            let html = ui_render_account_password_page(&st, &identity, Some(&err.to_string()));
+            let mut resp = Html(html).into_response();
+            *resp.status_mut() = StatusCode::BAD_REQUEST;
+            return resp;
+        }
+    };
+    let new_password = match ui_validate_password_no_whitespace(&f.new_password, "new_password") {
+        Ok(value) => value,
+        Err(err) => {
+            let html = ui_render_account_password_page(&st, &identity, Some(&err.to_string()));
+            let mut resp = Html(html).into_response();
+            *resp.status_mut() = StatusCode::BAD_REQUEST;
+            return resp;
+        }
+    };
     if f.confirm_new_password != new_password {
         let html = ui_render_account_password_page(&st, &identity, Some("confirm_new_password mismatch"));
         let mut resp = Html(html).into_response();
@@ -2039,8 +2047,47 @@ async fn ui_account_password_save(
         return resp;
     }
 
+    let old_username = identity.viewer.username.clone();
+    let required_initial_change = st.account_requires_credentials_change(old_username.as_str());
+    if required_initial_change && new_username == old_username {
+        let html = ui_render_account_password_page(
+            &st,
+            &identity,
+            Some("the initial username must be changed"),
+        );
+        let mut resp = Html(html).into_response();
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        return resp;
+    }
+    if new_password == identity.viewer.password {
+        let html = ui_render_account_password_page(
+            &st,
+            &identity,
+            Some("the new password must differ from the current password"),
+        );
+        let mut resp = Html(html).into_response();
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        return resp;
+    }
+
     let mut permission_list = st.permission_list.read().clone();
-    let Some(item) = permission_list.iter_mut().find(|v| v.username == identity.viewer.username) else {
+    if permission_list
+        .iter()
+        .any(|item| item.username == new_username && item.username != old_username)
+    {
+        let html = ui_render_account_password_page(
+            &st,
+            &identity,
+            Some("new username already exists"),
+        );
+        let mut resp = Html(html).into_response();
+        *resp.status_mut() = StatusCode::CONFLICT;
+        return resp;
+    }
+    let Some(item) = permission_list
+        .iter_mut()
+        .find(|v| v.username == old_username)
+    else {
         return text_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
@@ -2049,14 +2096,20 @@ async fn ui_account_password_save(
             ),
         );
     };
+    item.username = new_username;
     item.password = new_password;
     if let Err(err) = persist_permission_list(&st, &permission_list) {
         return text_response(StatusCode::BAD_GATEWAY, err);
     }
+    if required_initial_change {
+        if let Err(err) = st.complete_required_credentials_change(old_username.as_str()) {
+            tracing::warn!(username = %old_username, error = %err, "failed to clear completed credentials-change marker");
+        }
+    }
 
     let mut resp = Response::new(boxed(Body::empty()));
     *resp.status_mut() = StatusCode::SEE_OTHER;
-    let mut href = "./".to_string();
+    let mut href = "../../".to_string();
     if let Some(as_user) = identity.as_user.as_deref() {
         href = ui_href_with_as(&href, Some(as_user));
     }

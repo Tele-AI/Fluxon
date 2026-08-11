@@ -81,6 +81,11 @@ class PutOptionalArgs:
     - make_replica_task_mask: optional per-key replica admission decisions for
       local_fast_put_start(). Its length must match the key batch. The scalar
       make_replica_task remains the batch-wide gate.
+    - radix_parent_keys/content_depths: optional exact Radix lineage for the
+      ordered local_fast_put_start() key batch. Both fields must be supplied
+      together. A depth-zero key has no parent; every deeper key names its
+      exact parent key. The metadata is observational until a Radix-aware
+      eviction policy is explicitly enabled.
     - atomic_group_lens: optional positive lengths that partition the ordered
       local_fast_put_start() key batch into atomic groups. Replica admission
       must be uniform within every group.
@@ -91,6 +96,8 @@ class PutOptionalArgs:
     write_through: bool = True
     make_replica_task: bool = True
     make_replica_task_mask: Optional[List[bool]] = None
+    radix_parent_keys: Optional[List[Optional[str]]] = None
+    content_depths: Optional[List[int]] = None
     atomic_group_lens: Optional[List[int]] = None
 
     def support_mooncake(self) -> Tuple[bool, List[str]]:
@@ -116,6 +123,10 @@ class PutOptionalArgs:
             unsupported.append("make_replica_task")
         if self.make_replica_task_mask is not None:
             unsupported.append("make_replica_task_mask")
+        if self.radix_parent_keys is not None:
+            unsupported.append("radix_parent_keys")
+        if self.content_depths is not None:
+            unsupported.append("content_depths")
         if self.atomic_group_lens is not None:
             unsupported.append("atomic_group_lens")
         return (len(unsupported) == 0, unsupported)

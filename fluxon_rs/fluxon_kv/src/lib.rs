@@ -34,6 +34,10 @@ pub use fluxon_observability::types::FsMountKind;
 pub const OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES: u64 = 512 * 1024 * 1024;
 pub(crate) const OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES: u64 = 4 * 1024;
 
+pub(crate) fn owner_local_reserve_slot_offset_bytes(slot_index: u32) -> Option<u64> {
+    u64::from(slot_index).checked_mul(OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES)
+}
+
 pub(crate) fn owner_local_reserve_slot_size_bytes(value_len: u64) -> Option<u64> {
     let normalized = value_len.max(OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES);
     let alignment_mask = OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES - 1;
@@ -62,6 +66,10 @@ pub(crate) fn owner_local_reserve_expected_grant_count(
     let value_count =
         payload_capacity_bytes / value_len + u64::from(payload_capacity_bytes % value_len != 0);
     Some(value_count / slots_per_grant + u64::from(value_count % slots_per_grant != 0))
+}
+
+pub(crate) fn owner_local_reserve_physical_grant_count(physical_capacity_bytes: u64) -> u64 {
+    physical_capacity_bytes / OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
 }
 
 pub type MembershipEventReceiver =
@@ -114,8 +122,8 @@ use client_transfer_engine::ClientTransferEngine;
 use cluster_manager::{ClusterManager, ClusterManagerNewArg, ClusterManagerRdmaControlInit};
 use config::{
     ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig,
-    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TestSpecConfig,
-    TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
+    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TcpThreadReactorWaitMode,
+    TestSpecConfig, TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
 };
 use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
 use fluxon_commu::TransferBackendActivationMode;
@@ -129,7 +137,9 @@ use metric_reporter::{
     register_greptime_otlp_log_proxy_rpc, serialize_master_observe_broadcast,
     wait_master_observe_broadcast,
 };
-use p2p::p2p_module::{P2pModule, P2pModuleNewArg, P2pTcpThreadTransportTuning};
+use p2p::p2p_module::{
+    P2pModule, P2pModuleNewArg, P2pTcpThreadReactorWaitMode, P2pTcpThreadTransportTuning,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -649,11 +659,16 @@ fn find_default_config_file() -> Option<PathBuf> {
     None
 }
 
-fn tcp_thread_transport_tuning_from_test_spec_config(
+fn tcp_thread_transport_tuning_from_config(
+    protocol_config: &ProtocolConfig,
     test_spec_config: &TestSpecConfig,
 ) -> P2pTcpThreadTransportTuning {
     P2pTcpThreadTransportTuning {
         reactor_shard_count: test_spec_config.tcp_thread_reactor_shard_count,
+        reactor_wait_mode: match protocol_config.tcp_thread_reactor {
+            TcpThreadReactorWaitMode::BusyPoll => P2pTcpThreadReactorWaitMode::BusyPoll,
+            TcpThreadReactorWaitMode::EventDriven => P2pTcpThreadReactorWaitMode::EventDriven,
+        },
         bulk_lane_count: test_spec_config.tcp_thread_bulk_lane_count,
         control_lane_count: test_spec_config.tcp_thread_control_lane_count,
     }
@@ -850,6 +865,7 @@ fn build_side_transfer_worker_config(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
             rdma_device_names: None,
+            tcp_thread_reactor: owner_config.protocol.tcp_thread_reactor,
         },
         pprof_duration_seconds: owner_config.pprof_duration_seconds,
         replica_writeback_hot_capacity_ratio: None,
@@ -930,7 +946,7 @@ fn side_transfer_runtime_dir(owner_config: &ClientConfig) -> PathBuf {
 }
 
 fn cluster_manager_local_ipc_root(
-    share_mem_path: &str,
+    ipc_identity_path: &str,
     test_spec_config: &TestSpecConfig,
 ) -> Option<String> {
     // Test-only override:
@@ -944,20 +960,33 @@ fn cluster_manager_local_ipc_root(
         return None;
     }
 
-    // Local IPC and the mmap bundle must stay logically tied to the same share-group root, but
-    // they do not need to reuse the same literal filesystem path.
+    // Local IPC needs a stable, host-visible identity path, but iceoryx2 does not need to reuse
+    // that literal filesystem path as its runtime root. Owners/external clients use their mmap
+    // bundle root as the identity; the master uses its existing log root because it has no mmap
+    // bundle of its own.
     //
     // Causal chain:
-    // - `share_mem_path` is authoritative for mmap.file/shared.json coordination and can be long.
+    // - The identity path can be long (owner share_mem_path and master log_dir both commonly are).
     // - iceoryx2 event listeners materialize AF_UNIX socket files under `local_ipc_root`.
     // - AF_UNIX paths are short; reusing a long `share_mem_path` makes listener creation fail
     //   as `ResourceCreationFailed`, even on a clean start with no stale resources.
     // - Therefore we derive a short, stable alias from the canonical shared-memory root and publish
     //   only that alias as `local_ipc_root`.
     Some(
-        derive_short_local_ipc_root(share_mem_path)
+        derive_short_local_ipc_root(ipc_identity_path)
             .unwrap_or_else(|err| panic!("failed to derive local_ipc_root: {}", err)),
     )
+}
+
+fn master_cluster_manager_local_ipc_root(
+    log_dir: &str,
+    test_spec_config: &TestSpecConfig,
+) -> Option<String> {
+    // Master participates in the same local IPC transport as every other Fluxon member. Peers
+    // consume the exact root published in master membership, so this root does not need to equal
+    // an owner's share_mem_path-derived root. TCP remains the transport-control fallback when the
+    // local lane cannot be established.
+    cluster_manager_local_ipc_root(log_dir, test_spec_config)
 }
 
 fn derive_short_local_ipc_root(share_mem_path: &str) -> Result<String> {
@@ -1531,14 +1560,17 @@ async fn run_master_impl(
             instance_name: Some(config.instance_key.clone()),
             port: None,
             metadata,
-            local_ipc_root: None,
+            local_ipc_root: master_cluster_manager_local_ipc_root(
+                &config.log_dir,
+                &config.test_spec_config,
+            ),
             rdma_control_init,
             sub_cluster: None,
             network: config.network.clone(),
         },
         p2p_arg: P2pModuleNewArg::new(
             config.port,
-            tcp_thread_transport_tuning_from_test_spec_config(&config.test_spec_config),
+            tcp_thread_transport_tuning_from_config(&config.protocol, &config.test_spec_config),
             config.test_spec_config.disable_crossowner_ipc,
             config.test_spec_config.iceoryx_external_busy_poll,
         )
@@ -2076,7 +2108,7 @@ async fn run_client_impl(
             },
             p2p_arg: P2pModuleNewArg::new(
                 config.fluxonkv_spec.p2p_listen_port,
-                tcp_thread_transport_tuning_from_test_spec_config(&config.test_spec_config),
+                tcp_thread_transport_tuning_from_config(&config.protocol, &config.test_spec_config),
                 config.test_spec_config.disable_crossowner_ipc,
                 config.test_spec_config.iceoryx_external_busy_poll,
             )
@@ -2145,7 +2177,7 @@ async fn run_client_impl(
             },
             p2p_arg: P2pModuleNewArg::new(
                 config.fluxonkv_spec.p2p_listen_port,
-                tcp_thread_transport_tuning_from_test_spec_config(&config.test_spec_config),
+                tcp_thread_transport_tuning_from_config(&config.protocol, &config.test_spec_config),
                 config.test_spec_config.disable_crossowner_ipc,
                 config.test_spec_config.iceoryx_external_busy_poll,
             )
@@ -2165,6 +2197,9 @@ async fn run_client_impl(
                         (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
                     },
                 ),
+                owner_local_reserve_physical_capacity_bytes: config
+                    .contribute_to_cluster_pool_size
+                    .dram,
                 ssd_storage: ssd_storage_init,
             },
             client_seg_pool_arg: ClientSegPoolNewArg {
@@ -2571,6 +2606,22 @@ mod tests {
         path
     }
 
+    #[test]
+    fn production_owner_grant_remains_a_generic_mixed_size_extent() {
+        const SGLANG_KV_PAGE_BYTES: u64 = 4_718_592;
+
+        let slot_size = owner_local_reserve_slot_size_bytes(SGLANG_KV_PAGE_BYTES).unwrap();
+        let slots_per_grant = owner_local_reserve_slots_per_grant(slot_size).unwrap();
+        let slot_relative_tail =
+            OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES - u64::from(slots_per_grant) * slot_size;
+
+        assert_eq!(slots_per_grant, 113);
+        assert_eq!(slot_relative_tail, 3_670_016);
+        assert!(
+            slot_relative_tail >= owner_local_reserve_slot_size_bytes(3 * 1024 * 1024).unwrap()
+        );
+    }
+
     fn owner_config_for_side_transfer_test() -> ClientConfig {
         ClientConfig {
             cluster_name: "test_cluster".to_string(),
@@ -2583,6 +2634,7 @@ mod tests {
             protocol: ProtocolConfig {
                 protocol_type: ProtocolType::Tcp,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             },
             pprof_duration_seconds: None,
             replica_writeback_hot_capacity_ratio: None,
@@ -2620,6 +2672,7 @@ mod tests {
                 &ProtocolConfig {
                     protocol_type: ProtocolType::Tcp,
                     rdma_device_names: None,
+                    tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
                 },
                 Some(&cfg),
             ),
@@ -2639,6 +2692,7 @@ mod tests {
                 &ProtocolConfig {
                     protocol_type: ProtocolType::Rdma,
                     rdma_device_names: None,
+                    tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
                 },
                 Some(&cfg),
             ),
@@ -2722,10 +2776,38 @@ mod tests {
     }
 
     #[test]
+    fn master_cluster_manager_local_ipc_root_is_published_by_default() {
+        let tempdir = new_test_dir("fluxon_master_local_ipc_root");
+        let log_root = tempdir.join("master_logs");
+
+        let enabled = master_cluster_manager_local_ipc_root(
+            log_root.to_str().unwrap(),
+            &TestSpecConfig::default(),
+        );
+        assert!(enabled.is_some());
+        assert_eq!(
+            enabled,
+            cluster_manager_local_ipc_root(log_root.to_str().unwrap(), &TestSpecConfig::default(),)
+        );
+
+        let disabled = master_cluster_manager_local_ipc_root(
+            log_root.to_str().unwrap(),
+            &TestSpecConfig {
+                disable_local_ipc: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(disabled, None);
+
+        std::fs::remove_dir_all(&tempdir).unwrap();
+    }
+
+    #[test]
     fn transfer_engine_rdma_device_names_prefers_test_spec_devices() {
         let protocol = ProtocolConfig {
             protocol_type: ProtocolType::Rdma,
             rdma_device_names: Some("mlx5_9:1".to_string()),
+            tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
         };
         let cfg = TestSpecConfig {
             rdma_device_names: Some(vec!["mlx5_1".to_string(), "mlx5_0".to_string()]),
@@ -2743,6 +2825,7 @@ mod tests {
         owner_cfg.protocol = ProtocolConfig {
             protocol_type: ProtocolType::Rdma,
             rdma_device_names: Some("mlx5_2:1".to_string()),
+            tcp_thread_reactor: TcpThreadReactorWaitMode::EventDriven,
         };
         owner_cfg.fluxonkv_spec.transfer_engine = TransferEngineType::Closed;
         owner_cfg.fluxonkv_spec.enable_transfer_rpc_fast_path = true;
@@ -2765,6 +2848,10 @@ mod tests {
         );
         assert!(!side_cfg.fluxonkv_spec.enable_transfer_rpc_fast_path);
         assert_eq!(
+            side_cfg.protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::EventDriven
+        );
+        assert_eq!(
             side_cfg.test_spec_config.side_transfer_role,
             Some(SideTransferRole::Worker)
         );
@@ -2777,6 +2864,35 @@ mod tests {
         assert_eq!(side_cfg.test_spec_config.rdma_device_names, None);
         assert!(side_cfg.test_spec_config.enable_side_transfer);
         assert!(!side_cfg.test_spec_config.disable_local_ipc);
+    }
+
+    #[test]
+    fn tcp_thread_reactor_maps_to_p2p_tuning() {
+        let default_tuning = tcp_thread_transport_tuning_from_config(
+            &ProtocolConfig {
+                protocol_type: ProtocolType::Tcp,
+                rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::BusyPoll,
+            },
+            &TestSpecConfig::default(),
+        );
+        assert_eq!(
+            default_tuning.reactor_wait_mode,
+            P2pTcpThreadReactorWaitMode::BusyPoll
+        );
+
+        let event_driven_tuning = tcp_thread_transport_tuning_from_config(
+            &ProtocolConfig {
+                protocol_type: ProtocolType::Tcp,
+                rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::EventDriven,
+            },
+            &TestSpecConfig::default(),
+        );
+        assert_eq!(
+            event_driven_tuning.reactor_wait_mode,
+            P2pTcpThreadReactorWaitMode::EventDriven
+        );
     }
 
     #[test]
@@ -2831,6 +2947,7 @@ mod tests {
             Some(ProtocolConfig {
                 protocol_type: ProtocolType::Tcp,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             })
         );
         assert!(side_cfg_yaml.contribute_to_cluster_pool_size.is_none());
@@ -2892,6 +3009,7 @@ mod tests {
             protocol: ProtocolConfig {
                 protocol_type: ProtocolType::Tcp,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             },
             pprof_duration_seconds: None,
             replica_writeback_hot_capacity_ratio: None,

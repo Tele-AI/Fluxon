@@ -216,6 +216,7 @@ mod single_victim_transaction_tests {
         }
         Arc::new(OneKvNodesRoutes {
             put_id: member.put_id,
+            radix: None,
             lease_id: None,
             atomic_group,
             node_replicas: RwLock::new(replicas),
@@ -625,10 +626,13 @@ mod single_victim_transaction_tests {
 /// Only `MasterAllocationCapacity` may originate from the master resident
 /// cache's Size listener. `OwnerCapacityEviction` is an exact source-deletion
 /// request selected by the owner and may resolve to a CommittedSlot.
+/// `PostReadDuplicate` reclaims an exact unindexed source only while another
+/// live backing remains on the route.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum EvictionReclaimOrigin {
     MasterAllocationCapacity,
     OwnerCapacityEviction,
+    PostReadDuplicate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -831,6 +835,74 @@ fn route_item(
     })
 }
 
+fn has_other_live_backing(
+    replicas: &HashMap<NodeID, super::KvNodeReplicas>,
+    source_owner: &NodeID,
+) -> bool {
+    replicas.iter().any(|(node_id, replicas)| {
+        if replicas.tomb_tag.is_tomb() {
+            return false;
+        }
+        if node_id == source_owner {
+            replicas.ssd.is_some()
+        } else {
+            replicas.memory.is_some() || replicas.ssd.is_some()
+        }
+    })
+}
+
+fn post_read_duplicate_source_is_redundant(
+    view: &MasterKvRouterView,
+    source_owner: &NodeID,
+    item: &OwnerReclaimItem,
+) -> bool {
+    let Some(route) = view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .get(&item.key)
+        .map(|route| route.clone())
+    else {
+        return false;
+    };
+    if route.put_id != item.put_id || route.lease_id.is_some() {
+        return false;
+    }
+    let replicas = route.node_replicas.read();
+    let source_matches = replicas
+        .get(source_owner)
+        .filter(|replicas| !replicas.tomb_tag.is_tomb())
+        .and_then(|replicas| replicas.memory.as_ref())
+        .is_some_and(|memory| reclaim_backing_matches(memory, &item.backing));
+    source_matches && has_other_live_backing(&replicas, source_owner)
+}
+
+fn exact_reclaim_source_is_current(
+    view: &MasterKvRouterView,
+    source_owner: &NodeID,
+    item: &OwnerReclaimItem,
+) -> bool {
+    let Some(route) = view
+        .master_kv_router()
+        .inner()
+        .kv_routes
+        .get(&item.key)
+        .map(|route| route.clone())
+    else {
+        return false;
+    };
+    if route.put_id != item.put_id || route.lease_id.is_some() {
+        return false;
+    }
+    route
+        .node_replicas
+        .read()
+        .get(source_owner)
+        .filter(|replicas| !replicas.tomb_tag.is_tomb())
+        .and_then(|replicas| replicas.memory.as_ref())
+        .is_some_and(|memory| reclaim_backing_matches(memory, &item.backing))
+}
+
 fn item_still_valid(view: &MasterKvRouterView, owner: &NodeID, item: &OwnerReclaimItem) -> bool {
     if !view
         .master_kv_router()
@@ -840,7 +912,7 @@ fn item_still_valid(view: &MasterKvRouterView, owner: &NodeID, item: &OwnerRecla
     {
         return false;
     }
-    route_item(
+    let route_matches = route_item(
         view,
         owner,
         &item.key,
@@ -854,7 +926,10 @@ fn item_still_valid(view: &MasterKvRouterView, owner: &NodeID, item: &OwnerRecla
         item.reason,
         item.epoch,
     )
-    .is_some_and(|current| current.backing == item.backing && current.reason == item.reason)
+    .is_some_and(|current| current.backing == item.backing && current.reason == item.reason);
+    route_matches
+        && (item.reason != OwnerReclaimReason::PostReadDuplicate
+            || post_read_duplicate_source_is_redundant(view, owner, item))
 }
 
 /// Publish bytes already persisted by the owner onto the existing route while
@@ -1708,6 +1783,7 @@ fn remove_exact_owner_source_route(
     }
     let removed_desc = {
         let mut replicas = route.node_replicas.write();
+        let post_read_has_other_backing = has_other_live_backing(&replicas, owner);
         let Some(node_replicas) = replicas.get_mut(owner) else {
             return None;
         };
@@ -1718,6 +1794,9 @@ fn remove_exact_owner_source_route(
             return None;
         };
         if !reclaim_backing_matches(replica, &item.backing) {
+            return None;
+        }
+        if item.reason == OwnerReclaimReason::PostReadDuplicate && !post_read_has_other_backing {
             return None;
         }
         let capacity_bytes = replica.backing.capacity_bytes();
@@ -1855,9 +1934,41 @@ fn finish_unindexed_allocations(
             &item.backing,
             OwnerReclaimBacking::UnindexedAllocation { .. }
         ));
-        if remove_reclaimed_replica(view, owner, &item) {
+        let is_post_read = item.reason == OwnerReclaimReason::PostReadDuplicate;
+        let reclaimed_exact_source =
+            if is_post_read && !post_read_duplicate_source_is_redundant(view, owner, &item) {
+                false
+            } else {
+                remove_reclaimed_replica(view, owner, &item)
+                    && (!is_post_read || !exact_reclaim_source_is_current(view, owner, &item))
+            };
+        if reclaimed_exact_source {
             clear_master_fence(view, &item);
             reclaimed = reclaimed.saturating_add(1);
+            if is_post_read {
+                let counters = view
+                    .master_kv_router()
+                    .eviction_reclaim_counters(owner.as_ref());
+                counters
+                    .post_read_duplicate_reclaimed_items
+                    .fetch_add(1, Ordering::Relaxed);
+                counters.post_read_duplicate_reclaimed_bytes.fetch_add(
+                    match &item.backing {
+                        OwnerReclaimBacking::UnindexedAllocation { capacity_bytes, .. } => {
+                            *capacity_bytes
+                        }
+                        _ => 0,
+                    },
+                    Ordering::Relaxed,
+                );
+            }
+        } else if is_post_read {
+            clear_master_fence(view, &item);
+            tracing::debug!(
+                owner = %owner,
+                key = %item.key,
+                "post-read duplicate reclaim aborted because the exact source is no longer redundant"
+            );
         } else {
             tracing::error!(
                 "unindexed allocation reclaim backing could not be removed from master route: owner={} key={} epoch={}",
@@ -2482,8 +2593,15 @@ async fn reclaim_single_victim(
 #[cfg(test)]
 mod reclaim_partition_tests {
     use super::{
-        OwnerReclaimBacking, OwnerReclaimItem, OwnerReclaimReason, partition_reclaim_coordination,
+        OwnerReclaimBacking, OwnerReclaimItem, OwnerReclaimReason, has_other_live_backing,
+        partition_reclaim_coordination,
     };
+    use crate::cluster_manager::NodeID;
+    use crate::master_kv_router::{
+        CommittedSlotReplica, KvMemoryReplica, KvNodeReplicas, KvReplicaBacking, KvSsdReplica,
+    };
+    use crate::master_seg_manager::NodeTombTag;
+    use std::collections::HashMap;
 
     fn candidate(index: u32) -> OwnerReclaimItem {
         OwnerReclaimItem {
@@ -2534,6 +2652,44 @@ mod reclaim_partition_tests {
         assert_eq!(
             owner_coordinated,
             vec![indexed_allocation, unindexed_allocation, committed_slot]
+        );
+    }
+
+    #[test]
+    fn post_read_duplicate_requires_another_live_backing() {
+        let source: NodeID = "remote".to_string().into();
+        let local: NodeID = "local".to_string().into();
+        let replica = |owner: &NodeID| {
+            KvNodeReplicas::memory(
+                NodeTombTag::new(),
+                KvMemoryReplica {
+                    backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
+                        owner_node_id: owner.clone(),
+                        grant_id: 1,
+                        slot_index: 0,
+                        slot_size: 4096,
+                        addr: 0,
+                        len: 4096,
+                        base_addr: 0,
+                    }),
+                    owner_local_indexed: true,
+                    get_durable_reservation: None,
+                    capacity_reservation: None,
+                },
+            )
+        };
+        let mut replicas = HashMap::from([(source.clone(), replica(&source))]);
+        assert!(!has_other_live_backing(&replicas, &source));
+
+        replicas.insert(local.clone(), replica(&local));
+        assert!(has_other_live_backing(&replicas, &source));
+        replicas.get(&local).unwrap().tomb_tag.set_tomb();
+        assert!(!has_other_live_backing(&replicas, &source));
+
+        replicas.get_mut(&source).unwrap().ssd = Some(KvSsdReplica { len: 4096 });
+        assert!(
+            has_other_live_backing(&replicas, &source),
+            "same-owner SSD also prevents deleting the final backing"
         );
     }
 }
@@ -2763,6 +2919,7 @@ mod owner_get_holding_reclaim_tests {
                     committed_slot: None,
                     publish_local_cache: false,
                     atomic_group: None,
+                    radix: None,
                 },
                 raw_bytes: Vec::new(),
             },
@@ -2902,6 +3059,29 @@ fn request_is_current(view: &MasterKvRouterView, request: &EvictionReclaimReques
                                     && reclaim_backing_matches(replica, expected_backing)
                             })
                     })
+            })
+        }
+        EvictionReclaimOrigin::PostReadDuplicate => {
+            let owner: NodeID = request.owner_node_id.clone().into();
+            request.members.iter().all(|member| {
+                let Some(expected_backing) = member.expected_backing.as_ref() else {
+                    return false;
+                };
+                if !matches!(
+                    expected_backing,
+                    OwnerReclaimBacking::UnindexedAllocation { .. }
+                ) {
+                    return false;
+                }
+                let item = OwnerReclaimItem {
+                    key: member.key.clone(),
+                    put_id: member.desc.put_id,
+                    epoch: 0,
+                    backing: expected_backing.clone(),
+                    reason: OwnerReclaimReason::PostReadDuplicate,
+                };
+                exact_reclaim_source_is_current(view, &owner, &item)
+                    && post_read_duplicate_source_is_redundant(view, &owner, &item)
             })
         }
     }
@@ -3061,6 +3241,10 @@ pub(crate) fn spawn_eviction_reclaim_actor(
                             EvictionReclaimOrigin::OwnerCapacityEviction => (
                                 request.members.clone(),
                                 OwnerReclaimReason::OwnerCapacityEviction,
+                            ),
+                            EvictionReclaimOrigin::PostReadDuplicate => (
+                                request.members.clone(),
+                                OwnerReclaimReason::PostReadDuplicate,
                             ),
                             EvictionReclaimOrigin::MasterAllocationCapacity => {
                                 let member = match plan_master_allocation_capacity_victim(

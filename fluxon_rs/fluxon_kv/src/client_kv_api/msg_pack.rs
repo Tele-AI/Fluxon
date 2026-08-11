@@ -1,3 +1,4 @@
+use crate::master_kv_router::msg_pack::RadixKvMetadata;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::p2p::msg_pack::{MsgPackSerializePart, RPCReq};
 use crate::rpcresp_kvresult_convert::msg_and_error::{ErrorCode, OK};
@@ -506,6 +507,7 @@ pub struct ExternalBatchPutStartItemReq {
     pub reject_if_exist_same_key: bool,
     pub make_replica_task: bool,
     pub preferred_sub_cluster: Option<String>,
+    pub radix: Option<RadixKvMetadata>,
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]

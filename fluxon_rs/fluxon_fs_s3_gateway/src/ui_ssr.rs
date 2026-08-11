@@ -83,10 +83,42 @@ fn ui_require_identity(
     st: &GatewayState,
     as_user: Option<String>,
 ) -> Result<UiIdentity, Response> {
+    ui_require_identity_impl(headers, st, as_user, false)
+}
+
+fn ui_require_identity_for_credentials_change(
+    headers: &HeaderMap,
+    st: &GatewayState,
+    as_user: Option<String>,
+) -> Result<UiIdentity, Response> {
+    ui_require_identity_impl(headers, st, as_user, true)
+}
+
+fn ui_require_identity_impl(
+    headers: &HeaderMap,
+    st: &GatewayState,
+    as_user: Option<String>,
+    allow_pending_credentials_change: bool,
+) -> Result<UiIdentity, Response> {
     let viewer = match ui_basic_auth_account(headers, st) {
         Some(v) => v,
         None => return Err(ui_basic_auth_required()),
     };
+    if !allow_pending_credentials_change
+        && st.account_requires_credentials_change(viewer.username.as_str())
+    {
+        let mut resp = Response::new(boxed(Body::empty()));
+        *resp.status_mut() = StatusCode::SEE_OTHER;
+        let location = format!(
+            "{}/ui/account/password/",
+            st.external_base_path.trim_end_matches('/')
+        );
+        resp.headers_mut().insert(
+            header::LOCATION,
+            HeaderValue::from_str(location.as_str()).unwrap(),
+        );
+        return Err(resp);
+    }
 
     let as_user = ui_normalize_as_user(as_user);
     let Some(as_username) = as_user.clone() else {

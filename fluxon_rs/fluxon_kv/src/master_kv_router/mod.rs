@@ -6,6 +6,7 @@ pub mod put;
 mod reclaim;
 
 mod count_prefix_index;
+mod radix_shadow;
 mod route_maintenance;
 mod tiered_writeback;
 
@@ -48,7 +49,7 @@ use crate::client_kv_api::ClientKvApi;
 use crate::cluster_manager::{
     ClusterEvent, ClusterManager, ClusterManagerAccessTrait, NodeID, NodeIDString,
 };
-use crate::config::{ReplicaTaskPlacementConfig, TestSpecConfig};
+use crate::config::{PostReadRemotePolicy, ReplicaTaskPlacementConfig, TestSpecConfig};
 use crate::master_kv_router::delete::DeleteKeyInfo;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::master_lease_manager::{MasterLeaseManager, MasterLeaseManagerAccessTrait};
@@ -89,6 +90,10 @@ const MAX_GET_DURABLE_REPLICA_SLOTS: u32 = 2;
 const PLACEMENT_REPORT_INTERVAL_SECS: u64 = 10;
 const INFLIGHT_PUT_TTL_SECONDS: u64 = 60;
 const INFLIGHT_PUT_TTL_SECONDS_SKIP_PUT_END_COMMIT: u64 = 5;
+// Remote append transfer is asynchronous and may legitimately remain in the
+// closed-runtime data plane well beyond one RPC timeout under burst load. Keep
+// the master operation identity alive long enough for Done/Revoke to close it.
+const INFLIGHT_REPLICA_TASK_TTL_SECONDS: u64 = 5 * 60;
 const POST_ROUTE_MAINTENANCE_QUEUE_CAPACITY: usize = 512;
 const TIER1_WRITEBACK_QUEUE_CAPACITY: usize = 4096;
 pub const NODE_POOL_CAPACITY_USER_RPC_PATH: &str = "fluxon_kv/node_pool_capacity";
@@ -350,6 +355,10 @@ pub struct ReplicaCacheNodeObserveSnapshot {
     pub capacity_eviction_non_ring_b_entry_total: u64,
     pub capacity_eviction_hit_committed_slot: u64,
     pub eviction_reclaim_deduplicated: u64,
+    pub post_read_duplicate_enqueued_items: u64,
+    pub post_read_duplicate_enqueued_bytes: u64,
+    pub post_read_duplicate_reclaimed_items: u64,
+    pub post_read_duplicate_reclaimed_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -463,7 +472,9 @@ impl RequesterTargetPair {
 pub struct CommittedSlotReplica {
     pub owner_node_id: NodeID,
     pub grant_id: u64,
+    /// Grant-relative offset in 4 KiB allocation units.
     pub slot_index: u32,
+    /// 4 KiB-aligned allocation capacity in bytes.
     pub slot_size: u64,
     pub addr: u64,
     pub len: u64,
@@ -743,6 +754,10 @@ pub(crate) struct EvictionReclaimCounters {
     /// Duplicate listener/victim events suppressed while the same physical
     /// cache version already has an outstanding reclaim lifecycle.
     pub eviction_reclaim_deduplicated: AtomicU64,
+    pub post_read_duplicate_enqueued_items: AtomicU64,
+    pub post_read_duplicate_enqueued_bytes: AtomicU64,
+    pub post_read_duplicate_reclaimed_items: AtomicU64,
+    pub post_read_duplicate_reclaimed_bytes: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1137,6 +1152,13 @@ pub struct NodeValueReplicaDesc {
     pub put_id: PutIDForAKey,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PostReadRemoteReclaimCandidate {
+    pub source_node_id: NodeIDString,
+    pub source_node_start_time: i64,
+    pub member: reclaim::EvictionReclaimMember,
+}
+
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct MasterPinAlias {
     key: String,
@@ -1281,6 +1303,11 @@ pub struct OneKvNodesRoutes {
     /// the version id for a kv put operation
     pub put_id: PutIDForAKey,
 
+    /// Optional exact prefix dependency supplied by the content-aware caller.
+    /// It is immutable for this route generation and currently feeds only
+    /// shadow observability; eviction remains the existing single-KV policy.
+    pub radix: Option<msg_pack::RadixKvMetadata>,
+
     /// Lease binding of this key-version on the master. This is an explicit
     /// contract set at PutDone time only when the caller provides a lease_id.
     ///
@@ -1411,6 +1438,57 @@ fn ring_b_route_replica_desc(
     })
 }
 
+fn post_read_remote_reclaim_member(
+    route: &OneKvNodesRoutes,
+    key: &str,
+    source_node_id: &NodeID,
+    requester_node_id: &NodeID,
+    source_addr: u64,
+    source_base_addr: u64,
+    source_len: u64,
+) -> Option<reclaim::EvictionReclaimMember> {
+    if route.lease_id.is_some() || source_node_id == requester_node_id {
+        return None;
+    }
+    let replicas = route.node_replicas.read();
+    let requester = replicas.get(requester_node_id)?;
+    if requester.tomb_tag.is_tomb()
+        || !requester
+            .memory
+            .as_ref()
+            .is_some_and(|memory| memory.owner_local_indexed)
+    {
+        return None;
+    }
+    let source = replicas.get(source_node_id)?;
+    let source_memory = source.memory.as_ref()?;
+    let KvReplicaBacking::Allocation(allocation) = &source_memory.backing else {
+        return None;
+    };
+    if source.tomb_tag.is_tomb()
+        || source_memory.owner_local_indexed
+        || allocation.base_addr().checked_add(allocation.addr()) != Some(source_addr)
+        || allocation.base_addr() != source_base_addr
+        || allocation.size() != source_len
+    {
+        return None;
+    }
+    let capacity_bytes = allocation.capcity();
+    Some(reclaim::EvictionReclaimMember {
+        key: key.to_string(),
+        desc: NodeValueReplicaDesc {
+            weight_bytes: u32::try_from(capacity_bytes).ok()?,
+            put_id: route.put_id,
+        },
+        expected_backing: Some(msg_pack::OwnerReclaimBacking::UnindexedAllocation {
+            addr: source_addr,
+            base_addr: source_base_addr,
+            len: source_len,
+            capacity_bytes,
+        }),
+    })
+}
+
 /// True only while `tag` is the live registration generation currently bound to `node_id`.
 /// Completion paths must validate their captured tag instead of borrowing the tag of a later
 /// registration that happens to reuse the same node id.
@@ -1533,6 +1611,14 @@ fn member_left_can_forward_to_registration_actor(current_node_start_time: Option
     // MemberLeft carries only a node id. If membership already exposes a live generation,
     // forwarding the ambiguous old leave would cancel that generation's registration actor.
     current_node_start_time.is_none()
+}
+
+fn registration_epoch_needs_reschedule(desired_epoch: Option<i64>, observed_epoch: i64) -> bool {
+    // The cluster listener deliberately reconciles the same live member every two seconds.
+    // Re-arming the retry timer for an unchanged generation drops an in-flight registration
+    // future before a large transfer segment has finished registering, so that RPC can starve
+    // forever. Only a genuinely new generation may replace the current attempt.
+    desired_epoch != Some(observed_epoch)
 }
 
 /// Remove one departed node generation from a single route.
@@ -1695,15 +1781,34 @@ fn insert_master_cache_entry(cache: &MasterNodeCache, key: String, desc: NodeVal
 
 #[cfg(test)]
 mod tests {
+    use super::tokio;
     use super::*;
     use crate::cluster_manager::ClusterMember;
     use crate::master_kv_router::msg_pack::{OwnerReclaimBacking, OwnerReclaimReason};
     use std::collections::HashMap;
 
+    #[tokio::test]
+    async fn replica_task_reservation_ttl_is_five_minutes() {
+        let router = MasterKvRouter::construct(MasterKvRouterNewArg::default())
+            .await
+            .expect("construct master KV router");
+
+        assert_eq!(
+            router
+                .inner()
+                .inflight_replica_tasks
+                .policy()
+                .time_to_live(),
+            Some(Duration::from_secs(INFLIGHT_REPLICA_TASK_TTL_SECONDS))
+        );
+        assert_eq!(INFLIGHT_REPLICA_TASK_TTL_SECONDS, 5 * 60);
+    }
+
     #[test]
     fn one_kv_nodes_routes_only_reserves_two_get_durable_slots() {
         let routes = Arc::new(OneKvNodesRoutes {
             put_id: (1, 0),
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::new()),
@@ -1746,6 +1851,7 @@ mod tests {
     fn durable_slot_token_returns_capacity_across_ten_fill_demote_cycles() {
         let routes = Arc::new(OneKvNodesRoutes {
             put_id: (1, 0),
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::new()),
@@ -2024,6 +2130,7 @@ mod tests {
     ) -> OneKvNodesRoutes {
         OneKvNodesRoutes {
             put_id,
+            radix: None,
             lease_id,
             atomic_group: None,
             node_replicas: RwLock::new(
@@ -2043,6 +2150,7 @@ mod tests {
         let node: NodeID = "same-node".to_string().into();
         let make_route = |lease_id, replica| OneKvNodesRoutes {
             put_id: (91, 3),
+            radix: None,
             lease_id,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::from([(node.clone(), replica)])),
@@ -2069,6 +2177,100 @@ mod tests {
             .owner_local_indexed = false;
         let committed = make_route(None, committed);
         assert!(ring_b_route_replica_desc(&committed, "same-node").is_none());
+    }
+
+    #[test]
+    fn post_read_remote_reclaim_requires_exact_unindexed_source_and_live_local_backing() {
+        let source: NodeID = "remote-cache".to_string().into();
+        let requester: NodeID = "gpu-owner".to_string().into();
+        let source_replicas = test_allocation_route_info(source.as_ref(), false);
+        let (source_addr, source_base_addr, source_len, source_capacity) = {
+            let allocation = match &source_replicas
+                .memory
+                .as_ref()
+                .expect("source memory")
+                .backing
+            {
+                KvReplicaBacking::Allocation(allocation) => allocation,
+                KvReplicaBacking::CommittedSlot(_) => panic!("expected Allocation"),
+            };
+            (
+                allocation.base_addr() + allocation.addr(),
+                allocation.base_addr(),
+                allocation.size(),
+                allocation.capcity(),
+            )
+        };
+        let route = OneKvNodesRoutes {
+            put_id: (93, 4),
+            radix: None,
+            lease_id: None,
+            atomic_group: None,
+            node_replicas: RwLock::new(HashMap::from([
+                (source.clone(), source_replicas),
+                (
+                    requester.clone(),
+                    test_route_info(requester.as_ref(), false),
+                ),
+            ])),
+            get_durable_slots_used: AtomicU32::new(0),
+        };
+
+        let member = post_read_remote_reclaim_member(
+            &route,
+            "post-read-key",
+            &source,
+            &requester,
+            source_addr,
+            source_base_addr,
+            source_len,
+        )
+        .expect("exact duplicate source must be eligible");
+        assert_eq!(member.key, "post-read-key");
+        assert_eq!(member.desc.put_id, route.put_id);
+        assert_eq!(u64::from(member.desc.weight_bytes), source_capacity);
+        assert_eq!(
+            member.expected_backing,
+            Some(OwnerReclaimBacking::UnindexedAllocation {
+                addr: source_addr,
+                base_addr: source_base_addr,
+                len: source_len,
+                capacity_bytes: source_capacity,
+            })
+        );
+
+        assert!(
+            post_read_remote_reclaim_member(
+                &route,
+                "post-read-key",
+                &source,
+                &requester,
+                source_addr + 1,
+                source_base_addr,
+                source_len,
+            )
+            .is_none(),
+            "a stale source address must not delete a replacement Allocation"
+        );
+        route
+            .node_replicas
+            .write()
+            .get_mut(&requester)
+            .expect("requester route")
+            .memory = None;
+        assert!(
+            post_read_remote_reclaim_member(
+                &route,
+                "post-read-key",
+                &source,
+                &requester,
+                source_addr,
+                source_base_addr,
+                source_len,
+            )
+            .is_none(),
+            "the remote source must be retained after the local backing disappears"
+        );
     }
 
     #[test]
@@ -2115,6 +2317,7 @@ mod tests {
 
         let departed_route = Arc::new(OneKvNodesRoutes {
             put_id: (10, 0),
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::from([(
@@ -2125,6 +2328,7 @@ mod tests {
         });
         let live_route = Arc::new(OneKvNodesRoutes {
             put_id: (11, 0),
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::from([(
@@ -2135,6 +2339,7 @@ mod tests {
         });
         let newer_tomb_route = Arc::new(OneKvNodesRoutes {
             put_id: (12, 0),
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::from([(
@@ -2195,6 +2400,7 @@ mod tests {
         departed_tag.set_tomb();
         let old_route = Arc::new(OneKvNodesRoutes {
             put_id: (20, 0),
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::from([(
@@ -2289,6 +2495,7 @@ mod tests {
         departed_tag.set_tomb();
         let rejected = Arc::new(OneKvNodesRoutes {
             put_id: (41, 0),
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::from([(
@@ -2309,6 +2516,7 @@ mod tests {
         let live_tag = NodeTombTag::new();
         let accepted = Arc::new(OneKvNodesRoutes {
             put_id: (42, 0),
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::from([(
@@ -2362,6 +2570,13 @@ mod tests {
     fn delayed_member_left_is_not_forwarded_to_a_live_generation_actor() {
         assert!(member_left_can_forward_to_registration_actor(None));
         assert!(!member_left_can_forward_to_registration_actor(Some(17)));
+    }
+
+    #[test]
+    fn periodic_reconcile_keeps_the_inflight_registration_for_the_same_generation() {
+        assert!(registration_epoch_needs_reschedule(None, 17));
+        assert!(!registration_epoch_needs_reschedule(Some(17), 17));
+        assert!(registration_epoch_needs_reschedule(Some(17), 18));
     }
 
     #[test]
@@ -2923,12 +3138,26 @@ impl MasterKvRouter {
             .time_to_live(Duration::from_secs(120))
             .build();
         let inflight_replica_tasks = moka::future::Cache::builder()
-            .time_to_live(Duration::from_secs(60))
-            .eviction_listener(|_put_id, inflight_info: InflightReplicaTaskInfo, cause| {
-                if cause == RemovalCause::Expired {
-                    inflight_info._activity_lease.release_now();
-                }
-            })
+            .time_to_live(Duration::from_secs(INFLIGHT_REPLICA_TASK_TTL_SECONDS))
+            .eviction_listener(
+                |identity: Arc<(String, u64, u32)>,
+                 inflight_info: InflightReplicaTaskInfo,
+                 cause| {
+                    if cause == RemovalCause::Expired {
+                        warn!(
+                            key = %identity.0,
+                            put_time_ms = identity.1,
+                            put_version = identity.2,
+                            operation_id = inflight_info.operation_id,
+                            source_node_id = %inflight_info.source_node_id,
+                            target_node_id = %inflight_info.node_id,
+                            ttl_seconds = INFLIGHT_REPLICA_TASK_TTL_SECONDS,
+                            "inflight replica append expired before terminal Done/Revoke"
+                        );
+                        inflight_info._activity_lease.release_now();
+                    }
+                },
+            )
             .build();
         let completed_replica_tasks = moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(120))
@@ -3674,6 +3903,90 @@ impl MasterKvRouter {
         self.inner()
             .next_owner_reclaim_epoch
             .fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn post_read_remote_reclaim_candidate(
+        &self,
+        inflight: &InflightGetInfo,
+        completed_mode: GetAllocationMode,
+    ) -> Option<PostReadRemoteReclaimCandidate> {
+        if self.inner().test_spec_config.post_read_remote_policy != PostReadRemotePolicy::Drop
+            || inflight.source_kind != GetSourceKind::Memory
+            || inflight.src_node_id == inflight.req_node_id
+            || !matches!(
+                completed_mode,
+                GetAllocationMode::DurableReplica | GetAllocationMode::LocalCommittedSlot
+            )
+        {
+            return None;
+        }
+        let current_route = self
+            .inner()
+            .kv_routes
+            .get(&inflight.key)
+            .map(|route| route.clone())?;
+        if !Arc::ptr_eq(&current_route, &inflight.route) || current_route.put_id != inflight.put_id
+        {
+            return None;
+        }
+        let source_member = self
+            .inner()
+            .view()
+            .cluster_manager()
+            .get_member_info_cached(inflight.src_node_id.as_ref())?;
+        if !placement::member_matches_roles(
+            Some(&source_member),
+            &self.inner().replica_task_placement.remote_only_node_roles,
+        ) {
+            return None;
+        }
+        let member = post_read_remote_reclaim_member(
+            &current_route,
+            &inflight.key,
+            &inflight.src_node_id,
+            &inflight.req_node_id,
+            inflight.src_addr,
+            inflight.src_base_addr,
+            inflight.len,
+        )?;
+        Some(PostReadRemoteReclaimCandidate {
+            source_node_id: inflight.src_node_id.to_string(),
+            source_node_start_time: source_member.node_start_time,
+            member,
+        })
+    }
+
+    pub(crate) fn enqueue_post_read_remote_reclaim(
+        &self,
+        candidate: PostReadRemoteReclaimCandidate,
+    ) -> reclaim::EnqueueEvictionReclaimResult {
+        let owner_node_id = candidate.source_node_id;
+        let bytes = u64::from(candidate.member.desc.weight_bytes);
+        let key = candidate.member.key.clone();
+        let result = self.enqueue_eviction_reclaim_request_exact(
+            owner_node_id.clone(),
+            Some(candidate.source_node_start_time),
+            vec![candidate.member],
+            reclaim::EvictionReclaimOrigin::PostReadDuplicate,
+            true,
+        );
+        if matches!(result, reclaim::EnqueueEvictionReclaimResult::Accepted) {
+            let counters = self.eviction_reclaim_counters(&owner_node_id);
+            counters
+                .post_read_duplicate_enqueued_items
+                .fetch_add(1, Ordering::Relaxed);
+            counters
+                .post_read_duplicate_enqueued_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        tracing::debug!(
+            owner = %owner_node_id,
+            key = %key,
+            bytes,
+            ?result,
+            "post-read remote duplicate reclaim enqueue"
+        );
+        result
     }
 
     fn enqueue_eviction_reclaim(
@@ -4825,6 +5138,12 @@ impl MasterKvRouter {
 	                                        registered_epoch,
 	                                        &mut last_seen_epoch,
 	                                    ) {
+	                                        if !registration_epoch_needs_reschedule(
+	                                            desired_epoch,
+	                                            epoch,
+	                                        ) {
+	                                            continue;
+	                                        }
 	                                        desired_epoch = Some(epoch);
 	                                        backoff = INITIAL_BACKOFF;
 	                                        retry_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(0))));
@@ -4903,6 +5222,12 @@ impl MasterKvRouter {
 	                                        registered_epoch,
 	                                        &mut last_seen_epoch,
 	                                    ) {
+	                                        if !registration_epoch_needs_reschedule(
+	                                            desired_epoch,
+	                                            epoch,
+	                                        ) {
+	                                            continue;
+	                                        }
 	                                        desired_epoch = Some(epoch);
 	                                        backoff = INITIAL_BACKOFF;
 	                                        retry_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(0))));
@@ -4992,6 +5317,12 @@ impl MasterKvRouter {
 	                                        registered_epoch,
 	                                        &mut last_seen_epoch,
 	                                    ) {
+	                                        if !registration_epoch_needs_reschedule(
+	                                            desired_epoch,
+	                                            epoch,
+	                                        ) {
+	                                            continue;
+	                                        }
 	                                        desired_epoch = Some(epoch);
 	                                        backoff = INITIAL_BACKOFF;
 	                                        retry_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(0))));
@@ -6027,6 +6358,18 @@ impl MasterKvRouter {
                 eviction_reclaim_deduplicated: reclaim_counters
                     .eviction_reclaim_deduplicated
                     .load(Ordering::Relaxed),
+                post_read_duplicate_enqueued_items: reclaim_counters
+                    .post_read_duplicate_enqueued_items
+                    .load(Ordering::Relaxed),
+                post_read_duplicate_enqueued_bytes: reclaim_counters
+                    .post_read_duplicate_enqueued_bytes
+                    .load(Ordering::Relaxed),
+                post_read_duplicate_reclaimed_items: reclaim_counters
+                    .post_read_duplicate_reclaimed_items
+                    .load(Ordering::Relaxed),
+                post_read_duplicate_reclaimed_bytes: reclaim_counters
+                    .post_read_duplicate_reclaimed_bytes
+                    .load(Ordering::Relaxed),
             });
         }
 
@@ -6048,6 +6391,13 @@ impl MasterKvRouter {
                     _ = shutdown_waiter.wait() => break,
                     _ = interval.tick() => {
                         let snapshot = view_task.master_kv_router().runtime_observe_snapshot();
+                        let radix_view = view_task.clone();
+                        let radix_shadow = tokio::task::spawn_blocking(move || {
+                            radix_shadow::observe_radix_shadow(
+                                &radix_view.master_kv_router().inner().kv_routes,
+                            )
+                        })
+                        .await;
                         let activity = view_task
                             .master_kv_router()
                             .inner()
@@ -6067,6 +6417,51 @@ impl MasterKvRouter {
                             snapshot.get_holding_entries,
                             snapshot.get_holding_bytes
                         );
+                        match radix_shadow {
+                            Ok(radix) => {
+                                tracing::info!(
+                                    route_entries = radix.route_entries,
+                                    described_route_entries = radix.described_route_entries,
+                                    unknown_route_entries = radix.unknown_route_entries,
+                                    root_route_entries = radix.root_route_entries,
+                                    reachable_route_entries = radix.reachable_route_entries,
+                                    orphan_route_entries = radix.orphan_route_entries,
+                                    unresolved_route_entries = radix.unresolved_route_entries,
+                                    direct_gap_route_entries = radix.direct_gap_route_entries,
+                                    leaf_route_entries = radix.leaf_route_entries,
+                                    internal_route_entries = radix.internal_route_entries,
+                                    described_logical_bytes = radix.described_logical_bytes,
+                                    reachable_logical_bytes = radix.reachable_logical_bytes,
+                                    orphan_logical_bytes = radix.orphan_logical_bytes,
+                                    unresolved_logical_bytes = radix.unresolved_logical_bytes,
+                                    "master radix shadow runtime"
+                                );
+                                for owner in radix.owners {
+                                    tracing::info!(
+                                        owner = owner.owner_node,
+                                        memory_entries = owner.memory_entries,
+                                        memory_capacity_bytes = owner.memory_capacity_bytes,
+                                        described_memory_entries = owner.described_memory_entries,
+                                        described_memory_capacity_bytes = owner.described_memory_capacity_bytes,
+                                        reachable_memory_entries = owner.reachable_memory_entries,
+                                        reachable_memory_capacity_bytes = owner.reachable_memory_capacity_bytes,
+                                        orphan_memory_entries = owner.orphan_memory_entries,
+                                        orphan_memory_capacity_bytes = owner.orphan_memory_capacity_bytes,
+                                        unresolved_memory_entries = owner.unresolved_memory_entries,
+                                        unresolved_memory_capacity_bytes = owner.unresolved_memory_capacity_bytes,
+                                        leaf_memory_entries = owner.leaf_memory_entries,
+                                        leaf_memory_capacity_bytes = owner.leaf_memory_capacity_bytes,
+                                        internal_memory_entries = owner.internal_memory_entries,
+                                        internal_memory_capacity_bytes = owner.internal_memory_capacity_bytes,
+                                        "master radix shadow owner runtime"
+                                    );
+                                }
+                            }
+                            Err(err) => tracing::warn!(
+                                err = ?err,
+                                "master radix shadow snapshot task failed"
+                            ),
+                        }
                         tracing::info!(
                             active_keys = activity.active_keys,
                             put_keys = activity.put_keys,
@@ -6194,7 +6589,7 @@ impl MasterKvRouter {
                                 node.pool_available_capacity_bytes,
                             );
                             tracing::info!(
-                                "replica cache runtime: owner={} entries={} weighted_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_victims={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} last_route_removed_members={} last_route_removed_bytes={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={}",
+                                "replica cache runtime: owner={} entries={} weighted_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_victims={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} last_route_removed_members={} last_route_removed_bytes={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={} post_read_duplicate_enqueued_items={} post_read_duplicate_enqueued_bytes={} post_read_duplicate_reclaimed_items={} post_read_duplicate_reclaimed_bytes={}",
                                 node.owner_node,
                                 node.entries,
                                 node.weighted_bytes,
@@ -6230,6 +6625,10 @@ impl MasterKvRouter {
                                 node.capacity_eviction_non_ring_b_entry_total,
                                 node.capacity_eviction_hit_committed_slot,
                                 node.eviction_reclaim_deduplicated,
+                                node.post_read_duplicate_enqueued_items,
+                                node.post_read_duplicate_enqueued_bytes,
+                                node.post_read_duplicate_reclaimed_items,
+                                node.post_read_duplicate_reclaimed_bytes,
                             );
                             metrics.set_kv_replica_cache_entries(
                                 node.owner_node.as_str(),

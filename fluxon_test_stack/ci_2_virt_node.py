@@ -38,7 +38,7 @@ DEFAULT_TESTBED_HOSTWORKDIR = Path("/mnt/nvme0/store_team_dev/fluxon_deploy")
 LOCAL_PRIMARY_NODE_SUFFIX = "a"
 LOCAL_SECONDARY_NODE_SUFFIX = "b"
 TEST_STACK_START_TEST_BED_CONFIG_ENV = "FLUXON_TEST_STACK_START_TEST_BED_CONFIG"
-PLACEHOLDER_WHEEL_NAME = "fluxon-0.0.0-ci-placeholder-cp38-abi3-manylinux_2_28_x86_64.whl"
+PLACEHOLDER_WHEEL_NAME = "fluxon_py-0.0.0-ci-placeholder-cp38-abi3-manylinux_2_28_x86_64.whl"
 SAME_HOST_LOCAL_MULTI_NODE_ETCD_CLIENT_PORT_OFFSET = 100
 SAME_HOST_LOCAL_MULTI_NODE_GREPTIME_PORT_OFFSET = 110
 
@@ -893,7 +893,7 @@ def main() -> int:
         pack_env["FLUXON_PACK_RELEASE_NIX_CONFIG"] = str(ci_nix_pack_config_path)
         _run(pack_cmd, env=pack_env)
 
-    wheel_name = _find_single_wheel(release_dir, pattern="fluxon-*.whl", ctx="top-level release wheel")
+    wheel_name = _find_single_wheel(release_dir, pattern="fluxon_py-*.whl", ctx="top-level release wheel")
 
     metadata = _build_generated_configs(
         args=args,

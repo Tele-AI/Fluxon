@@ -594,12 +594,21 @@ def test_fluxonkv_test_spec_config():
         rdma_devices["test_spec_config"]["iceoryx_external_busy_poll"] = True
         rdma_devices["test_spec_config"]["iceoryx_owner_client_busy_poll"] = True
         rdma_devices["test_spec_config"]["tcp_thread_reactor_shard_count"] = 2
+        rdma_devices["protocol"] = {
+            "protocol_type": "rdma",
+            "tcp_thread_reactor": "event_driven",
+        }
         rdma_devices["test_spec_config"]["tcp_thread_bulk_lane_count"] = 4
         rdma_devices["test_spec_config"]["tcp_thread_control_lane_count"] = 3
         rdma_devices["test_spec_config"]["replica_task_max_inflight"] = 16
+        rdma_devices["test_spec_config"][
+            "owner_remote_put_max_inflight_bytes"
+        ] = 16 * 1024 * 1024 * 1024
+        rdma_devices["test_spec_config"]["owner_remote_put_max_inflight_items"] = 4096
         rdma_devices["test_spec_config"]["ssd_read_source_policy"] = (
             "local_ssd_only_first"
         )
+        rdma_devices["test_spec_config"]["post_read_remote_policy"] = "drop"
         rdma_devices["test_spec_config"][
             "require_transfer_rpc_fast_path_ready_timeout_seconds"
         ] = 45
@@ -612,18 +621,37 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["iceoryx_owner_client_busy_poll"] is True
         assert loaded["test_spec_config"]["rdma_device_names"] == ["mlx5_0", "mlx5_4"]
         assert loaded["test_spec_config"]["tcp_thread_reactor_shard_count"] == 2
+        assert loaded["protocol"]["tcp_thread_reactor"] == "event_driven"
         assert loaded["test_spec_config"]["tcp_thread_bulk_lane_count"] == 4
         assert loaded["test_spec_config"]["tcp_thread_control_lane_count"] == 3
         assert loaded["test_spec_config"]["replica_task_max_inflight"] == 16
         assert (
+            loaded["test_spec_config"]["owner_remote_put_max_inflight_bytes"]
+            == 16 * 1024 * 1024 * 1024
+        )
+        assert loaded["test_spec_config"]["owner_remote_put_max_inflight_items"] == 4096
+        assert (
             loaded["test_spec_config"]["ssd_read_source_policy"]
             == "local_ssd_only_first"
         )
+        assert loaded["test_spec_config"]["post_read_remote_policy"] == "drop"
         assert (
             loaded["test_spec_config"]["require_transfer_rpc_fast_path_ready_timeout_seconds"]
             == 45
         )
         assert config.protocol_rdma_device_names == "mlx5_0,mlx5_4"
+
+        invalid_remote_put_admission = copy.deepcopy(rdma_devices)
+        del invalid_remote_put_admission["test_spec_config"][
+            "owner_remote_put_max_inflight_bytes"
+        ]
+        try:
+            FluxonKvClientConfig(invalid_remote_put_admission)
+            raise AssertionError(
+                "remote Put item ceiling without a byte budget must be rejected"
+            )
+        except ValueError:
+            pass
 
         for removed_policy in (
             "local_ssd_after_memory",
@@ -638,6 +666,14 @@ def test_fluxonkv_test_spec_config():
                 )
             except ValueError:
                 pass
+
+        invalid_post_read_policy = copy.deepcopy(rdma_devices)
+        invalid_post_read_policy["test_spec_config"]["post_read_remote_policy"] = "ttl"
+        try:
+            FluxonKvClientConfig(invalid_post_read_policy)
+            raise AssertionError("unsupported post-read remote policy must be rejected")
+        except ValueError:
+            pass
 
         expected_capacity = _owner_fluxonkv_base_config(tag="expected_capacity")
         expected_capacity["contribute_to_cluster_pool_size"]["dram"] = 137438953472
@@ -694,6 +730,55 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["disable_observability"] is True
         assert loaded["test_spec_config"]["enable_iceoryx_logs"] is True
         assert "transport_mode" not in loaded["test_spec_config"]
+        assert "tcp_thread_reactor" not in loaded["test_spec_config"]
+        assert "protocol" not in loaded
+
+        busy_poll = copy.deepcopy(implicit_transport)
+        busy_poll["protocol"] = {
+            "protocol_type": "rdma",
+            "tcp_thread_reactor": "busy_poll",
+        }
+        config = FluxonKvClientConfig(busy_poll)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["protocol"]["tcp_thread_reactor"] == "busy_poll"
+
+        invalid_wait_mode = copy.deepcopy(implicit_transport)
+        invalid_wait_mode["protocol"] = {
+            "protocol_type": "rdma",
+            "tcp_thread_reactor": "epoll",
+        }
+        try:
+            FluxonKvClientConfig(invalid_wait_mode)
+            raise AssertionError("invalid tcp_thread_reactor should be rejected")
+        except ValueError:
+            pass
+
+        legacy_wait_mode = copy.deepcopy(implicit_transport)
+        legacy_wait_mode["test_spec_config"]["tcp_thread_reactor"] = "event_driven"
+        try:
+            FluxonKvClientConfig(legacy_wait_mode)
+            raise AssertionError("test_spec_config wait mode should be rejected")
+        except ValueError:
+            pass
+
+        legacy_p2p = copy.deepcopy(implicit_transport)
+        legacy_p2p["p2p"] = {"tcp_thread_reactor_wait_mode": "event_driven"}
+        try:
+            FluxonKvClientConfig(legacy_p2p)
+            raise AssertionError("legacy p2p reactor config should be rejected")
+        except ValueError:
+            pass
+
+        legacy_field_name = copy.deepcopy(implicit_transport)
+        legacy_field_name["protocol"] = {
+            "protocol_type": "rdma",
+            "tcp_thread_reactor_wait_mode": "event_driven",
+        }
+        try:
+            FluxonKvClientConfig(legacy_field_name)
+            raise AssertionError("legacy reactor field name should be rejected")
+        except ValueError:
+            pass
 
         closed_backend = copy.deepcopy(base)
         closed_backend["test_spec_config"]["transport_mode"] = "transfer_only"

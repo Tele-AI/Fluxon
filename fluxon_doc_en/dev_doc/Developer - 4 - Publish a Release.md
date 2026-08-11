@@ -6,7 +6,7 @@ This page explains how the current repository publishes a public release. The st
 
 | This page covers | This page does not cover | Why |
 |---|---|---|
-| Publishing install artifacts on GitHub Releases | Dispatching a release onto remote machines | Remote deployment belongs to `deployment/manual_dispatch_release.py` |
+| Publishing `fluxon-py` to PyPI and install artifacts on GitHub Releases | Dispatching a release onto remote machines | Remote deployment belongs to `deployment/manual_dispatch_release.py` |
 | The `publish_release` build entrypoint | The local wheel build internals | Local packaging details live in Developer 1 / 2 |
 | The GitHub Pages doc-site publish entrypoint | testbed / testrunner test flows | The test stack has its own workflow |
 
@@ -19,7 +19,7 @@ The repository does not have one single global version file. Before publishing, 
 | Python package version | `fluxon_py/__init__.py` | The repo-root `setup.py` reads the version from here |
 | Rust crate versions | `fluxon_rs/Cargo.toml`, `fluxon_rs/*/Cargo.toml`, `fluxon_rs/setup.py` | Public crate and wheel versions should stay aligned |
 | Quick Start image tag | `examples/fluxon_quick_start/build_image.py`, `examples/fluxon_quick_start/README.md` | The current public image name is `fluxon_quick_start:<version>` |
-| Release workflow artifact names | `.github/workflows/manual-release.yml` | The workflow currently emits `fluxon_quick_start_<version>_docker_image.tar.gz` |
+| Release workflow artifact names | `.github/workflows/workflow.yml` | The workflow currently emits `fluxon_quick_start_<version>_docker_image.tar.gz` |
 | GitHub Release notes | `fluxon_release/release_notes/v<version>.md` | The release body is read directly from this versioned file |
 | README release text | `README.md`, `README_CN.md` | Includes the badge, image-tag examples, and developer-doc links |
 
@@ -38,22 +38,22 @@ The release notes now use one file per version. The required path pattern is:
 fluxon_release/release_notes/v<version>.md
 ```
 
-For example, `v0.2.1` uses:
+For example, `v0.2.2` uses:
 
 ```text
-fluxon_release/release_notes/v0.2.1.md
+fluxon_release/release_notes/v0.2.2.md
 ```
 
 If that file is missing, `publish_release` fails fast instead of publishing a release with an incomplete body.
 
 ## 2. Push a `v<version>` tag to trigger `publish_release`
 
-The public release build entrypoint in this repository is the GitHub Actions workflow `.github/workflows/manual-release.yml`, whose workflow name is `publish_release`. It triggers automatically on `v*` tag pushes, and it also keeps a `workflow_dispatch` entrypoint for rebuilds. The stable path is:
+The public release build entrypoint in this repository is the GitHub Actions workflow `.github/workflows/workflow.yml`, whose workflow name is `publish_release`. It triggers automatically on `v*` tag pushes, and it also keeps a `workflow_dispatch` entrypoint for rebuilds. The stable path is:
 
 ```bash
 git push origin <branch>
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 On the GitHub runner it does these steps:
@@ -67,8 +67,9 @@ On the GitHub runner it does these steps:
 7. Run `python3 examples/fluxon_quick_start/build_image.py --mode existing_release --release-dir fluxon_release`.
 8. Upload the workflow artifact.
 9. Create or update the matching GitHub Release and upload the release assets automatically.
+10. On a tag-push run, publish the unified `fluxon_py-*.whl` to PyPI through trusted publishing and the `pypi` GitHub environment.
 
-If the tag is `v0.2.1` but the repository still declares `0.2.0` on its public version surfaces, or if `fluxon_release/release_notes/v0.2.1.md` is missing, the workflow fails fast instead of publishing an incomplete release.
+If the tag is `v0.2.2` but the repository still declares `0.2.1` on its public version surfaces, or if `fluxon_release/release_notes/v0.2.2.md` is missing, the workflow fails fast instead of publishing an incomplete release.
 
 After the workflow finishes, both the GitHub Actions artifact and the GitHub Release assets should contain at least:
 
@@ -80,6 +81,8 @@ After the workflow finishes, both the GitHub Actions artifact and the GitHub Rel
 - [Developer - 1 - Package Core Install Artifacts](<./Developer - 1 - Package Core Install Artifacts.md>)
 - [Developer - 2 - Package Middleware and Images](<./Developer - 2 - Package Middleware and Images.md>)
 
+The workflow builds `fluxon_quick_start:<version>` and archives it as a GitHub Release asset. It does not currently log in to Docker Hub or GHCR and does not push the image to a container registry.
+
 ## 3. When to trigger it manually
 
 In the normal path, no manual GitHub Release page work is needed. Once the `v<version>` tag push succeeds, the workflow reads `fluxon_release/release_notes/v<version>.md` and creates or updates the release automatically.
@@ -90,7 +93,9 @@ Use the manual `publish_release` trigger only in cases like these:
 - The workflow failed late and the same tag needs the assets uploaded again.
 - You want to validate the release pipeline without minting a new tag.
 
-For the manual trigger, provide an already existing tag such as `v0.2.1`. That tag must still match the repository public version exactly.
+For the manual trigger, provide an already existing tag such as `v0.2.2`. That tag must still match the repository public version exactly.
+
+The manual rebuild path does not republish to PyPI. PyPI publication runs only for a new `v*` tag push, because PyPI does not allow an existing distribution file to be overwritten.
 
 If a change only edits the GitHub Release text, update `fluxon_release/release_notes/v<version>.md` and rerun `publish_release` manually so the release body and assets stay in sync.
 

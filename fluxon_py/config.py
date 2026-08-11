@@ -65,6 +65,7 @@ instance_key: xxx                      # Unique distributed instance id (str)
 protocol:                              # Transport protocol override (dict(optional))
   protocol_type:                       # Protocol type (('tcp'|'rdma'))
   rdma_device_names:                   # Explicit RDMA devices for protocol config (['{str}'](optional))
+  tcp_thread_reactor:                  # busy_poll|event_driven; defaults to busy_poll (str(optional))
 pprof_duration_seconds:                # Dump pprof flamegraph after N seconds (int(optional))
 replica_writeback_hot_capacity_ratio: 0.75 # Owner-local hot working-set ratio in the open interval zero to one (float(optional))
 contribute_to_cluster_pool_size:       # Capacity contributed to cluster pool (dict(optional))
@@ -84,6 +85,7 @@ test_spec_config:                      # Test-only config overrides (dict(option
   short_circuit_put_payload_path: false # Keep large put_start allocation but skip payload memcpy + transfer (bool(optional))
   skip_put_end_commit: false           # Return success after payload transfer without put_done commit; inflight_put TTL cleanup only (bool(optional))
   ssd_read_source_policy: legacy_remote_first # legacy_remote_first|local_ssd_only_first (str(optional))
+  post_read_remote_policy: retain      # retain|drop exact remote DRAM source after a local Get backing commits (str(optional))
   owner_local_reserve_soft_wait_timeout_ms: # Local-reserve polling interval, >0 (int(optional))
   owner_local_reserve_hard_timeout_ms: # Local-reserve end-to-end claim timeout, > soft wait (int(optional))
   owner_local_reserve_expected_capacity: # Owner-only local-reserve prewarm target (dict(optional))
@@ -95,6 +97,8 @@ test_spec_config:                      # Test-only config overrides (dict(option
   tcp_thread_control_lane_count:       # tcp_thread control lane count, 1..8 (int(optional))
   user_rpc_sync_handler_thread_count:  # Owner-dedicated sync user-RPC worker thread count, >0 (int(optional))
   replica_task_max_inflight:           # Deprecated compatibility field, still validated as 1..64; direct remote-Put singleflight does not use a global actor queue (int(optional))
+  owner_remote_put_max_inflight_bytes: # Exact-byte, no-queue admission budget for direct remote-Put leaders, >0 (int(optional))
+  owner_remote_put_max_inflight_items: # Optional leader-count safety ceiling; requires the byte budget, >0 (int(optional))
   require_transfer_rpc_fast_path_ready_timeout_seconds: # Require owner-owner transfer-rpc fast path before owner ready/shared.json publication (int(optional))
   rdma_device_names:                   # Explicit RDMA devices for benchmark/test fast-path fanout (['{str}'](optional))
   enable_side_transfer: false          # Enable TCP side-transfer fast-path (bool(optional))
@@ -129,6 +133,32 @@ fluxonkv_spec:                        # fluxon kv specific config (dict(optional
 """
 
 
+def _normalize_protocol_config(raw: Any, ctx: str) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{ctx} must be a mapping")
+
+    allowed_keys = {"protocol_type", "rdma_device_names", "tcp_thread_reactor"}
+    unknown = sorted(set(raw.keys()) - allowed_keys)
+    if unknown:
+        raise ValueError(f"{ctx} contains unknown keys: {unknown}")
+
+    out = dict(raw)
+    wait_mode = raw.get("tcp_thread_reactor")
+    if wait_mode is not None:
+        if not isinstance(wait_mode, str):
+            raise ValueError(f"{ctx}.tcp_thread_reactor must be a string")
+        allowed_wait_modes = {"busy_poll", "event_driven"}
+        if wait_mode not in allowed_wait_modes:
+            raise ValueError(
+                f"{ctx}.tcp_thread_reactor must be one of "
+                f"{sorted(allowed_wait_modes)}, got {wait_mode!r}"
+            )
+        out["tcp_thread_reactor"] = wait_mode
+    return out
+
+
 def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
     if raw is None:
         raw = {}
@@ -148,6 +178,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "short_circuit_put_payload_path",
         "skip_put_end_commit",
         "ssd_read_source_policy",
+        "post_read_remote_policy",
         "owner_local_reserve_soft_wait_timeout_ms",
         "owner_local_reserve_hard_timeout_ms",
         "owner_local_reserve_expected_capacity",
@@ -157,6 +188,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "tcp_thread_control_lane_count",
         "user_rpc_sync_handler_thread_count",
         "replica_task_max_inflight",
+        "owner_remote_put_max_inflight_bytes",
+        "owner_remote_put_max_inflight_items",
         "require_transfer_rpc_fast_path_ready_timeout_seconds",
         "rdma_device_names",
         "enable_side_transfer",
@@ -203,6 +236,18 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
                 f"{sorted(allowed_ssd_read_source_policies)}, got {ssd_read_source_policy!r}"
             )
         out["ssd_read_source_policy"] = ssd_read_source_policy
+
+    post_read_remote_policy = raw.get("post_read_remote_policy")
+    if post_read_remote_policy is not None:
+        if not isinstance(post_read_remote_policy, str):
+            raise ValueError(f"{ctx}.post_read_remote_policy must be a string")
+        allowed_post_read_remote_policies = {"retain", "drop"}
+        if post_read_remote_policy not in allowed_post_read_remote_policies:
+            raise ValueError(
+                f"{ctx}.post_read_remote_policy must be one of "
+                f"{sorted(allowed_post_read_remote_policies)}, got {post_read_remote_policy!r}"
+            )
+        out["post_read_remote_policy"] = post_read_remote_policy
 
     transport_mode = raw.get("transport_mode")
     transport_mode_was_explicit = transport_mode is not None
@@ -286,6 +331,27 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         if user_rpc_sync_handler_thread_count <= 0:
             raise ValueError(f"{ctx}.user_rpc_sync_handler_thread_count must be > 0")
         out["user_rpc_sync_handler_thread_count"] = user_rpc_sync_handler_thread_count
+
+    for key in (
+        "owner_remote_put_max_inflight_bytes",
+        "owner_remote_put_max_inflight_items",
+    ):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{ctx}.{key} must be an int")
+        if value <= 0:
+            raise ValueError(f"{ctx}.{key} must be > 0")
+        out[key] = value
+    if (
+        "owner_remote_put_max_inflight_items" in out
+        and "owner_remote_put_max_inflight_bytes" not in out
+    ):
+        raise ValueError(
+            f"{ctx}.owner_remote_put_max_inflight_items requires "
+            f"{ctx}.owner_remote_put_max_inflight_bytes"
+        )
 
     reserve_timeouts: Dict[str, int] = {}
     for key in (
@@ -572,6 +638,10 @@ class FluxonKvClientConfig():
 
         _verify_config_by_template(plain)
 
+        if "protocol" in plain:
+            plain["protocol"] = _normalize_protocol_config(
+                plain.get("protocol"), "protocol"
+            )
         plain["test_spec_config"] = _normalize_test_spec_config(
             plain.get("test_spec_config"), "test_spec_config"
         )

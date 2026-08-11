@@ -4,7 +4,7 @@ This page only covers how `setup_and_pack/pack_release.py` gathers the core inst
 
 ## Artifacts
 
-- `fluxon_release/fluxon-*.whl`
+- `fluxon_release/fluxon_py-*.whl`
 - `fluxon_release/fluxon_pyo3-*.whl`
 - `fluxon_release/pylib_src.tar.gz`
 - `fluxon_release/install.py`

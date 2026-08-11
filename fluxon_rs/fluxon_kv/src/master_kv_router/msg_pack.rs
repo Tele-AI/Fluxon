@@ -33,7 +33,11 @@ pub enum GetSourceKind {
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct GetPreparedLocalReserveTarget {
     pub grant_id: u64,
+    /// Grant-relative offset in 4 KiB allocation units. The wire field stays
+    /// in place, but fixed-slot peers use a different meaning; mixed versions
+    /// must not share local-reserve messages.
     pub slot_index: u32,
+    /// 4 KiB-aligned allocation capacity in bytes.
     pub slot_size: u64,
     pub addr: u64,
     pub base_addr: u64,
@@ -596,6 +600,8 @@ pub enum OwnerReclaimReason {
     #[default]
     OwnerCapacityEviction,
     MasterAllocationCapacity,
+    /// Exact remote-only DRAM source made redundant by a committed local Get target.
+    PostReadDuplicate,
 }
 
 /// Per-victim SSD action for owner-local capacity reclaim. Selection and
@@ -995,11 +1001,26 @@ impl RPCReq for PutRevokeReq {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct PutDoneCommittedSlot {
     pub grant_id: u64,
+    /// Grant-relative offset in 4 KiB allocation units. Fixed-slot peers use a
+    /// different meaning, so local-reserve messages require coordinated peers.
     pub slot_index: u32,
+    /// 4 KiB-aligned allocation capacity in bytes.
     pub slot_size: u64,
     pub addr: u64,
     pub base_addr: u64,
     pub len: u64,
+}
+
+/// Exact prefix dependency for one immutable KV page.
+///
+/// `depth == 0` denotes a direct child of the Radix root and requires
+/// `parent_key == None`. Every deeper page names its exact parent. This
+/// metadata does not change the KV key, atomic group, or capacity-victim
+/// boundary; the first implementation only observes prefix-closure waste.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct RadixKvMetadata {
+    pub parent_key: Option<String>,
+    pub depth: u32,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -1103,6 +1124,8 @@ pub struct PutDoneReq {
     pub publish_local_cache: bool,
     /// Multi-key atomic group for this exact key version.
     pub atomic_group: Option<PutAtomicGroup>,
+    /// Optional exact Radix lineage for this immutable key.
+    pub radix: Option<RadixKvMetadata>,
 }
 impl MsgPackSerializePart for PutDoneReq {
     fn msg_id(&self) -> u32 {
@@ -1224,6 +1247,7 @@ pub struct BatchPutDoneItemReq {
     pub committed_slot: Option<PutDoneCommittedSlot>,
     pub publish_local_cache: bool,
     pub atomic_group: Option<PutAtomicGroup>,
+    pub radix: Option<RadixKvMetadata>,
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -1274,6 +1298,7 @@ pub struct GroupedBatchPutDoneItemReq {
     pub lease_id: Option<u64>,
     pub committed_slot: Option<PutDoneCommittedSlot>,
     pub publish_local_cache: bool,
+    pub radix: Option<RadixKvMetadata>,
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -1777,11 +1802,16 @@ mod put_atomic_group_tests {
                 committed_slot: None,
                 publish_local_cache: false,
                 atomic_group: Some(group.clone()),
+                radix: Some(RadixKvMetadata {
+                    parent_key: None,
+                    depth: 0,
+                }),
             }],
         };
         let decoded: BatchPutDoneReq =
             bitcode::decode(&bitcode::encode(&req)).expect("decode atomic put group");
         assert_eq!(decoded.items[0].atomic_group.as_ref(), Some(&group));
+        assert_eq!(decoded.items[0].radix, req.items[0].radix);
     }
 
     #[test]
@@ -1824,6 +1854,7 @@ mod put_atomic_group_tests {
                     committed_slot: None,
                     publish_local_cache: false,
                     atomic_group: Some(group.clone()),
+                    radix: None,
                 })
                 .collect(),
         };
@@ -1836,6 +1867,7 @@ mod put_atomic_group_tests {
                     lease_id: None,
                     committed_slot: None,
                     publish_local_cache: false,
+                    radix: None,
                 })
                 .collect(),
             atomic_group_lens: vec![128],

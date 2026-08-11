@@ -97,6 +97,14 @@ pub enum SideTransferRole {
     Worker,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpThreadReactorWaitMode {
+    #[default]
+    BusyPoll,
+    EventDriven,
+}
+
 /// Experimental source ordering for an external planned Get when SSD routes
 /// are present. The default preserves the sealed r89 behavior so a new
 /// release does not silently change an existing baseline.
@@ -112,6 +120,18 @@ pub enum SsdReadSourcePolicy {
     /// A remote owner's SSD route is deliberately excluded rather than used
     /// as a fallback.
     LocalSsdOnlyFirst,
+}
+
+/// Experimental policy for the remote DRAM source after a successful Get has
+/// published a requester-local backing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PostReadRemotePolicy {
+    /// Preserve the current inclusive-cache behavior.
+    #[default]
+    Retain,
+    /// Reclaim the exact remote-only DRAM source after the local route is live.
+    Drop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +181,8 @@ pub struct TestSpecConfig {
     pub skip_put_end_commit: bool,
     #[serde(default)]
     pub ssd_read_source_policy: SsdReadSourcePolicy,
+    #[serde(default)]
+    pub post_read_remote_policy: PostReadRemotePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_local_reserve_soft_wait_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -183,6 +205,16 @@ pub struct TestSpecConfig {
     /// existing configurations remain loadable, but it no longer throttles remote Put execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_task_max_inflight: Option<u16>,
+    /// Optional owner-side, no-queue admission budget for direct remote Put leaders. Followers
+    /// join an existing generation before admission is considered. A new leader must reserve its
+    /// exact source bytes before installing the flight or pinning the source; exhaustion returns
+    /// NotAdmitted immediately instead of creating a dispatcher queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_remote_put_max_inflight_bytes: Option<u64>,
+    /// Optional safety ceiling on the number of admitted remote Put leaders. This field may only
+    /// be used together with the byte budget above; bytes remain the primary resource boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_remote_put_max_inflight_items: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rdma_device_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +244,7 @@ impl Default for TestSpecConfig {
             short_circuit_put_payload_path: false,
             skip_put_end_commit: false,
             ssd_read_source_policy: SsdReadSourcePolicy::default(),
+            post_read_remote_policy: PostReadRemotePolicy::default(),
             owner_local_reserve_soft_wait_timeout_ms: None,
             owner_local_reserve_hard_timeout_ms: None,
             owner_local_reserve_expected_capacity: None,
@@ -221,6 +254,8 @@ impl Default for TestSpecConfig {
             tcp_thread_control_lane_count: None,
             user_rpc_sync_handler_thread_count: None,
             replica_task_max_inflight: None,
+            owner_remote_put_max_inflight_bytes: None,
+            owner_remote_put_max_inflight_items: None,
             rdma_device_names: None,
             require_transfer_rpc_fast_path_ready_timeout_seconds: None,
             enable_side_transfer: false,
@@ -480,6 +515,37 @@ fn validate_test_spec_tcp_thread_tuning(test_spec_config: &TestSpecConfig) -> Kv
             }
             .into_kverror());
         }
+    }
+    if matches!(
+        test_spec_config.owner_remote_put_max_inflight_bytes,
+        Some(0)
+    ) {
+        return Err(ConfigError::InvalidTestConfig {
+            detail: "test_spec_config.owner_remote_put_max_inflight_bytes must be > 0".to_string(),
+        }
+        .into_kverror());
+    }
+    if matches!(
+        test_spec_config.owner_remote_put_max_inflight_items,
+        Some(0)
+    ) {
+        return Err(ConfigError::InvalidTestConfig {
+            detail: "test_spec_config.owner_remote_put_max_inflight_items must be > 0".to_string(),
+        }
+        .into_kverror());
+    }
+    if test_spec_config
+        .owner_remote_put_max_inflight_items
+        .is_some()
+        && test_spec_config
+            .owner_remote_put_max_inflight_bytes
+            .is_none()
+    {
+        return Err(ConfigError::InvalidTestConfig {
+            detail: "test_spec_config.owner_remote_put_max_inflight_items requires test_spec_config.owner_remote_put_max_inflight_bytes"
+                .to_string(),
+        }
+        .into_kverror());
     }
     Ok(())
 }
@@ -982,6 +1048,8 @@ pub struct ProtocolConfig {
     pub protocol_type: ProtocolType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rdma_device_names: Option<String>,
+    #[serde(default)]
+    pub tcp_thread_reactor: TcpThreadReactorWaitMode,
 }
 
 /// Validated cluster pool size contribution
@@ -1468,6 +1536,7 @@ impl ClientConfigYaml {
             self.protocol.unwrap_or(ProtocolConfig {
                 protocol_type: ProtocolType::Rdma,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             }),
             normalized_rdma_device_names.as_ref(),
         );
@@ -2070,6 +2139,7 @@ impl MasterConfigYaml {
             self.protocol.unwrap_or(ProtocolConfig {
                 protocol_type: ProtocolType::Rdma,
                 rdma_device_names: None,
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             }),
             normalized_rdma_device_names.as_ref(),
         );
@@ -2117,6 +2187,51 @@ mod tests {
     fn cluster_scoped_shared_path_appends_cluster_name() {
         let scoped = cluster_scoped_shared_path("/tmp/fluxon_root", "test_cluster").unwrap();
         assert_eq!(scoped, "/tmp/fluxon_root/test_cluster");
+    }
+
+    #[test]
+    fn post_read_remote_policy_defaults_to_retain_and_parses_drop() {
+        assert_eq!(
+            TestSpecConfig::default().post_read_remote_policy,
+            PostReadRemotePolicy::Retain
+        );
+        let parsed: TestSpecConfig =
+            serde_yaml::from_str("post_read_remote_policy: drop\n").unwrap();
+        assert_eq!(parsed.post_read_remote_policy, PostReadRemotePolicy::Drop);
+    }
+
+    #[test]
+    fn protocol_tcp_thread_reactor_defaults_parses_and_rejects_legacy_placement() {
+        let default_protocol: ProtocolConfig =
+            serde_yaml::from_str("protocol_type: rdma\n").unwrap();
+        assert_eq!(
+            default_protocol.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::BusyPoll
+        );
+
+        let event_driven: ProtocolConfig =
+            serde_yaml::from_str("protocol_type: rdma\ntcp_thread_reactor: event_driven\n")
+                .unwrap();
+        assert_eq!(
+            event_driven.tcp_thread_reactor,
+            TcpThreadReactorWaitMode::EventDriven
+        );
+
+        assert!(
+            serde_yaml::from_str::<ProtocolConfig>(
+                "protocol_type: rdma\ntcp_thread_reactor: epoll\n"
+            )
+            .is_err()
+        );
+        assert!(
+            serde_yaml::from_str::<ProtocolConfig>(
+                "protocol_type: rdma\ntcp_thread_reactor_wait_mode: event_driven\n"
+            )
+            .is_err()
+        );
+        assert!(
+            serde_yaml::from_str::<TestSpecConfig>("tcp_thread_reactor: event_driven\n").is_err()
+        );
     }
 
     #[test]
@@ -2372,6 +2487,34 @@ test_spec_config:
                     .to_string()
                     .contains("replica_task_max_inflight must be in [1, 64]")
             );
+        }
+    }
+
+    #[test]
+    fn owner_remote_put_admission_requires_positive_primary_byte_budget() {
+        let valid = TestSpecConfig {
+            owner_remote_put_max_inflight_bytes: Some(16 * 1024 * 1024 * 1024),
+            owner_remote_put_max_inflight_items: Some(4096),
+            ..Default::default()
+        };
+        validate_test_spec_tcp_thread_tuning(&valid).unwrap();
+
+        for invalid in [
+            TestSpecConfig {
+                owner_remote_put_max_inflight_bytes: Some(0),
+                ..Default::default()
+            },
+            TestSpecConfig {
+                owner_remote_put_max_inflight_bytes: Some(1),
+                owner_remote_put_max_inflight_items: Some(0),
+                ..Default::default()
+            },
+            TestSpecConfig {
+                owner_remote_put_max_inflight_items: Some(1),
+                ..Default::default()
+            },
+        ] {
+            assert!(validate_test_spec_tcp_thread_tuning(&invalid).is_err());
         }
     }
 

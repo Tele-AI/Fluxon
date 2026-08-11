@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "askama",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_commu"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_commu_closed_sdk_consumer"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_commu_contract"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_framework"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "fluxon_framework_compiled",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_framework_compiled"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "crossbeam-queue",
@@ -1150,7 +1150,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_fs"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_fs_core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.21.7",
  "hex",
@@ -1204,7 +1204,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_fs_s3_gateway"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "askama",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_kv"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1273,6 +1273,7 @@ dependencies = [
  "limit_thirdparty",
  "local-ip-address",
  "moka",
+ "offset-allocator",
  "parking_lot",
  "paste",
  "pprof",
@@ -1301,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_mq"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1324,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_observability"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1345,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_ops"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "askama",
@@ -1376,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_proxy"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1390,14 +1391,14 @@ dependencies = [
 
 [[package]]
 name = "fluxon_proxy_proto"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bitcode",
 ]
 
 [[package]]
 name = "fluxon_pyo3"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1431,7 +1432,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_util"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2737,7 +2738,7 @@ dependencies = [
 
 [[package]]
 name = "limit_thirdparty"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "tokio",
 ]
@@ -3047,6 +3048,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "nonmax"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "610a5acd306ec67f907abe5567859a3c693fb9886eb1f012ab8f2a47bef3db51"
+
+[[package]]
 name = "ntapi"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3107,6 +3114,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "offset-allocator"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e234d535da3521eb95106f40f0b73483d80bfb3aacf27c40d7e2b72f1a3e00a2"
+dependencies = [
+ "log",
+ "nonmax",
 ]
 
 [[package]]

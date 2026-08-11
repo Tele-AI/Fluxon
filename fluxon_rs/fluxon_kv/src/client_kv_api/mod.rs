@@ -31,7 +31,7 @@ use crate::master_kv_router::msg_pack::{
     BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq,
     BatchPreparePutKeysReq, BatchPublishOwnerSsdReq, BatchPutAppendDoneReq, BatchPutAppendStartReq,
     BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
-    DeleteClientKvMetaCacheItem, GroupedBatchPutDoneReq,
+    DeleteClientKvMetaCacheItem, GroupedBatchPutDoneReq, RadixKvMetadata,
 };
 use crate::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use crate::memholder::{AllMemholderRefCount, ExternalMemHolderInfo, MemoryInfo, UserMemHolder};
@@ -65,8 +65,7 @@ use fluxon_util::pin_aware_moka::{PinAwareMoka, PinGuard};
 use limit_thirdparty::tokio;
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
-use std::collections::BTreeSet;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -299,6 +298,17 @@ pub struct OwnerRuntimeObserveSnapshot {
     pub remote_put_already_satisfied: u64,
     pub remote_put_obsolete: u64,
     pub remote_put_failed: u64,
+    pub remote_put_task_dropped: u64,
+    /// Zero means unbounded for the two configured limits below.
+    pub remote_put_admission_limit_bytes: u64,
+    pub remote_put_admission_limit_items: u64,
+    pub remote_put_admission_active_bytes: u64,
+    pub remote_put_admission_active_items: u64,
+    pub remote_put_admission_peak_bytes: u64,
+    pub remote_put_admission_peak_items: u64,
+    pub remote_put_admission_admitted: u64,
+    pub remote_put_admission_not_admitted: u64,
+    pub remote_put_admission_not_admitted_bytes: u64,
     pub local_ssd_put_flights_active: u64,
     pub local_ssd_put_flight_leaders: u64,
     pub local_ssd_put_flight_followers: u64,
@@ -308,6 +318,13 @@ pub struct OwnerRuntimeObserveSnapshot {
     pub local_ssd_put_dropped: u64,
     pub local_ssd_put_obsolete: u64,
     pub local_ssd_put_failed: u64,
+    pub local_reserve_grant_size_bytes: u64,
+    pub local_reserve_accounting_slot_size: u64,
+    pub local_reserve_raw_free_bytes: u64,
+    pub local_reserve_allocatable_slots: u64,
+    pub local_reserve_allocatable_bytes: u64,
+    pub local_reserve_slot_unallocatable_bytes: u64,
+    pub local_reserve_slot_unallocatable_ratio_ppm: u64,
     pub local_reserve_slots_free: u64,
     pub local_reserve_slots_prepared: u64,
     pub local_reserve_slots_pending_visible: u64,
@@ -1569,6 +1586,10 @@ pub struct ClientKvApiNewArg {
     pub test_spec_config: TestSpecConfig,
     /// Logical hot-tier capacity only. This does not resize the owner segment.
     pub owner_hot_cache_capacity_bytes: Option<u64>,
+    /// Physical owner DRAM already declared by `contribute_to_cluster_pool_size.dram`.
+    /// The local-reserve allocator may use whole grants from this budget while
+    /// Moka continues to enforce the smaller logical hot-tier capacity.
+    pub owner_local_reserve_physical_capacity_bytes: u64,
     pub ssd_storage: Option<KvSsdStorageInit>,
 }
 
@@ -1669,6 +1690,131 @@ struct OwnerRemotePutCounters {
     already_satisfied: AtomicU64,
     obsolete: AtomicU64,
     failed: AtomicU64,
+    task_dropped: AtomicU64,
+}
+
+/// Direct remote Put admission is a no-queue resource boundary. The exact source bytes are the
+/// primary budget; an optional item ceiling is only a safety bound against tiny-value task storms.
+/// Both counters are reserved before the generation flight is installed or a UserMemHolder pins
+/// the source. A failed `try_acquire` returns immediately and never creates deferred work.
+struct OwnerRemotePutAdmission {
+    max_bytes: Option<u64>,
+    max_items: Option<u64>,
+    active_bytes: AtomicU64,
+    active_items: AtomicU64,
+    peak_bytes: AtomicU64,
+    peak_items: AtomicU64,
+    admitted: AtomicU64,
+    not_admitted: AtomicU64,
+    not_admitted_bytes: AtomicU64,
+}
+
+impl OwnerRemotePutAdmission {
+    fn new(max_bytes: Option<u64>, max_items: Option<u64>) -> Arc<Self> {
+        debug_assert!(max_bytes != Some(0));
+        debug_assert!(max_items != Some(0));
+        debug_assert!(max_items.is_none() || max_bytes.is_some());
+        Arc::new(Self {
+            max_bytes,
+            max_items,
+            active_bytes: AtomicU64::new(0),
+            active_items: AtomicU64::new(0),
+            peak_bytes: AtomicU64::new(0),
+            peak_items: AtomicU64::new(0),
+            admitted: AtomicU64::new(0),
+            not_admitted: AtomicU64::new(0),
+            not_admitted_bytes: AtomicU64::new(0),
+        })
+    }
+
+    fn try_add_with_limit(current: &AtomicU64, amount: u64, limit: Option<u64>) -> Option<u64> {
+        let mut observed = current.load(Ordering::Acquire);
+        loop {
+            let next = observed.checked_add(amount)?;
+            if limit.is_some_and(|limit| next > limit) {
+                return None;
+            }
+            match current.compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(next),
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn record_not_admitted(&self, bytes: u64) {
+        self.not_admitted.fetch_add(1, Ordering::Relaxed);
+        self.not_admitted_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn try_acquire(self: &Arc<Self>, bytes: u64) -> Option<OwnerRemotePutAdmissionPermit> {
+        let Some(active_bytes) =
+            Self::try_add_with_limit(&self.active_bytes, bytes, self.max_bytes)
+        else {
+            self.record_not_admitted(bytes);
+            return None;
+        };
+        let Some(active_items) = Self::try_add_with_limit(&self.active_items, 1, self.max_items)
+        else {
+            let previous = self.active_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            debug_assert!(
+                previous >= bytes,
+                "remote Put admission byte refund underflow"
+            );
+            self.record_not_admitted(bytes);
+            return None;
+        };
+
+        self.peak_bytes.fetch_max(active_bytes, Ordering::Relaxed);
+        self.peak_items.fetch_max(active_items, Ordering::Relaxed);
+        self.admitted.fetch_add(1, Ordering::Relaxed);
+        Some(OwnerRemotePutAdmissionPermit {
+            admission: self.clone(),
+            bytes: Some(bytes),
+        })
+    }
+
+    fn release_bytes(&self, bytes: u64) {
+        let previous_bytes = self.active_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        debug_assert!(
+            previous_bytes >= bytes,
+            "remote Put admission byte release underflow"
+        );
+    }
+
+    fn release_item(&self) {
+        let previous_items = self.active_items.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            previous_items >= 1,
+            "remote Put admission item release underflow"
+        );
+    }
+}
+
+/// Unique admission credits for one exact `(key, put_id)` leader generation. Bytes cover only the
+/// transfer and can be released as soon as `put_transfer` returns. The item remains held until the
+/// permit is dropped at Done/Revoke terminal publication. RAII returns whichever credits remain
+/// after spawn unwind, panic, or task abort.
+pub(crate) struct OwnerRemotePutAdmissionPermit {
+    admission: Arc<OwnerRemotePutAdmission>,
+    bytes: Option<u64>,
+}
+
+impl OwnerRemotePutAdmissionPermit {
+    pub(crate) fn release_transfer_bytes(&mut self) -> bool {
+        let Some(bytes) = self.bytes.take() else {
+            return false;
+        };
+        self.admission.release_bytes(bytes);
+        true
+    }
+}
+
+impl Drop for OwnerRemotePutAdmissionPermit {
+    fn drop(&mut self) {
+        self.release_transfer_bytes();
+        self.admission.release_item();
+    }
 }
 
 #[derive(Default)]
@@ -1788,8 +1934,17 @@ pub(crate) struct OwnerHotEvictionEvent {
 
 pub(crate) enum OwnerHotEvictionDispatch {
     Victim(OwnerHotEvictionEvent),
-    BeginPressure { requested_bytes: u64 },
-    EndPressure { selected_bytes: u64 },
+    BeginPressure {
+        requested_bytes: u64,
+    },
+    EndPressure {
+        selected_bytes: u64,
+        /// The pressure producer must not select another Moka batch until
+        /// this batch has finished source fencing, master direct-delete, and
+        /// owner slot-release handling.  Candidate debt before that point is
+        /// deliberately not projected reclaim credit.
+        completion: ::tokio::sync::oneshot::Sender<()>,
+    },
     Flush,
 }
 
@@ -2151,9 +2306,11 @@ pub(crate) enum OwnerRemotePutReservation {
     Leader {
         op: Arc<OwnerRemotePutSharedOp>,
         memory_info: Arc<MemoryInfo>,
+        admission_permit: OwnerRemotePutAdmissionPermit,
     },
     Follower(Arc<OwnerRemotePutSharedOp>),
     SourceUnavailable,
+    NotAdmitted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2778,6 +2935,7 @@ impl std::ops::Deref for ClientKvApiViewHolder {
 pub struct ClientKvApiInner {
     view: ClientKvApiViewHolder,
     test_spec_config: TestSpecConfig,
+    owner_local_reserve_physical_capacity_bytes: u64,
     ssd_storage: Option<Arc<KvSsdStorage>>,
     metrics: OnceLock<Arc<MetricsHandle>>,
 
@@ -2818,6 +2976,7 @@ pub struct ClientKvApiInner {
         Arc<DashMap<OwnerHotReplicaIdentity, Arc<OwnerHotSelectionDebt>>>,
     owner_hot_counters: Arc<OwnerHotCacheCounters>,
     owner_remote_put_counters: Arc<OwnerRemotePutCounters>,
+    owner_remote_put_admission: Arc<OwnerRemotePutAdmission>,
     owner_local_ssd_put_counters: Arc<OwnerLocalSsdPutCounters>,
     planned_get_counters: OwnerPlannedGetCounters,
     ssd_stage_counters: OwnerSsdStageCounters,
@@ -3978,6 +4137,12 @@ impl ClientKvApiInner {
                 return OwnerRemotePutReservation::SourceUnavailable;
             }
         };
+        let Some(admission_permit) = self
+            .owner_remote_put_admission
+            .try_acquire(u64::from(memory_info.len))
+        else {
+            return OwnerRemotePutReservation::NotAdmitted;
+        };
 
         let op = OwnerRemotePutSharedOp::new(
             key,
@@ -3993,7 +4158,11 @@ impl ClientKvApiInner {
         self.owner_remote_put_counters
             .leaders
             .fetch_add(1, Ordering::Relaxed);
-        OwnerRemotePutReservation::Leader { op, memory_info }
+        OwnerRemotePutReservation::Leader {
+            op,
+            memory_info,
+            admission_permit,
+        }
     }
 
     pub(crate) fn finish_owner_remote_put(
@@ -4668,6 +4837,7 @@ pub struct ExternalPendingPutCtx {
     pub local_reserve_slot: Option<OwnerLocalReserveSlotRef>,
     pub local_reserve_slot_size: Option<u64>,
     pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
+    pub radix: Option<RadixKvMetadata>,
     /// Keep the per-key reclaim fence alive for every cache/user clone of this
     /// pending context.  The counter is released only by the final Arc drop.
     pub(crate) _pending_fence: Arc<ExternalPendingPutFenceGuard>,
@@ -4675,7 +4845,6 @@ pub struct ExternalPendingPutCtx {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum OwnerLocalReserveSlotState {
-    Free,
     Prepared,
     PendingLocalVisible {
         holder_ref_count: u32,
@@ -4707,69 +4876,149 @@ impl OwnerLocalReserveSlotLease {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+struct OwnerLocalReserveAllocationState {
+    allocation: offset_allocator::Allocation,
+    slot_size: u64,
+    state: OwnerLocalReserveSlotState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OwnerLocalReserveAllocatableReport {
+    pub raw_free_bytes: u64,
+    pub allocatable_slots: u64,
+    pub allocatable_bytes: u64,
+    /// Free bytes that cannot satisfy this report's requested slot size. This
+    /// is demand-relative capacity, not permanently stranded storage: a
+    /// smaller allocation may still consume it.
+    pub slot_unallocatable_bytes: u64,
+}
+
 pub(crate) struct OwnerLocalReserveGrantState {
     pub grant_id: u64,
     pub base_addr: u64,
     pub addr: u64,
     pub len: u64,
-    pub slot_size: u64,
-    pub slot_count: u32,
-    pub slot_states: Vec<OwnerLocalReserveSlotState>,
-    pub free_slots: Vec<u32>,
+    allocator: offset_allocator::Allocator,
+    // Ordered offsets let capacity accounting walk the exact free extents.
+    // Aggregate free bytes alone can include holes that are each too small for
+    // the pending slot size.
+    allocations: BTreeMap<u32, OwnerLocalReserveAllocationState>,
     pub fully_free_since: Option<Instant>,
 }
 
+impl std::fmt::Debug for OwnerLocalReserveGrantState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let report = self.allocator.storage_report();
+        f.debug_struct("OwnerLocalReserveGrantState")
+            .field("grant_id", &self.grant_id)
+            .field("base_addr", &format_args!("{:#x}", self.base_addr))
+            .field("addr", &format_args!("{:#x}", self.addr))
+            .field("len", &self.len)
+            .field("allocations", &self.allocations.len())
+            .field(
+                "free_bytes",
+                &(u64::from(report.total_free_space)
+                    * crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES),
+            )
+            .field(
+                "largest_free_bytes",
+                &(u64::from(report.largest_free_region)
+                    * crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES),
+            )
+            .finish()
+    }
+}
+
 impl OwnerLocalReserveGrantState {
-    pub fn new(
-        grant_id: u64,
-        base_addr: u64,
-        addr: u64,
-        len: u64,
-        slot_size: u64,
-        slot_count: u32,
-    ) -> Self {
-        let mut free_slots = Vec::with_capacity(slot_count as usize);
-        for slot_index in (0..slot_count).rev() {
-            free_slots.push(slot_index);
-        }
+    pub fn new(grant_id: u64, base_addr: u64, addr: u64, len: u64) -> Self {
+        assert!(
+            len > 0 && len % crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES == 0,
+            "local-reserve grant length must be a non-zero multiple of 4 KiB"
+        );
+        let allocation_units = u32::try_from(len / crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES)
+            .expect("local-reserve grant units must fit u32");
+        // OffsetAllocator needs one node for the free range and one spare while splitting it.
+        // Two extra nodes let a grant be filled completely with minimum-sized allocations.
+        let max_allocation_nodes = allocation_units
+            .checked_add(2)
+            .expect("local-reserve allocation-node count overflow");
         Self {
             grant_id,
             base_addr,
             addr,
             len,
-            slot_size,
-            slot_count,
-            slot_states: vec![OwnerLocalReserveSlotState::Free; slot_count as usize],
-            free_slots,
+            allocator: offset_allocator::Allocator::with_max_allocs(
+                allocation_units,
+                max_allocation_nodes,
+            ),
+            allocations: BTreeMap::new(),
             fully_free_since: Some(Instant::now()),
         }
     }
 
-    pub fn claim_prepared_slot(&mut self) -> Option<OwnerLocalReserveSlotRef> {
-        let slot_index = self.free_slots.pop()?;
-        let state = self
-            .slot_states
-            .get_mut(slot_index as usize)
-            .expect("slot state index out of range");
-        assert!(
-            matches!(*state, OwnerLocalReserveSlotState::Free),
-            "claim_prepared_slot expects a free slot"
+    pub fn claim_prepared_slot(&mut self, slot_size: u64) -> Option<OwnerLocalReserveSlotRef> {
+        if slot_size == 0
+            || slot_size > self.len
+            || slot_size % crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES != 0
+        {
+            return None;
+        }
+        let allocation_units =
+            u32::try_from(slot_size / crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES).ok()?;
+        let allocation = self.allocator.allocate(allocation_units)?;
+        let slot_index = allocation.offset;
+        let previous = self.allocations.insert(
+            slot_index,
+            OwnerLocalReserveAllocationState {
+                allocation,
+                slot_size,
+                state: OwnerLocalReserveSlotState::Prepared,
+            },
         );
-        *state = OwnerLocalReserveSlotState::Prepared;
+        assert!(
+            previous.is_none(),
+            "offset allocator returned a live offset"
+        );
         self.fully_free_since = None;
         Some(OwnerLocalReserveSlotRef {
             grant_id: self.grant_id,
             slot_index,
-            ptr: self.addr + self.slot_size * slot_index as u64,
+            ptr: self.addr
+                + crate::owner_local_reserve_slot_offset_bytes(slot_index)
+                    .expect("local-reserve allocation offset overflow"),
             base_addr: self.base_addr,
         })
     }
 
+    fn allocation(&self, slot_index: u32) -> Option<&OwnerLocalReserveAllocationState> {
+        self.allocations.get(&slot_index)
+    }
+
+    fn allocation_mut(&mut self, slot_index: u32) -> Option<&mut OwnerLocalReserveAllocationState> {
+        self.allocations.get_mut(&slot_index)
+    }
+
+    fn free_allocation(&mut self, slot_index: u32) {
+        let allocation = self
+            .allocations
+            .remove(&slot_index)
+            .expect("free_allocation expects a live allocation");
+        self.allocator.free(allocation.allocation);
+        if self.is_fully_free() {
+            self.fully_free_since = Some(Instant::now());
+        }
+    }
+
+    pub fn allocation_slot_size(&self, slot_index: u32) -> Option<u64> {
+        self.allocation(slot_index)
+            .map(|allocation| allocation.slot_size)
+    }
+
     pub fn mark_prepared_slot_pending_visible(&mut self, slot_index: u32) {
         let state = self
-            .slot_states
-            .get_mut(slot_index as usize)
+            .allocation_mut(slot_index)
+            .map(|allocation| &mut allocation.state)
             .expect("slot state index out of range");
         assert!(
             matches!(*state, OwnerLocalReserveSlotState::Prepared),
@@ -4783,8 +5032,8 @@ impl OwnerLocalReserveGrantState {
 
     pub fn promote_pending_visible_slot_to_committed(&mut self, slot_index: u32) {
         let state = self
-            .slot_states
-            .get_mut(slot_index as usize)
+            .allocation_mut(slot_index)
+            .map(|allocation| &mut allocation.state)
             .expect("slot state index out of range");
         let holder_ref_count = match *state {
             OwnerLocalReserveSlotState::PendingLocalVisible { holder_ref_count } => {
@@ -4802,25 +5051,21 @@ impl OwnerLocalReserveGrantState {
     }
 
     pub fn release_prepared_slot(&mut self, slot_index: u32) {
-        let state = self
-            .slot_states
-            .get_mut(slot_index as usize)
-            .expect("slot state index out of range");
+        let state = &self
+            .allocation(slot_index)
+            .expect("slot state index out of range")
+            .state;
         assert!(
             matches!(*state, OwnerLocalReserveSlotState::Prepared),
             "release_prepared_slot expects a prepared slot"
         );
-        *state = OwnerLocalReserveSlotState::Free;
-        self.free_slots.push(slot_index);
-        if self.is_fully_free() {
-            self.fully_free_since = Some(Instant::now());
-        }
+        self.free_allocation(slot_index);
     }
 
     pub fn retain_resident_slot_holder(&mut self, slot_index: u32) {
         let state = self
-            .slot_states
-            .get_mut(slot_index as usize)
+            .allocation_mut(slot_index)
+            .map(|allocation| &mut allocation.state)
             .expect("slot state index out of range");
         match state {
             OwnerLocalReserveSlotState::PendingLocalVisible { holder_ref_count }
@@ -4838,297 +5083,345 @@ impl OwnerLocalReserveGrantState {
     }
 
     pub fn release_resident_slot_holder(&mut self, slot_index: u32) {
-        let state = self
-            .slot_states
-            .get_mut(slot_index as usize)
-            .expect("slot state index out of range");
-        match state {
-            OwnerLocalReserveSlotState::PendingLocalVisible { holder_ref_count } => {
-                assert!(
-                    *holder_ref_count > 0,
-                    "release_resident_slot_holder expects holder_ref_count > 0"
-                );
-                *holder_ref_count -= 1;
-                if *holder_ref_count == 0 {
-                    *state = OwnerLocalReserveSlotState::Free;
-                    self.free_slots.push(slot_index);
-                    if self.is_fully_free() {
-                        self.fully_free_since = Some(Instant::now());
-                    }
+        let should_free = {
+            let state = self
+                .allocation_mut(slot_index)
+                .map(|allocation| &mut allocation.state)
+                .expect("slot state index out of range");
+            match state {
+                OwnerLocalReserveSlotState::PendingLocalVisible { holder_ref_count } => {
+                    assert!(
+                        *holder_ref_count > 0,
+                        "release_resident_slot_holder expects holder_ref_count > 0"
+                    );
+                    *holder_ref_count -= 1;
+                    *holder_ref_count == 0
+                }
+                OwnerLocalReserveSlotState::Committed {
+                    route_live,
+                    holder_ref_count,
+                } => {
+                    *holder_ref_count = holder_ref_count
+                        .checked_sub(1)
+                        .expect("release_resident_slot_holder expects holder_ref_count > 0");
+                    !*route_live && *holder_ref_count == 0
+                }
+                _ => {
+                    unreachable!("release_resident_slot_holder expects a resident slot");
                 }
             }
-            OwnerLocalReserveSlotState::Committed {
-                route_live,
-                holder_ref_count,
-            } => {
-                *holder_ref_count = holder_ref_count
-                    .checked_sub(1)
-                    .expect("release_resident_slot_holder expects holder_ref_count > 0");
-                if !*route_live && *holder_ref_count == 0 {
-                    *state = OwnerLocalReserveSlotState::Free;
-                    self.free_slots.push(slot_index);
-                    if self.is_fully_free() {
-                        self.fully_free_since = Some(Instant::now());
-                    }
-                }
-            }
-            _ => {
-                unreachable!("release_resident_slot_holder expects a resident slot");
-            }
+        };
+        if should_free {
+            self.free_allocation(slot_index);
         }
     }
 
     pub fn release_committed_slot_route(&mut self, slot_index: u32) {
-        let state = self
-            .slot_states
-            .get_mut(slot_index as usize)
-            .expect("slot state index out of range");
-        match state {
-            OwnerLocalReserveSlotState::Committed {
-                route_live,
-                holder_ref_count,
-            } => {
-                assert!(
-                    *route_live,
-                    "release_committed_slot_route expects a live route"
-                );
-                *route_live = false;
-                if *holder_ref_count == 0 {
-                    *state = OwnerLocalReserveSlotState::Free;
-                    self.free_slots.push(slot_index);
-                    if self.is_fully_free() {
-                        self.fully_free_since = Some(Instant::now());
-                    }
+        let should_free = {
+            let state = self
+                .allocation_mut(slot_index)
+                .map(|allocation| &mut allocation.state)
+                .expect("slot state index out of range");
+            match state {
+                OwnerLocalReserveSlotState::Committed {
+                    route_live,
+                    holder_ref_count,
+                } => {
+                    assert!(
+                        *route_live,
+                        "release_committed_slot_route expects a live route"
+                    );
+                    *route_live = false;
+                    *holder_ref_count == 0
+                }
+                _ => {
+                    unreachable!("release_committed_slot_route expects a committed slot");
                 }
             }
-            _ => {
-                unreachable!("release_committed_slot_route expects a committed slot");
+        };
+        if should_free {
+            self.free_allocation(slot_index);
+        }
+    }
+
+    pub fn release_committed_resident_slot(&mut self, slot_index: u32) {
+        let should_free = {
+            let state = self
+                .allocation_mut(slot_index)
+                .map(|allocation| &mut allocation.state)
+                .expect("slot state index out of range");
+            match state {
+                OwnerLocalReserveSlotState::Committed {
+                    route_live,
+                    holder_ref_count,
+                } => {
+                    assert!(
+                        *route_live,
+                        "release_committed_resident_slot expects a live route"
+                    );
+                    assert!(
+                        *holder_ref_count > 0,
+                        "release_committed_resident_slot expects holder_ref_count > 0"
+                    );
+                    *route_live = false;
+                    *holder_ref_count -= 1;
+                    *holder_ref_count == 0
+                }
+                _ => {
+                    unreachable!("release_committed_resident_slot expects a committed slot");
+                }
             }
+        };
+        if should_free {
+            self.free_allocation(slot_index);
         }
     }
 
     pub fn is_fully_free(&self) -> bool {
-        self.free_slots.len() == self.slot_count as usize
+        self.allocations.is_empty()
     }
 
     pub fn used_slot_count(&self) -> usize {
-        self.slot_count as usize - self.free_slots.len()
+        self.allocations.len()
+    }
+
+    pub fn total_free_bytes(&self) -> u64 {
+        u64::from(self.allocator.storage_report().total_free_space)
+            * crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES
+    }
+
+    pub fn largest_free_bytes(&self) -> u64 {
+        u64::from(self.allocator.storage_report().largest_free_region)
+            * crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES
+    }
+
+    pub fn allocatable_report(&self, slot_size: u64) -> OwnerLocalReserveAllocatableReport {
+        let raw_free_bytes = self.total_free_bytes();
+        if slot_size == 0
+            || slot_size > self.len
+            || slot_size % crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES != 0
+        {
+            return OwnerLocalReserveAllocatableReport {
+                raw_free_bytes,
+                slot_unallocatable_bytes: raw_free_bytes,
+                ..Default::default()
+            };
+        }
+
+        let mut cursor = 0u64;
+        let mut exact_free_bytes = 0u64;
+        let mut allocatable_slots = 0u64;
+        for (slot_index, allocation) in &self.allocations {
+            let allocation_start = crate::owner_local_reserve_slot_offset_bytes(*slot_index)
+                .expect("local-reserve allocation offset overflow");
+            assert!(
+                allocation_start >= cursor,
+                "local-reserve allocation intervals overlap"
+            );
+            let free_extent = allocation_start - cursor;
+            exact_free_bytes = exact_free_bytes.saturating_add(free_extent);
+            allocatable_slots = allocatable_slots.saturating_add(free_extent / slot_size);
+            cursor = allocation_start
+                .checked_add(allocation.slot_size)
+                .expect("local-reserve allocation end overflow");
+        }
+        assert!(cursor <= self.len, "local-reserve allocation exceeds grant");
+        let trailing_free = self.len - cursor;
+        exact_free_bytes = exact_free_bytes.saturating_add(trailing_free);
+        allocatable_slots = allocatable_slots.saturating_add(trailing_free / slot_size);
+        assert_eq!(
+            exact_free_bytes, raw_free_bytes,
+            "owner allocation index diverged from OffsetAllocator free accounting"
+        );
+
+        let allocatable_bytes = allocatable_slots.saturating_mul(slot_size);
+        OwnerLocalReserveAllocatableReport {
+            raw_free_bytes,
+            allocatable_slots,
+            allocatable_bytes,
+            slot_unallocatable_bytes: raw_free_bytes.saturating_sub(allocatable_bytes),
+        }
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct OwnerLocalReserveClassState {
-    pub slot_size: u64,
-    pub slots_per_grant: u32,
+#[derive(Debug, Default)]
+pub(crate) struct OwnerLocalReservePoolState {
     pub grants: Vec<OwnerLocalReserveGrantState>,
-    /// Stable grant identity -> current index in `grants`. Every vector removal uses
-    /// swap-remove and repairs the one moved entry, so per-slot state transitions never
-    /// scan all grants.
     grant_indices: HashMap<u64, usize>,
-    /// Dense set of grants which currently contain at least one free slot. This avoids
-    /// scanning full grants while assembling a lease.
-    claimable_grant_ids: Vec<u64>,
-    claimable_grant_indices: HashMap<u64, usize>,
-    free_slots: usize,
+    claimable_grants: BTreeSet<(u64, u64)>,
     prepared_slots: usize,
     pending_visible_slots: usize,
     committed_slots: usize,
+    pub pending_demand_by_slot_size: HashMap<u64, usize>,
+    /// Additional generic grants estimated by the latest failed real claim
+    /// for each request size. Keeping this per size prevents one class from
+    /// authorizing pressure for another class that has not attempted a claim.
+    pub failed_claim_refill_grants_by_slot_size: HashMap<u64, usize>,
+    /// Monotonic progress marker used only to reset pressure backoff. Partial
+    /// claims that are rolled back do not advance it.
+    pub claim_progress_epoch: u64,
     pub last_grow_at: Option<Instant>,
-    pub pending_slot_demand: usize,
-    pub max_observed_claim_slots: usize,
+    /// Whole-grant physical target. When an expected logical payload is
+    /// configured this includes its asynchronous publication/reclaim burst
+    /// reserve; it is not the Moka capacity.
     pub expected_grant_count: usize,
+    pub expected_slot_size: Option<u64>,
+    /// Physical grant extent size. Production grants stay generic 512 MiB
+    /// extents and are never rounded down to one accounting slot size.
+    pub grant_size_bytes: Option<u64>,
 }
 
-impl OwnerLocalReserveClassState {
-    pub fn new(slot_size: u64, slots_per_grant: u32) -> Self {
-        Self {
-            slot_size,
-            slots_per_grant,
-            grants: Vec::new(),
-            grant_indices: HashMap::new(),
-            claimable_grant_ids: Vec::new(),
-            claimable_grant_indices: HashMap::new(),
-            free_slots: 0,
-            prepared_slots: 0,
-            pending_visible_slots: 0,
-            committed_slots: 0,
-            last_grow_at: None,
-            pending_slot_demand: 0,
-            max_observed_claim_slots: 0,
-            expected_grant_count: 0,
-        }
+impl OwnerLocalReservePoolState {
+    fn grant_index(&self, grant_id: u64) -> Option<usize> {
+        self.grant_indices.get(&grant_id).copied()
     }
 
-    pub fn free_slot_count(&self) -> usize {
-        self.free_slots
-    }
-
-    pub fn used_slot_count(&self) -> usize {
-        self.prepared_slots
-            .saturating_add(self.pending_visible_slots)
-            .saturating_add(self.committed_slots)
-    }
-
-    pub fn grant_count(&self) -> usize {
-        self.grants.len()
-    }
-
-    pub fn prepared_slot_count(&self) -> usize {
-        self.prepared_slots
-    }
-
-    pub fn pending_visible_slot_count(&self) -> usize {
-        self.pending_visible_slots
-    }
-
-    pub fn committed_slot_count(&self) -> usize {
-        self.committed_slots
-    }
-
-    fn add_claimable_grant(&mut self, grant_id: u64) {
-        if self.claimable_grant_indices.contains_key(&grant_id) {
-            return;
-        }
-        let index = self.claimable_grant_ids.len();
-        self.claimable_grant_ids.push(grant_id);
-        let previous = self.claimable_grant_indices.insert(grant_id, index);
-        assert!(
-            previous.is_none(),
-            "duplicate claimable local-reserve grant"
-        );
-    }
-
-    fn remove_claimable_grant(&mut self, grant_id: u64) {
-        let Some(index) = self.claimable_grant_indices.remove(&grant_id) else {
+    fn remove_claimable_index(&mut self, grant_id: u64) {
+        let Some(index) = self.grant_index(grant_id) else {
             return;
         };
-        let removed = self.claimable_grant_ids.swap_remove(index);
-        assert_eq!(removed, grant_id, "claimable grant index drift");
-        if let Some(moved_grant_id) = self.claimable_grant_ids.get(index).copied() {
-            let moved_index = self
-                .claimable_grant_indices
-                .get_mut(&moved_grant_id)
-                .expect("moved claimable grant must remain indexed");
-            *moved_index = index;
+        let largest = self.grants[index].largest_free_bytes();
+        if largest != 0 {
+            assert!(
+                self.claimable_grants.remove(&(largest, grant_id)),
+                "local-reserve claimable-grant index drift"
+            );
+        }
+    }
+
+    fn add_claimable_index(&mut self, grant_id: u64) {
+        let index = self
+            .grant_index(grant_id)
+            .expect("claimable local-reserve grant must be installed");
+        let largest = self.grants[index].largest_free_bytes();
+        if largest != 0 {
+            assert!(
+                self.claimable_grants.insert((largest, grant_id)),
+                "duplicate local-reserve claimable-grant index"
+            );
         }
     }
 
     pub fn install_grant(&mut self, grant: OwnerLocalReserveGrantState) {
-        assert_eq!(grant.slot_size, self.slot_size, "grant slot-size drift");
-        assert_eq!(
-            grant.slot_count, self.slots_per_grant,
-            "grant slot-count drift"
-        );
+        if let Some(expected_len) = self.grant_size_bytes {
+            assert_eq!(
+                grant.len, expected_len,
+                "local-reserve grant length differs from configured extent size"
+            );
+        }
         assert!(
             !self.grant_indices.contains_key(&grant.grant_id),
             "duplicate local-reserve grant id"
         );
-
-        let mut free = 0usize;
-        let mut prepared = 0usize;
-        let mut pending_visible = 0usize;
-        let mut committed = 0usize;
-        for state in &grant.slot_states {
-            match state {
-                OwnerLocalReserveSlotState::Free => free += 1,
-                OwnerLocalReserveSlotState::Prepared => prepared += 1,
-                OwnerLocalReserveSlotState::PendingLocalVisible { .. } => pending_visible += 1,
-                OwnerLocalReserveSlotState::Committed { .. } => committed += 1,
-            }
-        }
-        assert_eq!(free, grant.free_slots.len(), "grant free-slot index drift");
-
         let grant_id = grant.grant_id;
         let index = self.grants.len();
         self.grants.push(grant);
-        let previous = self.grant_indices.insert(grant_id, index);
-        assert!(previous.is_none(), "duplicate local-reserve grant id");
-        if free != 0 {
-            self.add_claimable_grant(grant_id);
-        }
-        self.free_slots = self
-            .free_slots
-            .checked_add(free)
-            .expect("free slot overflow");
-        self.prepared_slots = self
-            .prepared_slots
-            .checked_add(prepared)
-            .expect("prepared slot overflow");
-        self.pending_visible_slots = self
-            .pending_visible_slots
-            .checked_add(pending_visible)
-            .expect("pending-visible slot overflow");
-        self.committed_slots = self
-            .committed_slots
-            .checked_add(committed)
-            .expect("committed slot overflow");
+        assert!(self.grant_indices.insert(grant_id, index).is_none());
+        self.add_claimable_index(grant_id);
+        self.last_grow_at = Some(Instant::now());
     }
 
-    pub fn claim_available(&mut self, max_slots: usize) -> Vec<OwnerLocalReserveSlotRef> {
-        let claim_count = self.free_slots.min(max_slots);
-        let mut slots = Vec::with_capacity(claim_count);
-        while slots.len() < claim_count {
-            let grant_id = *self
-                .claimable_grant_ids
-                .last()
-                .expect("free-slot counter requires a claimable grant");
-            let grant_index = *self
-                .grant_indices
-                .get(&grant_id)
-                .expect("claimable grant must be installed");
-            let (slot, exhausted) = {
-                let grant = &mut self.grants[grant_index];
-                let slot = grant
-                    .claim_prepared_slot()
-                    .expect("claimable grant must contain a free slot");
-                (slot, grant.free_slots.is_empty())
+    pub fn claim_available(
+        &mut self,
+        slot_size: u64,
+        max_slots: usize,
+    ) -> Vec<OwnerLocalReserveSlotRef> {
+        let mut slots = Vec::with_capacity(max_slots);
+        while slots.len() < max_slots {
+            let Some((_, grant_id)) = self
+                .claimable_grants
+                .range((slot_size, 0)..)
+                .next()
+                .copied()
+            else {
+                break;
             };
-            self.free_slots = self
-                .free_slots
-                .checked_sub(1)
-                .expect("free slot counter underflow");
+            self.remove_claimable_index(grant_id);
+            let grant_index = self
+                .grant_index(grant_id)
+                .expect("claimable local-reserve grant must be installed");
+            let slot = self.grants[grant_index]
+                .claim_prepared_slot(slot_size)
+                .expect("largest-free index must satisfy allocation");
+            self.add_claimable_index(grant_id);
             self.prepared_slots = self
                 .prepared_slots
                 .checked_add(1)
                 .expect("prepared slot overflow");
-            if exhausted {
-                self.remove_claimable_grant(grant_id);
-            }
             slots.push(slot);
         }
         slots
     }
 
-    fn grant_index(&self, grant_id: u64) -> Option<usize> {
-        self.grant_indices.get(&grant_id).copied()
+    pub fn record_failed_claim(&mut self, slot_size: u64, required_grants: usize) {
+        let debt = self
+            .failed_claim_refill_grants_by_slot_size
+            .entry(slot_size)
+            .or_default();
+        *debt = (*debt).max(required_grants);
     }
 
-    pub fn grant(&self, grant_id: u64) -> Option<&OwnerLocalReserveGrantState> {
-        self.grant_index(grant_id)
-            .and_then(|index| self.grants.get(index))
+    pub fn record_successful_claim(&mut self, slot_size: u64) {
+        self.claim_progress_epoch = self.claim_progress_epoch.saturating_add(1);
+        self.failed_claim_refill_grants_by_slot_size
+            .remove(&slot_size);
     }
 
-    pub fn release_prepared_slot(&mut self, grant_id: u64, slot_index: u32) -> bool {
+    pub fn record_refill_grant_installed(&mut self) {
+        self.failed_claim_refill_grants_by_slot_size
+            .values_mut()
+            .for_each(|required_grants| {
+                *required_grants = required_grants.saturating_sub(1);
+            });
+    }
+
+    pub fn failed_claim_refill_grants(&self) -> usize {
+        self.failed_claim_refill_grants_by_slot_size
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn slot_size_has_failed_claim(&self, slot_size: u64) -> bool {
+        self.failed_claim_refill_grants_by_slot_size
+            .contains_key(&slot_size)
+    }
+
+    pub fn release_prepared_slot(
+        &mut self,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> bool {
         let Some(grant_index) = self.grant_index(grant_id) else {
             return false;
         };
-        let was_exhausted = self.grants[grant_index].free_slots.is_empty();
+        if self.grants[grant_index].allocation_slot_size(slot_index) != Some(slot_size) {
+            return false;
+        }
+        self.remove_claimable_index(grant_id);
         self.grants[grant_index].release_prepared_slot(slot_index);
+        self.add_claimable_index(grant_id);
         self.prepared_slots = self
             .prepared_slots
             .checked_sub(1)
             .expect("prepared slot counter underflow");
-        self.free_slots = self.free_slots.checked_add(1).expect("free slot overflow");
-        if was_exhausted {
-            self.add_claimable_grant(grant_id);
-        }
         true
     }
 
-    pub fn mark_prepared_slot_pending_visible(&mut self, grant_id: u64, slot_index: u32) -> bool {
+    pub fn mark_prepared_slot_pending_visible(
+        &mut self,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> bool {
         let Some(grant_index) = self.grant_index(grant_id) else {
             return false;
         };
+        if self.grants[grant_index].allocation_slot_size(slot_index) != Some(slot_size) {
+            return false;
+        }
         self.grants[grant_index].mark_prepared_slot_pending_visible(slot_index);
         self.prepared_slots = self
             .prepared_slots
@@ -5143,12 +5436,16 @@ impl OwnerLocalReserveClassState {
 
     pub fn promote_pending_visible_slot_to_committed(
         &mut self,
+        slot_size: u64,
         grant_id: u64,
         slot_index: u32,
     ) -> bool {
         let Some(grant_index) = self.grant_index(grant_id) else {
             return false;
         };
+        if self.grants[grant_index].allocation_slot_size(slot_index) != Some(slot_size) {
+            return false;
+        }
         self.grants[grant_index].promote_pending_visible_slot_to_committed(slot_index);
         self.pending_visible_slots = self
             .pending_visible_slots
@@ -5161,34 +5458,45 @@ impl OwnerLocalReserveClassState {
         true
     }
 
-    pub fn retain_resident_slot_holder(&mut self, grant_id: u64, slot_index: u32) -> bool {
+    pub fn retain_resident_slot_holder(
+        &mut self,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> bool {
         let Some(grant_index) = self.grant_index(grant_id) else {
             return false;
         };
+        if self.grants[grant_index].allocation_slot_size(slot_index) != Some(slot_size) {
+            return false;
+        }
         self.grants[grant_index].retain_resident_slot_holder(slot_index);
         true
     }
 
-    pub fn release_resident_slot_holder(&mut self, grant_id: u64, slot_index: u32) -> bool {
+    pub fn release_resident_slot_holder(
+        &mut self,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> bool {
         let Some(grant_index) = self.grant_index(grant_id) else {
             return false;
         };
-        let (was_exhausted, prior_state, became_free) = {
-            let grant = &mut self.grants[grant_index];
-            let was_exhausted = grant.free_slots.is_empty();
-            let prior_state = grant
-                .slot_states
-                .get(slot_index as usize)
-                .expect("slot state index out of range")
-                .clone();
-            let free_before = grant.free_slots.len();
-            grant.release_resident_slot_holder(slot_index);
-            (
-                was_exhausted,
-                prior_state,
-                grant.free_slots.len() != free_before,
-            )
-        };
+        if self.grants[grant_index].allocation_slot_size(slot_index) != Some(slot_size) {
+            return false;
+        }
+        let prior_state = self.grants[grant_index]
+            .allocation(slot_index)
+            .expect("validated local-reserve allocation disappeared")
+            .state
+            .clone();
+        self.remove_claimable_index(grant_id);
+        self.grants[grant_index].release_resident_slot_holder(slot_index);
+        let became_free = self.grants[grant_index]
+            .allocation_slot_size(slot_index)
+            .is_none();
+        self.add_claimable_index(grant_id);
         if became_free {
             match prior_state {
                 OwnerLocalReserveSlotState::PendingLocalVisible { .. } => {
@@ -5203,36 +5511,37 @@ impl OwnerLocalReserveClassState {
                         .checked_sub(1)
                         .expect("committed slot counter underflow");
                 }
-                _ => unreachable!("resident holder must belong to a resident slot"),
-            }
-            self.free_slots = self.free_slots.checked_add(1).expect("free slot overflow");
-            if was_exhausted {
-                self.add_claimable_grant(grant_id);
+                OwnerLocalReserveSlotState::Prepared => {
+                    unreachable!("resident holder must belong to a resident slot")
+                }
             }
         }
         true
     }
 
-    pub fn release_committed_slot_route(&mut self, grant_id: u64, slot_index: u32) -> bool {
+    pub fn release_committed_slot_route(
+        &mut self,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> bool {
         let Some(grant_index) = self.grant_index(grant_id) else {
             return false;
         };
-        let (was_exhausted, became_free) = {
-            let grant = &mut self.grants[grant_index];
-            let was_exhausted = grant.free_slots.is_empty();
-            let free_before = grant.free_slots.len();
-            grant.release_committed_slot_route(slot_index);
-            (was_exhausted, grant.free_slots.len() != free_before)
-        };
+        if self.grants[grant_index].allocation_slot_size(slot_index) != Some(slot_size) {
+            return false;
+        }
+        self.remove_claimable_index(grant_id);
+        self.grants[grant_index].release_committed_slot_route(slot_index);
+        let became_free = self.grants[grant_index]
+            .allocation_slot_size(slot_index)
+            .is_none();
+        self.add_claimable_index(grant_id);
         if became_free {
             self.committed_slots = self
                 .committed_slots
                 .checked_sub(1)
                 .expect("committed slot counter underflow");
-            self.free_slots = self.free_slots.checked_add(1).expect("free slot overflow");
-            if was_exhausted {
-                self.add_claimable_grant(grant_id);
-            }
         }
         true
     }
@@ -5240,12 +5549,30 @@ impl OwnerLocalReserveClassState {
     /// Drop the route reference and the resident `MemoryInfo` reference as one
     /// slot-pool transaction. This is the normal owner-reclaim transition and
     /// avoids exposing an intermediate state across two pool lock acquisitions.
-    pub fn release_committed_resident_slot(&mut self, grant_id: u64, slot_index: u32) -> bool {
-        if self.grant_index(grant_id).is_none() {
+    pub fn release_committed_resident_slot(
+        &mut self,
+        slot_size: u64,
+        grant_id: u64,
+        slot_index: u32,
+    ) -> bool {
+        let Some(grant_index) = self.grant_index(grant_id) else {
+            return false;
+        };
+        if self.grants[grant_index].allocation_slot_size(slot_index) != Some(slot_size) {
             return false;
         }
-        assert!(self.release_committed_slot_route(grant_id, slot_index));
-        assert!(self.release_resident_slot_holder(grant_id, slot_index));
+        self.remove_claimable_index(grant_id);
+        self.grants[grant_index].release_committed_resident_slot(slot_index);
+        let became_free = self.grants[grant_index]
+            .allocation_slot_size(slot_index)
+            .is_none();
+        self.add_claimable_index(grant_id);
+        if became_free {
+            self.committed_slots = self
+                .committed_slots
+                .checked_sub(1)
+                .expect("committed slot counter underflow");
+        }
         true
     }
 
@@ -5258,32 +5585,110 @@ impl OwnerLocalReserveClassState {
             self.grants[grant_index].is_fully_free(),
             "only a fully-free grant may be detached"
         );
-        self.remove_claimable_grant(grant_id);
+        let largest = self.grants[grant_index].largest_free_bytes();
+        assert!(self.claimable_grants.remove(&(largest, grant_id)));
         let grant = self.grants.swap_remove(grant_index);
-        assert_eq!(grant.grant_id, grant_id, "grant index drift");
-        if let Some(moved_grant) = self.grants.get(grant_index) {
-            let moved_index = self
+        if let Some(moved) = self.grants.get(grant_index) {
+            *self
                 .grant_indices
-                .get_mut(&moved_grant.grant_id)
-                .expect("moved grant must remain indexed");
-            *moved_index = grant_index;
+                .get_mut(&moved.grant_id)
+                .expect("moved local-reserve grant must remain indexed") = grant_index;
         }
-        self.free_slots = self
-            .free_slots
-            .checked_sub(grant.slot_count as usize)
-            .expect("free slot counter underflow");
         Some(grant)
     }
 
     pub fn take_all_grants(&mut self) -> Vec<OwnerLocalReserveGrantState> {
         self.grant_indices.clear();
-        self.claimable_grant_ids.clear();
-        self.claimable_grant_indices.clear();
-        self.free_slots = 0;
+        self.claimable_grants.clear();
         self.prepared_slots = 0;
         self.pending_visible_slots = 0;
         self.committed_slots = 0;
         std::mem::take(&mut self.grants)
+    }
+
+    pub fn grant_count(&self) -> usize {
+        self.grants.len()
+    }
+
+    pub fn used_slot_count(&self) -> usize {
+        self.prepared_slots + self.pending_visible_slots + self.committed_slots
+    }
+
+    pub fn prepared_slot_count(&self) -> usize {
+        self.prepared_slots
+    }
+
+    pub fn pending_visible_slot_count(&self) -> usize {
+        self.pending_visible_slots
+    }
+
+    pub fn committed_slot_count(&self) -> usize {
+        self.committed_slots
+    }
+
+    pub fn total_free_bytes(&self) -> u64 {
+        self.grants
+            .iter()
+            .map(OwnerLocalReserveGrantState::total_free_bytes)
+            .sum()
+    }
+
+    pub fn allocatable_report(&self, slot_size: u64) -> OwnerLocalReserveAllocatableReport {
+        self.grants.iter().fold(
+            OwnerLocalReserveAllocatableReport::default(),
+            |mut total, grant| {
+                let report = grant.allocatable_report(slot_size);
+                total.raw_free_bytes = total.raw_free_bytes.saturating_add(report.raw_free_bytes);
+                total.allocatable_slots = total
+                    .allocatable_slots
+                    .saturating_add(report.allocatable_slots);
+                total.allocatable_bytes = total
+                    .allocatable_bytes
+                    .saturating_add(report.allocatable_bytes);
+                total.slot_unallocatable_bytes = total
+                    .slot_unallocatable_bytes
+                    .saturating_add(report.slot_unallocatable_bytes);
+                total
+            },
+        )
+    }
+
+    pub fn total_used_bytes(&self) -> u64 {
+        self.grants
+            .iter()
+            .map(|grant| grant.len.saturating_sub(grant.total_free_bytes()))
+            .sum()
+    }
+
+    pub fn largest_free_bytes(&self) -> u64 {
+        self.claimable_grants
+            .last()
+            .map(|(largest, _)| *largest)
+            .unwrap_or(0)
+    }
+
+    pub fn pending_demand_slots(&self, slot_size: u64) -> usize {
+        self.pending_demand_by_slot_size
+            .get(&slot_size)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn total_pending_bytes(&self) -> u64 {
+        self.pending_demand_by_slot_size
+            .iter()
+            .map(|(slot_size, count)| {
+                slot_size.saturating_mul(u64::try_from(*count).unwrap_or(u64::MAX))
+            })
+            .sum()
+    }
+
+    pub fn largest_pending_slot_size(&self) -> u64 {
+        self.pending_demand_by_slot_size
+            .iter()
+            .filter_map(|(slot_size, count)| (*count != 0).then_some(*slot_size))
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -5296,9 +5701,10 @@ mod owner_reclaim_slot_tests {
         OwnerHotEvictionDispatch, OwnerHotEvictionEvent, OwnerHotPinAlias, OwnerHotReplicaIdentity,
         OwnerHotRetryQueue, OwnerHotSelectionDebt, OwnerHotSelectionFenceOutcome,
         OwnerKeyControlState, OwnerKeyControlTable, OwnerLocalReserveGrantState,
-        OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef, OwnerLocalReserveSlotState,
-        OwnerLocalSsdPutOutcome, OwnerLocalSsdPutSharedOp, OwnerReclaimRecord,
-        OwnerRemotePutOutcome, OwnerRemotePutReservation, OwnerRemotePutSharedOp,
+        OwnerLocalReservePoolState, OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef,
+        OwnerLocalReserveSlotState, OwnerLocalSsdPutOutcome, OwnerLocalSsdPutSharedOp,
+        OwnerReclaimRecord, OwnerRemotePutAdmission, OwnerRemotePutOutcome,
+        OwnerRemotePutReservation, OwnerRemotePutSharedOp,
         acquire_external_pending_put_fence_for_key, allocate_external_holding_id,
         build_owner_hot_cache, clone_if_owner_hot_entry_matches,
         owner_hot_source_has_active_holders, pin_current_owner_hot_source_from_index,
@@ -5473,13 +5879,24 @@ mod owner_reclaim_slot_tests {
     async fn every_remote_put_trigger_joins_one_owner_generation_flight() {
         let key = "remote-put-singleflight";
         let put_id = (77, 3);
+        let test_spec_config = TestSpecConfig {
+            owner_remote_put_max_inflight_bytes: Some(1),
+            owner_remote_put_max_inflight_items: Some(1),
+            ..Default::default()
+        };
         let api = ClientKvApi::construct(ClientKvApiNewArg {
-            test_spec_config: TestSpecConfig::default(),
+            test_spec_config,
             owner_hot_cache_capacity_bytes: None,
+            owner_local_reserve_physical_capacity_bytes: 0,
             ssd_storage: None,
         })
         .await
         .expect("construct test ClientKvApi");
+        let saturation = api
+            .inner()
+            .owner_remote_put_admission
+            .try_acquire(1)
+            .expect("saturate new-leader admission");
         let op = OwnerRemotePutSharedOp::new(key, put_id, None, false);
         api.inner().owner_key_control.lock_key(key).insert(
             key.to_string(),
@@ -5512,6 +5929,9 @@ mod owner_reclaim_slot_tests {
                 }
                 OwnerRemotePutReservation::SourceUnavailable => {
                     panic!("a matching active remote Put flight was not reusable")
+                }
+                OwnerRemotePutReservation::NotAdmitted => {
+                    panic!("a matching follower must bypass new-leader admission")
                 }
             }
         }
@@ -5560,6 +5980,135 @@ mod owner_reclaim_slot_tests {
                 .load(Ordering::Relaxed),
             0
         );
+        drop(saturation);
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_admission
+                .active_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn remote_put_admission_is_exact_no_queue_and_raii_refunded() {
+        let admission = OwnerRemotePutAdmission::new(Some(10), Some(2));
+        let first = admission.try_acquire(4).expect("first permit");
+        let second = admission.try_acquire(6).expect("second permit");
+        assert!(
+            admission.try_acquire(1).is_none(),
+            "exhaustion must reject instead of queueing"
+        );
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 10);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 2);
+        assert_eq!(admission.peak_bytes.load(Ordering::Relaxed), 10);
+        assert_eq!(admission.peak_items.load(Ordering::Relaxed), 2);
+        assert_eq!(admission.admitted.load(Ordering::Relaxed), 2);
+        assert_eq!(admission.not_admitted.load(Ordering::Relaxed), 1);
+        assert_eq!(admission.not_admitted_bytes.load(Ordering::Relaxed), 1);
+
+        drop(first);
+        let replacement = admission
+            .try_acquire(4)
+            .expect("a terminal permit refund must be immediately reusable");
+        assert!(
+            admission.try_acquire(1).is_none(),
+            "the item safety ceiling remains exact after a byte refund"
+        );
+        drop((second, replacement));
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn remote_put_transfer_releases_bytes_but_retains_item_credit() {
+        let admission = OwnerRemotePutAdmission::new(Some(4), Some(1));
+        let mut permit = admission.try_acquire(4).expect("transfer permit");
+
+        assert!(permit.release_transfer_bytes());
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 1);
+        assert!(
+            admission.try_acquire(4).is_none(),
+            "Done/Revoke must retain the item safety credit"
+        );
+
+        drop(permit);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 0);
+        drop(
+            admission
+                .try_acquire(4)
+                .expect("terminal item refund must be reusable"),
+        );
+    }
+
+    #[test]
+    fn remote_put_transfer_byte_release_is_exactly_once() {
+        let admission = OwnerRemotePutAdmission::new(Some(4), Some(1));
+        let mut permit = admission.try_acquire(4).expect("transfer permit");
+
+        assert!(permit.release_transfer_bytes());
+        assert!(!permit.release_transfer_bytes());
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 1);
+
+        drop(permit);
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn remote_put_abort_raii_refunds_credits_before_and_after_transfer() {
+        let admission = OwnerRemotePutAdmission::new(Some(8), Some(2));
+        let before_transfer = admission.try_acquire(4).expect("pre-transfer permit");
+        let mut after_transfer = admission.try_acquire(4).expect("post-transfer permit");
+        assert!(after_transfer.release_transfer_bytes());
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 4);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 2);
+
+        drop(before_transfer);
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 1);
+
+        drop(after_transfer);
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn concurrent_remote_put_admission_never_oversubscribes_either_limit() {
+        let admission = OwnerRemotePutAdmission::new(Some(32), Some(5));
+        let entered = Arc::new(std::sync::Barrier::new(33));
+        let release = Arc::new(std::sync::Barrier::new(33));
+        let accepted = Arc::new(AtomicU64::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let admission = admission.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            let accepted = accepted.clone();
+            workers.push(std::thread::spawn(move || {
+                let permit = admission.try_acquire(4);
+                if permit.is_some() {
+                    accepted.fetch_add(1, Ordering::Relaxed);
+                }
+                entered.wait();
+                release.wait();
+                drop(permit);
+            }));
+        }
+        entered.wait();
+        assert_eq!(accepted.load(Ordering::Relaxed), 5);
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 5);
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 20);
+        assert!(admission.peak_items.load(Ordering::Relaxed) <= 5);
+        assert!(admission.peak_bytes.load(Ordering::Relaxed) <= 32);
+        release.wait();
+        for worker in workers {
+            worker.join().expect("admission worker");
+        }
+        assert_eq!(admission.active_items.load(Ordering::Relaxed), 0);
+        assert_eq!(admission.active_bytes.load(Ordering::Relaxed), 0);
     }
 
     #[limit_thirdparty::tokio::test]
@@ -5568,6 +6117,7 @@ mod owner_reclaim_slot_tests {
         let api = ClientKvApi::construct(ClientKvApiNewArg {
             test_spec_config: TestSpecConfig::default(),
             owner_hot_cache_capacity_bytes: None,
+            owner_local_reserve_physical_capacity_bytes: 0,
             ssd_storage: None,
         })
         .await
@@ -5654,6 +6204,7 @@ mod owner_reclaim_slot_tests {
         let api = ClientKvApi::construct(ClientKvApiNewArg {
             test_spec_config: TestSpecConfig::default(),
             owner_hot_cache_capacity_bytes: None,
+            owner_local_reserve_physical_capacity_bytes: 0,
             ssd_storage: None,
         })
         .await
@@ -5724,6 +6275,7 @@ mod owner_reclaim_slot_tests {
         let api = ClientKvApi::construct(ClientKvApiNewArg {
             test_spec_config: TestSpecConfig::default(),
             owner_hot_cache_capacity_bytes: None,
+            owner_local_reserve_physical_capacity_bytes: 0,
             ssd_storage: Some(KvSsdStorageInit {
                 roots: vec![KvSsdStorageRootLimit {
                     root_dir: root.clone(),
@@ -5879,6 +6431,7 @@ mod owner_reclaim_slot_tests {
                 local_reserve_slot: None,
                 local_reserve_slot_size: None,
                 atomic_group: None,
+                radix: None,
                 _pending_fence: fence,
             },
         );
@@ -6550,61 +7103,64 @@ mod owner_reclaim_slot_tests {
 
     #[test]
     fn committed_slot_becomes_free_only_after_route_and_holder_are_released() {
-        let mut grant = OwnerLocalReserveGrantState::new(7, 0, 0, 16, 8, 2);
-        let slot = grant.claim_prepared_slot().expect("slot should be free");
+        let mut grant = OwnerLocalReserveGrantState::new(7, 0, 0, 16 * 1024);
+        let slot = grant
+            .claim_prepared_slot(8 * 1024)
+            .expect("slot should be free");
         grant.mark_prepared_slot_pending_visible(slot.slot_index);
         grant.retain_resident_slot_holder(slot.slot_index);
         grant.promote_pending_visible_slot_to_committed(slot.slot_index);
 
         grant.release_committed_slot_route(slot.slot_index);
-        assert_eq!(grant.free_slots.len(), 1);
+        assert_eq!(grant.used_slot_count(), 1);
+        assert_eq!(grant.total_free_bytes(), 8 * 1024);
 
         grant.release_resident_slot_holder(slot.slot_index);
-        assert_eq!(grant.free_slots.len(), 2);
+        assert_eq!(grant.used_slot_count(), 0);
+        assert_eq!(grant.largest_free_bytes(), 16 * 1024);
         assert!(grant.is_fully_free());
     }
 
     #[test]
     fn owner_reclaim_releases_committed_route_and_resident_holder_as_one_pool_update() {
-        let mut class = super::OwnerLocalReserveClassState::new(8, 2);
-        class.install_grant(OwnerLocalReserveGrantState::new(7, 0, 0, 16, 8, 2));
-        let slot = class.claim_available(1).pop().expect("slot should be free");
-        assert!(class.mark_prepared_slot_pending_visible(slot.grant_id, slot.slot_index));
-        assert!(class.retain_resident_slot_holder(slot.grant_id, slot.slot_index));
-        assert!(class.promote_pending_visible_slot_to_committed(slot.grant_id, slot.slot_index));
-        assert_eq!(class.committed_slot_count(), 1);
-        assert_eq!(class.free_slot_count(), 1);
+        const SLOT_SIZE: u64 = 8 * 1024;
+        let mut pool = OwnerLocalReservePoolState::default();
+        pool.install_grant(OwnerLocalReserveGrantState::new(7, 0, 0, 16 * 1024));
+        let slot = pool
+            .claim_available(SLOT_SIZE, 1)
+            .pop()
+            .expect("slot should be free");
+        assert!(pool.mark_prepared_slot_pending_visible(SLOT_SIZE, slot.grant_id, slot.slot_index));
+        assert!(pool.retain_resident_slot_holder(SLOT_SIZE, slot.grant_id, slot.slot_index));
+        assert!(pool.promote_pending_visible_slot_to_committed(
+            SLOT_SIZE,
+            slot.grant_id,
+            slot.slot_index
+        ));
+        assert_eq!(pool.committed_slot_count(), 1);
 
-        assert!(class.release_committed_resident_slot(slot.grant_id, slot.slot_index));
-        assert_eq!(class.committed_slot_count(), 0);
-        assert_eq!(class.free_slot_count(), 2);
+        assert!(pool.release_committed_resident_slot(SLOT_SIZE, slot.grant_id, slot.slot_index));
+        assert_eq!(pool.committed_slot_count(), 0);
+        assert_eq!(pool.largest_free_bytes(), 16 * 1024);
     }
 
     #[test]
     fn failed_pending_get_releases_only_its_slot() {
-        let mut grant = OwnerLocalReserveGrantState::new(7, 0, 0, 24, 8, 3);
-        let failed = grant.claim_prepared_slot().expect("first slot");
-        let unrelated = grant.claim_prepared_slot().expect("second slot");
+        let mut grant = OwnerLocalReserveGrantState::new(7, 0, 0, 24 * 1024);
+        let failed = grant.claim_prepared_slot(8 * 1024).expect("first slot");
+        let unrelated = grant.claim_prepared_slot(8 * 1024).expect("second slot");
         grant.mark_prepared_slot_pending_visible(failed.slot_index);
         grant.retain_resident_slot_holder(failed.slot_index);
 
         grant.release_resident_slot_holder(failed.slot_index);
 
+        assert!(grant.allocation(failed.slot_index).is_none());
         assert!(matches!(
-            grant.slot_states[failed.slot_index as usize],
-            OwnerLocalReserveSlotState::Free
+            grant.allocation(unrelated.slot_index).unwrap().state,
+            OwnerLocalReserveSlotState::Prepared,
         ));
-        assert!(matches!(
-            grant.slot_states[unrelated.slot_index as usize],
-            OwnerLocalReserveSlotState::Prepared
-        ));
-        assert_eq!(grant.free_slots.len(), 2);
+        assert_eq!(grant.used_slot_count(), 1);
     }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct OwnerLocalReservePoolState {
-    pub classes: HashMap<u64, OwnerLocalReserveClassState>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -6860,29 +7416,45 @@ impl ClientKvApiInner {
             (flights, starting, finishing, revoking, undecided, retained)
         };
         let (
+            local_reserve_grant_size_bytes,
+            local_reserve_accounting_slot_size,
+            local_reserve_raw_free_bytes,
+            local_reserve_allocatable_slots,
+            local_reserve_allocatable_bytes,
+            local_reserve_slot_unallocatable_bytes,
+            local_reserve_slot_unallocatable_ratio_ppm,
             local_reserve_slots_free,
             local_reserve_slots_prepared,
             local_reserve_slots_pending_visible,
             local_reserve_slots_committed,
         ) = {
             let pool = self.owner_local_reserve_pool.lock();
-            let mut free = 0u64;
-            let mut prepared = 0u64;
-            let mut pending_visible = 0u64;
-            let mut committed = 0u64;
-            for class in pool.classes.values() {
-                free =
-                    free.saturating_add(u64::try_from(class.free_slot_count()).unwrap_or(u64::MAX));
-                prepared = prepared
-                    .saturating_add(u64::try_from(class.prepared_slot_count()).unwrap_or(u64::MAX));
-                pending_visible = pending_visible.saturating_add(
-                    u64::try_from(class.pending_visible_slot_count()).unwrap_or(u64::MAX),
-                );
-                committed = committed.saturating_add(
-                    u64::try_from(class.committed_slot_count()).unwrap_or(u64::MAX),
-                );
-            }
-            (free, prepared, pending_visible, committed)
+            let accounting_slot_size = pool
+                .expected_slot_size
+                .unwrap_or_else(|| pool.largest_pending_slot_size());
+            let raw_free_bytes = pool.total_free_bytes();
+            let allocatable = pool.allocatable_report(accounting_slot_size);
+            let slot_unallocatable_ratio_ppm = if accounting_slot_size == 0 || raw_free_bytes == 0 {
+                0
+            } else {
+                allocatable
+                    .slot_unallocatable_bytes
+                    .saturating_mul(1_000_000)
+                    / raw_free_bytes
+            };
+            (
+                pool.grant_size_bytes.unwrap_or(0),
+                accounting_slot_size,
+                raw_free_bytes,
+                allocatable.allocatable_slots,
+                allocatable.allocatable_bytes,
+                allocatable.slot_unallocatable_bytes,
+                slot_unallocatable_ratio_ppm,
+                raw_free_bytes / crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES,
+                u64::try_from(pool.prepared_slot_count()).unwrap_or(u64::MAX),
+                u64::try_from(pool.pending_visible_slot_count()).unwrap_or(u64::MAX),
+                u64::try_from(pool.committed_slot_count()).unwrap_or(u64::MAX),
+            )
         };
         OwnerRuntimeObserveSnapshot {
             ssd_capacity_bytes: ssd.capacity_bytes,
@@ -7089,6 +7661,46 @@ impl ClientKvApiInner {
                 .owner_remote_put_counters
                 .failed
                 .load(Ordering::Relaxed),
+            remote_put_task_dropped: self
+                .owner_remote_put_counters
+                .task_dropped
+                .load(Ordering::Relaxed),
+            remote_put_admission_limit_bytes: self
+                .owner_remote_put_admission
+                .max_bytes
+                .unwrap_or(0),
+            remote_put_admission_limit_items: self
+                .owner_remote_put_admission
+                .max_items
+                .unwrap_or(0),
+            remote_put_admission_active_bytes: self
+                .owner_remote_put_admission
+                .active_bytes
+                .load(Ordering::Relaxed),
+            remote_put_admission_active_items: self
+                .owner_remote_put_admission
+                .active_items
+                .load(Ordering::Relaxed),
+            remote_put_admission_peak_bytes: self
+                .owner_remote_put_admission
+                .peak_bytes
+                .load(Ordering::Relaxed),
+            remote_put_admission_peak_items: self
+                .owner_remote_put_admission
+                .peak_items
+                .load(Ordering::Relaxed),
+            remote_put_admission_admitted: self
+                .owner_remote_put_admission
+                .admitted
+                .load(Ordering::Relaxed),
+            remote_put_admission_not_admitted: self
+                .owner_remote_put_admission
+                .not_admitted
+                .load(Ordering::Relaxed),
+            remote_put_admission_not_admitted_bytes: self
+                .owner_remote_put_admission
+                .not_admitted_bytes
+                .load(Ordering::Relaxed),
             local_ssd_put_flights_active: self
                 .owner_local_ssd_put_counters
                 .active
@@ -7125,6 +7737,13 @@ impl ClientKvApiInner {
                 .owner_local_ssd_put_counters
                 .failed
                 .load(Ordering::Relaxed),
+            local_reserve_grant_size_bytes,
+            local_reserve_accounting_slot_size,
+            local_reserve_raw_free_bytes,
+            local_reserve_allocatable_slots,
+            local_reserve_allocatable_bytes,
+            local_reserve_slot_unallocatable_bytes,
+            local_reserve_slot_unallocatable_ratio_ppm,
             local_reserve_slots_free,
             local_reserve_slots_prepared,
             local_reserve_slots_pending_visible,
@@ -7663,33 +8282,37 @@ impl ClientKvApiInner {
     pub(crate) fn owner_local_reserve_register_pending_demand(
         &self,
         slot_size: u64,
-        slots_per_grant: u32,
         demand_slots: usize,
     ) {
         let mut pool = self.owner_local_reserve_pool.lock();
-        let class_state = pool
-            .classes
+        if pool.pending_demand_slots(slot_size) == 0 {
+            // Do not let a completed/cancelled generation of this size
+            // authorize pressure for a newly arriving claimant.
+            pool.failed_claim_refill_grants_by_slot_size
+                .remove(&slot_size);
+        }
+        let pending = pool
+            .pending_demand_by_slot_size
             .entry(slot_size)
-            .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
-        class_state.pending_slot_demand =
-            class_state.pending_slot_demand.saturating_add(demand_slots);
-        class_state.max_observed_claim_slots =
-            class_state.max_observed_claim_slots.max(demand_slots);
+            .or_default();
+        *pending = pending.saturating_add(demand_slots);
     }
 
     pub(crate) fn owner_local_reserve_consume_pending_demand(
         &self,
         slot_size: u64,
-        slots_per_grant: u32,
         demand_slots: usize,
     ) {
         let mut pool = self.owner_local_reserve_pool.lock();
-        let class_state = pool
-            .classes
-            .entry(slot_size)
-            .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
-        class_state.pending_slot_demand =
-            class_state.pending_slot_demand.saturating_sub(demand_slots);
+        let Some(pending) = pool.pending_demand_by_slot_size.get_mut(&slot_size) else {
+            return;
+        };
+        *pending = pending.saturating_sub(demand_slots);
+        if *pending == 0 {
+            pool.pending_demand_by_slot_size.remove(&slot_size);
+            pool.failed_claim_refill_grants_by_slot_size
+                .remove(&slot_size);
+        }
     }
 }
 impl ClientKvApi {
@@ -7795,6 +8418,13 @@ impl ClientKvApi {
                             ssd_target_pull_failures = snapshot.ssd_target_pull_failures,
                             ssd_target_pull_duration_us = snapshot.ssd_target_pull_duration_us,
                             ssd_stage_done_detached = snapshot.ssd_stage_done_detached,
+                            reserve_grant_size_bytes = snapshot.local_reserve_grant_size_bytes,
+                            reserve_accounting_slot_size = snapshot.local_reserve_accounting_slot_size,
+                            reserve_raw_free_bytes = snapshot.local_reserve_raw_free_bytes,
+                            reserve_allocatable_slots = snapshot.local_reserve_allocatable_slots,
+                            reserve_allocatable_bytes = snapshot.local_reserve_allocatable_bytes,
+                            reserve_slot_unallocatable_bytes = snapshot.local_reserve_slot_unallocatable_bytes,
+                            reserve_slot_unallocatable_ratio_ppm = snapshot.local_reserve_slot_unallocatable_ratio_ppm,
                             reserve_free = snapshot.local_reserve_slots_free,
                             reserve_prepared = snapshot.local_reserve_slots_prepared,
                             reserve_pending_visible = snapshot.local_reserve_slots_pending_visible,
@@ -7814,6 +8444,16 @@ impl ClientKvApi {
                             already_satisfied = snapshot.remote_put_already_satisfied,
                             obsolete = snapshot.remote_put_obsolete,
                             failed = snapshot.remote_put_failed,
+                            task_dropped = snapshot.remote_put_task_dropped,
+                            admission_limit_bytes = snapshot.remote_put_admission_limit_bytes,
+                            admission_limit_items = snapshot.remote_put_admission_limit_items,
+                            admission_active_bytes = snapshot.remote_put_admission_active_bytes,
+                            admission_active_items = snapshot.remote_put_admission_active_items,
+                            admission_peak_bytes = snapshot.remote_put_admission_peak_bytes,
+                            admission_peak_items = snapshot.remote_put_admission_peak_items,
+                            admission_admitted = snapshot.remote_put_admission_admitted,
+                            admission_not_admitted = snapshot.remote_put_admission_not_admitted,
+                            admission_not_admitted_bytes = snapshot.remote_put_admission_not_admitted_bytes,
                             "owner unified remote Put flight snapshot"
                         );
                         tracing::info!(
@@ -7872,6 +8512,7 @@ impl ClientKvApi {
         let ClientKvApiNewArg {
             test_spec_config,
             owner_hot_cache_capacity_bytes,
+            owner_local_reserve_physical_capacity_bytes,
             ssd_storage,
         } = arg;
         let ssd_storage = match ssd_storage {
@@ -7892,6 +8533,10 @@ impl ClientKvApi {
         let owner_source_eviction_selected = Arc::new(DashMap::new());
         let owner_hot_counters = Arc::new(OwnerHotCacheCounters::default());
         let owner_remote_put_counters = Arc::new(OwnerRemotePutCounters::default());
+        let owner_remote_put_admission = OwnerRemotePutAdmission::new(
+            test_spec_config.owner_remote_put_max_inflight_bytes,
+            test_spec_config.owner_remote_put_max_inflight_items,
+        );
         let owner_local_ssd_put_counters = Arc::new(OwnerLocalSsdPutCounters::default());
         let owner_hot_retry_queue = Arc::new(OwnerHotRetryQueue::new(owner_hot_counters.clone()));
         let owner_hot_cache = owner_hot_cache_capacity_bytes.map(|capacity_bytes| {
@@ -7906,6 +8551,7 @@ impl ClientKvApi {
         let inner = ClientKvApiInner {
             view: ClientKvApiViewHolder::new(),
             test_spec_config,
+            owner_local_reserve_physical_capacity_bytes,
             ssd_storage,
             metrics: OnceLock::new(),
             all_memholder_refcount: OnceLock::new(),
@@ -7926,6 +8572,7 @@ impl ClientKvApi {
             owner_source_eviction_selected,
             owner_hot_counters,
             owner_remote_put_counters,
+            owner_remote_put_admission,
             owner_local_ssd_put_counters,
             planned_get_counters: OwnerPlannedGetCounters::default(),
             ssd_stage_counters: OwnerSsdStageCounters::default(),

@@ -6,7 +6,7 @@
 
 | 本文覆盖 | 不覆盖 | 说明 |
 |---|---|---|
-| GitHub Releases 上的安装产物发布 | 远端机器上的 release dispatch | 远端部署属于 `deployment/manual_dispatch_release.py` 的范围 |
+| 发布 `fluxon-py` 到 PyPI，并发布 GitHub Releases 安装产物 | 远端机器上的 release dispatch | 远端部署属于 `deployment/manual_dispatch_release.py` 的范围 |
 | `publish_release` 的构建入口 | 本地打 wheel 的实现细节 | 本地打包细节见“开发者 - 1 / 2” |
 | GitHub Pages 文档站发布入口 | testbed / testrunner 的测试流程 | 测试栈另有独立流程 |
 
@@ -19,7 +19,7 @@
 | Python 包版本 | `fluxon_py/__init__.py` | 根目录 `setup.py` 会从这里读取版本号 |
 | Rust crate 版本 | `fluxon_rs/Cargo.toml`、`fluxon_rs/*/Cargo.toml`、`fluxon_rs/setup.py` | 对外 crate / wheel 版本应保持一致 |
 | Quick Start 镜像标签 | `examples/fluxon_quick_start/build_image.py`、`examples/fluxon_quick_start/README.md` | 镜像名当前是 `fluxon_quick_start:<version>` |
-| Release workflow 产物名 | `.github/workflows/manual-release.yml` | 当前会产出 `fluxon_quick_start_<version>_docker_image.tar.gz` |
+| Release workflow 产物名 | `.github/workflows/workflow.yml` | 当前会产出 `fluxon_quick_start_<version>_docker_image.tar.gz` |
 | GitHub Release 文案 | `fluxon_release/release_notes/v<version>.md` | 当前 release 正文直接读取这个版本文件 |
 | README 对外文案 | `README.md`、`README_CN.md` | 包括 badge、镜像标签示例和开发文档入口 |
 
@@ -38,22 +38,22 @@ rg -n "$OLD" README.md README_CN.md fluxon_py fluxon_rs examples .github/workflo
 fluxon_release/release_notes/v<version>.md
 ```
 
-例如 `v0.2.1` 对应：
+例如 `v0.2.2` 对应：
 
 ```text
-fluxon_release/release_notes/v0.2.1.md
+fluxon_release/release_notes/v0.2.2.md
 ```
 
 如果这个文件不存在，`publish_release` 会直接失败，不会发布一个没有正文的 release。
 
 ## 2. Push `v<version>` tag 触发 `publish_release`
 
-当前仓库的公开 release 构建入口是 GitHub Actions workflow `.github/workflows/manual-release.yml`，workflow 名称是 `publish_release`。它由 `v*` tag push 自动触发，也保留了 `workflow_dispatch` 作为重建入口。稳定主路径是：
+当前仓库的公开 release 构建入口是 GitHub Actions workflow `.github/workflows/workflow.yml`，workflow 名称是 `publish_release`。它由 `v*` tag push 自动触发，也保留了 `workflow_dispatch` 作为重建入口。稳定主路径是：
 
 ```bash
 git push origin <branch>
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 workflow 在 GitHub runner 上会自动完成这些步骤：
@@ -67,8 +67,9 @@ workflow 在 GitHub runner 上会自动完成这些步骤：
 7. 运行 `python3 examples/fluxon_quick_start/build_image.py --mode existing_release --release-dir fluxon_release`。
 8. 上传 workflow artifact。
 9. 自动创建或更新同名 GitHub Release，并上传 release assets。
+10. 对 tag push 触发的运行，通过 trusted publishing 和 GitHub `pypi` environment 将统一的 `fluxon_py-*.whl` 发布到 PyPI。
 
-如果 tag 是 `v0.2.1`，但仓库公开版本号仍然是 `0.2.0`，或者 `fluxon_release/release_notes/v0.2.1.md` 不存在，workflow 会直接失败，不会发布一个契约不完整的 release。
+如果 tag 是 `v0.2.2`，但仓库公开版本号仍然是 `0.2.1`，或者 `fluxon_release/release_notes/v0.2.2.md` 不存在，workflow 会直接失败，不会发布一个契约不完整的 release。
 
 本次 workflow 结束后，GitHub Actions artifact 和 GitHub Release assets 里都应至少包含：
 
@@ -80,6 +81,8 @@ workflow 在 GitHub runner 上会自动完成这些步骤：
 - [开发者 - 1 - 打包核心安装包](./开发者%20-%201%20-%20打包核心安装包.md)
 - [开发者 - 2 - 打包中间件和镜像](./开发者%20-%202%20-%20打包中间件和镜像.md)
 
+该 workflow 会构建 `fluxon_quick_start:<version>`，并将其归档为 GitHub Release asset；当前不会登录 Docker Hub 或 GHCR，也不会把镜像推送到容器 registry。
+
 ## 3. 什么时候需要手动触发
 
 默认情况下，不需要再手动去 GitHub `Releases` 页面建 release。成功 push `v<version>` tag 后，workflow 会自动读取对应的 `fluxon_release/release_notes/v<version>.md`，然后完成这件事。
@@ -90,7 +93,9 @@ workflow 在 GitHub runner 上会自动完成这些步骤：
 - 之前的 workflow 在打包后半段失败，需要对同一个 tag 重新上传 assets。
 - 你明确想验证 release workflow，但又不想新建 tag。
 
-手动触发时，需要在 GitHub Actions 页面给出一个已经存在的 tag，例如 `v0.2.1`。这个 tag 仍然必须和仓库里的公开版本号一致。
+手动触发时，需要在 GitHub Actions 页面给出一个已经存在的 tag，例如 `v0.2.2`。这个 tag 仍然必须和仓库里的公开版本号一致。
+
+手动重建不会再次发布 PyPI。PyPI 发布仅在新的 `v*` tag push 时运行，因为 PyPI 不允许覆盖已经存在的分发文件。
 
 如果只是改 GitHub Release 页面上的说明文字，需要修改对应的 `fluxon_release/release_notes/v<version>.md`，然后手动重跑 `publish_release`，这样既会更新 release 文案，也会重新上传 assets。
 

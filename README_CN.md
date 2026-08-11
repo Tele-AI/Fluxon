@@ -29,7 +29,7 @@ Fluxon 的设计正是围绕这些问题展开。它将数据面资源、对象�
 [![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#运行要求)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#运行要求)
 [![Rust](https://img.shields.io/badge/Rust-1.93.0-000000)](./fluxon_rs/rust-toolchain.toml)
-[![Latest](https://img.shields.io/badge/Latest-v0.2.1-f28500)](./fluxon_release)
+[![Latest](https://img.shields.io/badge/Latest-v0.2.2-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#接口能力)
 
 [中文](./README_CN.md) | [English](./README.md) | [用户文档](https://tele-ai.github.io/Fluxon/cn/) | [English Docs](https://tele-ai.github.io/Fluxon/) | <a href="https://github.com/Tele-AI/Fluxon" title="GitHub 仓库"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
@@ -166,7 +166,7 @@ Fluxon FS 是一款面向 AI 数据与模型文件、兼容 `S3` 的高性能文
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.2 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -199,7 +199,7 @@ del demo:hello
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.2 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -230,7 +230,7 @@ exit
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.2 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \
@@ -250,7 +250,62 @@ ui
 `FS Quick Start` 会额外打印：
 
 - `fs_s3` 端点
-- `Basic Auth` 入口，默认账号密码是 `admin / admin`
+- `Basic Auth` 入口；`0.2.2` 仅将 `admin / admin` 用作首次设置凭据
+
+新建工作目录首次登录时，必须同时修改用户名和密码，完成前 S3 访问会被拒绝；修改成功后，旧的 `admin / admin` 立即失效。首次发起 S3 请求前等待约 2 秒，让新权限传播到 FS agent。
+
+PyPI 包可以直接启动目录 S3 服务，无需下载源码：
+
+```bash
+python3 -m pip install --upgrade fluxon-py
+```
+
+`serve_s3_single_node.py` 按依赖顺序显式定义 KV master、KV owner 配置，再启动单机 FS S3：
+
+```python
+from fluxon_py.quick_start import serve_s3_single_node
+
+kv_master_config = {
+    "etcd_endpoints": ["127.0.0.1:22379"],
+    "cluster_name": "fluxon_s3",
+    "instance_key": "fluxon_s3_master",
+    "port": 25100,
+    "log_dir": "/absolute/path/to/state/kv-master/log",
+    "monitoring": {
+        "prometheus_base_url": "http://127.0.0.1:24000/v1/prometheus",
+        "prom_remote_write_url": ["http://127.0.0.1:24000/v1/prometheus/write"],
+        "otlp_log_api": {
+            "otlp_endpoint": "http://127.0.0.1:24000/v1/otlp/v1/logs",
+            "db_name": "public",
+            "table_name": "fluxon_logs",
+        },
+    },
+}
+kv_owner_config = {
+    "instance_key": "fluxon_s3_owner",
+    "contribute_to_cluster_pool_size": {"dram": 1073741824, "vram": {}},
+    "fluxonkv_spec": {
+        "etcd_addresses": ["127.0.0.1:22379"],
+        "cluster_name": "fluxon_s3",
+        "share_mem_path": "/dev/shm/fluxon-s3",
+        "sub_cluster": "default",
+        "large_file_paths": ["/absolute/path/to/state/kv-owner/large"],
+    },
+}
+serve_s3_single_node(
+    "/absolute/path/to/data",
+    "/absolute/path/to/state",
+    kv_master_config=kv_master_config,
+    kv_owner_config=kv_owner_config,
+    export_name="local-data",
+)
+```
+
+`serve_s3_single_node` 将两份配置直接交给已有的标准 KV runtime 启动入口，不再增加 KV 进程包装层；名称明确限定了它的单机适用范围。共享内存目录独立且可重建，需要确保所在文件系统容量充足。`export_name` 同时也是 S3 bucket 名；省略时使用 `quick-start-export`。
+
+```bash
+python3 serve_s3_single_node.py
+```
 
 预期运行效果：
 

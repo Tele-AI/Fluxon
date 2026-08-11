@@ -8,6 +8,13 @@
 
 ## Release Notes
 
+### 0.2.2
+
+- [FS] Add the single-node directory-backed S3 service and bidirectional local-file mapping
+- [FS] Require first-login credential replacement before enabling S3 access
+- [PYPI] Publish the Python distribution as `fluxon-py` through GitHub OIDC trusted publishing
+- [RELEASE] Unify Python, Rust, Quick Start, wheel, and release metadata on version `0.2.2`
+
 ### 0.2.1
 
 - [PERF] Optimize `RPC`, `KV`, and `FS` performance

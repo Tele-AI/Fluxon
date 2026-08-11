@@ -1,10 +1,170 @@
-use fluxon_util::vallocator::VirtualAllocator;
 use parking_lot::Mutex;
 
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult};
 use std::sync::Arc;
 
 use super::msg_pack::{SegmentDeviceDescription, SegmentDeviceID};
+
+const MASTER_OFFSET_ALLOCATION_UNIT_BYTES: u64 = 4 * 1024;
+const MASTER_OFFSET_MAX_ALLOCATION_NODES: u32 = 128 * 1024;
+
+#[derive(Clone, Copy)]
+struct MasterOffsetAllocation {
+    allocation: offset_allocator::Allocation,
+    offset_bytes: u64,
+    capacity_bytes: u64,
+}
+
+struct MasterOffsetAllocatorState {
+    allocator: offset_allocator::Allocator,
+    allocated_bytes: u64,
+}
+
+/// Thread-safe byte wrapper around `offset_allocator`, whose native unit is `u32`.
+///
+/// Master keeps byte-addressed public semantics while the allocator operates in 4 KiB units.
+/// The allocator intentionally uses a bounded metadata pool rather than preallocating one metadata
+/// node for every 4 KiB unit in a potentially hundreds-of-GiB owner segment.
+struct MasterOffsetAllocator {
+    inner: Mutex<MasterOffsetAllocatorState>,
+    total_size_bytes: u64,
+    usable_size_bytes: u64,
+}
+
+impl std::fmt::Debug for MasterOffsetAllocator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.inner.lock();
+        let report = state.allocator.storage_report();
+        f.debug_struct("MasterOffsetAllocator")
+            .field("total_size_bytes", &self.total_size_bytes)
+            .field("usable_size_bytes", &self.usable_size_bytes)
+            .field("allocated_bytes", &state.allocated_bytes)
+            .field(
+                "free_bytes",
+                &(u64::from(report.total_free_space) * MASTER_OFFSET_ALLOCATION_UNIT_BYTES),
+            )
+            .field(
+                "largest_free_bytes",
+                &(u64::from(report.largest_free_region) * MASTER_OFFSET_ALLOCATION_UNIT_BYTES),
+            )
+            .finish()
+    }
+}
+
+impl MasterOffsetAllocator {
+    fn new(total_size_bytes: u64) -> KvResult<Self> {
+        let allocation_units = u32::try_from(
+            total_size_bytes / MASTER_OFFSET_ALLOCATION_UNIT_BYTES,
+        )
+        .map_err(|_| {
+            KvError::Api(ApiError::Allocator {
+                detail: format!(
+                    "master segment exceeds offset-allocator address space: bytes={} unit_bytes={}",
+                    total_size_bytes, MASTER_OFFSET_ALLOCATION_UNIT_BYTES
+                ),
+            })
+        })?;
+        if allocation_units == 0 {
+            return Err(KvError::Api(ApiError::Allocator {
+                detail: format!(
+                    "master segment is smaller than one allocation unit: bytes={} unit_bytes={}",
+                    total_size_bytes, MASTER_OFFSET_ALLOCATION_UNIT_BYTES
+                ),
+            }));
+        }
+        let usable_size_bytes = u64::from(allocation_units) * MASTER_OFFSET_ALLOCATION_UNIT_BYTES;
+        // Small segments can reserve one node per unit. Large owner mappings cap metadata at a
+        // level still far above their possible 512 MiB grant count.
+        let max_allocation_nodes = allocation_units
+            .saturating_add(2)
+            .min(MASTER_OFFSET_MAX_ALLOCATION_NODES);
+        Ok(Self {
+            inner: Mutex::new(MasterOffsetAllocatorState {
+                allocator: offset_allocator::Allocator::with_max_allocs(
+                    allocation_units,
+                    max_allocation_nodes,
+                ),
+                allocated_bytes: 0,
+            }),
+            total_size_bytes,
+            usable_size_bytes,
+        })
+    }
+
+    fn aligned_capacity(size: u64) -> KvResult<(u32, u64)> {
+        if size == 0 {
+            return Err(KvError::Api(ApiError::Allocator {
+                detail: "master allocation size must be greater than zero".to_string(),
+            }));
+        }
+        let capacity_bytes = size
+            .checked_add(MASTER_OFFSET_ALLOCATION_UNIT_BYTES - 1)
+            .map(|value| {
+                value / MASTER_OFFSET_ALLOCATION_UNIT_BYTES * MASTER_OFFSET_ALLOCATION_UNIT_BYTES
+            })
+            .ok_or_else(|| {
+                KvError::Api(ApiError::Allocator {
+                    detail: format!("master allocation size overflows alignment: size={size}"),
+                })
+            })?;
+        let allocation_units =
+            u32::try_from(capacity_bytes / MASTER_OFFSET_ALLOCATION_UNIT_BYTES).map_err(|_| {
+                KvError::Api(ApiError::Allocator {
+                    detail: format!(
+                        "master allocation exceeds offset-allocator address space: size={} aligned={}",
+                        size, capacity_bytes
+                    ),
+                })
+            })?;
+        Ok((allocation_units, capacity_bytes))
+    }
+
+    fn allocate(&self, size: u64) -> KvResult<MasterOffsetAllocation> {
+        let (allocation_units, capacity_bytes) = Self::aligned_capacity(size)?;
+        let mut state = self.inner.lock();
+        let allocation = match state.allocator.allocate(allocation_units) {
+            Some(allocation) => allocation,
+            None => {
+                let report = state.allocator.storage_report();
+                return Err(KvError::Api(ApiError::Allocator {
+                    detail: format!(
+                        "master offset allocation failed: requested={} aligned={} free={} largest_free={}",
+                        size,
+                        capacity_bytes,
+                        u64::from(report.total_free_space) * MASTER_OFFSET_ALLOCATION_UNIT_BYTES,
+                        u64::from(report.largest_free_region) * MASTER_OFFSET_ALLOCATION_UNIT_BYTES
+                    ),
+                }));
+            }
+        };
+        state.allocated_bytes = state
+            .allocated_bytes
+            .checked_add(capacity_bytes)
+            .expect("master offset allocated-byte counter overflow");
+        Ok(MasterOffsetAllocation {
+            offset_bytes: u64::from(allocation.offset) * MASTER_OFFSET_ALLOCATION_UNIT_BYTES,
+            allocation,
+            capacity_bytes,
+        })
+    }
+
+    fn free(&self, allocation: offset_allocator::Allocation, capacity_bytes: u64) {
+        let mut state = self.inner.lock();
+        state.allocator.free(allocation);
+        state.allocated_bytes = state
+            .allocated_bytes
+            .checked_sub(capacity_bytes)
+            .expect("master offset allocated-byte counter underflow");
+    }
+
+    fn total_size_bytes(&self) -> u64 {
+        self.total_size_bytes
+    }
+
+    fn allocated_size_bytes(&self) -> u64 {
+        self.inner.lock().allocated_bytes
+    }
+}
 
 /// Runtime capacity state shared by every segment registered by one node generation.
 ///
@@ -138,7 +298,11 @@ impl NodePoolCapacityBudget {
         Ok(())
     }
 
-    fn allocate(&self, allocator: &VirtualAllocator, size: u64) -> KvResult<(u64, u64)> {
+    fn allocate(
+        &self,
+        allocator: &MasterOffsetAllocator,
+        size: u64,
+    ) -> KvResult<MasterOffsetAllocation> {
         // The budget lock spans the physical allocator mutation. Capacity changes and allocations
         // therefore have one total order; a resize cannot be bypassed by a stale pre-check.
         let mut state = self.state.lock();
@@ -157,22 +321,25 @@ impl NodePoolCapacityBudget {
                 ),
             }));
         }
-        let region = allocator.alloc(size)?;
-        let Some(next_used) = state.used_capacity_bytes.checked_add(region.size) else {
-            let _ = allocator.free(region.start_addr, region.size);
+        let allocation = allocator.allocate(size)?;
+        let Some(next_used) = state
+            .used_capacity_bytes
+            .checked_add(allocation.capacity_bytes)
+        else {
+            allocator.free(allocation.allocation, allocation.capacity_bytes);
             return Err(KvError::Api(ApiError::Allocator {
                 detail: "node pool used capacity overflow".to_string(),
             }));
         };
         if next_used > state.active_capacity_bytes {
-            // VirtualAllocator rounds allocations to its alignment. Roll the physical mutation
+            // OffsetAllocator rounds allocations to its alignment. Roll the physical mutation
             // back when the aligned size crosses the active byte boundary.
-            let _ = allocator.free(region.start_addr, region.size);
+            allocator.free(allocation.allocation, allocation.capacity_bytes);
             return Err(KvError::Api(ApiError::Allocator {
                 detail: format!(
                     "node pool active capacity exhausted after alignment: requested={} aligned={} active={} used={} epoch={}",
                     size,
-                    region.size,
+                    allocation.capacity_bytes,
                     state.active_capacity_bytes,
                     state.used_capacity_bytes,
                     state.capacity_epoch
@@ -180,27 +347,21 @@ impl NodePoolCapacityBudget {
             }));
         }
         state.used_capacity_bytes = next_used;
-        Ok((region.start_addr, region.size))
+        Ok(allocation)
     }
 
-    fn free(&self, allocator: &VirtualAllocator, addr: u64, capacity: u64) {
+    fn free(
+        &self,
+        allocator: &MasterOffsetAllocator,
+        allocation: offset_allocator::Allocation,
+        capacity: u64,
+    ) {
         let mut state = self.state.lock();
-        match allocator.free(addr, capacity) {
-            Ok(freed) => {
-                state.used_capacity_bytes = state
-                    .used_capacity_bytes
-                    .checked_sub(freed)
-                    .expect("node pool used capacity underflow");
-            }
-            Err(err) => {
-                tracing::error!(
-                    addr,
-                    capacity,
-                    error = %err,
-                    "failed to free segment allocation; preserving node pool used accounting"
-                );
-            }
-        }
+        allocator.free(allocation, capacity);
+        state.used_capacity_bytes = state
+            .used_capacity_bytes
+            .checked_sub(capacity)
+            .expect("node pool used capacity underflow");
     }
 }
 
@@ -214,6 +375,7 @@ pub struct Allocation {
     addr: u64,
     size: u64,
     capcity: u64,
+    offset_allocation: Option<offset_allocator::Allocation>,
 
     /// Used to free the allocation with RAII deref
     /// There's no circular reference, so we use arc
@@ -240,11 +402,18 @@ impl std::fmt::Debug for Allocation {
 
 impl Allocation {
     /// Creates a new allocation guard. This is typically done by the allocator.
-    pub fn new(addr: u64, size: u64, capcity: u64, allocator: Arc<OneSegAllocator>) -> Self {
+    fn new(
+        offset_allocation: offset_allocator::Allocation,
+        addr: u64,
+        size: u64,
+        capcity: u64,
+        allocator: Arc<OneSegAllocator>,
+    ) -> Self {
         Self {
             addr,
             size,
             capcity,
+            offset_allocation: Some(offset_allocation),
             allocator,
             on_drop: None,
         }
@@ -296,17 +465,21 @@ impl Drop for Allocation {
         if let Some(f) = self.on_drop.take() {
             (f)();
         }
-        self.allocator.free(self.addr, self.capcity);
+        let offset_allocation = self
+            .offset_allocation
+            .take()
+            .expect("master allocation handle must be present until drop");
+        self.allocator.free(offset_allocation, self.capcity);
     }
 }
 
-/// A thread-safe allocator for a single contiguous memory region using VirtualAllocator.
+/// A thread-safe allocator for a single contiguous memory region using `offset_allocator`.
 #[derive(Debug)]
 pub struct OneSegAllocator {
     pub seg_device_id: SegmentDeviceID,
     pub seg_device_desc: SegmentDeviceDescription,
     pub base_addr: u64,
-    inner: VirtualAllocator,
+    inner: MasterOffsetAllocator,
     capacity_budget: Arc<NodePoolCapacityBudget>,
 }
 
@@ -335,7 +508,7 @@ impl OneSegAllocator {
         size: u64,
         capacity_budget: Arc<NodePoolCapacityBudget>,
     ) -> KvResult<Self> {
-        let inner = VirtualAllocator::new(size as u64)?;
+        let inner = MasterOffsetAllocator::new(size)?;
         Ok(Self {
             seg_device_id,
             seg_device_desc,
@@ -348,30 +521,30 @@ impl OneSegAllocator {
     /// Allocates a block of memory of `size` bytes.
     /// Returns an RAII guard for the allocation.
     pub fn allocate(self: &Arc<Self>, size: u64) -> KvResult<Allocation> {
-        let (start_addr, capacity) = self.capacity_budget.allocate(&self.inner, size)?;
+        let allocation = self.capacity_budget.allocate(&self.inner, size)?;
         // return base0 offset in addr (pure offset); base address is carried separately
         Ok(Allocation::new(
-            start_addr,
+            allocation.allocation,
+            allocation.offset_bytes,
             size,
-            capacity,
+            allocation.capacity_bytes,
             Arc::clone(self),
         ))
     }
 
     /// Frees a block of memory.
-    fn free(&self, addr: u64, capcity: u64) {
-        // addr is offset (base0); free directly
-        self.capacity_budget.free(&self.inner, addr, capcity);
+    fn free(&self, allocation: offset_allocator::Allocation, capcity: u64) {
+        self.capacity_budget.free(&self.inner, allocation, capcity);
     }
 
     /// Returns total capacity (bytes) of this segment.
     pub fn total_size_bytes(&self) -> u64 {
-        self.inner.get_total_size() as u64
+        self.inner.total_size_bytes()
     }
 
     /// Returns currently allocated bytes in this segment.
     pub fn used_size_bytes(&self) -> u64 {
-        self.inner.get_allocated_size() as u64
+        self.inner.allocated_size_bytes()
     }
 
     /// Returns the active/parked capacity state shared by this node generation.
@@ -399,6 +572,45 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn master_offset_allocator_aligns_and_coalesces_neighboring_ranges() {
+        let size = 32 * 1024;
+        let budget = Arc::new(NodePoolCapacityBudget::new(size).unwrap());
+        let allocator = allocator_with_budget("cpu", size, budget);
+
+        let first = allocator.allocate(1).unwrap();
+        assert_eq!(first.addr(), 0);
+        assert_eq!(first.capcity(), 4 * 1024);
+        let second = allocator.allocate(4 * 1024 + 1).unwrap();
+        assert_eq!(second.addr(), 4 * 1024);
+        assert_eq!(second.capcity(), 8 * 1024);
+        let barrier = allocator.allocate(16 * 1024).unwrap();
+        assert_eq!(barrier.addr(), 12 * 1024);
+
+        drop(first);
+        drop(second);
+        let merged = allocator.allocate(12 * 1024).unwrap();
+        assert_eq!(merged.addr(), 0);
+        assert_eq!(merged.capcity(), 12 * 1024);
+        assert_eq!(allocator.used_size_bytes(), 28 * 1024);
+    }
+
+    #[test]
+    fn master_offset_allocator_supports_a_324_gib_owner_without_per_page_metadata() {
+        let owner_bytes = 324 * 1024 * 1024 * 1024_u64;
+        let allocator = MasterOffsetAllocator::new(owner_bytes).unwrap();
+        let grant = allocator
+            .allocate(crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES)
+            .unwrap();
+        assert_eq!(grant.offset_bytes, 0);
+        assert_eq!(
+            grant.capacity_bytes,
+            crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
+        );
+        allocator.free(grant.allocation, grant.capacity_bytes);
+        assert_eq!(allocator.allocated_size_bytes(), 0);
     }
 
     #[test]

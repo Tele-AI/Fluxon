@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Existing git tag to rebuild, for example v0.2.1"
+        description: "Existing git tag to rebuild, for example v0.2.2"
         required: true
         type: string
 
@@ -163,3 +163,34 @@ jobs:
             args+=(--prerelease)
           fi
           gh "${args[@]}"
+
+  publish-pypi:
+    name: Publish fluxon-py to PyPI
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: pack-release
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fluxon-py
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-artifacts-*
+          path: publish-input
+          merge-multiple: true
+
+      - name: Extract PyPI wheel
+        shell: bash
+        run: |
+          tar xzf publish-input/fluxon_release.tar.gz
+          mkdir -p dist
+          cp fluxon_release/fluxon_py-*.whl dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

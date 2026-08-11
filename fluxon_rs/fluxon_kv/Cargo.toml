@@ -1,6 +1,6 @@
 [package]
 name = "fluxon_kv"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 
 [features]
@@ -66,6 +66,7 @@ local-ip-address = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 etcd-client = { workspace = true }
 moka = { workspace = true }
+offset-allocator = { workspace = true }
 crossbeam = "0.8"
 tokio-metrics-collector = "0.3"
 libc = "0.2"

@@ -787,6 +787,7 @@ fn new_local_gateway_state_with_backend(
                 }],
                 scope_access: Vec::new(),
             },
+            require_bootstrap_credentials_change: false,
             transfer_state_store: Some(transfer_state_store),
         },
         Arc::new(FluxonFsGlobalConfig {

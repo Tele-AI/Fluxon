@@ -1,8 +1,8 @@
 use super::{
     ClientKvApiInner, OwnerHotEvictionEvent, OwnerHotEvictionPreparation,
-    OwnerHotSelectionFenceOutcome, OwnerLocalReserveClassState, OwnerLocalReserveGrantState,
-    OwnerLocalReservePoolState, OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef,
-    OwnerLocalSsdPutOutcome, OwnerLocalSsdPutReservation, OwnerLocalSsdPutSharedOp,
+    OwnerHotSelectionFenceOutcome, OwnerLocalReserveGrantState, OwnerLocalReservePoolState,
+    OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef, OwnerLocalSsdPutOutcome,
+    OwnerLocalSsdPutReservation, OwnerLocalSsdPutSharedOp, OwnerRemotePutAdmissionPermit,
     OwnerRemotePutOutcome, OwnerRemotePutReservation, OwnerRemotePutSharedOp,
     local_reserve_rebalance::{owner_local_reserve_timeout_config, wait_owner_local_reserve_ready},
 };
@@ -32,7 +32,7 @@ use crate::{
         OwnerSourceSsdPolicy, OwnerSsdPublishItem, OwnerSsdPublishOutcome, PutAppendDoneReq,
         PutAppendDoneResp, PutAppendRevokeReq, PutAppendStartOutcome, PutAppendStartReq,
         PutAppendStartResp, PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq, PutRevokeReq,
-        PutStartReq, PutStartResp, ReleaseLocalGrantReq, ReserveLocalGrantOutcome,
+        PutStartReq, PutStartResp, RadixKvMetadata, ReleaseLocalGrantReq, ReserveLocalGrantOutcome,
         ReserveLocalGrantReq, owner_source_eviction_epoch,
     },
     memholder::{UserMemHolder, UserMemHolderExposeKind},
@@ -63,53 +63,40 @@ fn owner_local_reserve_slot_size(value_len: u64) -> KvResult<u64> {
     })
 }
 
-fn owner_local_reserve_slots_per_grant(slot_size: u64) -> u32 {
-    crate::owner_local_reserve_slots_per_grant(slot_size)
-        .expect("validated local-reserve slot size must fit in a grant")
-}
-
 fn owner_local_reserve_install_grant(
     pool: &mut OwnerLocalReservePoolState,
-    slot_size: u64,
-    slots_per_grant: u32,
     grant: OwnerLocalReserveGrantState,
 ) {
-    let class_state = pool
-        .classes
-        .entry(slot_size)
-        .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
-    assert!(
-        class_state.slot_size == slot_size,
-        "slot_size drift detected while installing local reserve grant"
-    );
-    assert!(
-        class_state.slots_per_grant == slots_per_grant,
-        "slots_per_grant drift detected while installing local reserve grant"
-    );
-    class_state.install_grant(grant);
+    pool.install_grant(grant);
 }
 
 fn owner_local_reserve_try_claim(
     pool: &mut OwnerLocalReservePoolState,
     slot_size: u64,
-    slots_per_grant: u32,
     value_len: u64,
     key_count: usize,
 ) -> Option<OwnerLocalReserveSlotLease> {
-    let free_slots = pool
-        .classes
-        .entry(slot_size)
-        .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant))
-        .free_slot_count();
-    if free_slots < key_count {
+    let slots = owner_local_reserve_claim_available(pool, slot_size, key_count);
+    if slots.len() != key_count {
+        let missing = key_count - slots.len();
+        // Generic grants can hold floor(512 MiB / slot_size) allocations.
+        // Byte division is insufficient: 227 x 4.5 MiB needs three grants
+        // even though its aggregate bytes are less than two 512 MiB grants.
+        let slots_per_grant = u64::from(
+            crate::owner_local_reserve_slots_per_grant(slot_size)
+                .expect("validated local-reserve slot size must fit in a grant"),
+        );
+        let missing = u64::try_from(missing).unwrap_or(u64::MAX);
+        let required_grants = missing / slots_per_grant + u64::from(missing % slots_per_grant != 0);
+        pool.record_failed_claim(
+            slot_size,
+            usize::try_from(required_grants.max(1)).unwrap_or(usize::MAX),
+        );
+        for slot in &slots {
+            assert!(pool.release_prepared_slot(slot_size, slot.grant_id, slot.slot_index));
+        }
         return None;
     }
-    let slots = owner_local_reserve_claim_available(pool, slot_size, slots_per_grant, key_count);
-    assert_eq!(
-        slots.len(),
-        key_count,
-        "free_slot_count check and claim path diverged"
-    );
     Some(OwnerLocalReserveSlotLease {
         value_len,
         slot_size,
@@ -120,46 +107,23 @@ fn owner_local_reserve_try_claim(
 fn owner_local_reserve_claim_available(
     pool: &mut OwnerLocalReservePoolState,
     slot_size: u64,
-    slots_per_grant: u32,
     max_slots: usize,
 ) -> Vec<OwnerLocalReserveSlotRef> {
-    let class_state = pool
-        .classes
-        .entry(slot_size)
-        .or_insert_with(|| OwnerLocalReserveClassState::new(slot_size, slots_per_grant));
-    let claim_count = class_state.free_slot_count().min(max_slots);
-    let slots = class_state.claim_available(max_slots);
-    assert_eq!(
-        slots.len(),
-        claim_count,
-        "free_slot_count check and claim path diverged"
-    );
-    slots
+    pool.claim_available(slot_size, max_slots)
 }
 
 struct OwnerLocalReservePendingDemandGuard<'a> {
     inner: &'a ClientKvApiInner,
     slot_size: u64,
-    slots_per_grant: u32,
     pending_slots: usize,
 }
 
 impl<'a> OwnerLocalReservePendingDemandGuard<'a> {
-    fn new(
-        inner: &'a ClientKvApiInner,
-        slot_size: u64,
-        slots_per_grant: u32,
-        pending_slots: usize,
-    ) -> Self {
-        inner.owner_local_reserve_register_pending_demand(
-            slot_size,
-            slots_per_grant,
-            pending_slots,
-        );
+    fn new(inner: &'a ClientKvApiInner, slot_size: u64, pending_slots: usize) -> Self {
+        inner.owner_local_reserve_register_pending_demand(slot_size, pending_slots);
         Self {
             inner,
             slot_size,
-            slots_per_grant,
             pending_slots,
         }
     }
@@ -168,11 +132,8 @@ impl<'a> OwnerLocalReservePendingDemandGuard<'a> {
         if self.pending_slots == 0 {
             return;
         }
-        self.inner.owner_local_reserve_consume_pending_demand(
-            self.slot_size,
-            self.slots_per_grant,
-            self.pending_slots,
-        );
+        self.inner
+            .owner_local_reserve_consume_pending_demand(self.slot_size, self.pending_slots);
         self.pending_slots = 0;
         self.inner
             .owner_local_reserve_rebalance_notify()
@@ -200,9 +161,10 @@ impl Drop for OwnerLocalReservePendingDemandGuard<'_> {
 #[cfg(test)]
 mod local_reserve_claim_tests {
     use super::{
-        OwnerLocalReserveGrantState, OwnerLocalReservePoolState,
-        owner_local_reserve_claim_available, owner_local_reserve_install_grant,
-        owner_local_reserve_slot_size, owner_local_reserve_slots_per_grant,
+        OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES, OwnerLocalReserveGrantState,
+        OwnerLocalReservePoolState, owner_local_reserve_claim_available,
+        owner_local_reserve_install_grant, owner_local_reserve_slot_size,
+        owner_local_reserve_try_claim,
     };
     use crate::client_kv_api::{ClientKvApi, ClientKvApiNewArg};
     use crate::config::TestSpecConfig;
@@ -215,157 +177,272 @@ mod local_reserve_claim_tests {
 
         let slot_size = owner_local_reserve_slot_size(SGLANG_KV_PAGE_BYTES).unwrap();
         assert_eq!(slot_size, SGLANG_KV_PAGE_BYTES);
-        assert_eq!(owner_local_reserve_slots_per_grant(slot_size), 113);
         assert_eq!(owner_local_reserve_slot_size(4_097).unwrap(), 8_192);
     }
 
     #[test]
+    fn failed_claim_counts_per_size_capacity_of_generic_grants() {
+        const SGLANG_KV_PAGE_BYTES: u64 = 4_718_592;
+        let mut pool = OwnerLocalReservePoolState::default();
+        pool.grant_size_bytes = Some(OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES);
+
+        assert!(
+            owner_local_reserve_try_claim(
+                &mut pool,
+                SGLANG_KV_PAGE_BYTES,
+                SGLANG_KV_PAGE_BYTES,
+                227,
+            )
+            .is_none()
+        );
+        // 113 slots fit per generic grant, so 227 slots require three grants.
+        // Dividing aggregate bytes by 512 MiB incorrectly produces two.
+        assert_eq!(pool.failed_claim_refill_grants(), 3);
+        assert!(pool.slot_size_has_failed_claim(SGLANG_KV_PAGE_BYTES));
+    }
+
+    #[test]
     fn partial_claim_keeps_progress_for_large_waiters() {
+        const SLOT_SIZE: u64 = 4 * 1024;
         let mut pool = OwnerLocalReservePoolState::default();
         owner_local_reserve_install_grant(
             &mut pool,
-            8,
-            4,
-            OwnerLocalReserveGrantState::new(1, 1000, 1000, 32, 8, 4),
+            OwnerLocalReserveGrantState::new(1, 1000, 1000, 4 * SLOT_SIZE),
         );
 
-        let first = owner_local_reserve_claim_available(&mut pool, 8, 4, 3);
+        let first = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 3);
         assert_eq!(first.len(), 3);
-        assert_eq!(pool.classes.get(&8).unwrap().free_slot_count(), 1);
+        assert_eq!(pool.total_free_bytes(), SLOT_SIZE);
 
-        let second = owner_local_reserve_claim_available(&mut pool, 8, 4, 3);
+        let second = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 3);
         assert_eq!(second.len(), 1);
-        assert_eq!(pool.classes.get(&8).unwrap().free_slot_count(), 0);
+        assert_eq!(pool.total_free_bytes(), 0);
+    }
+
+    #[test]
+    fn mixed_sizes_share_one_grant_and_keep_4k_offset_indices() {
+        const KIB: u64 = 1024;
+        let mut pool = OwnerLocalReservePoolState::default();
+        owner_local_reserve_install_grant(
+            &mut pool,
+            OwnerLocalReserveGrantState::new(1, 1_000_000, 1_000_000, 64 * KIB),
+        );
+
+        let first = owner_local_reserve_try_claim(&mut pool, 12 * KIB, 12 * KIB, 1)
+            .unwrap()
+            .slots
+            .pop()
+            .unwrap();
+        let second = owner_local_reserve_try_claim(&mut pool, 20 * KIB, 20 * KIB, 1)
+            .unwrap()
+            .slots
+            .pop()
+            .unwrap();
+
+        assert_eq!(first.slot_index, 0);
+        assert_eq!(second.slot_index, 3);
+        assert_eq!(second.ptr - first.ptr, 12 * KIB);
+        assert_eq!(pool.grant_count(), 1);
+        assert_eq!(pool.total_used_bytes(), 32 * KIB);
+    }
+
+    #[test]
+    fn allocatable_report_excludes_free_bubbles_smaller_than_one_slot() {
+        const KIB: u64 = 1024;
+        let mut pool = OwnerLocalReservePoolState::default();
+        owner_local_reserve_install_grant(
+            &mut pool,
+            OwnerLocalReserveGrantState::new(1, 1_000_000, 1_000_000, 64 * KIB),
+        );
+
+        let slots = pool.claim_available(16 * KIB, 4);
+        assert_eq!(slots.len(), 4);
+        assert!(pool.release_prepared_slot(16 * KIB, slots[1].grant_id, slots[1].slot_index));
+        assert!(pool.release_prepared_slot(16 * KIB, slots[3].grant_id, slots[3].slot_index));
+
+        let report = pool.allocatable_report(24 * KIB);
+        assert_eq!(report.raw_free_bytes, 32 * KIB);
+        assert_eq!(report.allocatable_slots, 0);
+        assert_eq!(report.allocatable_bytes, 0);
+        assert_eq!(report.slot_unallocatable_bytes, 32 * KIB);
+    }
+
+    #[test]
+    fn minimum_sized_allocations_can_fill_and_restore_an_entire_grant() {
+        const KIB: u64 = 1024;
+        let mut pool = OwnerLocalReservePoolState::default();
+        owner_local_reserve_install_grant(
+            &mut pool,
+            OwnerLocalReserveGrantState::new(1, 1_000_000, 1_000_000, 64 * KIB),
+        );
+
+        let slots = pool.claim_available(4 * KIB, 16);
+        assert_eq!(slots.len(), 16);
+        assert_eq!(pool.total_free_bytes(), 0);
+        for slot in slots {
+            assert!(pool.release_prepared_slot(4 * KIB, slot.grant_id, slot.slot_index));
+        }
+        assert_eq!(pool.total_free_bytes(), 64 * KIB);
+        assert_eq!(pool.largest_free_bytes(), 64 * KIB);
+    }
+
+    #[test]
+    fn failed_batch_claim_rolls_back_every_offset_allocation() {
+        const KIB: u64 = 1024;
+        let mut pool = OwnerLocalReservePoolState::default();
+        owner_local_reserve_install_grant(
+            &mut pool,
+            OwnerLocalReserveGrantState::new(1, 1_000_000, 1_000_000, 64 * KIB),
+        );
+
+        assert!(owner_local_reserve_try_claim(&mut pool, 24 * KIB, 24 * KIB, 3).is_none());
+        assert_eq!(pool.used_slot_count(), 0);
+        assert_eq!(pool.total_free_bytes(), 64 * KIB);
+        assert_eq!(pool.largest_free_bytes(), 64 * KIB);
+        assert_eq!(pool.failed_claim_refill_grants(), 1);
     }
 
     #[test]
     fn grant_index_and_cached_counters_survive_swap_remove_and_reinstall() {
-        const SLOT_SIZE: u64 = 8;
-        const SLOTS_PER_GRANT: u32 = 4;
+        const SLOT_SIZE: u64 = 4 * 1024;
         let mut pool = OwnerLocalReservePoolState::default();
         for grant_id in 1..=3 {
             owner_local_reserve_install_grant(
                 &mut pool,
-                SLOT_SIZE,
-                SLOTS_PER_GRANT,
                 OwnerLocalReserveGrantState::new(
                     grant_id,
                     grant_id * 1000,
                     grant_id * 1000,
-                    SLOT_SIZE * u64::from(SLOTS_PER_GRANT),
-                    SLOT_SIZE,
-                    SLOTS_PER_GRANT,
+                    SLOT_SIZE * 4,
                 ),
             );
         }
 
-        let class = pool.classes.get_mut(&SLOT_SIZE).unwrap();
-        assert_eq!(class.free_slot_count(), 12);
-        assert_eq!(class.used_slot_count(), 0);
-        let detached = class
+        assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 12);
+        assert_eq!(pool.used_slot_count(), 0);
+        let detached = pool
             .detach_fully_free_grant(2)
             .expect("middle grant must be indexed");
-        assert_eq!(class.free_slot_count(), 8);
-        assert_eq!(class.grant_count(), 2);
+        assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 8);
+        assert_eq!(pool.grant_count(), 2);
 
         // Removing the middle Vec entry swap-moves grant 3. A subsequent state
         // transition by grant id proves that its repaired index is authoritative.
-        let claimed = class.claim_available(1);
-        assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].grant_id, 3);
-        assert_eq!(class.free_slot_count(), 7);
-        assert_eq!(class.prepared_slot_count(), 1);
-        assert!(class.release_prepared_slot(3, claimed[0].slot_index));
-        assert_eq!(class.free_slot_count(), 8);
-        assert_eq!(class.prepared_slot_count(), 0);
+        let claimed = pool.claim_available(SLOT_SIZE, 5);
+        assert_eq!(claimed.len(), 5);
+        assert_eq!(claimed[4].grant_id, 3);
+        assert_eq!(pool.prepared_slot_count(), 5);
+        for slot in claimed {
+            assert!(pool.release_prepared_slot(SLOT_SIZE, slot.grant_id, slot.slot_index));
+        }
+        assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 8);
+        assert_eq!(pool.prepared_slot_count(), 0);
 
-        class.install_grant(detached);
-        assert_eq!(class.free_slot_count(), 12);
-        assert_eq!(class.used_slot_count(), 0);
-        assert_eq!(class.grant_count(), 3);
+        pool.install_grant(detached);
+        assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 12);
+        assert_eq!(pool.used_slot_count(), 0);
+        assert_eq!(pool.grant_count(), 3);
     }
 
     #[test]
     fn committed_slots_are_reclaimed_and_reused_independently_across_grants() {
-        const SLOT_SIZE: u64 = 8;
-        const SLOTS_PER_GRANT: u32 = 4;
+        const SLOT_SIZE: u64 = 4 * 1024;
 
         let mut pool = OwnerLocalReservePoolState::default();
         for (grant_id, addr) in [(1, 1000), (2, 2000)] {
             owner_local_reserve_install_grant(
                 &mut pool,
-                SLOT_SIZE,
-                SLOTS_PER_GRANT,
-                OwnerLocalReserveGrantState::new(
-                    grant_id,
-                    addr,
-                    addr,
-                    SLOT_SIZE * u64::from(SLOTS_PER_GRANT),
-                    SLOT_SIZE,
-                    SLOTS_PER_GRANT,
-                ),
+                OwnerLocalReserveGrantState::new(grant_id, addr, addr, SLOT_SIZE * 4),
             );
         }
 
-        let initial = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOTS_PER_GRANT, 8);
+        let initial = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 8);
         assert_eq!(initial.len(), 8);
-        {
-            let class = pool.classes.get_mut(&SLOT_SIZE).unwrap();
-            for slot in &initial {
-                assert!(class.mark_prepared_slot_pending_visible(slot.grant_id, slot.slot_index));
-                assert!(class.retain_resident_slot_holder(slot.grant_id, slot.slot_index));
-                assert!(
-                    class.promote_pending_visible_slot_to_committed(slot.grant_id, slot.slot_index)
-                );
-            }
+        for slot in &initial {
+            assert!(pool.mark_prepared_slot_pending_visible(
+                SLOT_SIZE,
+                slot.grant_id,
+                slot.slot_index
+            ));
+            assert!(pool.retain_resident_slot_holder(SLOT_SIZE, slot.grant_id, slot.slot_index));
+            assert!(pool.promote_pending_visible_slot_to_committed(
+                SLOT_SIZE,
+                slot.grant_id,
+                slot.slot_index
+            ));
         }
 
         let victims = [initial[1].clone(), initial[5].clone()];
-        {
-            let class = pool.classes.get_mut(&SLOT_SIZE).unwrap();
-            for victim in &victims {
-                assert!(class.release_committed_slot_route(victim.grant_id, victim.slot_index));
-                assert!(class.release_resident_slot_holder(victim.grant_id, victim.slot_index));
-            }
-            assert_eq!(class.free_slot_count(), 2);
-            assert_eq!(class.grant_count(), 2);
-            assert!(class.grants.iter().all(|grant| !grant.is_fully_free()));
-            assert!(class.grants.iter().all(|grant| grant.free_slots.len() == 1));
+        for victim in &victims {
+            assert!(pool.release_committed_slot_route(
+                SLOT_SIZE,
+                victim.grant_id,
+                victim.slot_index
+            ));
+            assert!(pool.release_resident_slot_holder(
+                SLOT_SIZE,
+                victim.grant_id,
+                victim.slot_index
+            ));
         }
+        assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 2);
+        assert_eq!(pool.grant_count(), 2);
+        assert!(pool.grants.iter().all(|grant| !grant.is_fully_free()));
+        assert!(
+            pool.grants
+                .iter()
+                .all(|grant| grant.total_free_bytes() == SLOT_SIZE)
+        );
 
         for cycle in 0..10 {
-            let reused =
-                owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOTS_PER_GRANT, 2);
+            let reused = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 2);
             assert_eq!(reused.len(), 2, "cycle {cycle} did not reuse both slots");
             let mut reused_grant_ids = reused.iter().map(|slot| slot.grant_id).collect::<Vec<_>>();
             reused_grant_ids.sort_unstable();
             assert_eq!(reused_grant_ids, vec![1, 2]);
 
-            let class = pool.classes.get_mut(&SLOT_SIZE).unwrap();
             for slot in reused {
-                assert!(class.mark_prepared_slot_pending_visible(slot.grant_id, slot.slot_index));
-                assert!(class.retain_resident_slot_holder(slot.grant_id, slot.slot_index));
-                assert!(
-                    class.promote_pending_visible_slot_to_committed(slot.grant_id, slot.slot_index)
-                );
-                assert!(class.release_committed_slot_route(slot.grant_id, slot.slot_index));
-                assert!(class.release_resident_slot_holder(slot.grant_id, slot.slot_index));
+                assert!(pool.mark_prepared_slot_pending_visible(
+                    SLOT_SIZE,
+                    slot.grant_id,
+                    slot.slot_index
+                ));
+                assert!(pool.retain_resident_slot_holder(
+                    SLOT_SIZE,
+                    slot.grant_id,
+                    slot.slot_index
+                ));
+                assert!(pool.promote_pending_visible_slot_to_committed(
+                    SLOT_SIZE,
+                    slot.grant_id,
+                    slot.slot_index
+                ));
+                assert!(pool.release_committed_slot_route(
+                    SLOT_SIZE,
+                    slot.grant_id,
+                    slot.slot_index
+                ));
+                assert!(pool.release_resident_slot_holder(
+                    SLOT_SIZE,
+                    slot.grant_id,
+                    slot.slot_index
+                ));
             }
-            assert_eq!(class.free_slot_count(), 2);
-            assert_eq!(class.grant_count(), 2);
-            assert!(class.grants.iter().all(|grant| !grant.is_fully_free()));
+            assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 2);
+            assert_eq!(pool.grant_count(), 2);
+            assert!(pool.grants.iter().all(|grant| !grant.is_fully_free()));
         }
     }
 
     #[limit_thirdparty::tokio::test]
     async fn later_waiter_cannot_steal_slot_before_current_claim_turn_completes() {
         const SLOT_SIZE: u64 = 4 * 1024;
-        const SLOTS_PER_GRANT: u32 = 4;
 
         let api = Arc::new(
             ClientKvApi::construct(ClientKvApiNewArg {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
+                owner_local_reserve_physical_capacity_bytes: 0,
                 ssd_storage: None,
             })
             .await
@@ -375,16 +452,7 @@ mod local_reserve_claim_tests {
             let mut pool = api.inner().owner_local_reserve_pool.lock();
             owner_local_reserve_install_grant(
                 &mut pool,
-                SLOT_SIZE,
-                SLOTS_PER_GRANT,
-                OwnerLocalReserveGrantState::new(
-                    1,
-                    1000,
-                    1000,
-                    SLOT_SIZE * u64::from(SLOTS_PER_GRANT),
-                    SLOT_SIZE,
-                    SLOTS_PER_GRANT,
-                ),
+                OwnerLocalReserveGrantState::new(1, 1000, 1000, SLOT_SIZE * 4),
             );
         }
 
@@ -393,7 +461,7 @@ mod local_reserve_claim_tests {
         let current_claim_turn = claim_lock.lock().await;
         let first_partial = {
             let mut pool = api.inner().owner_local_reserve_pool.lock();
-            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOTS_PER_GRANT, 3)
+            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 3)
         };
         assert_eq!(first_partial.len(), 3);
 
@@ -415,11 +483,8 @@ mod local_reserve_claim_tests {
             api.inner()
                 .owner_local_reserve_pool
                 .lock()
-                .classes
-                .get(&SLOT_SIZE)
-                .unwrap()
-                .free_slot_count(),
-            1,
+                .total_free_bytes(),
+            SLOT_SIZE,
             "later waiter stole the current waiter's remaining free slot"
         );
 
@@ -428,18 +493,9 @@ mod local_reserve_claim_tests {
             let mut pool = api.inner().owner_local_reserve_pool.lock();
             owner_local_reserve_install_grant(
                 &mut pool,
-                SLOT_SIZE,
-                SLOTS_PER_GRANT,
-                OwnerLocalReserveGrantState::new(
-                    2,
-                    2000,
-                    2000,
-                    SLOT_SIZE * u64::from(SLOTS_PER_GRANT),
-                    SLOT_SIZE,
-                    SLOTS_PER_GRANT,
-                ),
+                OwnerLocalReserveGrantState::new(2, 2000, 2000, SLOT_SIZE * 4),
             );
-            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOTS_PER_GRANT, 2)
+            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 2)
         };
         assert_eq!(first_partial.len() + first_remainder.len(), 5);
         drop(current_claim_turn);
@@ -461,6 +517,7 @@ mod local_reserve_claim_tests {
             ClientKvApi::construct(ClientKvApiNewArg {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
+                owner_local_reserve_physical_capacity_bytes: 0,
                 ssd_storage: None,
             })
             .await
@@ -510,12 +567,12 @@ mod local_reserve_claim_tests {
     async fn pressured_class_does_not_block_an_unrelated_slot_class() {
         const BLOCKED_SLOT_SIZE: u64 = 4 * 1024;
         const READY_SLOT_SIZE: u64 = 8 * 1024;
-        let ready_slots_per_grant = owner_local_reserve_slots_per_grant(READY_SLOT_SIZE);
 
         let api = Arc::new(
             ClientKvApi::construct(ClientKvApiNewArg {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
+                owner_local_reserve_physical_capacity_bytes: 0,
                 ssd_storage: None,
             })
             .await
@@ -529,16 +586,7 @@ mod local_reserve_claim_tests {
             let mut pool = api.inner().owner_local_reserve_pool.lock();
             owner_local_reserve_install_grant(
                 &mut pool,
-                READY_SLOT_SIZE,
-                ready_slots_per_grant,
-                OwnerLocalReserveGrantState::new(
-                    1,
-                    1000,
-                    1000,
-                    READY_SLOT_SIZE * u64::from(ready_slots_per_grant),
-                    READY_SLOT_SIZE,
-                    ready_slots_per_grant,
-                ),
+                OwnerLocalReserveGrantState::new(1, 1000, 1000, READY_SLOT_SIZE * 2),
             );
         }
 
@@ -564,6 +612,7 @@ mod local_reserve_claim_tests {
             ClientKvApi::construct(ClientKvApiNewArg {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
+                owner_local_reserve_physical_capacity_bytes: 0,
                 ssd_storage: None,
             })
             .await
@@ -593,10 +642,7 @@ mod local_reserve_claim_tests {
                     .inner()
                     .owner_local_reserve_pool
                     .lock()
-                    .classes
-                    .get(&SLOT_SIZE)
-                    .map(|class| class.pending_slot_demand)
-                    .unwrap_or_default();
+                    .pending_demand_slots(SLOT_SIZE);
                 if pending == 5 {
                     break;
                 }
@@ -614,10 +660,7 @@ mod local_reserve_claim_tests {
             api.inner()
                 .owner_local_reserve_pool
                 .lock()
-                .classes
-                .get(&SLOT_SIZE)
-                .unwrap()
-                .pending_slot_demand,
+                .pending_demand_slots(SLOT_SIZE),
             0,
             "cancelled queued claims leaked pending demand"
         );
@@ -659,6 +702,7 @@ pub struct OwnerLocalPublishItem {
     pub remote_replica_admitted: bool,
     pub preferred_sub_cluster: Option<String>,
     pub atomic_group: Option<PutAtomicGroup>,
+    pub radix: Option<RadixKvMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -725,30 +769,37 @@ fn owner_local_reserve_timeout_error(
     hard_wait_timeout: std::time::Duration,
     request_started_at: Instant,
 ) -> KvError {
-    let (used_slots, free_slots, pending_slots, grants, expected_grants) = {
+    let (
+        used_slots,
+        free_bytes,
+        allocatable_slots,
+        slot_unallocatable_bytes,
+        pending_slots,
+        grants,
+        expected_grants,
+    ) = {
         let pool = inner.owner_local_reserve_pool.lock();
-        pool.classes
-            .get(&slot_size)
-            .map(|class_state| {
-                (
-                    class_state.used_slot_count(),
-                    class_state.free_slot_count(),
-                    class_state.pending_slot_demand,
-                    class_state.grant_count(),
-                    class_state.expected_grant_count,
-                )
-            })
-            .unwrap_or((0, 0, 0, 0, 0))
+        let allocatable = pool.allocatable_report(slot_size);
+        (
+            pool.used_slot_count(),
+            pool.total_free_bytes(),
+            allocatable.allocatable_slots,
+            allocatable.slot_unallocatable_bytes,
+            pool.pending_demand_slots(slot_size),
+            pool.grant_count(),
+            pool.expected_grant_count,
+        )
     };
     KvError::Api(ApiError::Unknown {
         detail: format!(
-            "owner local reserve refill timeout: stage={} slot_size={} key_count={} remaining_slots={} used_slots={} free_slots={} pending_slots={} grants={} expected_grants={} waited_ms={} soft_wait_timeout_ms={} hard_timeout_ms={}",
+            "owner local reserve refill timeout: stage={} slot_size={} key_count={} used_allocations={} raw_free_bytes={} allocatable_slots={} slot_unallocatable_bytes={} pending_slots={} grants={} expected_grants={} waited_ms={} soft_wait_timeout_ms={} hard_timeout_ms={}",
             stage,
             slot_size,
             key_count,
-            key_count.saturating_sub(free_slots),
             used_slots,
-            free_slots,
+            free_bytes,
+            allocatable_slots,
+            slot_unallocatable_bytes,
             pending_slots,
             grants,
             expected_grants,
@@ -766,7 +817,6 @@ impl ClientKvApiInner {
         key_count: usize,
     ) -> KvResult<OwnerLocalReserveSlotLease> {
         let slot_size = owner_local_reserve_slot_size(value_len)?;
-        let slots_per_grant = owner_local_reserve_slots_per_grant(slot_size);
         let (soft_wait_timeout, hard_wait_timeout) = owner_local_reserve_timeout_config(self);
         let request_started_at = Instant::now();
         let hard_deadline = request_started_at
@@ -779,7 +829,7 @@ impl ClientKvApiInner {
         // Publish demand before waiting for the FIFO turn so one refill can cover all queued
         // claimants. The guard also removes demand if the caller is cancelled while queued.
         let mut pending_demand =
-            OwnerLocalReservePendingDemandGuard::new(self, slot_size, slots_per_grant, key_count);
+            OwnerLocalReservePendingDemandGuard::new(self, slot_size, key_count);
         self.owner_local_reserve_rebalance_notify().notify_waiters();
 
         let Some(remaining_for_turn) = hard_deadline.checked_duration_since(Instant::now()) else {
@@ -812,22 +862,20 @@ impl ClientKvApiInner {
         loop {
             let claim = {
                 let mut pool = self.owner_local_reserve_pool.lock();
-                let claim = owner_local_reserve_try_claim(
-                    &mut pool,
-                    slot_size,
-                    slots_per_grant,
-                    value_len,
-                    key_count,
-                );
+                let claim =
+                    owner_local_reserve_try_claim(&mut pool, slot_size, value_len, key_count);
                 if claim.is_some() {
-                    let class_state = pool
-                        .classes
+                    pool.record_successful_claim(slot_size);
+                    let pending = pool
+                        .pending_demand_by_slot_size
                         .get_mut(&slot_size)
-                        .expect("claimed local-reserve class must exist");
-                    class_state.pending_slot_demand = class_state
-                        .pending_slot_demand
+                        .expect("claimed local-reserve demand must exist");
+                    *pending = pending
                         .checked_sub(key_count)
                         .expect("claimed local-reserve demand underflow");
+                    if *pending == 0 {
+                        pool.pending_demand_by_slot_size.remove(&slot_size);
+                    }
                 }
                 claim
             };
@@ -839,7 +887,6 @@ impl ClientKvApiInner {
             if !wait_owner_local_reserve_ready(
                 self,
                 slot_size,
-                slots_per_grant,
                 key_count,
                 soft_wait_timeout,
                 hard_deadline,
@@ -866,16 +913,12 @@ impl ClientKvApiInner {
     ) -> KvResult<()> {
         {
             let mut pool = self.owner_local_reserve_pool.lock();
-            let Some(class_state) = pool.classes.get_mut(&lease.slot_size) else {
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "resident local reserve class missing while releasing slot lease: slot_size={}",
-                        lease.slot_size
-                    ),
-                }));
-            };
             for slot_ref in &lease.slots {
-                if !class_state.release_prepared_slot(slot_ref.grant_id, slot_ref.slot_index) {
+                if !pool.release_prepared_slot(
+                    lease.slot_size,
+                    slot_ref.grant_id,
+                    slot_ref.slot_index,
+                ) {
                     return Err(KvError::Api(ApiError::Unknown {
                         detail: format!(
                             "resident local reserve grant missing while releasing slot lease: grant_id={}",
@@ -896,15 +939,7 @@ impl ClientKvApiInner {
         slot_index: u32,
     ) -> KvResult<()> {
         let mut pool = self.owner_local_reserve_pool.lock();
-        let Some(class_state) = pool.classes.get_mut(&slot_size) else {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "local reserve class missing while marking pending slot: slot_size={}",
-                    slot_size
-                ),
-            }));
-        };
-        if !class_state.mark_prepared_slot_pending_visible(grant_id, slot_index) {
+        if !pool.mark_prepared_slot_pending_visible(slot_size, grant_id, slot_index) {
             return Err(KvError::Api(ApiError::Unknown {
                 detail: format!(
                     "local reserve grant missing while marking pending slot: grant_id={}",
@@ -922,15 +957,7 @@ impl ClientKvApiInner {
         slot_index: u32,
     ) -> KvResult<()> {
         let mut pool = self.owner_local_reserve_pool.lock();
-        let Some(class_state) = pool.classes.get_mut(&slot_size) else {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "local reserve class missing while promoting pending slot: slot_size={}",
-                    slot_size
-                ),
-            }));
-        };
-        if !class_state.promote_pending_visible_slot_to_committed(grant_id, slot_index) {
+        if !pool.promote_pending_visible_slot_to_committed(slot_size, grant_id, slot_index) {
             return Err(KvError::Api(ApiError::Unknown {
                 detail: format!(
                     "local reserve grant missing while promoting pending slot: grant_id={}",
@@ -948,15 +975,7 @@ impl ClientKvApiInner {
         slot_index: u32,
     ) -> KvResult<()> {
         let mut pool = self.owner_local_reserve_pool.lock();
-        let Some(class_state) = pool.classes.get_mut(&slot_size) else {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "local reserve class missing while retaining resident slot holder: slot_size={}",
-                    slot_size
-                ),
-            }));
-        };
-        if !class_state.retain_resident_slot_holder(grant_id, slot_index) {
+        if !pool.retain_resident_slot_holder(slot_size, grant_id, slot_index) {
             return Err(KvError::Api(ApiError::Unknown {
                 detail: format!(
                     "local reserve grant missing while retaining resident slot holder: grant_id={}",
@@ -975,15 +994,7 @@ impl ClientKvApiInner {
     ) -> KvResult<()> {
         {
             let mut pool = self.owner_local_reserve_pool.lock();
-            let Some(class_state) = pool.classes.get_mut(&slot_size) else {
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "local reserve class missing while releasing resident slot holder: slot_size={}",
-                        slot_size
-                    ),
-                }));
-            };
-            if !class_state.release_resident_slot_holder(grant_id, slot_index) {
+            if !pool.release_resident_slot_holder(slot_size, grant_id, slot_index) {
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
                         "local reserve grant missing while releasing resident slot holder: grant_id={}",
@@ -1004,15 +1015,7 @@ impl ClientKvApiInner {
     ) -> KvResult<()> {
         {
             let mut pool = self.owner_local_reserve_pool.lock();
-            let Some(class_state) = pool.classes.get_mut(&slot_size) else {
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "local reserve class missing while releasing committed slot route: slot_size={}",
-                        slot_size
-                    ),
-                }));
-            };
-            if !class_state.release_committed_slot_route(grant_id, slot_index) {
+            if !pool.release_committed_slot_route(slot_size, grant_id, slot_index) {
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
                         "local reserve grant missing while releasing committed slot route: grant_id={}",
@@ -1033,15 +1036,7 @@ impl ClientKvApiInner {
     ) -> KvResult<()> {
         {
             let mut pool = self.owner_local_reserve_pool.lock();
-            let Some(class_state) = pool.classes.get_mut(&slot_size) else {
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "local reserve class missing while reclaiming committed resident slot: slot_size={}",
-                        slot_size
-                    ),
-                }));
-            };
-            if !class_state.release_committed_resident_slot(grant_id, slot_index) {
+            if !pool.release_committed_resident_slot(slot_size, grant_id, slot_index) {
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
                         "local reserve grant missing while reclaiming committed resident slot: grant_id={}",
@@ -1057,11 +1052,7 @@ impl ClientKvApiInner {
     pub async fn owner_shutdown_local_reserve_pool(&self) -> KvResult<()> {
         let grants = {
             let mut pool = self.owner_local_reserve_pool.lock();
-            let mut detached = Vec::new();
-            for (_slot_size, mut class_state) in pool.classes.drain() {
-                detached.extend(class_state.take_all_grants());
-            }
-            detached
+            pool.take_all_grants()
         };
         let mut first_err = None;
         for grant in grants {
@@ -1213,6 +1204,7 @@ impl ClientKvApiInner {
                 committed_slot: None,
                 publish_local_cache: false,
                 atomic_group: None,
+                radix: None,
             })
             .collect::<Vec<_>>();
         let done_resp = self.batch_put_done(done_req_items).await?;
@@ -1441,6 +1433,7 @@ impl ClientKvApiInner {
                 committed_slot: None,
                 publish_local_cache: false,
                 atomic_group: None,
+                radix: None,
             })
             .collect::<Vec<_>>();
         let done_resp = self.batch_put_done(done_req_items).await?;
@@ -1671,7 +1664,11 @@ impl ClientKvApiInner {
                 preferred_sub_cluster.clone(),
                 protect_source_on_remote_complete,
             ) {
-                OwnerRemotePutReservation::Leader { op, memory_info } => {
+                OwnerRemotePutReservation::Leader {
+                    op,
+                    memory_info,
+                    admission_permit,
+                } => {
                     let holder = Arc::new(UserMemHolder::new(
                         memory_info,
                         self.get_or_init_all_memholder_refcount(),
@@ -1679,8 +1676,13 @@ impl ClientKvApiInner {
                     ));
                     let spawn_view = self.view.clone_view();
                     let task_view = spawn_view.clone();
+                    let task_guard = OwnerRemotePutTaskGuard::new(
+                        task_view.clone(),
+                        op.clone(),
+                        admission_permit,
+                    );
                     let _ = spawn_view.spawn("owner_remote_put_leader", async move {
-                        run_owner_remote_put(task_view, op, holder).await;
+                        run_owner_remote_put(task_view, op, holder, task_guard).await;
                     });
                     return Ok(true);
                 }
@@ -1708,6 +1710,15 @@ impl ClientKvApiInner {
                 OwnerRemotePutReservation::SourceUnavailable => {
                     tracing::warn!(
                         "owner remote Put source is unavailable, fenced, or version-mismatched: key={} put_id=({},{})",
+                        key,
+                        put_id.0,
+                        put_id.1
+                    );
+                    return Ok(false);
+                }
+                OwnerRemotePutReservation::NotAdmitted => {
+                    tracing::debug!(
+                        "owner remote Put was not admitted without queueing: key={} put_id=({},{})",
                         key,
                         put_id.0,
                         put_id.1
@@ -2898,6 +2909,7 @@ impl ClientKvApiInner {
                 committed_slot: None,
                 publish_local_cache: false,
                 atomic_group: None,
+                radix: None,
             },
             raw_bytes: Vec::new(),
         };
@@ -2954,6 +2966,7 @@ impl ClientKvApiInner {
                 committed_slot: None,
                 publish_local_cache,
                 atomic_group: None,
+                radix: None,
             },
             raw_bytes: Vec::new(),
         };
@@ -3079,6 +3092,7 @@ mod owner_hot_replica_policy_tests {
             remote_replica_admitted: false,
             preferred_sub_cluster: None,
             atomic_group,
+            radix: None,
         }
     }
 
@@ -3884,7 +3898,10 @@ pub fn spawn_owner_source_eviction_dispatcher(
                     }
                     pressure_open = true;
                 }
-                super::OwnerHotEvictionDispatch::EndPressure { selected_bytes } => {
+                super::OwnerHotEvictionDispatch::EndPressure {
+                    selected_bytes,
+                    completion,
+                } => {
                     if !pressure_open {
                         tracing::warn!(
                             selected_bytes,
@@ -3894,6 +3911,12 @@ pub fn spawn_owner_source_eviction_dispatcher(
                     pressure_open = false;
                     process_owner_source_eviction_events(&view_task, std::mem::take(&mut events))
                         .await;
+                    if completion.send(()).is_err() {
+                        tracing::debug!(
+                            selected_bytes,
+                            "owner pressure producer stopped before batch completion ACK"
+                        );
+                    }
                 }
                 super::OwnerHotEvictionDispatch::Flush => {
                     if !pressure_open && !events.is_empty() {
@@ -4122,9 +4145,9 @@ async fn run_owner_local_ssd_put_batch(
     }
 }
 
-async fn fail_owner_remote_put(
+async fn revoke_owner_remote_put(
     view: &ClientKvApiView,
-    op: Arc<OwnerRemotePutSharedOp>,
+    op: &Arc<OwnerRemotePutSharedOp>,
     operation_id: Option<u64>,
     reason: &'static str,
 ) {
@@ -4145,13 +4168,80 @@ async fn fail_owner_remote_put(
             );
         }
     }
-    inner.finish_owner_remote_put(&op, OwnerRemotePutOutcome::Failed);
+}
+
+/// Owns the unique byte/item admission credit for one leader task. Explicit terminal paths call
+/// `finish`; unwinding or aborting the task publishes Failed and returns the same permit in Drop.
+/// The pointer-checked `finish_owner_remote_put` keeps an old generation from clearing a newer
+/// per-key flight, while the permit itself can only be dropped once.
+struct OwnerRemotePutTaskGuard {
+    view: ClientKvApiView,
+    op: Arc<OwnerRemotePutSharedOp>,
+    admission_permit: Option<OwnerRemotePutAdmissionPermit>,
+    finished: bool,
+}
+
+impl OwnerRemotePutTaskGuard {
+    fn new(
+        view: ClientKvApiView,
+        op: Arc<OwnerRemotePutSharedOp>,
+        admission_permit: OwnerRemotePutAdmissionPermit,
+    ) -> Self {
+        Self {
+            view,
+            op,
+            admission_permit: Some(admission_permit),
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, outcome: OwnerRemotePutOutcome) {
+        debug_assert!(!self.finished, "remote Put task finished twice");
+        self.view
+            .client_kv_api()
+            .inner()
+            .finish_owner_remote_put(&self.op, outcome);
+        self.finished = true;
+        drop(self.admission_permit.take());
+    }
+
+    fn release_transfer_bytes(&mut self) {
+        let released = self
+            .admission_permit
+            .as_mut()
+            .expect("remote Put admission permit missing before task terminal")
+            .release_transfer_bytes();
+        debug_assert!(released, "remote Put transfer bytes released twice");
+    }
+}
+
+impl Drop for OwnerRemotePutTaskGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        tracing::warn!(
+            key = self.op.key,
+            put_time_ms = self.op.put_id.0,
+            put_version = self.op.put_id.1,
+            "owner remote Put leader task dropped before terminal publication"
+        );
+        let inner = self.view.client_kv_api().inner();
+        inner
+            .owner_remote_put_counters
+            .task_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        inner.finish_owner_remote_put(&self.op, OwnerRemotePutOutcome::Failed);
+        self.finished = true;
+        drop(self.admission_permit.take());
+    }
 }
 
 async fn run_owner_remote_put(
     view: ClientKvApiView,
     op: Arc<OwnerRemotePutSharedOp>,
     holder: Arc<UserMemHolder>,
+    mut task_guard: OwnerRemotePutTaskGuard,
 ) {
     let inner = view.client_kv_api().inner();
     let src_offset = holder.memory_info().offset;
@@ -4167,7 +4257,8 @@ async fn run_owner_remote_put(
                 len
             );
             drop(holder);
-            fail_owner_remote_put(&view, op, None, "length does not fit u32").await;
+            revoke_owner_remote_put(&view, &op, None, "length does not fit u32").await;
+            task_guard.finish(OwnerRemotePutOutcome::Failed);
             return;
         }
     };
@@ -4183,7 +4274,8 @@ async fn run_owner_remote_put(
                 err
             );
             drop(holder);
-            fail_owner_remote_put(&view, op, None, "start error").await;
+            revoke_owner_remote_put(&view, &op, None, "start error").await;
+            task_guard.finish(OwnerRemotePutOutcome::Failed);
             return;
         }
     };
@@ -4191,12 +4283,12 @@ async fn run_owner_remote_put(
         PutAppendStartOutcome::Scheduled => {}
         PutAppendStartOutcome::AlreadySatisfied => {
             drop(holder);
-            inner.finish_owner_remote_put(&op, OwnerRemotePutOutcome::AlreadySatisfied);
+            task_guard.finish(OwnerRemotePutOutcome::AlreadySatisfied);
             return;
         }
         PutAppendStartOutcome::Obsolete => {
             drop(holder);
-            inner.finish_owner_remote_put(&op, OwnerRemotePutOutcome::Obsolete);
+            task_guard.finish(OwnerRemotePutOutcome::Obsolete);
             return;
         }
         PutAppendStartOutcome::RetryableNoSpace | PutAppendStartOutcome::Unspecified => {
@@ -4208,7 +4300,7 @@ async fn run_owner_remote_put(
                 op.put_id.1
             );
             drop(holder);
-            inner.finish_owner_remote_put(&op, OwnerRemotePutOutcome::Failed);
+            task_guard.finish(OwnerRemotePutOutcome::Failed);
             return;
         }
     }
@@ -4230,12 +4322,13 @@ async fn run_owner_remote_put(
             target.len
         );
         drop(holder);
-        fail_owner_remote_put(&view, op, Some(target.operation_id), "length mismatch").await;
+        revoke_owner_remote_put(&view, &op, Some(target.operation_id), "length mismatch").await;
+        task_guard.finish(OwnerRemotePutOutcome::Failed);
         return;
     }
 
     inner.record_owner_remote_put_transfer();
-    if let Err(err) = inner
+    let transfer_result = inner
         .put_transfer(
             &op.key,
             op.put_id,
@@ -4245,8 +4338,13 @@ async fn run_owner_remote_put(
             Some(target.node_id),
             Some(target.target_base_addr),
         )
-        .await
-    {
+        .await;
+    // The payload and byte admission credit cover only the transfer. Keep the
+    // item credit and generation flight through Done/Revoke so a slow control
+    // response cannot block unrelated payloads from entering the data plane.
+    drop(holder);
+    task_guard.release_transfer_bytes();
+    if let Err(err) = transfer_result {
         tracing::warn!(
             "owner remote Put transfer failed: key={} put_id=({},{}) err={}",
             op.key,
@@ -4254,15 +4352,11 @@ async fn run_owner_remote_put(
             op.put_id.1,
             err
         );
-        drop(holder);
-        fail_owner_remote_put(&view, op, Some(target.operation_id), "transfer error").await;
+        revoke_owner_remote_put(&view, &op, Some(target.operation_id), "transfer error").await;
+        task_guard.finish(OwnerRemotePutOutcome::Failed);
         return;
     }
 
-    // The payload is no longer read after transfer.  Keep the generation
-    // flight installed through Done so eviction cannot cross the completion
-    // protocol even though the physical source holder is now releasable.
-    drop(holder);
     match inner
         .put_append_done(&op.key, op.put_id, target.operation_id)
         .await
@@ -4280,7 +4374,7 @@ async fn run_owner_remote_put(
                 op.put_id.1,
                 resp.appended
             );
-            inner.finish_owner_remote_put(&op, outcome);
+            task_guard.finish(outcome);
         }
         Err(err) => {
             tracing::warn!(
@@ -4290,7 +4384,8 @@ async fn run_owner_remote_put(
                 op.put_id.1,
                 err
             );
-            fail_owner_remote_put(&view, op, Some(target.operation_id), "done error").await;
+            revoke_owner_remote_put(&view, &op, Some(target.operation_id), "done error").await;
+            task_guard.finish(OwnerRemotePutOutcome::Failed);
         }
     }
 }
@@ -4468,6 +4563,7 @@ pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLoc
                             lease_id: item.lease_id,
                             committed_slot: Some(item.committed_slot.clone()),
                             publish_local_cache: false,
+                            radix: item.radix.clone(),
                         })
                         .collect::<Vec<_>>();
                     inner
@@ -4494,6 +4590,7 @@ pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLoc
                             committed_slot: Some(item.committed_slot.clone()),
                             publish_local_cache: false,
                             atomic_group: item.atomic_group.clone(),
+                            radix: item.radix.clone(),
                         })
                         .collect::<Vec<_>>();
                     inner

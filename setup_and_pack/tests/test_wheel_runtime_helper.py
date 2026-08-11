@@ -186,22 +186,30 @@ class WheelRuntimeHelperTest(unittest.TestCase):
     def test_merge_binary_wheel_copies_runtime_payload_and_runtime_tag(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            pure_wheel = root / "fluxon-0.2.1-py3-none-any.whl"
-            runtime_wheel = root / "fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
-            output_wheel = root / "fluxon-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+            pure_wheel = root / "fluxon_py-0.2.2-py3-none-any.whl"
+            runtime_wheel = root / "fluxon_pyo3-0.2.2-cp38-abi3-manylinux_2_28_x86_64.whl"
+            output_wheel = root / "fluxon_py-0.2.2-cp38-abi3-manylinux_2_28_x86_64.whl"
 
             pure_src = root / "pure_src"
             pure_pkg = pure_src / "fluxon_py"
-            pure_dist = pure_src / "fluxon-0.2.1.dist-info"
-            pure_pkg.mkdir(parents=True)
+            pure_quick_start_pkg = pure_pkg / "quick_start"
+            pure_dist = pure_src / "fluxon_py-0.2.2.dist-info"
+            pure_quick_start_pkg.mkdir(parents=True)
             pure_dist.mkdir(parents=True)
-            (pure_pkg / "__init__.py").write_text("__version__ = '0.2.1'\n", encoding="utf-8")
+            (pure_pkg / "__init__.py").write_text("__version__ = '0.2.2'\n", encoding="utf-8")
+            (pure_pkg / "s3_service.py").write_text("def main(): pass\n", encoding="utf-8")
+            (pure_quick_start_pkg / "__init__.py").write_text("", encoding="utf-8")
+            (pure_quick_start_pkg / "start.py").write_text("def main(): pass\n", encoding="utf-8")
             (pure_dist / "WHEEL").write_text(
                 "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
                 encoding="utf-8",
             )
             (pure_dist / "METADATA").write_text(
-                "Metadata-Version: 2.1\nName: fluxon\nVersion: 0.2.1\n",
+                "Metadata-Version: 2.1\nName: fluxon-py\nVersion: 0.2.2\nRequires-Dist: Flask\n",
+                encoding="utf-8",
+            )
+            (pure_dist / "entry_points.txt").write_text(
+                "[console_scripts]\nfluxon-s3 = fluxon_py.s3_service:main\n",
                 encoding="utf-8",
             )
             _WHEEL_HELPER.create_wheel(str(pure_wheel), str(pure_src))
@@ -209,7 +217,7 @@ class WheelRuntimeHelperTest(unittest.TestCase):
             runtime_src = root / "runtime_src"
             runtime_pkg = runtime_src / "fluxon_pyo3"
             runtime_libs = runtime_src / "fluxon_pyo3.libs"
-            runtime_dist = runtime_src / "fluxon_pyo3-0.2.1.dist-info"
+            runtime_dist = runtime_src / "fluxon_pyo3-0.2.2.dist-info"
             runtime_pkg.mkdir(parents=True)
             runtime_libs.mkdir(parents=True)
             runtime_dist.mkdir(parents=True)
@@ -221,7 +229,7 @@ class WheelRuntimeHelperTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (runtime_dist / "METADATA").write_text(
-                "Metadata-Version: 2.1\nName: fluxon-pyo3\nVersion: 0.2.1\n",
+                "Metadata-Version: 2.1\nName: fluxon-pyo3\nVersion: 0.2.2\n",
                 encoding="utf-8",
             )
             _WHEEL_HELPER.create_wheel(str(runtime_wheel), str(runtime_src))
@@ -233,10 +241,27 @@ class WheelRuntimeHelperTest(unittest.TestCase):
             )
 
             with zipfile.ZipFile(output_wheel, "r") as zip_ref:
-                self.assertEqual(zip_ref.read("fluxon_py/__init__.py").decode("utf-8"), "__version__ = '0.2.1'\n")
+                self.assertEqual(zip_ref.read("fluxon_py/__init__.py").decode("utf-8"), "__version__ = '0.2.2'\n")
+                self.assertEqual(
+                    zip_ref.read("fluxon_py/s3_service.py").decode("utf-8"),
+                    "def main(): pass\n",
+                )
+                self.assertEqual(
+                    zip_ref.read("fluxon_py/quick_start/start.py").decode("utf-8"),
+                    "def main(): pass\n",
+                )
+                self.assertNotIn(
+                    "fluxon_py/quick_start/components.py",
+                    zip_ref.namelist(),
+                )
+                metadata_text = zip_ref.read("fluxon_py-0.2.2.dist-info/METADATA").decode("utf-8")
+                self.assertIn("Name: fluxon-py", metadata_text)
+                self.assertIn("Requires-Dist: Flask", metadata_text)
+                entry_points_text = zip_ref.read("fluxon_py-0.2.2.dist-info/entry_points.txt").decode("utf-8")
+                self.assertIn("fluxon-s3 = fluxon_py.s3_service:main", entry_points_text)
                 self.assertEqual(zip_ref.read("fluxon_pyo3/fluxon_pyo3.abi3.so"), b"runtime-so")
                 self.assertEqual(zip_ref.read("fluxon_pyo3.libs/libruntime.so"), b"runtime-lib")
-                wheel_text = zip_ref.read("fluxon-0.2.1.dist-info/WHEEL").decode("utf-8")
+                wheel_text = zip_ref.read("fluxon_py-0.2.2.dist-info/WHEEL").decode("utf-8")
                 self.assertIn("Root-Is-Purelib: false", wheel_text)
                 self.assertIn("Tag: cp38-abi3-manylinux_2_28_x86_64", wheel_text)
 

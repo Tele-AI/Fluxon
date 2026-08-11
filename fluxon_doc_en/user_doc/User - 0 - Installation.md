@@ -4,7 +4,7 @@
 
 If you use Fluxon directly, you usually deal with two install bundles:
 
-- Fluxon core artifacts: `fluxon-*.whl`, `fluxon_pyo3-*.whl`, `pylib_src.tar.gz`, `install.py`, `fluxon_release.sha256`
+- Fluxon core artifacts: `fluxon_py-*.whl`, `fluxon_pyo3-*.whl`, `pylib_src.tar.gz`, `install.py`, `fluxon_release.sha256`
 - Runtime packages for `etcd / Greptime / TiKV`: `ext_images.tar.gz`
 
 If your Python process only attaches to an existing service plane, you normally only need the Fluxon core package. If you also need to start the KV / MQ / FS service plane yourself, prepare the `etcd / Greptime / TiKV` runtime package as well. See [Architecture and Concepts](<./User - 1 - Architecture and Concepts.md>) for the role model.
@@ -22,7 +22,7 @@ https://github.com/<org>/fluxon/releases
 ```bash
 tar xzf fluxon_release.tar.gz
 cd fluxon_release
-pip install fluxon-*.whl fluxon_pyo3-*.whl
+pip install fluxon_py-*.whl fluxon_pyo3-*.whl
 ```
 
 #### Unpack `etcd / Greptime / TiKV`
@@ -64,7 +64,7 @@ Related docs:
 
 | File | Description |
 |---|---|
-| `fluxon-*.whl` | Fluxon Python package |
+| `fluxon_py-*.whl` | `fluxon-py` Python distribution |
 | `fluxon_pyo3-*.whl` | Fluxon Rust bindings (PyO3) |
 | `pylib_src.tar.gz` | Python source bundle |
 | `install.py` | Release runtime entrypoint |

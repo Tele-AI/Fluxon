@@ -4055,6 +4055,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             "prefer_local_placement",
             "short_circuit_put_payload_path",
             "skip_put_end_commit",
+            "post_read_remote_policy",
             "p2p_transport_impl",
             "transport_mode",
             "tcp_thread_reactor_shard_count",
@@ -4087,6 +4088,17 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
     ):
         if key in cfg:
             out[key] = _require_bool(cfg.get(key), f"{ctx}.{key}")
+    if "post_read_remote_policy" in cfg:
+        post_read_remote_policy = _require_str(
+            cfg.get("post_read_remote_policy"), f"{ctx}.post_read_remote_policy"
+        )
+        allowed_post_read_remote_policies = {"retain", "drop"}
+        if post_read_remote_policy not in allowed_post_read_remote_policies:
+            raise ValueError(
+                f"{ctx}.post_read_remote_policy must be one of "
+                f"{sorted(allowed_post_read_remote_policies)}, got {post_read_remote_policy!r}"
+            )
+        out["post_read_remote_policy"] = post_read_remote_policy
     if "p2p_transport_impl" in cfg:
         p2p_transport_impl = _require_str(cfg.get("p2p_transport_impl"), f"{ctx}.p2p_transport_impl")
         allowed_p2p_transport_impls = {"tcp", "tcp_thread"}
@@ -12557,7 +12569,7 @@ def _test_stack_target_host_venv_python(
 
 def _test_stack_runtime_wheel_paths(*, run_dir: Path) -> Tuple[Path]:
     wheels_root = (run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_WHEEL_DIRNAME).resolve()
-    wheel_candidates = sorted(path for path in wheels_root.glob("fluxon-*.whl") if path.is_file())
+    wheel_candidates = sorted(path for path in wheels_root.glob("fluxon_py-*.whl") if path.is_file())
     if len(wheel_candidates) != 1:
         raise ValueError(
             "TEST_STACK runtime must contain exactly one Fluxon wheel: "

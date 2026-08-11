@@ -141,7 +141,7 @@ def main() -> int:
         with script_utils.stage("Seeding profile cache compatibility entries"):
             _seed_profile_cache_compat_entries(release_dir=release_dir)
 
-        wheel = _find_single(release_dir, "fluxon-*.whl", "release wheel")
+        wheel = _find_single(release_dir, "fluxon_py-*.whl", "release wheel")
         try:
             manylinux_version = load_manylinux_version_static(repo_root=repo_root)
         except Exception as e:
@@ -227,8 +227,8 @@ def _run_pack_steps(
 
     _remove_release_wheels(
         release_dir=release_dir,
-        pattern="fluxon-*.whl",
-        ignore_predicate=lambda path: "pyo3" in path.name,
+        pattern="fluxon*.whl",
+        ignore_predicate=lambda path: path.name.startswith("fluxon_pyo3-"),
     )
 
     pack_py = repo_root / "setup_and_pack" / "pack_fluxon_pylib.py"
@@ -241,7 +241,7 @@ def _run_pack_steps(
             cwd=str(repo_root),
         )
 
-    wheel_py = _find_single(release_dir, "fluxon-*.whl", "pure python wheel")
+    wheel_py = _find_single(release_dir, "fluxon_py-*.whl", "pure python wheel")
     with script_utils.stage("Assembling unified release wheel"):
         merged_wheel = _assemble_unified_release_wheel(
             release_dir=release_dir,
@@ -382,7 +382,7 @@ def _merged_fluxon_wheel_name(*, pure_python_wheel_name: str, pyo3_wheel_name: s
         raise RuntimeError(f"invalid pyo3 wheel filename: {pyo3_wheel_name}")
     version = pure_parts[1]
     tag_parts = pyo3_parts[-3:]
-    return "-".join(["fluxon", version, *tag_parts])
+    return "-".join(["fluxon_py", version, *tag_parts])
 
 
 def _assert_no_top_level_pyo3_wheel(*, release_dir: Path, manylinux_version: str) -> None:

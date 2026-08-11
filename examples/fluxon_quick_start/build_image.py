@@ -15,7 +15,7 @@ REPO_ROOT = SCRIPT_DIR.parent.parent
 SCRIPTS_DIR = REPO_ROOT / "setup_and_pack"
 DOCKERFILE_PATH = SCRIPT_DIR / "Dockerfile"
 IMAGE_NAME = "fluxon_quick_start"
-IMAGE_TAG = "0.2.1"
+IMAGE_TAG = "0.2.2"
 
 # Binaries to copy from ext_images into quick_start bin/.
 EXT_BINARIES = ("etcd/etcd", "etcd/etcdctl", "greptime/greptime")
@@ -62,7 +62,7 @@ def _run(cmd: list[str]) -> None:
 
 
 def _validate_existing_release(*, release_dir: Path) -> None:
-    required_globs = ("fluxon-*.whl",)
+    required_globs = ("fluxon_py-*.whl",)
     required_relpaths = ("ext_images/etcd/etcd", "ext_images/etcd/etcdctl", "ext_images/greptime/greptime")
     if not release_dir.is_dir():
         raise FileNotFoundError(f"missing quick_start release directory: {release_dir}")

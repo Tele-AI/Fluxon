@@ -1037,6 +1037,8 @@ async fn async_main(
             fluxon_fs_s3_gateway::GatewayAccessConfig {
                 access_db_path: panel_cfg.access_db_path.clone(),
                 bootstrap_access_model: panel_cfg.bootstrap_access_model.clone(),
+                require_bootstrap_credentials_change: panel_cfg
+                    .require_bootstrap_credentials_change,
                 transfer_state_store: panel_cfg.transfer_state_store.clone(),
             },
             Arc::new(fs_cache.clone()),

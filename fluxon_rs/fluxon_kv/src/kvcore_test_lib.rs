@@ -81,6 +81,7 @@ fn new_master_config_with_cluster(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
             rdma_device_names: None,
+            tcp_thread_reactor: Default::default(),
         },
         transfer_engine: TransferEngineType::P2p,
         enable_transfer_rpc_fast_path: false,
@@ -136,6 +137,7 @@ fn new_client_config_with_cluster_and_dram(
         protocol: ProtocolConfig {
             protocol_type: ProtocolType::Tcp,
             rdma_device_names: None,
+            tcp_thread_reactor: Default::default(),
         },
         pprof_duration_seconds: None,
         replica_writeback_hot_capacity_ratio: None,

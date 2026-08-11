@@ -3594,6 +3594,7 @@ impl HandlerForExternalClient for ClientKvApi {
                 local_reserve_slot: None,
                 local_reserve_slot_size: None,
                 atomic_group: None,
+                radix: None,
                 _pending_fence: pending_fence_claim.take_for_pending_context(),
             },
         );
@@ -3846,6 +3847,7 @@ impl HandlerForExternalClient for ClientKvApi {
                     local_reserve_slot: Some(slot_ref.clone()),
                     local_reserve_slot_size: Some(slot_size),
                     atomic_group: atomic_groups[idx].clone(),
+                    radix: req_item.radix.clone(),
                     _pending_fence: pending_fence,
                 },
             );
@@ -4230,6 +4232,7 @@ impl HandlerForExternalClient for ClientKvApi {
                             remote_replica_admitted: pending_ctx.remote_replica_admitted,
                             preferred_sub_cluster: pending_ctx.preferred_sub_cluster.clone(),
                             atomic_group: pending_ctx.atomic_group.clone(),
+                            radix: pending_ctx.radix.clone(),
                         });
                         local_publish_contexts.push(pending_ctx);
                         results[idx] = Some(ExternalBatchPutTransferEndItemResp {
@@ -4381,6 +4384,7 @@ impl HandlerForExternalClient for ClientKvApi {
                         committed_slot: None,
                         publish_local_cache: true,
                         atomic_group: None,
+                        radix: None,
                     })
                     .collect(),
             )
@@ -4776,6 +4780,7 @@ impl HandlerForExternalClient for ClientKvApi {
                             remote_replica_admitted: pending_ctx.remote_replica_admitted,
                             preferred_sub_cluster: pending_ctx.preferred_sub_cluster.clone(),
                             atomic_group: pending_ctx.atomic_group.clone(),
+                            radix: pending_ctx.radix.clone(),
                         });
                         local_publish_contexts.push(pending_ctx);
                         results[idx] = Some(ExternalBatchPutCommitItemResp {
@@ -4918,6 +4923,7 @@ impl HandlerForExternalClient for ClientKvApi {
                         committed_slot: None,
                         publish_local_cache: true,
                         atomic_group: None,
+                        radix: None,
                     })
                     .collect(),
             )

@@ -817,7 +817,7 @@ def _validate_existing_release_dir(*, release_dir: Path) -> None:
     if not release_dir.exists() or not release_dir.is_dir():
         raise RuntimeError(f"pack_test_stack_rsc requires an existing release dir: {release_dir}")
 
-    required_file_globs = ("fluxon-*.whl",)
+    required_file_globs = ("fluxon_py-*.whl",)
     required_relpaths = (
         "install.py",
         RELEASE_MANIFEST_FILENAME,

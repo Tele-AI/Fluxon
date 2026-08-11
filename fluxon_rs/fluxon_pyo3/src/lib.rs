@@ -31,7 +31,7 @@ use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
 use fluxon_kv::external_client_api::ExternalClientApiViewTrait;
 use fluxon_kv::master_kv_router::msg_pack::{
-    BatchPreparePutKeyItemReq, PutDoneCommittedSlot, ReserveLocalGrantOutcome,
+    BatchPreparePutKeyItemReq, PutDoneCommittedSlot, RadixKvMetadata, ReserveLocalGrantOutcome,
     build_put_atomic_group_assignments,
 };
 use fluxon_kv::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
@@ -2134,6 +2134,7 @@ struct StagedOwnerPutPlanData {
     key_reservation_ids: Vec<u64>,
     slot_lease: OwnerLocalReserveSlotLease,
     make_replica_task_mask: Vec<bool>,
+    radix_metadata: Vec<Option<RadixKvMetadata>>,
     atomic_group_lens: Vec<usize>,
 }
 
@@ -3214,6 +3215,58 @@ fn normalize_put_atomic_group_lens(
     Ok(group_lens)
 }
 
+fn normalize_put_radix_metadata(
+    keys: &[String],
+    radix_parent_keys: Option<Vec<Option<String>>>,
+    content_depths: Option<Vec<u32>>,
+) -> Result<Vec<Option<RadixKvMetadata>>, String> {
+    let (parents, depths) = match (radix_parent_keys, content_depths) {
+        (None, None) => return Ok(vec![None; keys.len()]),
+        (Some(parents), Some(depths)) => (parents, depths),
+        _ => {
+            return Err(
+                "radix_parent_keys and content_depths must be provided together".to_string(),
+            );
+        }
+    };
+    if parents.len() != keys.len() || depths.len() != keys.len() {
+        return Err(format!(
+            "radix metadata lengths must match keys length; keys={} parents={} depths={}",
+            keys.len(),
+            parents.len(),
+            depths.len()
+        ));
+    }
+    keys.iter()
+        .zip(parents)
+        .zip(depths)
+        .enumerate()
+        .map(|(index, ((key, parent_key), depth))| {
+            if parent_key.as_deref().is_some_and(str::is_empty) {
+                return Err(format!(
+                    "radix parent key must be non-empty when present; index={index}"
+                ));
+            }
+            if depth == 0 && parent_key.is_some() {
+                return Err(format!(
+                    "a depth-zero radix key must not have a parent; index={index} key={key}"
+                ));
+            }
+            if depth > 0 && parent_key.is_none() {
+                return Err(format!(
+                    "a non-root radix key must have a parent; index={index} key={key} depth={depth}"
+                ));
+            }
+            if parent_key.as_deref() == Some(key.as_str()) {
+                return Err(format!(
+                    "a radix key cannot be its own parent; index={index} key={key}"
+                ));
+            }
+            Ok(Some(RadixKvMetadata { parent_key, depth }))
+        })
+        .collect()
+}
+
 #[pymethods]
 impl KvClient {
     /// Create a new KV client
@@ -3581,7 +3634,7 @@ impl KvClient {
         release_local_grant_blocking_inner(self, grant_id, py).into_py_object(py)
     }
 
-    #[pyo3(signature = (keys, value_len, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true, make_replica_task_mask=None, atomic_group_lens=None))]
+    #[pyo3(signature = (keys, value_len, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true, make_replica_task_mask=None, radix_parent_keys=None, content_depths=None, atomic_group_lens=None))]
     fn local_fast_put_start(
         &self,
         keys: Vec<String>,
@@ -3591,6 +3644,8 @@ impl KvClient {
         write_through: bool,
         make_replica_task: bool,
         make_replica_task_mask: Option<Vec<bool>>,
+        radix_parent_keys: Option<Vec<Option<String>>>,
+        content_depths: Option<Vec<u32>>,
         atomic_group_lens: Option<Vec<usize>>,
         py: Python,
     ) -> PyObject {
@@ -3603,6 +3658,8 @@ impl KvClient {
             write_through: bool,
             make_replica_task: bool,
             make_replica_task_mask: Option<Vec<bool>>,
+            radix_parent_keys: Option<Vec<Option<String>>>,
+            content_depths: Option<Vec<u32>>,
             atomic_group_lens: Option<Vec<usize>>,
             py: Python,
         ) -> ApiResult<PyObject> {
@@ -3643,6 +3700,13 @@ impl KvClient {
                     return ApiResult::new_error(new_invalid_argument_error(py, &detail));
                 }
             };
+            let radix_metadata =
+                match normalize_put_radix_metadata(&keys, radix_parent_keys, content_depths) {
+                    Ok(metadata) => metadata,
+                    Err(detail) => {
+                        return ApiResult::new_error(new_invalid_argument_error(py, &detail));
+                    }
+                };
             let framework = match require_kv_framework_api(client, py) {
                 Ok(v) => v,
                 Err(e) => return ApiResult::new_error(e),
@@ -3660,6 +3724,7 @@ impl KvClient {
                 let framework_for_start = framework.clone();
                 let keys_for_req = keys.clone();
                 let make_replica_task_mask_for_req = make_replica_task_mask.clone();
+                let radix_metadata_for_req = radix_metadata.clone();
                 let atomic_group_lens_for_req = atomic_group_lens.clone();
                 let external_start_result = match py.allow_threads(|| {
                     runtime.run_async_from_sync(async move {
@@ -3673,13 +3738,17 @@ impl KvClient {
                                 items: keys_for_req
                                     .iter()
                                     .zip(make_replica_task_mask_for_req.iter())
-                                    .map(|(key, make_replica_task)| ExternalBatchPutStartItemReq {
-                                        key: key.clone(),
-                                        len: value_len,
-                                        reject_if_inflight_same_key,
-                                        reject_if_exist_same_key,
-                                        make_replica_task: *make_replica_task,
-                                        preferred_sub_cluster: None,
+                                    .zip(radix_metadata_for_req.iter())
+                                    .map(|((key, make_replica_task), radix)| {
+                                        ExternalBatchPutStartItemReq {
+                                            key: key.clone(),
+                                            len: value_len,
+                                            reject_if_inflight_same_key,
+                                            reject_if_exist_same_key,
+                                            make_replica_task: *make_replica_task,
+                                            preferred_sub_cluster: None,
+                                            radix: radix.clone(),
+                                        }
                                     })
                                     .collect(),
                                 atomic_group_lens: Some(atomic_group_lens_for_req),
@@ -3946,6 +4015,7 @@ impl KvClient {
                         key_reservation_ids,
                         slot_lease,
                         make_replica_task_mask,
+                        radix_metadata,
                         atomic_group_lens,
                     },
                 ))),
@@ -3968,6 +4038,8 @@ impl KvClient {
             write_through,
             make_replica_task,
             make_replica_task_mask,
+            radix_parent_keys,
+            content_depths,
             atomic_group_lens,
             py,
         )
@@ -4112,13 +4184,15 @@ impl KvClient {
                         let slot_size = owner_data.slot_lease.slot_size;
                         if slot_refs.len() != owner_data.keys.len()
                             || owner_data.make_replica_task_mask.len() != owner_data.keys.len()
+                            || owner_data.radix_metadata.len() != owner_data.keys.len()
                         {
                             let err = CoreKvError::Api(CoreApiError::Unknown {
                                 detail: format!(
-                                    "local_fast_put_commit staged length mismatch: keys={} slots={} replica_mask={}",
+                                    "local_fast_put_commit staged length mismatch: keys={} slots={} replica_mask={} radix_metadata={}",
                                     owner_data.keys.len(),
                                     slot_refs.len(),
-                                    owner_data.make_replica_task_mask.len()
+                                    owner_data.make_replica_task_mask.len(),
+                                    owner_data.radix_metadata.len()
                                 ),
                             });
                             let _ = release_staged_put_resources(
@@ -4224,6 +4298,7 @@ impl KvClient {
                                 remote_replica_admitted: *make_replica_task,
                                 preferred_sub_cluster: None,
                                 atomic_group: atomic_groups[idx].clone(),
+                                radix: owner_data.radix_metadata[idx].clone(),
                             });
                             ret_codes.push(0);
                         }
@@ -7947,9 +8022,10 @@ mod tests {
         configure_bundled_rdmav_driver_env, defer_drop_to_runtime,
         discover_bundled_ibverbs_driver_config,
         extract_fluxon_pyo3_libs_root_from_loaded_library_line, loaded_fluxon_pyo3_libs_roots,
-        normalize_put_atomic_group_lens, parse_bundled_ibverbs_driver_name,
-        resolve_make_replica_task_mask, sanitize_bundled_ld_library_path_entries,
-        set_authoritative_bundled_ld_library_path, validate_single_fluxon_pyo3_libs_root,
+        normalize_put_atomic_group_lens, normalize_put_radix_metadata,
+        parse_bundled_ibverbs_driver_name, resolve_make_replica_task_mask,
+        sanitize_bundled_ld_library_path_entries, set_authoritative_bundled_ld_library_path,
+        validate_single_fluxon_pyo3_libs_root,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8069,6 +8145,47 @@ mod tests {
         assert_eq!(
             normalize_put_atomic_group_lens(3, Some(vec![1, 1])).unwrap_err(),
             "atomic_group_lens must sum to keys length; sum=2 keys=3"
+        );
+    }
+
+    #[test]
+    fn local_fast_put_radix_metadata_accepts_root_and_chain() {
+        let keys = vec!["root".to_string(), "child".to_string()];
+        let metadata = normalize_put_radix_metadata(
+            &keys,
+            Some(vec![None, Some("root".to_string())]),
+            Some(vec![0, 1]),
+        )
+        .unwrap();
+        assert_eq!(metadata[0].as_ref().unwrap().parent_key, None);
+        assert_eq!(metadata[0].as_ref().unwrap().depth, 0);
+        assert_eq!(
+            metadata[1].as_ref().unwrap().parent_key.as_deref(),
+            Some("root")
+        );
+        assert_eq!(metadata[1].as_ref().unwrap().depth, 1);
+    }
+
+    #[test]
+    fn local_fast_put_radix_metadata_rejects_partial_or_invalid_lineage() {
+        let keys = vec!["page".to_string()];
+        assert_eq!(
+            normalize_put_radix_metadata(&keys, Some(vec![None]), None).unwrap_err(),
+            "radix_parent_keys and content_depths must be provided together"
+        );
+        assert!(
+            normalize_put_radix_metadata(
+                &keys,
+                Some(vec![Some("parent".to_string())]),
+                Some(vec![0]),
+            )
+            .unwrap_err()
+            .contains("depth-zero")
+        );
+        assert!(
+            normalize_put_radix_metadata(&keys, Some(vec![None]), Some(vec![1]))
+                .unwrap_err()
+                .contains("must have a parent")
         );
     }
 

@@ -1,7 +1,7 @@
 use super::{
     CommittedSlotReplica, CompletedGetInfo, InflightGetInfo, InflightGetTarget, KvMemoryReplica,
     KvNodeReplicas, MasterKeyActivityCompletionGuard, MasterKvRouterView, OwnerHoldingGetInfo,
-    ReservedCapacityReason,
+    PostReadRemoteReclaimCandidate, ReservedCapacityReason,
     msg_pack::{
         BatchGetBindItemReq, BatchGetBindReq, BatchGetBindResp, BatchGetDoneItemResp,
         BatchGetDoneReq, BatchGetDoneResp, BatchGetPlanItemResp, BatchGetPlanReq, BatchGetPlanResp,
@@ -136,9 +136,15 @@ fn validate_prepared_local_reserve_target(
     let grant_addr = grant_base_addr
         .checked_add(grant.allocation.addr())
         .ok_or_else(|| invalid("local-reserve grant address overflow".to_string()))?;
-    let slot_offset = target
-        .slot_size
-        .checked_mul(u64::from(target.slot_index))
+    if target.slot_size == 0
+        || target.slot_size % crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES != 0
+    {
+        return Err(invalid(format!(
+            "prepared local-reserve Get target has invalid allocation capacity: grant_id={} slot_size={}",
+            target.grant_id, target.slot_size
+        )));
+    }
+    let slot_offset = crate::owner_local_reserve_slot_offset_bytes(target.slot_index)
         .ok_or_else(|| invalid("prepared local-reserve Get slot offset overflow".to_string()))?;
     let slot_end = slot_offset
         .checked_add(target.slot_size)
@@ -410,6 +416,7 @@ mod planned_get_tests {
         let source_tag = NodeTombTag::new();
         let route = Arc::new(OneKvNodesRoutes {
             put_id: (7, 3),
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::from([(
@@ -1951,6 +1958,7 @@ async fn handle_get_done_locked(
     req_node_id: NodeID,
     mut deferred_route_events: Option<&mut Vec<RoutePublishEvent>>,
     mut deferred_terminals: Option<&mut Vec<(u64, CompletedGetInfo)>>,
+    mut deferred_post_read_reclaims: Option<&mut Vec<PostReadRemoteReclaimCandidate>>,
 ) -> MsgPack<GetDoneResp> {
     tracing::debug!("Handling GetDoneReq: {:?}", req.serialize_part);
 
@@ -2011,7 +2019,7 @@ async fn handle_get_done_locked(
         let mut allocation_mode = inflight_info.allocation_mode;
         // clone req_node_id to avoid borrow/move conflict when inserting into kv_routes
         let req_node_id = inflight_info.req_node_id.clone();
-        let key = inflight_info.key;
+        let key = inflight_info.key.clone();
         let target_cap = inflight_info.target.capacity();
         if allocation_mode == GetAllocationMode::ExternalSink {
             let generation_is_current = match &inflight_info.target {
@@ -2471,6 +2479,9 @@ async fn handle_get_done_locked(
             req_node_id: req_node_id.clone(),
             response: terminal.clone(),
         };
+        let post_read_reclaim = view
+            .master_kv_router()
+            .post_read_remote_reclaim_candidate(&inflight_info, allocation_mode);
         if let Some(terminals) = deferred_terminals.as_deref_mut() {
             terminals.push((get_id, completed));
         } else {
@@ -2479,6 +2490,16 @@ async fn handle_get_done_locked(
                 .completed_gets
                 .insert(get_id, completed)
                 .await;
+        }
+        drop(_activity_completion);
+        if let Some(candidate) = post_read_reclaim {
+            if let Some(reclaims) = deferred_post_read_reclaims.as_deref_mut() {
+                reclaims.push(candidate);
+            } else {
+                let _ = view
+                    .master_kv_router()
+                    .enqueue_post_read_remote_reclaim(candidate);
+            }
         }
         MsgPack {
             serialize_part: terminal,
@@ -2541,7 +2562,7 @@ pub async fn handle_get_done(
         .get_done_locks
         .get_lock(req.serialize_part.get_id);
     let _done_guard = done_lock.lock().await;
-    handle_get_done_locked(view, req, req_node_id, None, None).await
+    handle_get_done_locked(view, req, req_node_id, None, None, None).await
 }
 
 // --- MemHolder Handler Functions ---
@@ -2909,6 +2930,7 @@ pub async fn handle_batch_get_done(
     let mut items = Vec::with_capacity(get_ids.len());
     let mut route_events = Vec::new();
     let mut deferred_terminals = Vec::new();
+    let mut deferred_post_read_reclaims = Vec::new();
     let mut response_by_get_id = HashMap::<u64, GetDoneResp>::new();
     for get_id in get_ids {
         let part = if let Some(part) = response_by_get_id.get(&get_id) {
@@ -2923,6 +2945,7 @@ pub async fn handle_batch_get_done(
                 req_node_id.clone(),
                 Some(&mut route_events),
                 Some(&mut deferred_terminals),
+                Some(&mut deferred_post_read_reclaims),
             )
             .await
             .serialize_part;
@@ -2953,6 +2976,11 @@ pub async fn handle_batch_get_done(
             .completed_gets
             .insert(get_id, completed)
             .await;
+    }
+    for candidate in deferred_post_read_reclaims {
+        let _ = view
+            .master_kv_router()
+            .enqueue_post_read_remote_reclaim(candidate);
     }
     let elapsed = started_at.elapsed();
     if elapsed.as_millis() >= 100 {

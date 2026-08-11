@@ -13,7 +13,7 @@ def get_version():
         for line in f:
             if line.startswith('__version__'):
                 return line.split('=')[1].strip().strip('"\'')
-    return "0.2.1"
+    return "0.2.2"
 
 # Read README if exists
 def get_long_description():
@@ -34,6 +34,7 @@ def get_install_requires():
         'etcd3==0.12.0', 
         'protobuf<=3.20.4', 
         'msgpack',
+        'Flask',
         # Required by Mooncake backend (used for RW locks)
         'readerwriterlock',
         ]
@@ -47,7 +48,7 @@ _extras = {
 }
 
 setup(
-    name='fluxon',
+    name='fluxon-py',
     version=get_version(),
     description='Fluxon - high-performance distributed cache and message queue for AI workloads',
     long_description=get_long_description(),

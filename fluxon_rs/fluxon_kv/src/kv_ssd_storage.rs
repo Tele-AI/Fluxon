@@ -1313,6 +1313,7 @@ mod tests {
 
         let route = Arc::new(OneKvNodesRoutes {
             put_id,
+            radix: None,
             lease_id: None,
             atomic_group: None,
             node_replicas: RwLock::new(HashMap::from([(

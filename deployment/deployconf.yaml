@@ -3,7 +3,7 @@
 namespace: fluxon-example
 
 name_prefix: fluxon-example
-image: fluxon_quick_start:0.2.1
+image: fluxon_quick_start:0.2.2
 
 cluster_nodes:
   - hostname: example-node-a
@@ -37,8 +37,8 @@ global_envs:
   # FLUXON_REPO_BRANCH: "main"
   # FLUXON_DEPLOY_REPO: ""
   # FLUXON_DEPLOY_REPO_BRANCH: "main"
-  FLUXON_RELEASE_WHEEL_PY: "fluxon-0.2.1-py3-none-any.whl"
-  FLUXON_RELEASE_WHEEL_PYO3: "fluxon_pyo3-0.2.1-cp38-abi3-manylinux_2_28_x86_64.whl"
+  FLUXON_RELEASE_WHEEL_PY: "fluxon_py-0.2.2-py3-none-any.whl"
+  FLUXON_RELEASE_WHEEL_PYO3: "fluxon_pyo3-0.2.2-cp38-abi3-manylinux_2_28_x86_64.whl"
   FLUXON_RELEASE_PYLIB_SRC_TAR: "pylib_src.tar.gz"
   FLUXON_RELEASE_SHA256_FILE: "fluxon_release.sha256"
   # Use local artifacts prepared at ${HOSTWORKDIR}/download/fluxon_release.
@@ -224,7 +224,7 @@ service:
       exec /run.sh
 
   # mooncake-metadata:
-  #   image: fluxon_quick_start:0.2.1
+  #   image: fluxon_quick_start:0.2.2
   #   port: 30880
   #   in_container_port: 30880
   #   node_bind:
@@ -1045,7 +1045,7 @@ service:
       sleep inf
 
   # kvclient_benchmark_node3:
-  #   image: fluxon_quick_start:0.2.1
+  #   image: fluxon_quick_start:0.2.2
   #   node_bind:
   #     node: ["example-node-a"]
   #     hostport: false
@@ -1072,7 +1072,7 @@ service:
   #     sleep inf
 
   # kvclient_benchmark_node4:
-  #   image: fluxon_quick_start:0.2.1
+  #   image: fluxon_quick_start:0.2.2
   #   node_bind:
   #     node: ["example-node-a"]
   #     hostport: false
@@ -1099,7 +1099,7 @@ service:
   #     sleep inf
 
   # kvclient_benchmark_node5:
-  #   image: fluxon_quick_start:0.2.1
+  #   image: fluxon_quick_start:0.2.2
   #   node_bind:
   #     node: ["example-node-a"]
   #     hostport: false

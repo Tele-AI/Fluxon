@@ -7,7 +7,7 @@
 [![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#runtime-requirements)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#runtime-requirements)
 [![Rust](https://img.shields.io/badge/Rust-1.93.0-000000)](./fluxon_rs/rust-toolchain.toml)
-[![Latest](https://img.shields.io/badge/Latest-v0.2.1-f28500)](./fluxon_release)
+[![Latest](https://img.shields.io/badge/Latest-v0.2.2-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#interface-capabilities)
 
 [English](./README.md) | [中文](./README_CN.md) | [Docs](https://tele-ai.github.io/Fluxon/) | [中文文档](https://tele-ai.github.io/Fluxon/cn/) | <a href="https://github.com/Tele-AI/Fluxon" title="GitHub Repository"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
@@ -164,7 +164,7 @@ Quick Start is the shortest path to try Fluxon. For formal installation, deploym
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.2 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -197,7 +197,7 @@ Related interface docs:
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.2 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -228,7 +228,7 @@ Related interface docs:
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.1 \
+  hanbaoaaa/fluxon_quick_start:0.2.2 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \
@@ -248,7 +248,68 @@ ui
 `FS Quick Start` additionally prints:
 
 - `fs_s3` endpoint
-- `Basic Auth` entry; the default username / password is `admin / admin`
+- `Basic Auth` entry; `0.2.2` uses `admin / admin` only as first-time setup credentials
+
+A new workdir requires both the username and password to be changed on the first sign-in, and S3
+access remains disabled until that succeeds. The old `admin / admin` credentials become invalid
+immediately after the update. Allow about two seconds for the updated permissions to reach the FS
+agent before the first S3 request.
+
+The PyPI package can start the directory-backed S3 service without a source checkout:
+
+```bash
+python3 -m pip install --upgrade fluxon-py
+```
+
+Create `serve_s3_single_node.py`:
+
+```python
+from fluxon_py.quick_start import serve_s3_single_node
+
+kv_master_config = {
+    "etcd_endpoints": ["127.0.0.1:22379"],
+    "cluster_name": "fluxon_s3",
+    "instance_key": "fluxon_s3_master",
+    "port": 25100,
+    "log_dir": "/absolute/path/to/state/kv-master/log",
+    "monitoring": {
+        "prometheus_base_url": "http://127.0.0.1:24000/v1/prometheus",
+        "prom_remote_write_url": ["http://127.0.0.1:24000/v1/prometheus/write"],
+        "otlp_log_api": {
+            "otlp_endpoint": "http://127.0.0.1:24000/v1/otlp/v1/logs",
+            "db_name": "public",
+            "table_name": "fluxon_logs",
+        },
+    },
+}
+kv_owner_config = {
+    "instance_key": "fluxon_s3_owner",
+    "contribute_to_cluster_pool_size": {"dram": 1073741824, "vram": {}},
+    "fluxonkv_spec": {
+        "etcd_addresses": ["127.0.0.1:22379"],
+        "cluster_name": "fluxon_s3",
+        "share_mem_path": "/dev/shm/fluxon-s3",
+        "sub_cluster": "default",
+        "large_file_paths": ["/absolute/path/to/state/kv-owner/large"],
+    },
+}
+serve_s3_single_node(
+    "/absolute/path/to/data",
+    "/absolute/path/to/state",
+    kv_master_config=kv_master_config,
+    kv_owner_config=kv_owner_config,
+    export_name="local-data",
+)
+```
+
+`serve_s3_single_node` passes both dictionaries to the canonical KV runtime starters without introducing
+another KV process wrapper. The name makes its single-node scope explicit. The shared-memory root is
+separate and rebuildable; ensure it has enough capacity. `export_name` is also the S3 bucket name;
+omit it to use `quick-start-export`.
+
+```bash
+python3 serve_s3_single_node.py
+```
 
 Expected runtime view:
 

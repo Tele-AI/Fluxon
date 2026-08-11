@@ -66,7 +66,7 @@ FS 用户进程的共享前置链路如下：
 
 `examples/start_kv_and_fs_svc.py` 只启动 Fluxon 自己的角色。`etcd` / `greptime` 仍按服务平面文档单独启动；如果需要 `/ui/transfers/` 和预扫描，还要先启动 `transfer_state_store` 对应的 `pd` / `tikv`：
 
-- 当前 `python3` 所在环境已经安装 `fluxon-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)
+- 当前 `python3` 所在环境已经安装 `fluxon_py-*.whl` 和 `fluxon_pyo3-*.whl`；安装方式见 [用户 - 0 - 安装](./用户%20-%200%20-%20安装.md)
 
 这个脚本支持两种启动方式：
 
@@ -666,6 +666,7 @@ print(summary)
  fluxon_fs:
   master_panel:
     access_db_path: /path/to/access.db
+    require_bootstrap_credentials_change: true
     bootstrap_access_model:
       users:
         - username: admin
@@ -680,6 +681,10 @@ print(summary)
 - `bootstrap_access_model` 必须在启动配置里显式提供
 - 只有当 `access_db` 还没有用户时，`bootstrap_access_model` 才会写入数据库
 - 数据库一旦已有用户，后续重启以数据库为准
+- `require_bootstrap_credentials_change` 默认为 `false`；设为 `true` 时，由空数据库创建的 bootstrap 账号在首次使用前必须在 Web UI 中同时修改用户名和密码
+- 待修改账号只能访问 `Change Credentials` 页，S3 请求返回 `AccessDenied`
+- 待修改状态与新凭据都持久化到 `access_db`；已有用户的数据库不会因后续开启该选项而被追加标记
+- Unix 下 `access_db` 文件权限会被收紧为 `0600`
 - `can_manage_users: true` 的用户在运行时可以访问所有当前 export，不依赖在数据库里预先展开 root `scope_access`
 - 页面不再提供首次管理员创建入口；首个管理员只能通过启动配置初始化
 

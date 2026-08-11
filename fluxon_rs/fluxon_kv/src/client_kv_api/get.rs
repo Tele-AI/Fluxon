@@ -563,21 +563,23 @@ impl ClientKvApiInner {
             .into();
         let mut local_hot_admissions = Vec::new();
 
-        for (pending, done_item) in done_pending.into_iter().zip(done_resp.items.into_iter()) {
+        for (mut pending, done_item) in done_pending.into_iter().zip(done_resp.items.into_iter()) {
             if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
                 done_item.error_code,
                 done_item.error_json.clone(),
             ) {
-                if let Some(target) = pending.start_item.prepared_target.as_ref() {
+                if pending.start_item.prepared_target.is_some() {
                     self.abort_hidden_pending_local_get(&pending.key, pending.start_item.get_id);
                     let canonical = self.local_committed_mem_holder_for_put_id(
                         &pending.key,
                         pending.start_item.put_id,
                     );
-                    if let Err(release_err) = release_prepared_get_target(self, target).await {
-                        results[pending.idx] = Some(Err(release_err));
-                        continue;
-                    }
+                    // Installation moved this slot out of Prepared and into the
+                    // resident MemoryInfo lifecycle. Removing the hidden index and
+                    // dropping its final local Arc performs the one valid release.
+                    // Calling release_prepared_get_target here would release the same
+                    // slot through the obsolete Prepared-state path.
+                    drop(pending.prepared_memory_info.take());
                     // A same-version PutDone/GetDone may have won while this
                     // transfer was in flight.  Converge on the owner's
                     // canonical local backing instead of turning an already

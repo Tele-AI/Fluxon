@@ -7,23 +7,27 @@ It does not replace the formal service-plane, KV, MQ, or FS interface docs.
 
 ## User-Facing Objects
 
-- `start.py`
-  - unified quick-start entrypoint
+- `fluxon_py.quick_start`
+  - unified entrypoint included in the installed `fluxon-py` distribution
+- `examples/fluxon_quick_start/start.py`
+  - compatibility wrapper for source-tree development
 - `build_image.py`
   - quick-start image build entrypoint
-- `fluxon_quick_start:0.2.1`
+- `fluxon_quick_start:0.2.2`
   - quick-start Docker image
 
 ## Runtime Modes
 
-Quick start supports two runtime modes:
+Quick start supports three runtime modes:
 
+- installed-package mode
+  - `pip install fluxon-py`, then call `serve_s3_single_node(...)` without downloading the repository
 - image-first mode
   - primary path
   - build the image from release artifacts, then run the container
 - repo-run mode
   - development-only path
-  - runs `examples/fluxon_quick_start/start.py` from the checkout
+  - runs the same `fluxon_py.quick_start` module from the checkout
   - requires the current Python environment to already have a working Fluxon runtime installed
   - quick start does not create a venv or install wheels at runtime
 
@@ -75,18 +79,18 @@ Quick start is only for fast bring-up and interaction:
 python3 examples/fluxon_quick_start/build_image.py --mode existing_release
 ```
 
-The image consumes release artifacts only. It installs `fluxon` and `fluxon_pyo3`
-from `fluxon_release/*.whl` and does not use editable source installs.
+The image consumes release artifacts only. It installs the unified `fluxon-py` wheel from
+`fluxon_release/*.whl` and does not use editable source installs.
 
 Repo-run mode is also supported for development, but it is not self-bootstrapping.
-Before running `python3 examples/fluxon_quick_start/start.py`, make sure the current
+Before running `python3 -m fluxon_py.quick_start`, make sure the current
 Python environment can already import both `fluxon_py` and `fluxon_pyo3`.
 
 ## KV Quick Start
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.1 \
+  fluxon_quick_start:0.2.2 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -98,7 +102,7 @@ docker run --rm -it --network host \
 Run directly from the repo:
 
 ```bash
-python3 examples/fluxon_quick_start/start.py \
+python3 -m fluxon_py.quick_start \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -119,7 +123,7 @@ del demo:hello
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.1 \
+  fluxon_quick_start:0.2.2 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -130,7 +134,7 @@ docker run --rm -it --network host \
 Run directly from the repo:
 
 ```bash
-python3 examples/fluxon_quick_start/start.py \
+python3 -m fluxon_py.quick_start \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -155,7 +159,7 @@ The background consumer keeps printing received messages.
 
 ```bash
 docker run --rm -it --network host \
-  fluxon_quick_start:0.2.1 \
+  fluxon_quick_start:0.2.2 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \
@@ -166,8 +170,9 @@ docker run --rm -it --network host \
 Run directly from the repo:
 
 ```bash
-python3 examples/fluxon_quick_start/start.py \
+python3 -m fluxon_py.quick_start \
   --mode fs \
+  --share-mem-path /dev/shm/fluxon-fs-quick-start \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \
   --greptime-http-port 14000 \
@@ -188,7 +193,113 @@ FS quick start also prints:
 - `fs_s3` endpoint
 - object UI URL
 - bucket UI URL
-- Basic Auth entry
+- bootstrap Basic Auth credentials: `admin / admin`
+
+On a new FS workdir, the first Web UI sign-in requires changing both the username and password.
+Until that succeeds, normal Web UI pages redirect to `Change Credentials` and S3 requests return
+`AccessDenied`. The result is persisted in `<workdir>/fs_master/access.db`; keep the workdir across
+restarts. On Unix, Quick Start creates that database with mode `0600`. Allow about two seconds for
+the updated permissions to reach the FS agent before the first S3 request.
+
+### Long-Running FS/S3 Service
+
+After `pip install fluxon-py`, the user script provides the complete KV master and owner configs, then
+starts FS S3. The owner shared-memory path is explicit and independent from persistent state:
+
+```python
+from fluxon_py.quick_start import serve_s3_single_node
+
+kv_master_config = {
+    "etcd_endpoints": ["127.0.0.1:22379"],
+    "cluster_name": "fluxon_s3",
+    "instance_key": "fluxon_s3_master",
+    "port": 25100,
+    "log_dir": "/absolute/path/to/state/kv-master/log",
+    "monitoring": {
+        "prometheus_base_url": "http://127.0.0.1:24000/v1/prometheus",
+        "prom_remote_write_url": ["http://127.0.0.1:24000/v1/prometheus/write"],
+        "otlp_log_api": {
+            "otlp_endpoint": "http://127.0.0.1:24000/v1/otlp/v1/logs",
+            "db_name": "public",
+            "table_name": "fluxon_logs",
+        },
+    },
+}
+kv_owner_config = {
+    "instance_key": "fluxon_s3_owner",
+    "contribute_to_cluster_pool_size": {"dram": 1073741824, "vram": {}},
+    "fluxonkv_spec": {
+        "etcd_addresses": ["127.0.0.1:22379"],
+        "cluster_name": "fluxon_s3",
+        "share_mem_path": "/dev/shm/fluxon-s3",
+        "sub_cluster": "default",
+        "large_file_paths": ["/absolute/path/to/state/kv-owner/large"],
+    },
+}
+serve_s3_single_node(
+    "/absolute/path/to/data",
+    "/absolute/path/to/state",
+    kv_master_config=kv_master_config,
+    kv_owner_config=kv_owner_config,
+    export_name="local-data",
+)
+```
+
+`/dev/shm/fluxon-s3` contains the owner's `mmap.file`, `shared.json`, and peer metadata. It is
+rebuildable runtime state; ensure the selected filesystem has enough capacity for the owner pool.
+`export_name` is also the S3 bucket name; omit it to use `quick-start-export`.
+
+The equivalent container command overrides the image's default Quick Start command and runs the
+same scenario composition directly with `python3 -c`:
+
+```bash
+docker run -d --name fluxon-s3 --restart unless-stopped --network host --shm-size 2g \
+  --mount type=bind,src=/absolute/path/to/data,dst=/data \
+  --mount type=bind,src=/absolute/path/to/state,dst=/state \
+  --entrypoint python3 \
+  fluxon_quick_start:<version> \
+  -c '
+from fluxon_py.quick_start import serve_s3_single_node
+
+kv_master_config = {
+    "etcd_endpoints": ["127.0.0.1:22379"],
+    "cluster_name": "fluxon_s3",
+    "instance_key": "fluxon_s3_master",
+    "port": 25100,
+    "log_dir": "/state/kv-master/log",
+    "monitoring": {
+        "prometheus_base_url": "http://127.0.0.1:24000/v1/prometheus",
+        "prom_remote_write_url": ["http://127.0.0.1:24000/v1/prometheus/write"],
+        "otlp_log_api": {
+            "otlp_endpoint": "http://127.0.0.1:24000/v1/otlp/v1/logs",
+            "db_name": "public",
+            "table_name": "fluxon_logs",
+        },
+    },
+}
+kv_owner_config = {
+    "instance_key": "fluxon_s3_owner",
+    "contribute_to_cluster_pool_size": {"dram": 1073741824, "vram": {}},
+    "fluxonkv_spec": {
+        "etcd_addresses": ["127.0.0.1:22379"],
+        "cluster_name": "fluxon_s3",
+        "share_mem_path": "/dev/shm/fluxon-s3",
+        "sub_cluster": "default",
+        "large_file_paths": ["/state/kv-owner/large"],
+    },
+}
+serve_s3_single_node(
+    "/data",
+    "/state",
+    kv_master_config=kv_master_config,
+    kv_owner_config=kv_owner_config,
+    export_name="local-data",
+)
+'
+```
+
+Use a Python package and image version containing the same feature set. Keep the panel port private
+until the bootstrap credentials have been replaced.
 
 ## When Not To Use Quick Start
 

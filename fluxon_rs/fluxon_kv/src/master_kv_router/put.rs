@@ -15,9 +15,9 @@ use super::{
         OwnerSsdPublishItem, OwnerSsdPublishItemResp, OwnerSsdPublishOutcome, PutAppendDoneReq,
         PutAppendDoneResp, PutAppendRevokeReq, PutAppendRevokeResp, PutAppendStartOutcome,
         PutAppendStartReq, PutAppendStartResp, PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq,
-        PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq, PutStartResp, ReleaseLocalGrantReq,
-        ReleaseLocalGrantResp, ReserveLocalGrantOutcome, ReserveLocalGrantReq,
-        ReserveLocalGrantResp, build_shared_put_atomic_group_assignments,
+        PutDoneResp, PutRevokeReq, PutRevokeResp, PutStartReq, PutStartResp, RadixKvMetadata,
+        ReleaseLocalGrantReq, ReleaseLocalGrantResp, ReserveLocalGrantOutcome,
+        ReserveLocalGrantReq, ReserveLocalGrantResp, build_shared_put_atomic_group_assignments,
     },
     node_generation_is_current_live,
     placement::PutPlacementTarget,
@@ -53,6 +53,22 @@ use std::{
 };
 
 pub type PutIDForAKey = (u64, u32);
+
+fn validate_radix_metadata(key: &str, radix: &RadixKvMetadata) -> Result<(), String> {
+    if radix.parent_key.as_deref().is_some_and(str::is_empty) {
+        return Err("radix parent key must be non-empty when present".to_string());
+    }
+    if radix.depth == 0 && radix.parent_key.is_some() {
+        return Err("a depth-zero radix key must not have a parent".to_string());
+    }
+    if radix.depth > 0 && radix.parent_key.is_none() {
+        return Err("a non-root radix key must have a parent".to_string());
+    }
+    if radix.parent_key.as_deref() == Some(key) {
+        return Err("a radix key cannot be its own parent".to_string());
+    }
+    Ok(())
+}
 
 fn publish_owner_ssd_item(
     view: &MasterKvRouterView,
@@ -504,7 +520,10 @@ fn validate_put_done_committed_slot(
     let invalid = |detail: String| {
         msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument { detail })
     };
-    if slot.slot_size == 0 || slot.len > slot.slot_size {
+    if slot.slot_size == 0
+        || slot.slot_size % crate::OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES != 0
+        || slot.len > slot.slot_size
+    {
         return Err(invalid(format!(
             "invalid committed local slot geometry: grant_id={} slot_size={} len={}",
             slot.grant_id, slot.slot_size, slot.len
@@ -541,9 +560,7 @@ fn validate_put_done_committed_slot(
     let grant_addr = grant_base
         .checked_add(grant.allocation.addr())
         .ok_or_else(|| invalid("committed local slot grant address overflow".to_string()))?;
-    let slot_offset = slot
-        .slot_size
-        .checked_mul(u64::from(slot.slot_index))
+    let slot_offset = crate::owner_local_reserve_slot_offset_bytes(slot.slot_index)
         .ok_or_else(|| invalid("committed local slot offset overflow".to_string()))?;
     let slot_end = slot_offset
         .checked_add(slot.slot_size)
@@ -713,6 +730,7 @@ async fn publish_completed_put_route(
     put_id: PutIDForAKey,
     lease_id_opt: Option<u64>,
     atomic_group: Option<Arc<super::msg_pack::PutAtomicGroup>>,
+    radix: Option<RadixKvMetadata>,
     node_id: NodeID,
     publish_tag: crate::master_seg_manager::NodeTombTag,
     completed_info: KvMemoryReplica,
@@ -723,6 +741,7 @@ async fn publish_completed_put_route(
         put_id,
         lease_id: lease_id_opt,
         atomic_group: atomic_group.clone(),
+        radix,
         node_replicas: RwLock::new(HashMap::from([(
             node_id.clone(),
             KvNodeReplicas::memory(publish_tag.clone(), completed_info),
@@ -1511,6 +1530,20 @@ async fn handle_put_done_with_resolved_group(
 
     let put_id = req.serialize_part.put_id;
     let lease_id_opt = req.serialize_part.lease_id;
+    if let Some(radix) = req.serialize_part.radix.as_ref() {
+        if let Err(detail) = validate_radix_metadata(&req.serialize_part.key, radix) {
+            let err = msg_and_error::KvError::Api(msg_and_error::ApiError::InvalidArgument {
+                detail: format!(
+                    "invalid radix metadata for key={}: {detail}",
+                    req.serialize_part.key
+                ),
+            });
+            return MsgPack {
+                serialize_part: crate::rpcresp_kvresult_convert::FromError::from_error(&err),
+                raw_bytes: Vec::new(),
+            };
+        }
+    }
     let full_put_id: (String, u64, u32) = (req.serialize_part.key.clone(), put_id.0, put_id.1);
     let mut local_cache_holder_id: Option<u64>;
     let atomic_group = if let Some(group) = resolved_atomic_group {
@@ -1822,6 +1855,7 @@ async fn handle_put_done_with_resolved_group(
             put_id,
             lease_id: lease_id_opt,
             atomic_group: atomic_group.clone(),
+            radix: req.serialize_part.radix.clone(),
             node_replicas: RwLock::new(HashMap::from([(
                 node_id.clone(),
                 KvNodeReplicas::memory(publish_tag.clone(), completed_info),
@@ -1996,6 +2030,7 @@ async fn handle_put_done_with_resolved_group(
                 put_id,
                 lease_id_opt,
                 atomic_group,
+                req.serialize_part.radix.clone(),
                 node_id,
                 tomb_tag,
                 completed_info,
@@ -2131,6 +2166,7 @@ pub async fn handle_batch_put_done(
                     committed_slot: item.committed_slot,
                     publish_local_cache: item.publish_local_cache,
                     atomic_group: item.atomic_group,
+                    radix: item.radix,
                 },
                 raw_bytes: Vec::new(),
             },
@@ -2239,6 +2275,7 @@ pub async fn handle_grouped_batch_put_done(
                     committed_slot: item.committed_slot,
                     publish_local_cache: item.publish_local_cache,
                     atomic_group: None,
+                    radix: item.radix,
                 },
                 raw_bytes: Vec::new(),
             },

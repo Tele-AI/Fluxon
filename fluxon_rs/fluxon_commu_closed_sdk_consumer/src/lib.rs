@@ -26,7 +26,7 @@ use fluxon_commu_contract::{
 
 pub mod rdma_probe;
 
-pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 6;
+pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 7;
 pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 9;
 pub const FLUXON_COMMU_CLOSED_HOST_CALLBACKS_ABI_VERSION: u32 = 8;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK: i32 = 0;
@@ -2315,5 +2315,32 @@ pub async fn drop_runtime_handle(
         other => Err(ClosedSdkConsumerError::RuntimeUnexpectedResponse {
             detail: format!("{other:?}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FLUXON_COMMU_CLOSED_ABI_VERSION, FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION, abi_version,
+        assert_abi_compatible, query_version, sdk_schema_version,
+    };
+
+    #[test]
+    fn bundled_sdk_matches_the_consumer_contract() {
+        assert_eq!(
+            env!("FLUXON_COMMU_CLOSED_TRANSFER_LINK_SNAPSHOT_MODE"),
+            "watch-v1"
+        );
+        assert_eq!(sdk_schema_version(), FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION);
+        assert_eq!(abi_version(), FLUXON_COMMU_CLOSED_ABI_VERSION);
+        assert_abi_compatible().expect("bundled closed SDK ABI must match the consumer");
+
+        let version = query_version().expect("bundled closed SDK version query must succeed");
+        assert_eq!(
+            version.sdk_schema_version,
+            FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION
+        );
+        assert_eq!(version.abi_version, FLUXON_COMMU_CLOSED_ABI_VERSION);
+        assert_eq!(version.boundary_mode, "closed-sdk-consumer");
     }
 }

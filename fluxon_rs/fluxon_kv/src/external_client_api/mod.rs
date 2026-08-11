@@ -6246,6 +6246,7 @@ key={}, attempt={}/{}, err={}",
                         reject_if_exist_same_key,
                         make_replica_task,
                         preferred_sub_cluster: preferred_sub_cluster.map(|s| s.to_string()),
+                        radix: None,
                     })
                     .collect(),
                 atomic_group_lens: None,

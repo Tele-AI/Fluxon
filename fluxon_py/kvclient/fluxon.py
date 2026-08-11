@@ -114,6 +114,74 @@ def _validate_put_atomic_groups(
     return normalized_group_lens
 
 
+def _validate_put_radix_metadata(
+    keys: List[str],
+    radix_parent_keys: Optional[List[Optional[str]]],
+    content_depths: Optional[List[int]],
+) -> Tuple[Optional[List[Optional[str]]], Optional[List[int]]]:
+    if radix_parent_keys is None and content_depths is None:
+        return None, None
+    if radix_parent_keys is None or content_depths is None:
+        raise ValueError(
+            "radix_parent_keys and content_depths must be provided together"
+        )
+    if not isinstance(radix_parent_keys, list):
+        raise ValueError(
+            "radix_parent_keys must be list[Optional[str]] when provided; "
+            f"got {type(radix_parent_keys)}"
+        )
+    if not isinstance(content_depths, list):
+        raise ValueError(
+            "content_depths must be list[int] when provided; "
+            f"got {type(content_depths)}"
+        )
+    if len(radix_parent_keys) != len(keys) or len(content_depths) != len(keys):
+        raise ValueError(
+            "radix metadata lengths must match keys length; "
+            f"keys={len(keys)} parents={len(radix_parent_keys)} "
+            f"depths={len(content_depths)}"
+        )
+
+    normalized_parents: List[Optional[str]] = []
+    normalized_depths: List[int] = []
+    for index, (key, parent, depth) in enumerate(
+        zip(keys, radix_parent_keys, content_depths)
+    ):
+        if type(depth) is not int:
+            raise ValueError(
+                "content_depths items must be int; "
+                f"index={index} got={type(depth)}"
+            )
+        if depth < 0 or depth > 0xFFFFFFFF:
+            raise ValueError(
+                "content_depths items must fit u32; "
+                f"index={index} got={depth}"
+            )
+        if parent is not None and (not isinstance(parent, str) or not parent):
+            raise ValueError(
+                "radix_parent_keys items must be non-empty str or None; "
+                f"index={index} got={parent!r}"
+            )
+        if depth == 0 and parent is not None:
+            raise ValueError(
+                "a depth-zero radix key must not have a parent; "
+                f"index={index} key={key!r} parent={parent!r}"
+            )
+        if depth > 0 and parent is None:
+            raise ValueError(
+                "a non-root radix key must have a parent; "
+                f"index={index} key={key!r} depth={depth}"
+            )
+        if parent == key:
+            raise ValueError(
+                "a radix key cannot be its own parent; "
+                f"index={index} key={key!r}"
+            )
+        normalized_parents.append(parent)
+        normalized_depths.append(depth)
+    return normalized_parents, normalized_depths
+
+
 def _percentile_nearest_rank_ns(sorted_values: List[int], percentile: int) -> int:
     idx = ((len(sorted_values) * percentile + 99) // 100) - 1
     idx = max(0, min(idx, len(sorted_values) - 1))
@@ -1840,6 +1908,11 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             opts.atomic_group_lens if opts is not None else None,
             make_replica_task_mask,
         )
+        radix_parent_keys, content_depths = _validate_put_radix_metadata(
+            keys,
+            opts.radix_parent_keys if opts is not None else None,
+            opts.content_depths if opts is not None else None,
+        )
         inner_res = self._client.local_fast_put_start(
             keys,
             value_len,
@@ -1848,6 +1921,8 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             write_through=write_through,
             make_replica_task=make_replica_task,
             make_replica_task_mask=make_replica_task_mask,
+            radix_parent_keys=radix_parent_keys,
+            content_depths=content_depths,
             atomic_group_lens=atomic_group_lens,
         )
         if not inner_res.is_ok():
