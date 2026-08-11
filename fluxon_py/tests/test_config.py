@@ -342,6 +342,7 @@ def test_fluxonkv_owner_ssd_capacity():
         owner["fluxonkv_spec"]["large_limit_size"] = [67108864]
         owner["fluxonkv_spec"]["ssd_write_rate_limit_bytes_per_sec"] = 268435456
         owner["fluxonkv_spec"]["ssd_write_burst_bytes"] = 67108864
+        owner["fluxonkv_spec"]["ssd_capacity_writeback_enabled"] = False
         config = FluxonKvClientConfig(owner)
         assert config.to_dict()["fluxonkv_spec"]["large_limit_size"] == [67108864]
         assert (
@@ -349,11 +350,16 @@ def test_fluxonkv_owner_ssd_capacity():
             == 268435456
         )
         assert config.to_dict()["fluxonkv_spec"]["ssd_write_burst_bytes"] == 67108864
+        assert (
+            config.to_dict()["fluxonkv_spec"]["ssd_capacity_writeback_enabled"]
+            is False
+        )
         rendered = config.to_fluxon_kv_client_config_yaml_str()
         assert "large_limit_size:" in rendered
         assert "- 67108864" in rendered
         assert "ssd_write_rate_limit_bytes_per_sec: 268435456" in rendered
         assert "ssd_write_burst_bytes: 67108864" in rendered
+        assert "ssd_capacity_writeback_enabled: false" in rendered
 
         unpaired = _owner_fluxonkv_base_config(tag="owner_ssd_unpaired_limit")
         unpaired["fluxonkv_spec"]["large_limit_size"] = [67108864]

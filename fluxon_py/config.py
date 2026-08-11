@@ -121,6 +121,7 @@ fluxonkv_spec:                        # fluxon kv specific config (dict(optional
   large_limit_size:                   # Optional per-root SSD capacity in bytes (list(optional))
   ssd_write_rate_limit_bytes_per_sec: # Optional non-queueing SSD write rate (int(optional))
   ssd_write_burst_bytes:              # Paired immediate SSD write burst (int(optional))
+  ssd_capacity_writeback_enabled:     # Preserve last backing during capacity eviction; omitted means true (bool(optional))
   p2p_listen_port:                    # P2P QUIC listen port override (int(optional))
   redis_compat:                       # Enable Redis protocol shim (dict(optional))
     listen_addr:                      # TCP listen addr, e.g. "127.0.0.1:16379" (str)
@@ -469,6 +470,7 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
             "large_limit_size",
             "ssd_write_rate_limit_bytes_per_sec",
             "ssd_write_burst_bytes",
+            "ssd_capacity_writeback_enabled",
         ]
         for key in forbidden_spec_keys:
             if key in spec:
@@ -527,6 +529,7 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
 
     write_rate = spec.get("ssd_write_rate_limit_bytes_per_sec")
     write_burst = spec.get("ssd_write_burst_bytes")
+    capacity_writeback = spec.get("ssd_capacity_writeback_enabled")
     if (write_rate is None) != (write_burst is None):
         raise ValueError(
             "fluxonkv_spec.ssd_write_rate_limit_bytes_per_sec and "
@@ -544,6 +547,13 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
             raise ValueError("SSD write rate and burst must both be positive integers")
         if "large_limit_size" not in spec:
             raise ValueError("SSD write admission requires fluxonkv_spec.large_limit_size")
+    if capacity_writeback is not None:
+        if not isinstance(capacity_writeback, bool):
+            raise ValueError("ssd_capacity_writeback_enabled must be a bool")
+        if "large_limit_size" not in spec:
+            raise ValueError(
+                "SSD capacity write-back policy requires fluxonkv_spec.large_limit_size"
+            )
 
 
 class FluxonKvClientConfig():

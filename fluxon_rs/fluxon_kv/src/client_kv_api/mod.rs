@@ -5731,6 +5731,7 @@ mod owner_reclaim_slot_tests {
                 }],
                 write_rate_limit_bytes_per_sec: Some(1),
                 write_burst_bytes: Some(4),
+                capacity_writeback_enabled: true,
             }),
         })
         .await

@@ -2687,6 +2687,7 @@ mod owner_get_holding_reclaim_tests {
                     limit_bytes: MIN_CAPACITY_BYTES,
                     write_rate_limit_bytes_per_sec: None,
                     write_burst_bytes: None,
+                    capacity_writeback_enabled: true,
                 });
                 let target = std::env::var("CARGO_TARGET_DIR")
                     .expect("SSD integration test requires the NVMe Cargo target");

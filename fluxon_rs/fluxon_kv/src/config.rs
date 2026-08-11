@@ -924,6 +924,11 @@ pub struct FluxonKvSpecYaml {
     /// `ssd_write_rate_limit_bytes_per_sec`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssd_write_burst_bytes: Option<u64>,
+    /// Whether capacity eviction may synchronously preserve an exact last
+    /// backing on SSD. `false` keeps normal-Put early SSD backing and SSD Get,
+    /// while making capacity victims follow the ordinary direct-Drop path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssd_capacity_writeback_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -941,6 +946,7 @@ pub struct KvSsdStorageConfig {
     pub limit_bytes: u64,
     pub write_rate_limit_bytes_per_sec: Option<u64>,
     pub write_burst_bytes: Option<u64>,
+    pub capacity_writeback_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1635,6 +1641,10 @@ impl ClientConfigYaml {
         let ssd_write_rate_limit_bytes_per_sec =
             self.fluxonkv_spec.ssd_write_rate_limit_bytes_per_sec;
         let ssd_write_burst_bytes = self.fluxonkv_spec.ssd_write_burst_bytes;
+        let ssd_capacity_writeback_enabled = self
+            .fluxonkv_spec
+            .ssd_capacity_writeback_enabled
+            .unwrap_or(true);
         let write_limit = match (ssd_write_rate_limit_bytes_per_sec, ssd_write_burst_bytes) {
             (None, None) => None,
             (Some(rate), Some(burst)) if rate > 0 && burst > 0 => Some((rate, burst)),
@@ -1655,9 +1665,11 @@ impl ClientConfigYaml {
         };
 
         let ssd_storage = if is_external {
-            if write_limit.is_some() {
+            if write_limit.is_some() || self.fluxonkv_spec.ssd_capacity_writeback_enabled.is_some()
+            {
                 return Err(ConfigError::InvalidClientConfig {
-                    detail: "SSD write admission is only valid on owner configs".to_string(),
+                    detail: "SSD write admission and capacity write-back policy are only valid on owner configs"
+                        .to_string(),
                 }
                 .into_kverror());
             }
@@ -1665,9 +1677,11 @@ impl ClientConfigYaml {
         } else {
             match std::mem::take(&mut self.fluxonkv_spec.large_limit_size) {
                 None | Some(YamlNullable::Null) => {
-                    if write_limit.is_some() {
+                    if write_limit.is_some()
+                        || self.fluxonkv_spec.ssd_capacity_writeback_enabled.is_some()
+                    {
                         return Err(ConfigError::InvalidClientConfig {
-                            detail: "SSD write admission requires fluxonkv_spec.large_limit_size"
+                            detail: "SSD write admission and capacity write-back policy require fluxonkv_spec.large_limit_size"
                                 .to_string(),
                         }
                         .into_kverror());
@@ -1702,6 +1716,7 @@ impl ClientConfigYaml {
                         limit_bytes,
                         write_rate_limit_bytes_per_sec,
                         write_burst_bytes,
+                        capacity_writeback_enabled: ssd_capacity_writeback_enabled,
                     })
                 }
             }
@@ -2412,6 +2427,7 @@ fluxonkv_spec:
   large_limit_size: [67108864]
   ssd_write_rate_limit_bytes_per_sec: 268435456
   ssd_write_burst_bytes: 67108864
+  ssd_capacity_writeback_enabled: false
   sub_cluster: rack-a
 "#,
         )
@@ -2435,6 +2451,13 @@ fluxonkv_spec:
                 .as_ref()
                 .and_then(|ssd| ssd.write_burst_bytes),
             Some(67108864)
+        );
+        assert_eq!(
+            valid
+                .ssd_storage
+                .as_ref()
+                .map(|ssd| ssd.capacity_writeback_enabled),
+            Some(false)
         );
 
         let multiple_roots = ClientConfigYaml::from_str(

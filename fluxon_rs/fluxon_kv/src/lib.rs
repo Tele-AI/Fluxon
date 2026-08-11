@@ -913,6 +913,7 @@ fn build_side_transfer_worker_config_yaml(
             large_limit_size: None,
             ssd_write_rate_limit_bytes_per_sec: None,
             ssd_write_burst_bytes: None,
+            ssd_capacity_writeback_enabled: None,
             p2p_listen_port: side_config.fluxonkv_spec.p2p_listen_port,
             redis_compat: None,
             sub_cluster: None,
@@ -2052,6 +2053,7 @@ async fn run_client_impl(
                     }],
                     write_rate_limit_bytes_per_sec: ssd.write_rate_limit_bytes_per_sec,
                     write_burst_bytes: ssd.write_burst_bytes,
+                    capacity_writeback_enabled: ssd.capacity_writeback_enabled,
                 })
         })
         .transpose()?;

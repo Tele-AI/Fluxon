@@ -3202,10 +3202,18 @@ fn owner_source_eviction_identity(
     }
 }
 
+fn owner_source_ssd_policy(capacity_writeback_enabled: bool) -> OwnerSourceSsdPolicy {
+    if capacity_writeback_enabled {
+        OwnerSourceSsdPolicy::SelectLastLive
+    } else {
+        OwnerSourceSsdPolicy::Drop
+    }
+}
+
 fn owner_source_eviction_victim(
     identity: &super::OwnerHotReplicaIdentity,
     memory_info: &crate::memholder::MemoryInfo,
-    ssd_enabled: bool,
+    ssd_capacity_writeback_enabled: bool,
 ) -> Option<OwnerSourceEvictionVictim> {
     let (slot_size, grant_id, slot_index) = memory_info.local_reserve_resident_slot_ref()?;
     Some(OwnerSourceEvictionVictim {
@@ -3217,11 +3225,7 @@ fn owner_source_eviction_victim(
             slot_size,
         },
         ssd_backing_len: None,
-        ssd_policy: if ssd_enabled {
-            OwnerSourceSsdPolicy::SelectLastLive
-        } else {
-            OwnerSourceSsdPolicy::Drop
-        },
+        ssd_policy: owner_source_ssd_policy(ssd_capacity_writeback_enabled),
     })
 }
 
@@ -3342,8 +3346,12 @@ fn prepare_owner_source_eviction_event(
     };
     debug_assert_eq!(resolved_trigger, trigger);
 
+    let ssd_capacity_writeback_enabled = inner
+        .ssd_storage
+        .as_ref()
+        .is_some_and(|store| store.capacity_writeback_enabled());
     let Some(victim) =
-        owner_source_eviction_victim(&trigger, source.as_ref(), inner.ssd_storage.is_some())
+        owner_source_eviction_victim(&trigger, source.as_ref(), ssd_capacity_writeback_enabled)
     else {
         event.selection_debt.release();
         inner
@@ -3563,8 +3571,18 @@ where
 
 #[cfg(test)]
 mod owner_ssd_fast_drop_tests {
-    use super::reclaim_admission_drops_before_ssd_persist;
+    use super::{owner_source_ssd_policy, reclaim_admission_drops_before_ssd_persist};
+    use crate::master_kv_router::msg_pack::OwnerSourceSsdPolicy;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn early_only_ssd_mode_keeps_capacity_eviction_on_direct_drop() {
+        assert_eq!(owner_source_ssd_policy(false), OwnerSourceSsdPolicy::Drop);
+        assert_eq!(
+            owner_source_ssd_policy(true),
+            OwnerSourceSsdPolicy::SelectLastLive
+        );
+    }
 
     #[limit_thirdparty::tokio::test]
     async fn admission_drops_finish_before_ssd_persist_starts() {

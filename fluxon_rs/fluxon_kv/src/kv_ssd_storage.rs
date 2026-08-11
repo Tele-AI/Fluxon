@@ -43,6 +43,7 @@ pub struct KvSsdStorageInit {
     pub roots: Vec<KvSsdStorageRootLimit>,
     pub write_rate_limit_bytes_per_sec: Option<u64>,
     pub write_burst_bytes: Option<u64>,
+    pub capacity_writeback_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -180,6 +181,7 @@ pub struct KvSsdStorage {
     cache: HybridCache<KvSsdKey, Vec<u8>>,
     root_dir: PathBuf,
     capacity_bytes: u64,
+    capacity_writeback_enabled: bool,
     write_rate_limiter: Option<Mutex<WriteRateLimiter>>,
     // Exactly one admitted write batch may own Foyer's global durability
     // barrier. New unrelated pressure batches use try_lock and fail open to
@@ -295,6 +297,7 @@ impl KvSsdStorage {
             capacity_bytes = root.limit_bytes,
             write_rate_limit_bytes_per_sec = init.write_rate_limit_bytes_per_sec,
             write_burst_bytes = init.write_burst_bytes,
+            capacity_writeback_enabled = init.capacity_writeback_enabled,
             direct_io = true,
             "Initialized owner-local KV SSD backing"
         );
@@ -303,6 +306,7 @@ impl KvSsdStorage {
             cache,
             root_dir: root.root_dir.clone(),
             capacity_bytes: root.limit_bytes,
+            capacity_writeback_enabled: init.capacity_writeback_enabled,
             write_rate_limiter,
             persist_batch_gate: Arc::new(AsyncMutex::new(())),
             entry_lengths: Mutex::new(HashMap::new()),
@@ -341,6 +345,10 @@ impl KvSsdStorage {
 
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
+    }
+
+    pub(crate) fn capacity_writeback_enabled(&self) -> bool {
+        self.capacity_writeback_enabled
     }
 
     pub fn usage_snapshot(&self) -> KvSsdStorageDeviceUsage {
@@ -935,6 +943,7 @@ mod tests {
             }],
             write_rate_limit_bytes_per_sec: Some(1),
             write_burst_bytes: Some(10),
+            capacity_writeback_enabled: true,
         })
         .await
         .unwrap();
@@ -962,6 +971,7 @@ mod tests {
             }],
             write_rate_limit_bytes_per_sec: Some(1),
             write_burst_bytes: Some(10),
+            capacity_writeback_enabled: true,
         })
         .await
         .unwrap();
@@ -987,6 +997,7 @@ mod tests {
             }],
             write_rate_limit_bytes_per_sec: None,
             write_burst_bytes: None,
+            capacity_writeback_enabled: true,
         })
         .await
         .unwrap();
@@ -1050,6 +1061,7 @@ mod tests {
             }],
             write_rate_limit_bytes_per_sec: None,
             write_burst_bytes: None,
+            capacity_writeback_enabled: true,
         })
         .await
         .unwrap();
@@ -1097,6 +1109,7 @@ mod tests {
             }],
             write_rate_limit_bytes_per_sec: None,
             write_burst_bytes: None,
+            capacity_writeback_enabled: true,
         })
         .await
         .unwrap();
@@ -1159,6 +1172,7 @@ mod tests {
             }],
             write_rate_limit_bytes_per_sec: None,
             write_burst_bytes: None,
+            capacity_writeback_enabled: true,
         })
         .await
         .unwrap();
@@ -1245,6 +1259,7 @@ mod tests {
             }],
             write_rate_limit_bytes_per_sec: None,
             write_burst_bytes: None,
+            capacity_writeback_enabled: true,
         })
         .await
         .unwrap();
@@ -1287,6 +1302,7 @@ mod tests {
             }],
             write_rate_limit_bytes_per_sec: None,
             write_burst_bytes: None,
+            capacity_writeback_enabled: true,
         })
         .await
         .unwrap();
