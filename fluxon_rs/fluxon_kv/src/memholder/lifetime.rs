@@ -10,6 +10,7 @@ use crate::master_kv_router::msg_pack::{
     BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, DeleteAckItem, DeleteClientKvMetaCacheItem,
 };
 use crate::master_kv_router::{MasterKvRouterView, OwnerHoldingGetInfo};
+use crate::p2p::control_plane_rpc::call_control_plane_rpc;
 use crate::p2p::msg_pack::{MsgPack, RPCCaller};
 use crate::rpcresp_kvresult_convert::msg_and_error;
 use async_trait::async_trait;
@@ -511,16 +512,16 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
             raw_bytes: Vec::new(),
         };
 
-        let resp = rpc_caller
-            .call(
-                ctx.p2p_module(),
-                target.node_id.clone().into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                0,
-            )
-            .await
-            .map_err(|err| format!("{err:?}"))?;
+        let resp = call_control_plane_rpc(
+            &rpc_caller,
+            ctx.p2p_module(),
+            target.node_id.clone().into(),
+            req,
+            Some(std::time::Duration::from_secs(60)),
+            0,
+        )
+        .await
+        .map_err(|err| format!("{err:?}"))?;
 
         if resp.serialize_part.error_code != msg_and_error::OK {
             return Err(format!(
@@ -638,16 +639,16 @@ impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
             raw_bytes: Vec::new(),
         };
 
-        let resp = rpc_caller
-            .call(
-                ctx.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(Duration::from_secs(60)),
-                0,
-            )
-            .await
-            .map_err(|err| format!("{err:?}"))?;
+        let resp = call_control_plane_rpc(
+            &rpc_caller,
+            ctx.p2p_module(),
+            master_node_id.into(),
+            req,
+            Some(Duration::from_secs(60)),
+            0,
+        )
+        .await
+        .map_err(|err| format!("{err:?}"))?;
 
         if resp.serialize_part.error_code != msg_and_error::OK {
             return Err(format!(
@@ -689,7 +690,7 @@ impl OwnerExternalMemMgr {
             .iter()
             .filter_map(|entry| {
                 owner_external_holding_matches_generation(
-                    &entry.value().req_node_id,
+                    entry.value().req_node_id.as_ref(),
                     entry.value().requester_node_start_time,
                     node_id,
                     node_start_time,
@@ -704,7 +705,7 @@ impl OwnerExternalMemMgr {
                     .as_map()
                     .remove_if(key, |_, holding| {
                         owner_external_holding_matches_generation(
-                            &holding.req_node_id,
+                            holding.req_node_id.as_ref(),
                             holding.requester_node_start_time,
                             node_id,
                             node_start_time,
@@ -804,7 +805,7 @@ impl MemholderManagerTrait for OwnerExternalMemMgr {
             };
             let Some(member) = ctx
                 .cluster_manager()
-                .get_member_info_cached(&holding.req_node_id)
+                .get_member_info_cached(holding.req_node_id.as_ref())
             else {
                 continue;
             };
@@ -812,7 +813,7 @@ impl MemholderManagerTrait for OwnerExternalMemMgr {
                 continue;
             }
             targets.insert(DeleteTargetMember::new(
-                holding.req_node_id.clone(),
+                holding.req_node_id.to_string(),
                 holding_epoch,
             ));
         }

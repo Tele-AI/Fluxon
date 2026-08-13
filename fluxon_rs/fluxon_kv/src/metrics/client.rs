@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::master_kv_router::msg_pack::{GetMasterOnlyMetricPartReq, GetMasterOnlyMetricPartResp};
+use crate::p2p::control_plane_rpc::call_control_plane_rpc;
 use crate::p2p::msg_pack::{MsgPack, RPCCaller};
 use crate::p2p::p2p_module::P2pModule;
 use crate::rpcresp_kvresult_convert::msg_and_error::KvError;
@@ -31,19 +32,19 @@ pub async fn get_master_only_metric_map(
         part: part.to_string(),
     };
     let caller = RPCCaller::<GetMasterOnlyMetricPartReq>::new();
-    let resp: MsgPack<GetMasterOnlyMetricPartResp> = caller
-        .call(
-            fw.p2p_view().p2p_module(),
-            master_node_id.into(),
-            MsgPack {
-                serialize_part: req,
-                raw_bytes: Vec::new(),
-            },
-            Some(Duration::from_secs(30)),
-            0,
-        )
-        .await
-        .map_err(KvError::from)?;
+    let resp: MsgPack<GetMasterOnlyMetricPartResp> = call_control_plane_rpc(
+        &caller,
+        fw.p2p_view().p2p_module(),
+        master_node_id.into(),
+        MsgPack {
+            serialize_part: req,
+            raw_bytes: Vec::new(),
+        },
+        Some(Duration::from_secs(30)),
+        0,
+    )
+    .await
+    .map_err(KvError::from)?;
 
     rpcresp_kvresult_convert::try_from_code(
         resp.serialize_part.error_code,

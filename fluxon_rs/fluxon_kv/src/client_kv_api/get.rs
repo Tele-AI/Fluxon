@@ -20,7 +20,7 @@ use crate::{
         GetDoneResp, GetMetaReq, GetMetaResp, GetPreparedLocalReserveTarget, GetRevokeReq,
         GetSourceKind, GetStartReq, GetStartResp,
     },
-    p2p::msg_pack::MsgPack,
+    p2p::{control_plane_rpc::call_control_plane_rpc, msg_pack::MsgPack},
     rpcresp_kvresult_convert::msg_and_error::codes_api,
     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK},
 };
@@ -1105,11 +1105,16 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let resp = self
-            .rpc_caller_batch_is_exist
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_batch_is_exist,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         let resp_part = resp.serialize_part;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp_part.error_code,
@@ -1466,11 +1471,16 @@ impl ClientKvApiInner {
             .await?;
 
         // 调用 RPC
-        let resp = self
-            .rpc_caller_get_meta
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_get_meta,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
 
         Ok(resp.serialize_part)
     }
@@ -1499,11 +1509,16 @@ impl ClientKvApiInner {
             .await?;
 
         // 调用 RPC
-        let resp = self
-            .rpc_caller_get_start
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_get_start,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
 
         Ok(resp.serialize_part)
     }
@@ -1536,11 +1551,16 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let resp = self
-            .rpc_caller_batch_get_start
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_batch_get_start,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -1575,20 +1595,19 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let resp = self
-            .rpc_caller_batch_get_bind
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                MsgPack {
-                    serialize_part: BatchGetBindReq { items },
-                    raw_bytes: Vec::new(),
-                },
-                None,
-                0,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_batch_get_bind,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            MsgPack {
+                serialize_part: BatchGetBindReq { items },
+                raw_bytes: Vec::new(),
+            },
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -1611,11 +1630,16 @@ impl ClientKvApiInner {
             .await?;
 
         // 调用 RPC
-        let _resp = self
-            .rpc_caller_get_revoke
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
-            .await
-            .map_err(KvError::from)?;
+        let _resp = call_control_plane_rpc(
+            &self.rpc_caller_get_revoke,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
 
         Ok(())
     }
@@ -1642,11 +1666,16 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let resp = self
-            .rpc_caller_batch_get_revoke
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_batch_get_revoke,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -1669,11 +1698,16 @@ impl ClientKvApiInner {
             .await?;
 
         // 调用 RPC
-        let resp = self
-            .rpc_caller_get_done
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_get_done,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
 
         Ok(resp.serialize_part)
     }
@@ -1710,11 +1744,16 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let resp = self
-            .rpc_caller_batch_get_done
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 2)
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_batch_get_done,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),

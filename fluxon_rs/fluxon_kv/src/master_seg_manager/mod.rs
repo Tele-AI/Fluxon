@@ -6,6 +6,7 @@ use self::one_seg_allocator::{
     Allocation, NodePoolCapacityBudget, NodePoolCapacitySnapshot, OneSegAllocator,
 };
 use crate::cluster_manager::NodeID;
+use crate::p2p::control_plane_rpc::call_control_plane_rpc;
 use crate::p2p::p2p_module::P2pModuleAccessTrait;
 use crate::rpcresp_kvresult_convert::msg_and_error::OK;
 use crate::{
@@ -466,24 +467,23 @@ impl MasterSegManager {
 
         tracing::info!("Requesting segment registration from node: {}", node_id);
 
-        let resp = inner
-            .rpc_caller_request_segment_registration
-            .call(
-                inner.view().p2p_module(),
-                node_id.clone(),
-                req,
-                Some(Duration::from_secs(30)), // 30 second timeout
-                1, // Master controls retry/backoff to validate member liveness/epoch before each attempt
-            )
-            .await
-            .map_err(|e| {
-                tracing::warn!(
-                    "Failed to request segment registration from node {}: {:?}",
-                    node_id,
-                    e
-                );
+        let resp = call_control_plane_rpc(
+            &inner.rpc_caller_request_segment_registration,
+            inner.view().p2p_module(),
+            node_id.clone(),
+            req,
+            Some(Duration::from_secs(30)), // 30 second timeout
+            1, // Master controls retry/backoff to validate member liveness/epoch before each attempt
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                "Failed to request segment registration from node {}: {:?}",
+                node_id,
                 e
-            })?;
+            );
+            e
+        })?;
 
         if resp.serialize_part.error_code != OK {
             let error = crate::rpcresp_kvresult_convert::msg_and_error::KvError::from_json(

@@ -4,6 +4,7 @@ use crate::client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAc
 use crate::cluster_manager::{ClusterManagerAccessTrait, NodeRole};
 use crate::config::ContributeToClusterPoolSize;
 use crate::master_seg_manager::msg_pack::SegmentDeviceMemInfo;
+use crate::p2p::control_plane_rpc::send_control_plane_rpc_response;
 use crate::p2p::p2p_module::P2pModule;
 use crate::p2p::p2p_module::P2pModuleAccessTrait;
 use crate::rpcresp_kvresult_convert::FromError;
@@ -118,6 +119,134 @@ impl MsgPackSerializePart for ResolveSideTransferLaneResp {
 }
 
 pub const SIDE_TRANSFER_PEERS_DIRNAME: &str = "side_transfer_peers";
+
+#[derive(Debug)]
+struct TransferRpcRequiredPeerSet {
+    members: Vec<ClusterMember>,
+    owner_peer_count: usize,
+    master_peer_count: usize,
+}
+
+impl TransferRpcRequiredPeerSet {
+    fn has_complete_roles(&self) -> bool {
+        self.owner_peer_count > 0 && self.master_peer_count == 1
+    }
+}
+
+fn transfer_rpc_required_peer_set(
+    self_member_id: &str,
+    members: Vec<ClusterMember>,
+) -> TransferRpcRequiredPeerSet {
+    let mut required = Vec::new();
+    let mut owner_peer_count = 0;
+    let mut master_peer_count = 0;
+
+    for member in members {
+        if member.id == self_member_id {
+            continue;
+        }
+        match member.node_role() {
+            NodeRole::Master => {
+                master_peer_count += 1;
+                required.push(member);
+            }
+            NodeRole::Client
+                if member
+                    .metadata
+                    .get("p2p_relay")
+                    .is_some_and(|value| value == "true")
+                    && !member
+                        .metadata
+                        .get("side_transfer_worker")
+                        .is_some_and(|value| value == "true") =>
+            {
+                owner_peer_count += 1;
+                required.push(member);
+            }
+            _ => {}
+        }
+    }
+    required.sort_by(|left, right| left.id.cmp(&right.id));
+    required.dedup_by(|left, right| left.id == right.id);
+
+    TransferRpcRequiredPeerSet {
+        members: required,
+        owner_peer_count,
+        master_peer_count,
+    }
+}
+
+#[cfg(test)]
+mod transfer_rpc_required_peer_tests {
+    use super::{ClusterMember, transfer_rpc_required_peer_set};
+    use std::collections::HashMap;
+
+    fn member(id: &str, metadata: &[(&str, &str)]) -> ClusterMember {
+        ClusterMember {
+            id: id.to_string(),
+            addresses: Vec::new(),
+            port: None,
+            node_start_time: 1,
+            metadata: metadata
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<HashMap<_, _>>(),
+            sub_cluster: None,
+            network: None,
+        }
+    }
+
+    #[test]
+    fn required_set_contains_master_and_segment_owners_only() {
+        let peers = transfer_rpc_required_peer_set(
+            "owner-self",
+            vec![
+                member("owner-self", &[("client", "true"), ("p2p_relay", "true")]),
+                member("master", &[("master", "true")]),
+                member("owner-peer", &[("client", "true"), ("p2p_relay", "true")]),
+                member(
+                    "side-worker",
+                    &[
+                        ("client", "true"),
+                        ("p2p_relay", "true"),
+                        ("side_transfer_worker", "true"),
+                    ],
+                ),
+                member("external", &[("external_client", "true")]),
+            ],
+        );
+
+        assert!(peers.has_complete_roles());
+        assert_eq!(peers.owner_peer_count, 1);
+        assert_eq!(peers.master_peer_count, 1);
+        assert_eq!(
+            peers
+                .members
+                .iter()
+                .map(|member| member.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["master", "owner-peer"]
+        );
+    }
+
+    #[test]
+    fn required_set_does_not_complete_without_master_or_owner_peer() {
+        let owner_only = transfer_rpc_required_peer_set(
+            "owner-self",
+            vec![member(
+                "owner-peer",
+                &[("client", "true"), ("p2p_relay", "true")],
+            )],
+        );
+        assert!(!owner_only.has_complete_roles());
+
+        let master_only = transfer_rpc_required_peer_set(
+            "owner-self",
+            vec![member("master", &[("master", "true")])],
+        );
+        assert!(!master_only.has_complete_roles());
+    }
+}
 
 pub(crate) fn parse_side_transfer_worker_lane_idx(instance_key: &str) -> Option<u16> {
     let (_, suffix) = instance_key.rsplit_once("__side_")?;
@@ -541,40 +670,10 @@ impl ClientSegPool {
         &self.inner().large_file_paths
     }
 
-    fn transfer_rpc_fast_path_eligible_members(&self) -> Vec<ClusterMember> {
+    fn transfer_rpc_fast_path_required_members(&self) -> TransferRpcRequiredPeerSet {
         let inner = self.inner();
         let self_info = inner.view().cluster_manager().get_self_info();
-        inner
-            .view()
-            .cluster_manager()
-            .get_client_members()
-            .into_iter()
-            .filter(|member| member.id != self_info.id)
-            .filter(|member| {
-                member
-                    .metadata
-                    .get("client")
-                    .is_some_and(|value| value == "true")
-            })
-            .filter(|member| {
-                member
-                    .metadata
-                    .get("p2p_relay")
-                    .is_some_and(|value| value == "true")
-            })
-            .filter(|member| {
-                !member
-                    .metadata
-                    .get("external_client")
-                    .is_some_and(|value| value == "true")
-            })
-            .filter(|member| {
-                !member
-                    .metadata
-                    .get("side_transfer_worker")
-                    .is_some_and(|value| value == "true")
-            })
-            .collect()
+        transfer_rpc_required_peer_set(&self_info.id, inner.view().cluster_manager().get_members())
     }
 
     fn format_transfer_rpc_fast_path_pending_details(
@@ -623,10 +722,10 @@ impl ClientSegPool {
         let self_info = inner.view().cluster_manager().get_self_info();
 
         loop {
-            let eligible_members = self.transfer_rpc_fast_path_eligible_members();
-            if !eligible_members.is_empty() {
+            let required_peers = self.transfer_rpc_fast_path_required_members();
+            if required_peers.has_complete_roles() {
                 let snapshot = inner.view().p2p_module().tier_snapshot();
-                let all_ready = eligible_members.iter().all(|member| {
+                let all_ready = required_peers.members.iter().all(|member| {
                     let peer_id = member.id.clone().into();
                     snapshot
                         .peer_gen(&peer_id)
@@ -636,9 +735,11 @@ impl ClientSegPool {
                     tracing::info!(
                         owner_id = %self_info.id,
                         owner_start_time = self_info.node_start_time,
-                        peer_count = eligible_members.len(),
+                        peer_count = required_peers.members.len(),
+                        owner_peer_count = required_peers.owner_peer_count,
+                        master_peer_count = required_peers.master_peer_count,
                         elapsed_ms = started_at.elapsed().as_millis(),
-                        "required transfer-rpc fast path ready for all eligible owner peers"
+                        "required transfer-rpc fast path ready for master and all eligible owner peers"
                     );
                     return Ok(());
                 }
@@ -646,16 +747,20 @@ impl ClientSegPool {
 
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
-                let detail = if eligible_members.is_empty() {
+                let detail = if !required_peers.has_complete_roles() {
                     format!(
-                        "no eligible owner peers observed within {:?}; self={} start_time={}",
-                        timeout, self_info.id, self_info.node_start_time
+                        "required peer roles incomplete within {:?}; self={} start_time={} owner_peer_count={} master_peer_count={}",
+                        timeout,
+                        self_info.id,
+                        self_info.node_start_time,
+                        required_peers.owner_peer_count,
+                        required_peers.master_peer_count,
                     )
                 } else {
                     format!(
                         "pending peers after {:?}: {}",
                         timeout,
-                        self.format_transfer_rpc_fast_path_pending_details(&eligible_members)
+                        self.format_transfer_rpc_fast_path_pending_details(&required_peers.members)
                     )
                 };
                 return Err(KvError::Api(ApiError::Unknown {
@@ -1024,7 +1129,7 @@ impl ClientSegPool {
                     let req = req.serialize_part;
                     let _ = view.spawn("rpc_request_segment_registration", async move {
                         let response = handle_segment_registration_request(view_task, req).await;
-                        if let Err(e) = resp.send_resp(response).await {
+                        if let Err(e) = send_control_plane_rpc_response(&resp, response).await {
                             tracing::error!(
                                 "Failed to send RequestSegmentRegistrationResp: {:?}",
                                 e

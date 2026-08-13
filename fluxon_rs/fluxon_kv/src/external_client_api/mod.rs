@@ -43,6 +43,7 @@ use crate::{
     master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq},
     memholder::ExternalMemHolder,
     p2p::{
+        control_plane_rpc::call_control_plane_rpc,
         msg_pack::{MsgPack, RPCCaller, RPCHandler},
         p2p_module::{P2pModule, P2pModuleAccessTrait, RpcTransportPolicy},
     },
@@ -3387,20 +3388,19 @@ impl ExternalInner {
             .find_or_wait_master_node()
             .await?;
         let expected_get_ids = get_ids.clone();
-        let resp: MsgPack<BatchGetRevokeResp> = self
-            .rpc_caller_master_batch_get_revoke
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                MsgPack {
-                    serialize_part: BatchGetRevokeReq { get_ids },
-                    raw_bytes: Vec::new(),
-                },
-                None,
-                0,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let resp: MsgPack<BatchGetRevokeResp> = call_control_plane_rpc(
+            &self.rpc_caller_master_batch_get_revoke,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            MsgPack {
+                serialize_part: BatchGetRevokeReq { get_ids },
+                raw_bytes: Vec::new(),
+            },
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -3441,20 +3441,19 @@ impl ExternalInner {
             .find_or_wait_master_node()
             .await?;
         let expected_get_ids = get_ids.clone();
-        let resp: MsgPack<BatchGetDoneResp> = self
-            .rpc_caller_master_batch_get_done
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                MsgPack {
-                    serialize_part: BatchGetDoneReq { get_ids },
-                    raw_bytes: Vec::new(),
-                },
-                None,
-                0,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let resp: MsgPack<BatchGetDoneResp> = call_control_plane_rpc(
+            &self.rpc_caller_master_batch_get_done,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            MsgPack {
+                serialize_part: BatchGetDoneReq { get_ids },
+                raw_bytes: Vec::new(),
+            },
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -3526,20 +3525,19 @@ impl ExternalInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let response: MsgPack<BatchGetBindResp> = self
-            .rpc_caller_master_batch_get_bind
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                MsgPack {
-                    serialize_part: BatchGetBindReq { items },
-                    raw_bytes: Vec::new(),
-                },
-                None,
-                0,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let response: MsgPack<BatchGetBindResp> = call_control_plane_rpc(
+            &self.rpc_caller_master_batch_get_bind,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            MsgPack {
+                serialize_part: BatchGetBindReq { items },
+                raw_bytes: Vec::new(),
+            },
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             response.serialize_part.error_code,
             response.serialize_part.error_json.clone(),
@@ -3745,22 +3743,21 @@ impl ExternalInner {
                 .cluster_manager()
                 .find_or_wait_master_node()
                 .await?;
-            let response: MsgPack<BatchGetPlanResp> = self
-                .rpc_caller_master_batch_get_plan
-                .call(
-                    self.view.p2p_module(),
-                    master_node_id.into(),
-                    MsgPack {
-                        serialize_part: BatchGetPlanReq {
-                            keys: remote_keys.clone(),
-                        },
-                        raw_bytes: Vec::new(),
+            let response: MsgPack<BatchGetPlanResp> = call_control_plane_rpc(
+                &self.rpc_caller_master_batch_get_plan,
+                self.view.p2p_module(),
+                master_node_id.into(),
+                MsgPack {
+                    serialize_part: BatchGetPlanReq {
+                        keys: remote_keys.clone(),
                     },
-                    None,
-                    0,
-                )
-                .await
-                .map_err(KvError::from)?;
+                    raw_bytes: Vec::new(),
+                },
+                None,
+                0,
+            )
+            .await
+            .map_err(KvError::from)?;
             crate::rpcresp_kvresult_convert::try_from_code(
                 response.serialize_part.error_code,
                 response.serialize_part.error_json.clone(),
@@ -4293,24 +4290,23 @@ impl ExternalInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let resp: MsgPack<BatchGetStartResp> = self
-            .rpc_caller_master_batch_get_start
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                MsgPack {
-                    serialize_part: BatchGetStartReq {
-                        keys: keys.clone(),
-                        prepared_targets: Vec::new(),
-                        external_sink_targets,
-                    },
-                    raw_bytes: Vec::new(),
+        let resp: MsgPack<BatchGetStartResp> = call_control_plane_rpc(
+            &self.rpc_caller_master_batch_get_start,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            MsgPack {
+                serialize_part: BatchGetStartReq {
+                    keys: keys.clone(),
+                    prepared_targets: Vec::new(),
+                    external_sink_targets,
                 },
-                None,
-                0,
-            )
-            .await
-            .map_err(KvError::from)?;
+                raw_bytes: Vec::new(),
+            },
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),

@@ -6,6 +6,7 @@ use crate::master_kv_router::msg_pack::{
     OwnerReclaimReason, OwnerSourceEvictionOutcome, OwnerSourceEvictionVictim,
     OwnerSourceEvictionVictimResp, OwnerSourceSsdPolicy, owner_source_eviction_epoch,
 };
+use crate::p2p::control_plane_rpc::call_control_plane_rpc;
 use crate::p2p::msg_pack::{MIN_EXPLICIT_RPC_TIMEOUT_SECS, MsgPack, RPCCaller};
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
 use limit_thirdparty::tokio;
@@ -1024,22 +1025,22 @@ async fn call_owner_phase(
     }));
     let caller = RPCCaller::<BatchOwnerReclaimReq>::new();
     caller.regist(view.p2p_module());
-    let resp = caller
-        .call(
-            view.p2p_module(),
-            owner.clone(),
-            MsgPack {
-                serialize_part: BatchOwnerReclaimReq {
-                    phase,
-                    items: items.clone(),
-                },
-                raw_bytes: Vec::new(),
+    let resp = call_control_plane_rpc(
+        &caller,
+        view.p2p_module(),
+        owner.clone(),
+        MsgPack {
+            serialize_part: BatchOwnerReclaimReq {
+                phase,
+                items: items.clone(),
             },
-            Some(OWNER_RECLAIM_RPC_TIMEOUT),
-            1,
-        )
-        .await
-        .map_err(|err| format!("{err:?}"))?;
+            raw_bytes: Vec::new(),
+        },
+        Some(OWNER_RECLAIM_RPC_TIMEOUT),
+        1,
+    )
+    .await
+    .map_err(|err| format!("{err:?}"))?;
     if resp.serialize_part.error_code != OK {
         return Err(format!(
             "code={} error={}",

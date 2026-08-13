@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::master_kv_router::MasterKvRouterView;
 use crate::master_kv_router::msg_pack::{GetMasterOnlyMetricPartReq, GetMasterOnlyMetricPartResp};
+use crate::p2p::control_plane_rpc::send_control_plane_rpc_response;
 use crate::p2p::msg_pack::{MsgPack, RPCHandler};
 use crate::rpcresp_kvresult_convert::msg_and_error::KvError;
 use crate::rpcresp_kvresult_convert::{self};
@@ -14,7 +15,7 @@ pub fn register_master_only_metric_handler(view: &MasterKvRouterView) {
         let view_task = view.clone();
         let _ = view.spawn("rpc_get_master_only_metric_part", async move {
             let ack = handle_get_master_only_metric_part(&view_task, msg).await;
-            let _ = resp.send_resp(ack).await;
+            let _ = send_control_plane_rpc_response(&resp, ack).await;
         });
         Ok(())
     });

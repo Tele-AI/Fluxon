@@ -51,6 +51,7 @@ use crate::{
     metric_reporter::{MetricReporter, MetricReporterAccessTrait},
     metrics::{KvLocalitySnapshot, MetricsHandle, OperationKind, RequestStage},
     p2p::{
+        control_plane_rpc::{call_control_plane_rpc, send_control_plane_rpc_response},
         msg_pack::{RPCCaller, RPCHandler},
         p2p_module::{P2pModule, P2pModuleAccessTrait, RpcTransportPolicy},
     },
@@ -203,13 +204,35 @@ mod ssd_stage_singleflight_tests {
 #[derive(Clone)]
 pub struct ExternalHoldingGetInfo {
     pub key: String,
-    pub req_node_id: String,
+    pub req_node_id: Arc<str>,
     /// Requester membership generation observed when this holding was
     /// installed. Unknown generations are never removed by generation-scoped
     /// MemberLeft cleanup.
     pub requester_node_start_time: Option<i64>,
     pub memory_info: Arc<MemoryInfo>, // The actual memholder being held
     _owner_hot_pin: Option<PinGuard>,
+}
+
+/// Requester identity and holder-id reservation shared by one external Get
+/// batch.  The reservation may contain gaps when some probe items miss; holder
+/// ids are opaque and only need to remain non-zero and generation-unique.
+pub(crate) struct ExternalGetHoldingBatch {
+    req_node_id: Arc<str>,
+    requester_node_start_time: Option<i64>,
+    first_holder_id: u64,
+    reserved_len: usize,
+}
+
+impl ExternalGetHoldingBatch {
+    fn holder_id_at(&self, index: usize) -> u64 {
+        assert!(
+            index < self.reserved_len,
+            "external holding batch index must stay inside its reservation"
+        );
+        self.first_holder_id
+            .checked_add(u64::try_from(index).expect("holder index must fit u64"))
+            .expect("external holding id space exhausted")
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2746,10 +2769,12 @@ impl Drop for ExternalPendingPutFenceGuard {
     }
 }
 
-fn allocate_external_holding_id(counter: &AtomicU64) -> u64 {
+fn allocate_external_holding_ids(counter: &AtomicU64, count: usize) -> u64 {
+    assert!(count > 0, "external holding reservation cannot be empty");
+    let count = u64::try_from(count).expect("external holding reservation must fit u64");
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
+            current.checked_add(count)
         })
         .expect("external holding id space exhausted")
 }
@@ -3170,20 +3195,19 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let response = self
-            .rpc_caller_ssd_stage_begin
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                MsgPack {
-                    serialize_part: SsdStageBeginReq { get_id },
-                    raw_bytes: Vec::new(),
-                },
-                Some(SSD_STAGE_RPC_TIMEOUT),
-                2,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let response = call_control_plane_rpc(
+            &self.rpc_caller_ssd_stage_begin,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            MsgPack {
+                serialize_part: SsdStageBeginReq { get_id },
+                raw_bytes: Vec::new(),
+            },
+            Some(SSD_STAGE_RPC_TIMEOUT),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             response.serialize_part.error_code,
             response.serialize_part.error_json,
@@ -3197,23 +3221,22 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let response = self
-            .rpc_caller_ssd_stage_done
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                MsgPack {
-                    serialize_part: SsdStageDoneReq {
-                        get_id,
-                        drop_ssd_source,
-                    },
-                    raw_bytes: Vec::new(),
+        let response = call_control_plane_rpc(
+            &self.rpc_caller_ssd_stage_done,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            MsgPack {
+                serialize_part: SsdStageDoneReq {
+                    get_id,
+                    drop_ssd_source,
                 },
-                Some(SSD_STAGE_RPC_TIMEOUT),
-                2,
-            )
-            .await
-            .map_err(KvError::from)?;
+                raw_bytes: Vec::new(),
+            },
+            Some(SSD_STAGE_RPC_TIMEOUT),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             response.serialize_part.error_code,
             response.serialize_part.error_json,
@@ -4403,8 +4426,38 @@ impl ClientKvApiInner {
         req_node_id: &str,
         memory_info: Arc<MemoryInfo>,
     ) -> ExternalMemHolderInfo {
-        let external_holder_id = allocate_external_holding_id(&self.next_external_holding_id);
-        let key = NodeHolderKey::new(req_node_id.to_string(), external_holder_id);
+        let batch = self.prepare_external_get_holding_batch(req_node_id, 1);
+        self.install_external_get_holding_from_batch(&batch, 0, memory_info)
+    }
+
+    pub(crate) fn prepare_external_get_holding_batch(
+        &self,
+        req_node_id: &str,
+        reserved_len: usize,
+    ) -> ExternalGetHoldingBatch {
+        ExternalGetHoldingBatch {
+            req_node_id: Arc::from(req_node_id),
+            requester_node_start_time: self
+                .view
+                .cluster_manager()
+                .get_member_info_cached(req_node_id)
+                .map(|member| member.node_start_time),
+            first_holder_id: allocate_external_holding_ids(
+                &self.next_external_holding_id,
+                reserved_len,
+            ),
+            reserved_len,
+        }
+    }
+
+    pub(crate) fn install_external_get_holding_from_batch(
+        &self,
+        batch: &ExternalGetHoldingBatch,
+        reservation_index: usize,
+        memory_info: Arc<MemoryInfo>,
+    ) -> ExternalMemHolderInfo {
+        let external_holder_id = batch.holder_id_at(reservation_index);
+        let key = NodeHolderKey::new(batch.req_node_id.to_string(), external_holder_id);
         let external_memholder_info = ExternalMemHolderInfo {
             offset: memory_info.offset,
             len: memory_info.len,
@@ -4415,12 +4468,8 @@ impl ClientKvApiInner {
             key,
             ExternalHoldingGetInfo {
                 key: memory_info.key.clone(),
-                req_node_id: req_node_id.to_string(),
-                requester_node_start_time: self
-                    .view
-                    .cluster_manager()
-                    .get_member_info_cached(req_node_id)
-                    .map(|member| member.node_start_time),
+                req_node_id: batch.req_node_id.clone(),
+                requester_node_start_time: batch.requester_node_start_time,
                 memory_info,
                 _owner_hot_pin: owner_hot_pin,
             },
@@ -5705,7 +5754,7 @@ mod owner_reclaim_slot_tests {
         OwnerLocalReserveSlotState, OwnerLocalSsdPutOutcome, OwnerLocalSsdPutSharedOp,
         OwnerReclaimRecord, OwnerRemotePutAdmission, OwnerRemotePutOutcome,
         OwnerRemotePutReservation, OwnerRemotePutSharedOp,
-        acquire_external_pending_put_fence_for_key, allocate_external_holding_id,
+        acquire_external_pending_put_fence_for_key, allocate_external_holding_ids,
         build_owner_hot_cache, clone_if_owner_hot_entry_matches,
         owner_hot_source_has_active_holders, pin_current_owner_hot_source_from_index,
     };
@@ -5985,6 +6034,98 @@ mod owner_reclaim_slot_tests {
             api.inner()
                 .owner_remote_put_admission
                 .active_bytes
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn tier1_batch_ack_joins_inflight_remote_puts_without_waiting_or_retransfer() {
+        const BATCH_ITEMS: usize = 256;
+        let api = ClientKvApi::construct(ClientKvApiNewArg {
+            test_spec_config: TestSpecConfig::default(),
+            owner_hot_cache_capacity_bytes: None,
+            owner_local_reserve_physical_capacity_bytes: 0,
+            ssd_storage: None,
+        })
+        .await
+        .expect("construct test ClientKvApi");
+        let mut flights = Vec::with_capacity(BATCH_ITEMS);
+
+        for index in 0..BATCH_ITEMS {
+            let key = format!("tier1-batch-follower-{index}");
+            let put_id = (1000 + index as u64, 1);
+            let op = OwnerRemotePutSharedOp::new(&key, put_id, None, false);
+            api.inner().owner_key_control.lock_key(&key).insert(
+                key.clone(),
+                OwnerKeyControlState {
+                    remote_put: Some(op.clone()),
+                    ..Default::default()
+                },
+            );
+            api.inner()
+                .owner_remote_put_counters
+                .active
+                .fetch_add(1, Ordering::Relaxed);
+            api.inner()
+                .owner_remote_put_counters
+                .leaders
+                .fetch_add(1, Ordering::Relaxed);
+            flights.push((key, put_id, op));
+        }
+
+        let started_at = Instant::now();
+        for (key, put_id, _) in &flights {
+            assert!(
+                api.inner()
+                    .start_remote_put_nonblocking(key, *put_id, None, false),
+                "an existing exact-generation flight must be acknowledged"
+            );
+        }
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "metadata-only batch acknowledgement must not wait for payload terminals"
+        );
+        assert!(
+            flights
+                .iter()
+                .all(|(_, _, op)| op.outcome() == OwnerRemotePutOutcome::InFlight),
+            "acknowledgement must return while every payload flight is still in progress"
+        );
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_counters
+                .leaders
+                .load(Ordering::Relaxed),
+            BATCH_ITEMS as u64,
+            "followers must not create replacement leaders"
+        );
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_counters
+                .followers
+                .load(Ordering::Relaxed),
+            BATCH_ITEMS as u64
+        );
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_counters
+                .transfers
+                .load(Ordering::Relaxed),
+            0,
+            "followers must not start duplicate payload transfers"
+        );
+
+        for (_, _, op) in flights {
+            assert!(
+                api.inner()
+                    .finish_owner_remote_put(&op, OwnerRemotePutOutcome::Published)
+            );
+        }
+        assert_eq!(
+            api.inner()
+                .owner_remote_put_counters
+                .active
                 .load(Ordering::Relaxed),
             0
         );
@@ -6447,11 +6588,23 @@ mod owner_reclaim_slot_tests {
     #[test]
     fn external_holding_ids_are_nonzero_and_unique_for_resident_pages() {
         let counter = AtomicU64::new(1);
-        let first = allocate_external_holding_id(&counter);
-        let second = allocate_external_holding_id(&counter);
+        let first = allocate_external_holding_ids(&counter, 1);
+        let second = allocate_external_holding_ids(&counter, 1);
         assert_eq!(first, 1);
         assert_eq!(second, 2);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn external_holding_batch_reserves_one_contiguous_unique_range() {
+        let counter = AtomicU64::new(1);
+        let first = allocate_external_holding_ids(&counter, 3);
+        let following = allocate_external_holding_ids(&counter, 1);
+        let second = allocate_external_holding_ids(&counter, 2);
+        assert_eq!(first, 1);
+        assert_eq!(following, 4);
+        assert_eq!(second, 5);
+        assert_eq!(counter.load(Ordering::Relaxed), 7);
     }
 
     #[test]
@@ -9130,7 +9283,7 @@ impl ClientKvApi {
                 let view_task = view.clone();
                 view.spawn("rpc_batch_enqueue_replica_tasks", async move {
                     let ack = put::handle_batch_enqueue_replica_tasks(&view_task, msg).await;
-                    if let Err(e) = resp.send_resp(ack).await {
+                    if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                         warn!("Failed to send BatchEnqueueReplicaTaskResp: {:?}", e);
                     }
                 });
@@ -9147,7 +9300,7 @@ impl ClientKvApi {
                 let view_task = view.clone();
                 view.spawn("rpc_batch_owner_reclaim", async move {
                     let ack = handle_batch_owner_reclaim(&view_task, msg, req_node_id).await;
-                    if let Err(e) = resp.send_resp(ack).await {
+                    if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                         warn!("Failed to send BatchOwnerReclaimResp: {:?}", e);
                     }
                 });
@@ -9166,7 +9319,7 @@ impl ClientKvApi {
                     let ack =
                         handle_batch_delete_client_kv_meta_cache(&view_task, msg, req_node_id)
                             .await;
-                    if let Err(e) = resp.send_resp(ack).await {
+                    if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                         warn!("Failed to send BatchDeleteClientKvMetaCacheResp: {:?}", e);
                     }
                 });

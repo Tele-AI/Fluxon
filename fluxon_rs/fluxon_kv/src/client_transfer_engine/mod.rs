@@ -14,7 +14,7 @@
 
 use crate::ClientSegPoolAccessTrait;
 use crate::client_seg_pool::{ClientCpuMemReadGuard, ClientSegPool};
-use crate::cluster_manager::{ClusterManager, NodeID, NodeIDString, NodeRole};
+use crate::cluster_manager::{ClusterManager, ClusterMember, NodeID, NodeIDString, NodeRole};
 use crate::p2p::p2p_module::P2pModule;
 use crate::rpcresp_kvresult_convert::msg_and_error::{KvError, KvResult};
 use crate::{P2pModuleAccessTrait, cluster_manager::ClusterManagerAccessTrait};
@@ -93,6 +93,34 @@ impl GpuMemoryGuard {
 pub enum ClientTransferMemoryGuard {
     Cpu(ClientCpuMemReadGuard),
     Gpu(GpuMemoryGuard),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientTransferRuntimeMode {
+    ControlOnly,
+    SegmentCapable,
+}
+
+impl ClientTransferRuntimeMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ControlOnly => "control_only",
+            Self::SegmentCapable => "segment_capable",
+        }
+    }
+}
+
+fn transfer_runtime_mode_for_member(member: &ClusterMember) -> ClientTransferRuntimeMode {
+    if matches!(member.node_role(), NodeRole::Client | NodeRole::External)
+        || member
+            .metadata
+            .get("side_transfer_worker")
+            .is_some_and(|value| value == "true")
+    {
+        ClientTransferRuntimeMode::SegmentCapable
+    } else {
+        ClientTransferRuntimeMode::ControlOnly
+    }
 }
 
 #[derive(Debug)]
@@ -267,13 +295,15 @@ struct ClientTransferRuntimeAdapter {
 }
 
 impl ClientTransferRuntimeAdapter {
+    fn runtime_mode(&self) -> ClientTransferRuntimeMode {
+        transfer_runtime_mode_for_member(&self.view.cluster_manager().get_self_info())
+    }
+
     fn local_segment_transfer_enabled(&self) -> bool {
-        let self_info = self.view.cluster_manager().get_self_info();
-        matches!(self_info.node_role(), NodeRole::Client | NodeRole::External)
-            || self_info
-                .metadata
-                .get("side_transfer_worker")
-                .is_some_and(|v| v == "true")
+        matches!(
+            self.runtime_mode(),
+            ClientTransferRuntimeMode::SegmentCapable
+        )
     }
 }
 
@@ -600,10 +630,31 @@ impl ClientTransferEngine {
     }
 
     pub async fn init2_for_init_dag(&self) -> Result<(), KvError> {
+        let runtime = self.runtime();
+        let self_info = runtime.view.cluster_manager().get_self_info();
+        let mode = runtime.runtime_mode();
+        let config = self.core.current_runtime_config().await;
+        tracing::info!(
+            member_id = %self_info.id,
+            node_role = %self_info.node_role(),
+            runtime_mode = mode.as_str(),
+            rpc_fast_path_enabled = config.enable_transfer_rpc_fast_path,
+            local_segment_transfer_enabled = runtime.local_segment_transfer_enabled(),
+            "initializing transfer engine runtime"
+        );
         self.core
-            .init2_for_init_dag(self.runtime())
+            .init2_for_init_dag(runtime)
             .await
-            .map_err(KvError::from)
+            .map_err(KvError::from)?;
+        let initialized = self.view.get().unwrap().cluster_manager().get_self_info();
+        tracing::info!(
+            member_id = %initialized.id,
+            node_role = %initialized.node_role(),
+            runtime_mode = mode.as_str(),
+            transfer_backend_epoch = ?initialized.metadata.get("transfer_backend_epoch"),
+            "transfer engine runtime initialized"
+        );
+        Ok(())
     }
 
     pub async fn close(&self) {
@@ -619,6 +670,14 @@ impl ClientTransferEngine {
     }
 
     pub async fn register_local_segment(&self, cpu_mem: &CpuAllocatedMem) -> KvResult<()> {
+        if !self.runtime().local_segment_transfer_enabled() {
+            return Err(KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
+                    detail: "local segment registration is unavailable on a control-only transfer runtime"
+                        .to_string(),
+                },
+            ));
+        }
         self.core
             .register_local_segment(self.runtime(), cpu_mem)
             .await
@@ -638,6 +697,15 @@ impl ClientTransferEngine {
         len: u64,
         device_id: u32,
     ) -> KvResult<GpuMemoryRegistration> {
+        if !self.runtime().local_segment_transfer_enabled() {
+            return Err(KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
+                    detail:
+                        "GPU memory registration is unavailable on a control-only transfer runtime"
+                            .to_string(),
+                },
+            ));
+        }
         let registration = self
             .gpu_memory_registry
             .begin_register(addr, len, device_id)
@@ -852,7 +920,44 @@ impl LogicalModule for ClientTransferEngine {
 
 #[cfg(test)]
 mod gpu_memory_registry_tests {
-    use super::GpuMemoryRegistry;
+    use super::{ClientTransferRuntimeMode, GpuMemoryRegistry, transfer_runtime_mode_for_member};
+    use crate::cluster_manager::ClusterMember;
+    use std::collections::HashMap;
+
+    fn member(metadata: HashMap<String, String>) -> ClusterMember {
+        ClusterMember {
+            id: "runtime-mode-test".to_string(),
+            addresses: Vec::new(),
+            port: None,
+            node_start_time: 1,
+            metadata,
+            sub_cluster: None,
+            network: None,
+        }
+    }
+
+    #[test]
+    fn master_runtime_is_control_only_without_a_kv_segment() {
+        let master = member(HashMap::from([("master".to_string(), "true".to_string())]));
+        assert_eq!(
+            transfer_runtime_mode_for_member(&master),
+            ClientTransferRuntimeMode::ControlOnly
+        );
+    }
+
+    #[test]
+    fn owners_externals_and_side_workers_remain_segment_capable() {
+        for metadata in [
+            HashMap::from([("client".to_string(), "true".to_string())]),
+            HashMap::from([("external_client".to_string(), "true".to_string())]),
+            HashMap::from([("side_transfer_worker".to_string(), "true".to_string())]),
+        ] {
+            assert_eq!(
+                transfer_runtime_mode_for_member(&member(metadata)),
+                ClientTransferRuntimeMode::SegmentCapable
+            );
+        }
+    }
 
     fn active_registry() -> (GpuMemoryRegistry, u64) {
         let registry = GpuMemoryRegistry::new();

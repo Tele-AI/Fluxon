@@ -59,6 +59,7 @@ use crate::master_seg_manager::NodeTombTag;
 use crate::master_seg_manager::one_seg_allocator::{Allocation, NodePoolCapacitySnapshot};
 use crate::memholder::{EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait};
 use crate::metric_reporter::{MetricReporter, MetricReporterAccessTrait};
+use crate::p2p::control_plane_rpc::send_control_plane_rpc_response;
 use crate::p2p::msg_pack::{MsgPack, RPCCaller, RPCHandler};
 use crate::p2p::p2p_module::{
     P2pModule, P2pModuleAccessTrait, UserRpcAsyncHandler, UserRpcFuture,
@@ -4326,7 +4327,7 @@ impl MasterKvRouter {
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 let get_started = ack.serialize_part.error_code
                     == crate::rpcresp_kvresult_convert::msg_and_error::OK;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send GetStartResp: {:?}", e);
                     if get_started {
                         if let Some(inflight_info) = cleanup_view
@@ -4353,7 +4354,7 @@ impl MasterKvRouter {
             let req_node_id = resp.node_id().clone();
             let _ = view.spawn("rpc_get_revoke", async move {
                 let ack = handle_get_revoke(view_task, msg, req_node_id).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send GetRevokeResp: {:?}", e);
                 }
             });
@@ -4370,7 +4371,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_get_done(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send GetDoneResp: {:?}", e);
                 }
             });
@@ -4384,7 +4385,7 @@ impl MasterKvRouter {
             let req_node_id = resp.node_id().clone();
             view.spawn("rpc_ssd_stage_begin", async move {
                 let ack = handle_ssd_stage_begin(task_view, msg, req_node_id).await;
-                let _ = resp.send_resp(ack).await;
+                let _ = send_control_plane_rpc_response(&resp, ack).await;
             });
             Ok(())
         });
@@ -4396,7 +4397,7 @@ impl MasterKvRouter {
             let req_node_id = resp.node_id().clone();
             view.spawn("rpc_ssd_stage_done", async move {
                 let ack = handle_ssd_stage_done(task_view, msg, req_node_id).await;
-                let _ = resp.send_resp(ack).await;
+                let _ = send_control_plane_rpc_response(&resp, ack).await;
             });
             Ok(())
         });
@@ -4408,7 +4409,7 @@ impl MasterKvRouter {
             let view_task = view.clone();
             let _ = view.spawn("rpc_count_prefix", async move {
                 let ack = handle_count_prefix(&view_task, msg).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send CountPrefixResp: {:?}", e);
                 }
             });
@@ -4430,7 +4431,7 @@ impl MasterKvRouter {
                 let (grant_id, mut ack) =
                     handle_reserve_local_grant(view_task.clone(), msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send ReserveLocalGrantResp: {:?}", e);
                     if grant_id != 0 {
                         let _ = view_task
@@ -4452,7 +4453,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_release_local_grant(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send ReleaseLocalGrantResp: {:?}", e);
                 }
             });
@@ -4470,7 +4471,7 @@ impl MasterKvRouter {
                 let (reservation_ids, mut ack) =
                     handle_batch_prepare_put_keys(view_task.clone(), msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchPreparePutKeysResp: {:?}", e);
                     for reservation_id in reservation_ids {
                         let _ = view_task
@@ -4493,7 +4494,7 @@ impl MasterKvRouter {
                 let mut ack =
                     handle_batch_release_put_key_reservations(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchReleasePutKeyReservationsResp: {:?}", e);
                 }
             });
@@ -4520,7 +4521,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let (put_id, mut ack) = handle_put_start(view_task.clone(), msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send PutStartResp: {:?}", e);
                     if put_id != (0, 0) {
                         if let Some(inflight_info) = view_task
@@ -4561,7 +4562,7 @@ impl MasterKvRouter {
             let view_task = view2.clone();
             let _ = view.spawn("rpc_put_revoke", async move {
                 let ack = handle_put_revoke(view_task, msg).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send PutRevokeResp: {:?}", e);
                 }
             });
@@ -4578,7 +4579,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_put_done(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send PutDoneResp: {:?}", e);
                 }
             });
@@ -4618,7 +4619,7 @@ impl MasterKvRouter {
             let view_task = view2.clone();
             let _ = view.spawn("rpc_delete", async move {
                 let ack = handle_delete(view_task, msg).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send DeleteResp: {:?}", e);
                 }
             });
@@ -4633,7 +4634,7 @@ impl MasterKvRouter {
             let view_task = view2.clone();
             view.spawn("rpc_delete_ack", async move {
                 let ack = handle_delete_ack(view_task, msg).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send DeleteAckResp: {:?}", e);
                 }
             });
@@ -4647,7 +4648,7 @@ impl MasterKvRouter {
             let view_task = view2.clone();
             view.spawn("rpc_batch_delete_ack", async move {
                 let ack = handle_batch_delete_ack(view_task, msg).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchDeleteAckResp: {:?}", e);
                 }
             });
@@ -4661,7 +4662,7 @@ impl MasterKvRouter {
             let view_task = view.clone();
             let _ = view.spawn("rpc_batch_evict_owner_source", async move {
                 let ack = handle_batch_evict_owner_source(&view_task, msg, owner).await;
-                if let Err(err) = resp.send_resp(ack).await {
+                if let Err(err) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchEvictOwnerSourceResp: {:?}", err);
                 }
             });
@@ -4675,7 +4676,7 @@ impl MasterKvRouter {
             let view_task = view.clone();
             let _ = view.spawn("rpc_batch_publish_owner_ssd", async move {
                 let ack = handle_batch_publish_owner_ssd(view_task, msg, owner).await;
-                if let Err(err) = resp.send_resp(ack).await {
+                if let Err(err) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchPublishOwnerSsdResp: {:?}", err);
                 }
             });
@@ -4692,7 +4693,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_put_append_start(view_task.clone(), msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send PutAppendStartResp: {:?}", e);
                 }
             });
@@ -4709,7 +4710,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_batch_put_append_start(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchPutAppendStartResp: {:?}", e);
                 }
             });
@@ -4723,7 +4724,7 @@ impl MasterKvRouter {
             let view_task = view2.clone();
             let _ = view.spawn("rpc_put_append_revoke", async move {
                 let ack = handle_put_append_revoke(view_task, msg).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send PutAppendRevokeResp: {:?}", e);
                 }
             });
@@ -4739,7 +4740,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_put_append_done(view_task, msg).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send PutAppendDoneResp: {:?}", e);
                 }
             });
@@ -4755,7 +4756,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_batch_put_append_done(view_task, msg).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchPutAppendDoneResp: {:?}", e);
                 }
             });
@@ -4769,7 +4770,7 @@ impl MasterKvRouter {
             let view2 = view.clone();
             view.spawn("rpc_get_meta", async move {
                 let ack = handle_get_meta(view2, msg, resp.node_id().clone()).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send GetMetaResp: {:?}", e);
                 }
             });
@@ -4782,7 +4783,7 @@ impl MasterKvRouter {
             let view2 = view.clone();
             view.spawn("rpc_batch_is_exist", async move {
                 let ack = handle_batch_is_exist(view2, msg, resp.node_id().clone()).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchIsExistResp: {:?}", e);
                 }
             });
@@ -4798,7 +4799,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_batch_put_start(view2, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchPutStartResp: {:?}", e);
                 }
             });
@@ -4811,7 +4812,7 @@ impl MasterKvRouter {
             let view2 = view.clone();
             view.spawn("rpc_batch_put_revoke", async move {
                 let ack = handle_batch_put_revoke(view2, msg).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchPutRevokeResp: {:?}", e);
                 }
             });
@@ -4827,7 +4828,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_batch_put_done(view2, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchPutDoneResp: {:?}", e);
                 }
             });
@@ -4839,12 +4840,24 @@ impl MasterKvRouter {
             let view = view.clone();
             let view2 = view.clone();
             let req_node_id = resp.node_id().clone();
+            let log_node_id = req_node_id.clone();
+            let item_count = msg.serialize_part.items.len();
             view.spawn("rpc_grouped_batch_put_done", async move {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_grouped_batch_put_done(view2, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                let server_process_us = ack.serialize_part.server_process_us;
+                let send_t0 = Utc::now().timestamp_micros();
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send GroupedBatchPutDoneResp: {:?}", e);
+                } else {
+                    info!(
+                        "GroupedBatchPutDone response sent: requester={} items={} server_process_us={} response_send_us={}",
+                        log_node_id,
+                        item_count,
+                        server_process_us,
+                        Utc::now().timestamp_micros() - send_t0,
+                    );
                 }
             });
             Ok(())
@@ -4869,7 +4882,7 @@ impl MasterKvRouter {
                     })
                     .map(|item| item.get_id)
                     .collect::<Vec<_>>();
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchGetPlanResp: {:?}", e);
                     for get_id in planned_get_ids {
                         cleanup_view
@@ -4893,7 +4906,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_batch_get_bind(view2, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchGetBindResp: {:?}", e);
                 }
             });
@@ -4919,7 +4932,7 @@ impl MasterKvRouter {
                     })
                     .map(|item| item.get_id)
                     .collect::<Vec<_>>();
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchGetStartResp: {:?}", e);
                     for get_id in started_get_ids {
                         if let Some(inflight_info) = cleanup_view
@@ -4945,7 +4958,7 @@ impl MasterKvRouter {
             let req_node_id = resp.node_id().clone();
             view.spawn("rpc_batch_get_revoke", async move {
                 let ack = handle_batch_get_revoke(view2, msg, req_node_id).await;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchGetRevokeResp: {:?}", e);
                 }
             });
@@ -4961,7 +4974,7 @@ impl MasterKvRouter {
                 let t0 = Utc::now().timestamp_micros();
                 let mut ack = handle_batch_get_done(view2, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = resp.send_resp(ack).await {
+                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchGetDoneResp: {:?}", e);
                 }
             });

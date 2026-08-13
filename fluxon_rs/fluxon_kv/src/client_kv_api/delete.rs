@@ -11,7 +11,7 @@ use crate::memholder::{
 use crate::{
     cluster_manager::app_logic_ext::ClusterManagerAppLogicExt,
     master_kv_router::msg_pack::DeleteReq,
-    p2p::msg_pack::MsgPack,
+    p2p::{control_plane_rpc::call_control_plane_rpc, msg_pack::MsgPack},
     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK},
 };
 use limit_thirdparty::tokio;
@@ -38,11 +38,16 @@ impl ClientKvApiInner {
             .await?;
 
         // 调用 RPC
-        let resp = self
-            .rpc_caller_delete
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_delete,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
 
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,

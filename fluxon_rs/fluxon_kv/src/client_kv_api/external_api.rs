@@ -2896,7 +2896,8 @@ impl HandlerForExternalClient for ClientKvApi {
         }
         let mut items = Vec::with_capacity(req.keys.len());
         let mut hot_touches = Vec::new();
-        for key in &req.keys {
+        let mut holding_batch = None;
+        for (item_index, key) in req.keys.iter().enumerate() {
             let (item, hot_touch) = {
                 let controls = inner.owner_key_control.lock_key(key);
                 if controls
@@ -2914,7 +2915,14 @@ impl HandlerForExternalClient for ClientKvApi {
                     // Install the holder under the same per-key fence used for
                     // local visibility. Reclaim cannot slip between the probe
                     // decision and the pin that owns this exact backing.
-                    let info = inner.install_external_get_holding(&req.req_node_id, memory_info);
+                    let batch = holding_batch.get_or_insert_with(|| {
+                        inner.prepare_external_get_holding_batch(&req.req_node_id, req.keys.len())
+                    });
+                    let info = inner.install_external_get_holding_from_batch(
+                        batch,
+                        item_index,
+                        memory_info,
+                    );
                     (Some(info), hot_touch)
                 } else {
                     (None, None)

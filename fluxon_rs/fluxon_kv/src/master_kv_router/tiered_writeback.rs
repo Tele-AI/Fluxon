@@ -1,6 +1,7 @@
 use super::{MasterKvRouterView, NodeValueReplicaDesc};
 use crate::cluster_manager::{NodeID, NodeIDString};
 use crate::master_kv_router::msg_pack::{BatchEnqueueReplicaTaskReq, EnqueueReplicaTaskItem};
+use crate::p2p::control_plane_rpc::call_control_plane_rpc;
 use crate::p2p::msg_pack::{MIN_EXPLICIT_RPC_TIMEOUT_SECS, MsgPack, RPCCaller};
 use crate::rpcresp_kvresult_convert::msg_and_error::OK;
 use limit_thirdparty::tokio;
@@ -49,18 +50,18 @@ async fn dispatch_owner_batch(
         .collect::<Vec<_>>();
     let caller = RPCCaller::<BatchEnqueueReplicaTaskReq>::new();
     caller.regist(view.p2p_module());
-    let result = caller
-        .call(
-            view.p2p_module(),
-            NodeID::from(source_node_id.clone()),
-            MsgPack {
-                serialize_part: BatchEnqueueReplicaTaskReq { items },
-                raw_bytes: Vec::new(),
-            },
-            Some(TIER1_WRITEBACK_RPC_TIMEOUT),
-            1,
-        )
-        .await;
+    let result = call_control_plane_rpc(
+        &caller,
+        view.p2p_module(),
+        NodeID::from(source_node_id.clone()),
+        MsgPack {
+            serialize_part: BatchEnqueueReplicaTaskReq { items },
+            raw_bytes: Vec::new(),
+        },
+        Some(TIER1_WRITEBACK_RPC_TIMEOUT),
+        1,
+    )
+    .await;
 
     let response = match result {
         Ok(response)

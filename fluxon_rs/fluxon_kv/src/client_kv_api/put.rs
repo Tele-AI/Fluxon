@@ -10,6 +10,7 @@ use crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
 use crate::cluster_manager::NodeIDString;
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::master_kv_router::put::PutIDForAKey;
+use crate::p2p::control_plane_rpc::{CONTROL_PLANE_RPC_TRANSPORT_POLICY, call_control_plane_rpc};
 // no StageScope; timestamps-based metrics only
 use crate::memholder::kvclient_encode::{calc_flat_dict_encoded_len, write_flat_dict_ptrs_to_ptr};
 use crate::observe_kvope::{
@@ -37,7 +38,6 @@ use crate::{
     },
     memholder::{UserMemHolder, UserMemHolderExposeKind},
     p2p::msg_pack::MsgPack,
-    p2p::p2p_module::RpcTransportPolicy,
     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult},
 };
 use chrono::Utc;
@@ -808,6 +808,15 @@ fn owner_local_reserve_timeout_error(
             hard_wait_timeout.as_millis()
         ),
     })
+}
+
+/// Ephemeral result of entering the existing owner-side remote Put singleflight.
+/// This does not add a second state machine: the shared operation remains the
+/// only generation terminal and only its leader owns the transfer task.
+enum OwnerRemotePutStart {
+    LeaderStarted,
+    Follower(Arc<OwnerRemotePutSharedOp>),
+    Rejected,
 }
 
 impl ClientKvApiInner {
@@ -1642,13 +1651,105 @@ impl ClientKvApiInner {
         self.start_early_owner_local_ssd_puts(vec![(key.to_string(), put_id, value_len)]);
     }
 
+    /// Enter the one owner-side remote Put singleflight and launch its leader.
+    ///
+    /// The per-key reservation remains a short synchronous critical section.
+    /// Only a new leader acquires a source holder and spawns Start/transfer/Done;
+    /// a follower receives the already-installed shared operation without
+    /// acquiring another holder or starting another transfer.
+    fn start_or_join_owner_remote_put(
+        &self,
+        key: &str,
+        put_id: PutIDForAKey,
+        preferred_sub_cluster: Option<String>,
+        protect_source_on_remote_complete: bool,
+    ) -> OwnerRemotePutStart {
+        match self.begin_owner_remote_put(
+            key,
+            put_id,
+            preferred_sub_cluster,
+            protect_source_on_remote_complete,
+        ) {
+            OwnerRemotePutReservation::Leader {
+                op,
+                memory_info,
+                admission_permit,
+            } => {
+                let holder = Arc::new(UserMemHolder::new(
+                    memory_info,
+                    self.get_or_init_all_memholder_refcount(),
+                    UserMemHolderExposeKind::SegPtr,
+                ));
+                let spawn_view = self.view.clone_view();
+                let task_view = spawn_view.clone();
+                let task_guard =
+                    OwnerRemotePutTaskGuard::new(task_view.clone(), op.clone(), admission_permit);
+                let _ = spawn_view.spawn("owner_remote_put_leader", async move {
+                    run_owner_remote_put(task_view, op, holder, task_guard).await;
+                });
+                OwnerRemotePutStart::LeaderStarted
+            }
+            OwnerRemotePutReservation::Follower(op) => {
+                tracing::debug!(
+                    "owner remote Put joined existing flight: key={} put_id=({},{})",
+                    op.key,
+                    op.put_id.0,
+                    op.put_id.1
+                );
+                OwnerRemotePutStart::Follower(op)
+            }
+            OwnerRemotePutReservation::SourceUnavailable => {
+                tracing::warn!(
+                    "owner remote Put source is unavailable, fenced, or version-mismatched: key={} put_id=({},{})",
+                    key,
+                    put_id.0,
+                    put_id.1
+                );
+                OwnerRemotePutStart::Rejected
+            }
+            OwnerRemotePutReservation::NotAdmitted => {
+                tracing::debug!(
+                    "owner remote Put was not admitted without queueing: key={} put_id=({},{})",
+                    key,
+                    put_id.0,
+                    put_id.1
+                );
+                OwnerRemotePutStart::Rejected
+            }
+        }
+    }
+
+    /// Non-blocking enqueue acknowledgement for an owner-side remote Put.
+    ///
+    /// `true` means this call either launched the unique leader or joined its
+    /// existing flight. It deliberately does not wait for Start/transfer/Done;
+    /// the shared flight still publishes the eventual terminal to callers that
+    /// explicitly need to wait for it.
+    pub(crate) fn start_remote_put_nonblocking(
+        &self,
+        key: &str,
+        put_id: PutIDForAKey,
+        preferred_sub_cluster: Option<String>,
+        protect_source_on_remote_complete: bool,
+    ) -> bool {
+        matches!(
+            self.start_or_join_owner_remote_put(
+                key,
+                put_id,
+                preferred_sub_cluster,
+                protect_source_on_remote_complete,
+            ),
+            OwnerRemotePutStart::LeaderStarted | OwnerRemotePutStart::Follower(_)
+        )
+    }
+
     /// Ensure one remote backing exists for an exact owner-local generation.
     ///
     /// Normal Put, pre-reserved replica, proactive write-back, and tier1 all
-    /// enter here.  Only the flight leader pins the source and immediately
-    /// launches Start/transfer/Done in its own async task; there is no actor or
-    /// intermediate work queue. Followers wait for and reuse that terminal
-    /// result instead of acquiring their own holder.
+    /// enter the same singleflight here. Only the flight leader pins the source
+    /// and immediately launches Start/transfer/Done in its own async task;
+    /// followers wait for and reuse that terminal result instead of acquiring
+    /// their own holder.
     pub async fn ensure_remote_put(
         &self,
         key: &str,
@@ -1658,73 +1759,28 @@ impl ClientKvApiInner {
     ) -> KvResult<bool> {
         let mut follower_takeover_attempted = false;
         loop {
-            match self.begin_owner_remote_put(
+            match self.start_or_join_owner_remote_put(
                 key,
                 put_id,
                 preferred_sub_cluster.clone(),
                 protect_source_on_remote_complete,
             ) {
-                OwnerRemotePutReservation::Leader {
-                    op,
-                    memory_info,
-                    admission_permit,
-                } => {
-                    let holder = Arc::new(UserMemHolder::new(
-                        memory_info,
-                        self.get_or_init_all_memholder_refcount(),
-                        UserMemHolderExposeKind::SegPtr,
-                    ));
-                    let spawn_view = self.view.clone_view();
-                    let task_view = spawn_view.clone();
-                    let task_guard = OwnerRemotePutTaskGuard::new(
-                        task_view.clone(),
-                        op.clone(),
-                        admission_permit,
-                    );
-                    let _ = spawn_view.spawn("owner_remote_put_leader", async move {
-                        run_owner_remote_put(task_view, op, holder, task_guard).await;
-                    });
-                    return Ok(true);
-                }
-                OwnerRemotePutReservation::Follower(op) => {
-                    tracing::debug!(
-                        "owner remote Put joined existing flight: key={} put_id=({},{})",
-                        op.key,
-                        op.put_id.0,
-                        op.put_id.1
-                    );
-                    match op.wait().await {
-                        OwnerRemotePutOutcome::Published
-                        | OwnerRemotePutOutcome::AlreadySatisfied => return Ok(true),
-                        OwnerRemotePutOutcome::Obsolete => return Ok(false),
-                        OwnerRemotePutOutcome::Failed if !follower_takeover_attempted => {
-                            follower_takeover_attempted = true;
-                            continue;
-                        }
-                        OwnerRemotePutOutcome::Failed => return Ok(false),
-                        OwnerRemotePutOutcome::InFlight => {
-                            unreachable!("remote Put wait must return a terminal outcome")
-                        }
+                OwnerRemotePutStart::LeaderStarted => return Ok(true),
+                OwnerRemotePutStart::Follower(op) => match op.wait().await {
+                    OwnerRemotePutOutcome::Published | OwnerRemotePutOutcome::AlreadySatisfied => {
+                        return Ok(true);
                     }
-                }
-                OwnerRemotePutReservation::SourceUnavailable => {
-                    tracing::warn!(
-                        "owner remote Put source is unavailable, fenced, or version-mismatched: key={} put_id=({},{})",
-                        key,
-                        put_id.0,
-                        put_id.1
-                    );
-                    return Ok(false);
-                }
-                OwnerRemotePutReservation::NotAdmitted => {
-                    tracing::debug!(
-                        "owner remote Put was not admitted without queueing: key={} put_id=({},{})",
-                        key,
-                        put_id.0,
-                        put_id.1
-                    );
-                    return Ok(false);
-                }
+                    OwnerRemotePutOutcome::Obsolete => return Ok(false),
+                    OwnerRemotePutOutcome::Failed if !follower_takeover_attempted => {
+                        follower_takeover_attempted = true;
+                        continue;
+                    }
+                    OwnerRemotePutOutcome::Failed => return Ok(false),
+                    OwnerRemotePutOutcome::InFlight => {
+                        unreachable!("remote Put wait must return a terminal outcome")
+                    }
+                },
+                OwnerRemotePutStart::Rejected => return Ok(false),
             }
         }
     }
@@ -2135,17 +2191,16 @@ impl ClientKvApiInner {
             .await?;
         let rpc_started_at = Instant::now();
         let start_rpc_timestamp = Utc::now().timestamp_micros() as i64;
-        let resp = self
-            .rpc_caller_put_start
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                2,
-            )
-            .await
-            .map_err(|e| KvError::P2p(e))?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_put_start,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            Some(std::time::Duration::from_secs(60)),
+            2,
+        )
+        .await
+        .map_err(KvError::P2p)?;
         let end_rpc_timestamp = Utc::now().timestamp_micros() as i64;
         let ser = resp.serialize_part.clone();
         if crate::rpcresp_kvresult_convert::try_from_code(ser.error_code, ser.error_json.clone())
@@ -2202,13 +2257,16 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
+        // Local grants bootstrap the owner's allocatable pool. They cannot rely on the direct
+        // transfer-RPC path whose usable segments are established by this control sequence.
         let resp = self
             .rpc_caller_reserve_local_grant
-            .call(
+            .call_with_transport_policy(
                 self.view.p2p_module(),
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 2,
             )
             .await
@@ -2240,17 +2298,16 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let resp = self
-            .rpc_caller_release_local_grant
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                2,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_release_local_grant,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            Some(std::time::Duration::from_secs(60)),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -2281,17 +2338,16 @@ impl ClientKvApiInner {
             .await?;
 
         // 调用 RPC
-        let _resp = self
-            .rpc_caller_put_revoke
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                2,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let _resp = call_control_plane_rpc(
+            &self.rpc_caller_put_revoke,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            Some(std::time::Duration::from_secs(60)),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
         // cleanup pending stat if any
         let _ = self.metrics_handle().pending_put_remove(&put_id);
         Ok(())
@@ -2327,11 +2383,12 @@ impl ClientKvApiInner {
             .await?;
         let resp = self
             .rpc_caller_put_append_start
-            .call(
+            .call_with_transport_policy(
                 self.view.p2p_module(),
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 2,
             )
             .await
@@ -2377,7 +2434,7 @@ impl ClientKvApiInner {
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
-                RpcTransportPolicy::ForceTransport,
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 2,
             )
             .await
@@ -2430,7 +2487,7 @@ impl ClientKvApiInner {
                 master_node_id.into(),
                 req,
                 Some(Duration::from_secs(60)),
-                RpcTransportPolicy::ForceTransport,
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 2,
             )
             .await
@@ -2486,7 +2543,7 @@ impl ClientKvApiInner {
                 master_node_id.into(),
                 req,
                 Some(Duration::from_secs(60)),
-                RpcTransportPolicy::ForceTransport,
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 2,
             )
             .await
@@ -2524,11 +2581,12 @@ impl ClientKvApiInner {
             .await?;
         let _resp = self
             .rpc_caller_put_append_revoke
-            .call(
+            .call_with_transport_policy(
                 self.view.p2p_module(),
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 2,
             )
             .await
@@ -2562,11 +2620,12 @@ impl ClientKvApiInner {
             .await?;
         let resp = self
             .rpc_caller_put_append_done
-            .call(
+            .call_with_transport_policy(
                 self.view.p2p_module(),
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 0,
             )
             .await
@@ -2611,7 +2670,7 @@ impl ClientKvApiInner {
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
-                RpcTransportPolicy::ForceTransport,
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 0,
             )
             .await
@@ -2648,7 +2707,7 @@ impl ClientKvApiInner {
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
-                RpcTransportPolicy::ForceTransport,
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 2,
             )
             .await
@@ -2687,17 +2746,16 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let resp = self
-            .rpc_caller_batch_prepare_put_keys
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                2,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_batch_prepare_put_keys,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            Some(std::time::Duration::from_secs(60)),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -2732,17 +2790,16 @@ impl ClientKvApiInner {
             .cluster_manager()
             .find_or_wait_master_node()
             .await?;
-        let resp = self
-            .rpc_caller_batch_release_put_key_reservations
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                2,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_batch_release_put_key_reservations,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            Some(std::time::Duration::from_secs(60)),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -2782,7 +2839,7 @@ impl ClientKvApiInner {
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
-                RpcTransportPolicy::ForceTransport,
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 2,
             )
             .await
@@ -2827,7 +2884,7 @@ impl ClientKvApiInner {
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
-                RpcTransportPolicy::ForceTransport,
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 0,
             )
             .await
@@ -2877,7 +2934,7 @@ impl ClientKvApiInner {
                 master_node_id.into(),
                 req,
                 Some(std::time::Duration::from_secs(60)),
-                RpcTransportPolicy::ForceTransport,
+                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
                 0,
             )
             .await
@@ -2923,17 +2980,16 @@ impl ClientKvApiInner {
         let rpc_started_at = Instant::now();
 
         // 调用 RPC
-        let resp = self
-            .rpc_caller_put_done
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                0,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_put_done,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            Some(std::time::Duration::from_secs(60)),
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         if let Err(e) = crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -2976,17 +3032,16 @@ impl ClientKvApiInner {
             .find_or_wait_master_node()
             .await?;
         let rpc_started_at = Instant::now();
-        let resp = self
-            .rpc_caller_put_done
-            .call(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                0,
-            )
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_put_done,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            Some(std::time::Duration::from_secs(60)),
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
@@ -4397,22 +4452,10 @@ pub async fn handle_batch_enqueue_replica_tasks(
     let inner = view.client_kv_api().inner();
     let mut items = Vec::with_capacity(req.serialize_part.items.len());
     for item in req.serialize_part.items {
-        let accepted = match inner
-            .ensure_remote_put(&item.key, item.put_id, None, false)
-            .await
-        {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                tracing::warn!(
-                    "tier1 write-back enqueue failed: key={} put_id=({},{}) err={}",
-                    item.key,
-                    item.put_id.0,
-                    item.put_id.1,
-                    err
-                );
-                false
-            }
-        };
+        // This RPC acknowledges admission into the existing per-generation
+        // singleflight. Waiting for a follower's payload terminal here lets
+        // one slow transfer hold the entire metadata batch past its deadline.
+        let accepted = inner.start_remote_put_nonblocking(&item.key, item.put_id, None, false);
         items.push(EnqueueReplicaTaskItemResp {
             key: item.key,
             put_id: item.put_id,

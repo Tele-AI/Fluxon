@@ -19,7 +19,10 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "test_bins"))]
 use super::msg_pack::{BatchDeleteClientKvMetaCacheReq, DeleteClientKvMetaCacheItem};
 #[cfg(any(test, feature = "test_bins"))]
-use crate::{cluster_manager::NodeID, p2p::msg_pack::RPCCaller};
+use crate::{
+    cluster_manager::NodeID,
+    p2p::{control_plane_rpc::call_control_plane_rpc, msg_pack::RPCCaller},
+};
 #[cfg(any(test, feature = "test_bins"))]
 use std::time::Duration;
 
@@ -166,15 +169,15 @@ pub fn evict_one_kv_replica_for_node(
             },
             raw_bytes: Vec::new(),
         };
-        match rpc_caller
-            .call(
-                view_task.p2p_module(),
-                node_for_delete.clone(),
-                req,
-                Some(Duration::from_secs(60)),
-                0,
-            )
-            .await
+        match call_control_plane_rpc(
+            &rpc_caller,
+            view_task.p2p_module(),
+            node_for_delete.clone(),
+            req,
+            Some(Duration::from_secs(60)),
+            0,
+        )
+        .await
         {
             Ok(resp) => {
                 if resp.serialize_part.error_code == msg_and_error::OK {

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::master_kv_router::msg_pack::CountPrefixReq;
+use crate::p2p::control_plane_rpc::call_control_plane_rpc;
 use crate::p2p::msg_pack::{MsgPack, RPCCaller};
 use crate::p2p::p2p_module::P2pModule;
 use crate::rpcresp_kvresult_convert;
@@ -31,16 +32,16 @@ pub async fn count_prefix_for_framework(fw: &crate::Framework, prefix: &str) -> 
     };
 
     let caller = RPCCaller::<CountPrefixReq>::new();
-    let resp = caller
-        .call(
-            fw.p2p_view().p2p_module(),
-            master_node_id.into(),
-            req,
-            Some(Duration::from_secs(60)),
-            0,
-        )
-        .await
-        .map_err(KvError::from)?;
+    let resp = call_control_plane_rpc(
+        &caller,
+        fw.p2p_view().p2p_module(),
+        master_node_id.into(),
+        req,
+        Some(Duration::from_secs(60)),
+        0,
+    )
+    .await
+    .map_err(KvError::from)?;
 
     if let Err(e) = rpcresp_kvresult_convert::try_from_code(
         resp.serialize_part.error_code,

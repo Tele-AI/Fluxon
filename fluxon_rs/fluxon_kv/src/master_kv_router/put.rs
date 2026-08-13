@@ -736,6 +736,7 @@ async fn publish_completed_put_route(
     completed_info: KvMemoryReplica,
     target_cap_bytes: u64,
     local_cache_holder_id: Option<u64>,
+    deferred_maintenance_events: Option<&mut Vec<RoutePublishEvent>>,
 ) -> MsgPack<PutDoneResp> {
     let new_route = Arc::new(OneKvNodesRoutes {
         put_id,
@@ -792,17 +793,18 @@ async fn publish_completed_put_route(
         }
     }
 
-    apply_post_route_maintenance_batch(
-        &view,
-        vec![RoutePublishEvent::primary_put(
-            key.clone(),
-            put_id,
-            lease_id_opt,
-            node_id.clone(),
-            target_cap_bytes,
-        )],
-    )
-    .await;
+    let maintenance_event = RoutePublishEvent::primary_put(
+        key.clone(),
+        put_id,
+        lease_id_opt,
+        node_id.clone(),
+        target_cap_bytes,
+    );
+    if let Some(events) = deferred_maintenance_events {
+        events.push(maintenance_event);
+    } else {
+        apply_post_route_maintenance_batch(&view, vec![maintenance_event]).await;
+    }
 
     tracing::debug!(
         "Completed put operation with put_id: {:?}, key: {:?}",
@@ -1517,7 +1519,7 @@ pub async fn handle_put_done(
     req: MsgPack<PutDoneReq>,
     req_node_id: NodeID,
 ) -> MsgPack<PutDoneResp> {
-    handle_put_done_with_resolved_group(view, req, req_node_id, None).await
+    handle_put_done_with_resolved_group(view, req, req_node_id, None, None).await
 }
 
 async fn handle_put_done_with_resolved_group(
@@ -1525,6 +1527,7 @@ async fn handle_put_done_with_resolved_group(
     req: MsgPack<PutDoneReq>,
     req_node_id: NodeID,
     resolved_atomic_group: Option<Arc<PutAtomicGroup>>,
+    deferred_maintenance_events: Option<&mut Vec<RoutePublishEvent>>,
 ) -> MsgPack<PutDoneResp> {
     tracing::debug!("Handling PutDoneReq: {:?}", req.serialize_part);
 
@@ -2036,6 +2039,7 @@ async fn handle_put_done_with_resolved_group(
                 completed_info,
                 target_cap_bytes,
                 None,
+                deferred_maintenance_events,
             )
             .await;
         }
@@ -2152,11 +2156,12 @@ pub async fn handle_batch_put_done(
     req_node_id: NodeID,
 ) -> MsgPack<BatchPutDoneResp> {
     let mut items = Vec::with_capacity(req.serialize_part.items.len());
+    let mut maintenance_events = Vec::with_capacity(req.serialize_part.items.len());
     for item in req.serialize_part.items {
         let key = item.key.clone();
         let put_id = item.put_id;
         let lease_id = item.lease_id;
-        let resp = handle_put_done(
+        let resp = handle_put_done_with_resolved_group(
             view.clone(),
             MsgPack {
                 serialize_part: PutDoneReq {
@@ -2171,6 +2176,8 @@ pub async fn handle_batch_put_done(
                 raw_bytes: Vec::new(),
             },
             req_node_id.clone(),
+            None,
+            Some(&mut maintenance_events),
         )
         .await;
         let part = resp.serialize_part;
@@ -2181,6 +2188,9 @@ pub async fn handle_batch_put_done(
             error_json: part.error_json,
             local_cache_holder_id: part.local_cache_holder_id,
         });
+    }
+    if !maintenance_events.is_empty() {
+        apply_post_route_maintenance_batch(&view, maintenance_events).await;
     }
     MsgPack {
         serialize_part: BatchPutDoneResp {
@@ -2262,6 +2272,7 @@ pub async fn handle_grouped_batch_put_done(
     }
 
     let mut items = Vec::with_capacity(request_items.len());
+    let mut maintenance_events = Vec::with_capacity(request_items.len());
     for (item, atomic_group) in request_items.into_iter().zip(assignments) {
         let key = item.key.clone();
         let put_id = item.put_id;
@@ -2281,6 +2292,7 @@ pub async fn handle_grouped_batch_put_done(
             },
             req_node_id.clone(),
             atomic_group,
+            Some(&mut maintenance_events),
         )
         .await;
         let part = resp.serialize_part;
@@ -2291,6 +2303,9 @@ pub async fn handle_grouped_batch_put_done(
             error_json: part.error_json,
             local_cache_holder_id: part.local_cache_holder_id,
         });
+    }
+    if !maintenance_events.is_empty() {
+        apply_post_route_maintenance_batch(&view, maintenance_events).await;
     }
     MsgPack {
         serialize_part: GroupedBatchPutDoneResp {
