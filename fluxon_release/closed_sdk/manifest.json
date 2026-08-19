@@ -1,6 +1,6 @@
 {
   "object_kind": "FluxonCommuClosedSdk",
-  "schema_version": 6,
+  "schema_version": 7,
   "abi_version": 9,
   "sdk_version": "0.2.1",
   "required_open_surface_version": "0.2.1",
@@ -9,7 +9,7 @@
     "runtime_authority_crate": "fluxon_commu_private_impl",
     "transfer_link_snapshot_mode": "watch-v1"
   },
-  "public_workspace_input_sha256": "9258d049cf12a522e2d5964624c5cfdb2b78d2a8398d8f1aba920e4091b7b3e8",
+  "public_workspace_input_sha256": "813d5267b713d0d9e84cfa3d0e438be9f7fb8e9c3ad586836b8aee508577ba84",
   "layout": {
     "native": "native",
     "lib": "lib"
