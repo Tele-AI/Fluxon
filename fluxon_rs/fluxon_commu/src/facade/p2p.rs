@@ -748,6 +748,41 @@ impl P2pModule {
         }
     }
 
+    /// Install a dispatch handler as an awaited init-DAG action.
+    ///
+    /// Startup-critical handlers must use this form so the publishing DAG step
+    /// cannot complete while the closed runtime still lacks the handler.
+    pub(crate) async fn regist_dispatch_raw_for_init_dag<F>(
+        &self,
+        msg_id: MsgId,
+        f: F,
+    ) -> P2PResult<()>
+    where
+        F: Fn(
+                &str,
+                &P2pModule,
+                ClosedRuntimeDispatchRequestRef<'_>,
+                &bytes::Bytes,
+            ) -> P2PResult<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let view = self.module_view();
+        let handle = self.ensure_closed_runtime_handle().await?;
+        p2p_register_dispatch(
+            handle,
+            msg_id,
+            Arc::new(
+                move |request: ClosedRuntimeDispatchRequestRef<'_>, body: bytes::Bytes| {
+                    f(request.reply_next_hop, view.p2p_module(), request, &body).map(|_| ())
+                },
+            ),
+        )
+        .await
+        .map_err(p2p_closed_sdk_error)
+    }
+
     pub(crate) fn register_rpc_response_msg_id(&self, msg_id: MsgId) {
         {
             if self.is_rpc_response_msg_id_registered_runtime(msg_id) {
@@ -983,6 +1018,10 @@ pub mod rpc {
     use crate::{NodeID, TaskId};
     use tracing::warn;
 
+    fn should_wait_before_rpc_retry(attempt_idx: usize, total_attempts: usize) -> bool {
+        attempt_idx.saturating_add(1) < total_attempts
+    }
+
     pub use fluxon_commu_contract::p2p::rpc::*;
 
     #[derive(Default)]
@@ -998,6 +1037,7 @@ pub mod rpc {
     pub struct Responser {
         task_id: TaskId,
         node_id: NodeID,
+        node_start_time: i64,
         reply_next_hop: NodeID,
         incoming_local_observe: crate::p2p::WireTransportLocalObserve,
         view: P2pModuleView,
@@ -1056,6 +1096,11 @@ pub mod rpc {
             self.node_id.clone()
         }
 
+        /// Exact logical-source generation authenticated by the transport.
+        pub fn node_start_time(&self) -> i64 {
+            self.node_start_time
+        }
+
         pub fn task_id(&self) -> TaskId {
             self.task_id
         }
@@ -1086,6 +1131,11 @@ pub mod rpc {
 
         pub fn node_id(&self) -> NodeID {
             self.responsor.node_id()
+        }
+
+        /// Exact logical-source generation authenticated by the transport.
+        pub fn node_start_time(&self) -> i64 {
+            self.responsor.node_start_time()
         }
 
         pub fn task_id(&self) -> TaskId {
@@ -1202,6 +1252,15 @@ pub mod rpc {
             regist_rpc_recv::<R, _>(p2p, req_handler);
         }
 
+        /// Await handler installation for a startup-critical init-DAG step.
+        pub async fn regist_for_init_dag<F>(&self, p2p: &P2pModule, req_handler: F) -> P2PResult<()>
+        where
+            F: Fn(RPCResponsor<R>, MsgPack<R>) -> P2PResult<()> + Send + Sync + 'static,
+            R: Default,
+        {
+            regist_rpc_recv_for_init_dag::<R, _>(p2p, req_handler).await
+        }
+
         pub async fn call(
             &self,
             p2p: &P2pModule,
@@ -1250,6 +1309,7 @@ pub mod rpc {
                 Responser {
                     task_id: request_view.task_id,
                     node_id: logical_source,
+                    node_start_time: request_view.logical_source_node_start_time,
                     reply_next_hop: reply_next_hop.to_string().into(),
                     incoming_local_observe: crate::p2p::WireTransportLocalObserve {
                         frame_recv_done_ts_us: request_view.incoming_frame_recv_done_ts_us,
@@ -1287,6 +1347,49 @@ pub mod rpc {
             };
             req_handler(rpc_resp, req)
         });
+    }
+
+    pub async fn regist_rpc_recv_for_init_dag<REQ, F>(
+        p2p: &P2pModule,
+        req_handler: F,
+    ) -> P2PResult<()>
+    where
+        REQ: RPCReq + Default,
+        F: Fn(RPCResponsor<REQ>, MsgPack<REQ>) -> P2PResult<()> + Send + Sync + 'static,
+    {
+        let req_type = REQ::default();
+        let msg_id = req_type.msg_id();
+        let view = p2p.module_view();
+        p2p.regist_dispatch_raw_for_init_dag(
+            msg_id,
+            move |_reply_next_hop, _p2p, request_view, data| {
+                let raw_lengths = request_view.body_raw_bytes_lengths;
+                let req = MsgPack::<REQ>::decode_from_body_view(
+                    request_view.body_serialize_part_len,
+                    raw_lengths,
+                    data,
+                )?;
+                let rpc_resp = RPCResponsor {
+                    responsor: Responser {
+                        task_id: request_view.task_id,
+                        node_id: request_view.logical_source_peer_id.to_string().into(),
+                        node_start_time: request_view.logical_source_node_start_time,
+                        reply_next_hop: request_view.reply_next_hop.to_string().into(),
+                        incoming_local_observe: crate::p2p::WireTransportLocalObserve {
+                            frame_recv_done_ts_us: request_view.incoming_frame_recv_done_ts_us,
+                            dispatch_enqueued_ts_us: request_view.incoming_dispatch_enqueued_ts_us,
+                            dispatch_started_ts_us: request_view.incoming_dispatch_started_ts_us,
+                            complete_pending_call_ts_us: request_view
+                                .incoming_complete_pending_call_ts_us,
+                        },
+                        view: view.clone(),
+                    },
+                    _phantom: PhantomData,
+                };
+                req_handler(rpc_resp, req)
+            },
+        )
+        .await
     }
 
     pub async fn call_with_retry<REQ: RPCReq>(
@@ -1332,13 +1435,21 @@ pub mod rpc {
                     if matches!(err, P2pError::InvalidRpcTimeout { .. }) {
                         return Err(err);
                     }
-                    warn!(
-                        "RPC call failed with error={:?}, retrying in 5 seconds, msg_id={}",
-                        err,
-                        req.msg_id()
-                    );
-                    tokio::time::sleep(Duration::from_secs(5)).await;
                     failed_count += 1;
+                    if should_wait_before_rpc_retry(attempt_idx, retry) {
+                        warn!(
+                            "RPC call failed with error={:?}, retrying in 5 seconds, msg_id={}",
+                            err,
+                            req.msg_id()
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    } else {
+                        warn!(
+                            "RPC call failed with error={:?}, no retries remaining, msg_id={}",
+                            err,
+                            req.msg_id()
+                        );
+                    }
                 }
             }
         }
@@ -1466,6 +1577,20 @@ pub mod rpc {
         handler: Arc<dyn UserRpcBytesAsyncHandler>,
     ) {
         p2p.register_user_rpc_bytes_handler_async(path, handler);
+    }
+
+    #[cfg(test)]
+    mod retry_tests {
+        use super::should_wait_before_rpc_retry;
+
+        #[test]
+        fn final_failed_attempt_never_adds_retry_delay() {
+            assert!(!should_wait_before_rpc_retry(0, 0));
+            assert!(!should_wait_before_rpc_retry(0, 1));
+            assert!(should_wait_before_rpc_retry(0, 3));
+            assert!(should_wait_before_rpc_retry(1, 3));
+            assert!(!should_wait_before_rpc_retry(2, 3));
+        }
     }
 }
 

@@ -14,7 +14,6 @@ use fluxon_fs::config::{
     FS_MASTER_CONFIG_RPC_PATH, FluxonFsRequestIdentity, FluxonFsS3KvMissPolicy,
     FsAgentDeclaredExportWire,
 };
-use fluxon_kv::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
 use fluxon_kv::client_kv_api::ClientKvApiViewTrait;
 use fluxon_kv::client_kv_api::msg_pack::{
     ExternalBatchPutCommitItemReq, ExternalBatchPutCommitReq, ExternalBatchPutStartItemReq,
@@ -22,7 +21,7 @@ use fluxon_kv::client_kv_api::msg_pack::{
     ExternalPutRevokeReq,
 };
 use fluxon_kv::client_kv_api::{
-    ClientKvApiInner, OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerLocalReserveSlotLease,
+    ClientKvApiInner, OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerSlotLease,
 };
 use fluxon_kv::client_seg_pool::ClientSegPoolViewTrait;
 use fluxon_kv::client_transfer_engine::ClientTransferEngineAccessTrait;
@@ -31,8 +30,7 @@ use fluxon_kv::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use fluxon_kv::config::{ClientConfigYaml, MasterConfigYaml};
 use fluxon_kv::external_client_api::ExternalClientApiViewTrait;
 use fluxon_kv::master_kv_router::msg_pack::{
-    BatchPreparePutKeyItemReq, PutDoneCommittedSlot, RadixKvMetadata, ReserveLocalGrantOutcome,
-    build_put_atomic_group_assignments,
+    BatchPreparePutKeyItemReq, RadixKvMetadata, build_put_atomic_group_assignments,
 };
 use fluxon_kv::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use fluxon_kv::memholder::kvclient_encode::{BorrowedFlatKvValueRange, flat_kv_decode_borrowed};
@@ -2132,7 +2130,7 @@ struct StagedOwnerPutPlanData {
     keys: Vec<String>,
     value_len: u64,
     key_reservation_ids: Vec<u64>,
-    slot_lease: OwnerLocalReserveSlotLease,
+    slot_lease: OwnerSlotLease,
     make_replica_task_mask: Vec<bool>,
     radix_metadata: Vec<Option<RadixKvMetadata>>,
     atomic_group_lens: Vec<usize>,
@@ -2308,7 +2306,7 @@ fn cleanup_plan_registry_entry(
 async fn release_staged_put_resources(
     inner: &ClientKvApiInner,
     key_reservation_ids: Vec<u64>,
-    slot_lease: OwnerLocalReserveSlotLease,
+    slot_lease: OwnerSlotLease,
 ) -> KvResult<()> {
     let release_keys_result = inner
         .batch_release_put_key_reservations(key_reservation_ids)
@@ -3507,133 +3505,6 @@ impl KvClient {
         wait_local_segments_ready_inner(self, py).into_py_object(py)
     }
 
-    #[pyo3(signature = ())]
-    fn reserve_local_grant_blocking(&self, py: Python) -> PyObject {
-        fn reserve_local_grant_blocking_inner(
-            client: &KvClient,
-            py: Python,
-        ) -> ApiResult<PyObject> {
-            let framework = match require_kv_framework_api(client, py) {
-                Ok(v) => v,
-                Err(e) => return ApiResult::new_error(e),
-            };
-            if framework.is_external_mode() {
-                return ApiResult::new_error(new_invalid_argument_error(
-                    py,
-                    "reserve_local_grant_blocking currently only supports owner mode",
-                ));
-            }
-            let runtime = match client.runtime.as_ref() {
-                Some(v) => v,
-                None => {
-                    return ApiResult::new_error(new_general_error(
-                        py,
-                        "Client runtime is missing",
-                    ));
-                }
-            };
-            let framework_for_reserve = framework.clone();
-            let reserve_resp = match py.allow_threads(|| {
-                runtime.run_async_from_sync(async move {
-                    framework_for_reserve
-                        .client_kv_api_view()
-                        .client_kv_api()
-                        .inner()
-                        .reserve_local_grant()
-                        .await
-                })
-            }) {
-                Ok(v) => v,
-                Err(e) => {
-                    return ApiResult::new_error(new_general_error(
-                        py,
-                        &format!("runtime bridge failed: {}", e),
-                    ));
-                }
-            };
-            match reserve_resp {
-                Ok(ReserveLocalGrantOutcome::Granted {
-                    grant_id,
-                    node_id: _,
-                    addr,
-                    base_addr,
-                    len,
-                }) => ApiResult::new_success((grant_id, addr, base_addr, len).into_py(py)),
-                Ok(ReserveLocalGrantOutcome::None) => {
-                    unreachable!("reserve_local_grant filters empty successful outcomes")
-                }
-                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
-                    py,
-                    &err,
-                    &format!(
-                        "reserve_local_grant_blocking failed for fixed quantum={}B",
-                        OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
-                    ),
-                )),
-            }
-        }
-
-        reserve_local_grant_blocking_inner(self, py).into_py_object(py)
-    }
-
-    #[pyo3(signature = (grant_id))]
-    fn release_local_grant_blocking(&self, grant_id: u64, py: Python) -> PyObject {
-        fn release_local_grant_blocking_inner(
-            client: &KvClient,
-            grant_id: u64,
-            py: Python,
-        ) -> ApiResult<PyObject> {
-            let framework = match require_kv_framework_api(client, py) {
-                Ok(v) => v,
-                Err(e) => return ApiResult::new_error(e),
-            };
-            if framework.is_external_mode() {
-                return ApiResult::new_error(new_invalid_argument_error(
-                    py,
-                    "release_local_grant_blocking currently only supports owner mode",
-                ));
-            }
-            let runtime = match client.runtime.as_ref() {
-                Some(v) => v,
-                None => {
-                    return ApiResult::new_error(new_general_error(
-                        py,
-                        "Client runtime is missing",
-                    ));
-                }
-            };
-            let framework_for_release = framework.clone();
-            let release_result = match py.allow_threads(|| {
-                runtime.run_async_from_sync(async move {
-                    framework_for_release
-                        .client_kv_api_view()
-                        .client_kv_api()
-                        .inner()
-                        .release_local_grant(grant_id)
-                        .await
-                })
-            }) {
-                Ok(v) => v,
-                Err(e) => {
-                    return ApiResult::new_error(new_general_error(
-                        py,
-                        &format!("runtime bridge failed: {}", e),
-                    ));
-                }
-            };
-            match release_result {
-                Ok(()) => ApiResult::new_success(0i32.into_py(py)),
-                Err(err) => ApiResult::new_error(crate::error::py_error_from_kv_error(
-                    py,
-                    &err,
-                    "release_local_grant_blocking failed",
-                )),
-            }
-        }
-
-        release_local_grant_blocking_inner(self, grant_id, py).into_py_object(py)
-    }
-
     #[pyo3(signature = (keys, value_len, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true, make_replica_task_mask=None, radix_parent_keys=None, content_depths=None, atomic_group_lens=None))]
     fn local_fast_put_start(
         &self,
@@ -3974,7 +3845,7 @@ impl KvClient {
                                 Ok(_) => Err(err),
                                 Err(cleanup_err) => Err(CoreKvError::Api(CoreApiError::Unknown {
                                     detail: format!(
-                                        "local_fast_put_start reserve_local_grant failed: {} cleanup_err={}",
+                                        "local_fast_put_start owner-segment claim failed: {} cleanup_err={}",
                                         err, cleanup_err
                                     ),
                                 })),
@@ -4182,17 +4053,27 @@ impl KvClient {
                         let inner = client_kv_api_view.client_kv_api().inner();
                         let slot_refs = owner_data.slot_lease.slots.clone();
                         let slot_size = owner_data.slot_lease.slot_size;
+                        let invalid_slot_count = slot_refs
+                            .iter()
+                            .filter(|slot| {
+                                !slot.is_valid()
+                                    || slot.len != owner_data.value_len
+                                    || slot.capacity_bytes != slot_size
+                            })
+                            .count();
                         if slot_refs.len() != owner_data.keys.len()
                             || owner_data.make_replica_task_mask.len() != owner_data.keys.len()
                             || owner_data.radix_metadata.len() != owner_data.keys.len()
+                            || invalid_slot_count != 0
                         {
                             let err = CoreKvError::Api(CoreApiError::Unknown {
                                 detail: format!(
-                                    "local_fast_put_commit staged length mismatch: keys={} slots={} replica_mask={} radix_metadata={}",
+                                    "local_fast_put_commit staged identity mismatch: keys={} slots={} replica_mask={} radix_metadata={} invalid_slots={}",
                                     owner_data.keys.len(),
                                     slot_refs.len(),
                                     owner_data.make_replica_task_mask.len(),
-                                    owner_data.radix_metadata.len()
+                                    owner_data.radix_metadata.len(),
+                                    invalid_slot_count,
                                 ),
                             });
                             let _ = release_staged_put_resources(
@@ -4268,11 +4149,11 @@ impl KvClient {
                             let memory_info = inner
                                 .build_local_reserve_resident_memory_info(
                                     key,
-                                    slot_ref.ptr,
+                                    slot_ref.addr,
                                     value_len_u32,
-                                    slot_size,
-                                    slot_ref.grant_id,
-                                    slot_ref.slot_index,
+                                    slot_ref.allocation_id,
+                                    slot_ref.segment_offset,
+                                    slot_ref.capacity_bytes,
                                 )
                                 .await;
                             inner.install_precommit_local_visible_memory_info(key, memory_info);
@@ -4283,14 +4164,7 @@ impl KvClient {
                                 put_id,
                                 value_len: owner_data.value_len,
                                 lease_id: None,
-                                committed_slot: PutDoneCommittedSlot {
-                                    grant_id: slot_ref.grant_id,
-                                    slot_index: slot_ref.slot_index,
-                                    slot_size,
-                                    addr: slot_ref.ptr,
-                                    base_addr: slot_ref.base_addr,
-                                    len: owner_data.value_len,
-                                },
+                                committed_slot: slot_ref.clone(),
                                 make_replica_task: *make_replica_task,
                                 // This owner-local path has no earlier remote
                                 // reservation. Selected items are admitted to
@@ -6879,7 +6753,7 @@ impl KvClient {
             client: &KvClient,
             py: Python,
         ) -> ApiResult<PyObject> {
-            let _framework = match require_kv_framework_api(client, py) {
+            let framework = match require_kv_framework_api(client, py) {
                 Ok(v) => v,
                 Err(e) => return ApiResult::new_error(e),
             };
@@ -6895,6 +6769,10 @@ impl KvClient {
             let locality_counters = client.locality_counters.clone();
             let future = async move {
                 let metrics = locality_counters.snapshot();
+                let reliability = framework
+                    .external_client_api_view()
+                    .external_client_api()
+                    .planned_get_reliability_snapshot();
                 Python::with_gil(|py| {
                     let out = PyDict::new_bound(py);
                     out.set_item("l2_local_hit_pages", metrics.l2_local_hit_pages)
@@ -6905,6 +6783,16 @@ impl KvClient {
                         .expect("set l2_remote_hit_pages");
                     out.set_item("l2_remote_hit_bytes", metrics.l2_remote_hit_bytes)
                         .expect("set l2_remote_hit_bytes");
+                    out.set_item(
+                        "master_get_plan_hit_items",
+                        reliability.master_plan_hit_items,
+                    )
+                    .expect("set master_get_plan_hit_items");
+                    out.set_item(
+                        "planned_cpu_direct_miss_items",
+                        reliability.direct_miss_items,
+                    )
+                    .expect("set planned_cpu_direct_miss_items");
                     let io = PyDict::new_bound(py);
                     for (key, item) in [
                         ("put_local", metrics.put_local.clone()),

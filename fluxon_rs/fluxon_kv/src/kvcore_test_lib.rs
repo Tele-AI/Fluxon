@@ -141,6 +141,7 @@ fn new_client_config_with_cluster_and_dram(
         },
         pprof_duration_seconds: None,
         replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: vec![etcd],
@@ -255,6 +256,25 @@ pub async fn start_master_and_client_with_client_config(
 
     sleep(Duration::from_secs(3)).await;
     (master_fw, client_fw)
+}
+
+/// Join one additional owner to an already-running test cluster without
+/// cleaning membership or restarting the master.  The caller remains
+/// responsible for shutting this framework down before the original pair.
+pub async fn start_additional_client_with_config(
+    master_key: &str,
+    client_key: &str,
+    configure: impl FnOnce(&mut ClientConfig),
+) -> Arc<Framework> {
+    let cluster_name = test_cluster_name(master_key);
+    let mut client_config =
+        new_client_config_with_cluster_and_dram(client_key, &cluster_name, 1024 * 1024 * 160);
+    configure(&mut client_config);
+    let (client_fw, _) = run_client(ConfigArg::Config(client_config))
+        .await
+        .expect("start additional test client");
+    sleep(Duration::from_secs(3)).await;
+    client_fw
 }
 
 pub async fn stop_master_and_client(master_fw: Arc<Framework>, client_fw: Arc<Framework>) {

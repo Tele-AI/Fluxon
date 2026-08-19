@@ -16,10 +16,15 @@ use crate::cluster_manager::{
     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
 };
 use crate::master_kv_router::msg_pack::{
-    BatchGetBindItemReq, BatchGetBindReq, BatchGetBindResp, BatchGetDoneReq, BatchGetDoneResp,
-    BatchGetPlanItemResp, BatchGetPlanReq, BatchGetPlanResp, BatchGetRevokeReq, BatchGetRevokeResp,
-    BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp, GetAllocationMode, GetBindTarget,
-    GetExternalSinkTarget,
+    BatchGetDoneItemReq, BatchGetDoneReq, BatchGetDoneResp, BatchGetPlanItemResp, BatchGetPlanReq,
+    BatchGetPlanResp, BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp,
+    BatchGetStartReq, BatchGetStartResp, GetAllocationMode, GetBindTarget, GetExternalSinkTarget,
+};
+use crate::owner_segment::{
+    OWNER_TRANSFER_EXTERNAL_ACK_STREAM, OwnerExternalGpuWriteCapability, OwnerGeneration,
+    OwnerGetDestinationCapability, OwnerGetSourceCapability, OwnerSegmentTransferItem,
+    OwnerSegmentTransferOutcome, OwnerSegmentTransferReq, OwnerTransferOpId, OwnerTransferOpKind,
+    OwnerTransferPeerTracker,
 };
 use crate::rpcresp_kvresult_convert::ToResult;
 use crate::{
@@ -57,13 +62,13 @@ use fluxon_commu::ShareGroupOwnerRef;
 use fluxon_framework::{LogicalModule, define_module};
 use fluxon_observability::kv_metrics_actor::{ObserveComponent, ObserveDirection};
 use fluxon_util::semaphore_map::SemaphoreMap;
-use futures::{StreamExt, stream};
 use libc::{MAP_SHARED, PROT_READ, PROT_WRITE, mmap};
 use limit_thirdparty::tokio;
 use limit_thirdparty::tokio::sync::{ARwLock, Notify};
 use limit_thirdparty::tokio::time::sleep;
 use parking_lot::Mutex;
 use std::{
+    collections::HashMap,
     fs::File,
     // path::PathBuf, // 不再使用PathBuf
     sync::{
@@ -101,6 +106,16 @@ const EXTERNAL_OWNER_INTRA_RPC_READY_TIMEOUT_SECS: u64 = 30;
 const EXTERNAL_PLANNED_CPU_GET_FOREGROUND_RPC_TIMEOUT_SECS: u64 =
     crate::p2p::msg_pack::MIN_EXPLICIT_RPC_TIMEOUT_SECS;
 const EXTERNAL_PLANNED_CPU_GET_REPLAY_RPC_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExternalPlannedGetReliabilitySnapshot {
+    /// Items for which the master returned a concrete source plan.
+    pub master_plan_hit_items: u64,
+    /// Planned items whose first owner execution found a deterministic stale
+    /// or absent source, or whose bounded foreground owner RPC timed out, and
+    /// were returned directly as a cache miss.
+    pub direct_miss_items: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExternalDeleteAckBatchSendResult {
@@ -170,6 +185,40 @@ fn external_gpu_transfer_plan_geometry_is_valid(
         && registered_generation == destination.registration_id
 }
 
+fn external_gpu_transfer_start_from_plan(
+    key: &str,
+    plan: BatchGetPlanItemResp,
+    destination: &ExternalGpuDestination,
+    requester_node_start_time: i64,
+) -> KvResult<(BatchGetStartItemResp, GetBindTarget)> {
+    if !plan.gpu_direct_eligible {
+        return Err(KvError::Api(ApiError::InvalidArgument {
+            detail: format!(
+                "planned GPU Get source is not direct eligible: key={} get_id={}",
+                key, plan.get_id,
+            ),
+        }));
+    }
+
+    let target = GetBindTarget::ExternalSink(GetExternalSinkTarget {
+        addr: destination.addr,
+        capacity: destination.capacity,
+        registration_id: destination.registration_id,
+        requester_node_start_time,
+    });
+    let start = plan
+        .materialize_owner_source_late_target(&target, None)
+        .map_err(|detail| {
+            KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "planned GPU Get cannot materialize owner source: key={} get_id={} detail={}",
+                    key, plan.get_id, detail
+                ),
+            })
+        })?;
+    Ok((start, target))
+}
+
 fn external_get_plan_raw_prefixes(items: &[BatchGetPlanItemResp]) -> (usize, usize) {
     external_get_plan_raw_prefixes_from_statuses(
         items
@@ -202,6 +251,9 @@ enum ExternalGpuGetTerminal {
     },
     Revoked {
         transfer_error: Option<String>,
+    },
+    Miss {
+        key: String,
     },
     Failed {
         detail: String,
@@ -252,6 +304,13 @@ struct PendingExternalGpuGet {
     terminal_rx: watch::Receiver<Option<ExternalGpuGetTerminalEvent>>,
 }
 
+struct ExternalGpuTransferItem {
+    key: String,
+    start: BatchGetStartItemResp,
+    gpu_guard: GpuMemoryGuard,
+    late_target: Option<GetBindTarget>,
+}
+
 enum PendingExternalGetPlanItem {
     Local {
         holder: Arc<ExternalMemHolder>,
@@ -277,6 +336,9 @@ enum ExternalPlannedCpuGetTerminal {
         owner_start_time: i64,
     },
     Revoked,
+    Miss {
+        key: String,
+    },
     Failed {
         detail: String,
     },
@@ -508,15 +570,23 @@ mod inline_external_get_start_tests {
     use super::{
         EXTERNAL_PLANNED_CPU_GET_FOREGROUND_RPC_TIMEOUT_SECS,
         EXTERNAL_PLANNED_CPU_GET_REPLAY_RPC_TIMEOUT_SECS, ExternalGpuDestination,
-        PendingRegistryEntryGuard, external_get_plan_raw_prefixes,
-        external_get_plan_raw_prefixes_from_statuses, external_gpu_transfer_plan_geometry_is_valid,
+        ExternalGpuGetTerminal, ExternalPlannedCpuGetTerminal, PendingRegistryEntryGuard,
+        external_get_plan_raw_prefixes, external_get_plan_raw_prefixes_from_statuses,
+        external_gpu_get_terminal_error, external_gpu_transfer_plan_geometry_is_valid,
+        external_gpu_transfer_start_from_plan, external_planned_cpu_get_terminal_error,
         inline_external_get_tail_holder_ids, observe_external_gpu_get_consume_timing,
+        planned_cpu_get_foreground_error_is_direct_miss, planned_cpu_get_response_direct_miss,
         validate_external_local_holder_geometry, validate_inline_external_get_owner_generation,
         validate_inline_external_get_start_plan, validate_mixed_planned_cpu_terminal,
     };
-    use crate::client_kv_api::msg_pack::ExternalBatchGetItemResp;
-    use crate::master_kv_router::msg_pack::{BatchGetPlanItemResp, BatchGetStartItemResp};
+    use crate::client_kv_api::msg_pack::{
+        ExternalBatchGetItemResp, ExternalExecutePlannedGetResp, ExternalPlannedGetItem,
+    };
+    use crate::master_kv_router::msg_pack::{
+        BatchGetPlanItemResp, BatchGetStartItemResp, GetBindTarget, GetSourceKind,
+    };
     use crate::memholder::ExternalMemHolderInfo;
+    use crate::owner_segment::{OwnerGeneration, OwnerSlotDesc, OwnerSourceRouteToken};
     use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
     use dashmap::DashMap;
     use std::time::{Duration, Instant};
@@ -554,6 +624,114 @@ mod inline_external_get_start_tests {
             EXTERNAL_PLANNED_CPU_GET_FOREGROUND_RPC_TIMEOUT_SECS
                 < EXTERNAL_PLANNED_CPU_GET_REPLAY_RPC_TIMEOUT_SECS
         );
+    }
+
+    #[test]
+    fn planned_cpu_get_foreground_timeout_is_a_typed_miss_only_for_timeout() {
+        assert!(planned_cpu_get_foreground_error_is_direct_miss(
+            &crate::p2p::P2PError::Timeout {
+                detail: "foreground deadline elapsed".to_string(),
+            }
+        ));
+        assert!(!planned_cpu_get_foreground_error_is_direct_miss(
+            &crate::p2p::P2PError::Other {
+                detail: "malformed owner response".to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn direct_planned_get_miss_stays_a_typed_batch_miss() {
+        let cpu_error = external_planned_cpu_get_terminal_error(
+            &ExternalPlannedCpuGetTerminal::Miss {
+                key: "missing-cpu-page".to_string(),
+            },
+            17,
+        )
+        .expect("a miss terminal must carry a typed error");
+        assert!(matches!(
+            cpu_error,
+            KvError::Api(ApiError::KeyNotFound { ref key }) if key == "missing-cpu-page"
+        ));
+
+        let mixed_error = external_gpu_get_terminal_error(
+            &ExternalGpuGetTerminal::Miss {
+                key: "missing-mixed-page".to_string(),
+            },
+            18,
+        )
+        .expect("a mixed miss terminal must carry a typed error");
+        assert!(matches!(
+            mixed_error,
+            KvError::Api(ApiError::KeyNotFound { ref key }) if key == "missing-mixed-page"
+        ));
+    }
+
+    #[test]
+    fn first_key_not_found_is_a_direct_miss_without_replan() {
+        let error = KvError::Api(ApiError::KeyNotFound {
+            key: "owner-detail-key".to_string(),
+        });
+        let response = ExternalExecutePlannedGetResp {
+            items: vec![ExternalBatchGetItemResp {
+                error_code: error.code(),
+                error_json: error.to_json(),
+                external_memholder_info: None,
+            }],
+            error_code: OK,
+            error_json: String::new(),
+        };
+        let plan = vec![ExternalPlannedGetItem {
+            key: "requested-key".to_string(),
+            plan: BatchGetPlanItemResp::default(),
+        }];
+        let miss = planned_cpu_get_response_direct_miss(&response, &plan)
+            .expect("KeyNotFound must become a direct miss");
+        assert_eq!(miss.key, "requested-key");
+        assert_eq!(miss.failed_items, 1);
+    }
+
+    #[test]
+    fn legacy_plain_text_key_not_found_is_still_a_direct_miss() {
+        let response = ExternalExecutePlannedGetResp {
+            items: vec![ExternalBatchGetItemResp {
+                error_code:
+                    crate::rpcresp_kvresult_convert::msg_and_error::codes_api::API_KEY_NOT_FOUND,
+                error_json: "Key not found".to_string(),
+                external_memholder_info: None,
+            }],
+            error_code: OK,
+            error_json: String::new(),
+        };
+        let plan = vec![ExternalPlannedGetItem {
+            key: "legacy-missing-page".to_string(),
+            plan: BatchGetPlanItemResp::default(),
+        }];
+        let miss = planned_cpu_get_response_direct_miss(&response, &plan)
+            .expect("legacy code 105 item must remain a typed direct miss");
+        assert_eq!(miss.key, "legacy-missing-page");
+        assert_eq!(miss.failed_items, 1);
+    }
+
+    #[test]
+    fn internal_owner_failure_is_not_converted_to_a_cache_miss() {
+        let error = KvError::Api(ApiError::Unknown {
+            detail: "transport completion was uncertain".to_string(),
+        });
+        let response = ExternalExecutePlannedGetResp {
+            items: vec![ExternalBatchGetItemResp {
+                error_code: error.code(),
+                error_json: error.to_json(),
+                external_memholder_info: None,
+            }],
+            error_code: OK,
+            error_json: String::new(),
+        };
+        let plan = vec![ExternalPlannedGetItem {
+            key: "must-fail".to_string(),
+            plan: BatchGetPlanItemResp::default(),
+        }];
+        assert!(planned_cpu_get_response_direct_miss(&response, &plan).is_none());
     }
 
     #[test]
@@ -664,6 +842,73 @@ mod inline_external_get_start_tests {
             &destination,
             destination.registration_id,
         ));
+    }
+
+    #[test]
+    fn planned_gpu_transfer_materializes_source_from_plan_and_defers_exact_sink() {
+        let destination = ExternalGpuDestination {
+            registration_id: 7,
+            addr: 0x9000,
+            capacity: 8192,
+        };
+        let source = OwnerSlotDesc {
+            owner: OwnerGeneration::new("source-owner", 13),
+            allocation_id: 19,
+            segment_offset: 0x2000,
+            capacity_bytes: 8192,
+            addr: 0x5000,
+            base_addr: 0x3000,
+            len: 4096,
+            segment_registration_epoch: 3,
+        };
+        let plan = BatchGetPlanItemResp {
+            get_id: 0,
+            node_id: "source-owner".to_string(),
+            put_id: (5, 2),
+            src_addr: source.addr,
+            src_base_addr: source.base_addr,
+            len: source.len,
+            source_kind: GetSourceKind::Memory,
+            source_route_token: Some(OwnerSourceRouteToken {
+                key: "key".to_string(),
+                put_id: (5, 2),
+                route_epoch: source.allocation_id,
+                source: source.clone(),
+                atomic_batch: None,
+                plan_nonce: 1,
+            }),
+            gpu_direct_eligible: true,
+            error_code: OK,
+            ..Default::default()
+        };
+
+        let (start, late_target) =
+            external_gpu_transfer_start_from_plan("key", plan.clone(), &destination, 23)
+                .expect("owner-backed plan must materialize without a Bind RPC");
+        assert_eq!(start.get_id, plan.get_id);
+        assert_eq!(start.node_id, plan.node_id);
+        assert_eq!(start.put_id, plan.put_id);
+        assert_eq!(start.src_addr, plan.src_addr);
+        assert_eq!(start.src_base_addr, plan.src_base_addr);
+        assert_eq!(start.len, plan.len);
+        assert_eq!(start.source_route_token, plan.source_route_token);
+        assert_eq!(start.target_addr, destination.addr);
+        assert_eq!(start.target_base_addr, destination.addr);
+        assert!(matches!(
+            late_target,
+            GetBindTarget::ExternalSink(target)
+                if target.addr == destination.addr
+                    && target.capacity == destination.capacity
+                    && target.registration_id == destination.registration_id
+                    && target.requester_node_start_time == 23
+        ));
+
+        let mut transitional = plan;
+        transitional.source_route_token = None;
+        assert!(
+            external_gpu_transfer_start_from_plan("key", transitional, &destination, 23).is_err(),
+            "a master-Allocation source has no holder before late Done and must fail closed"
+        );
     }
 
     #[test]
@@ -1060,9 +1305,10 @@ pub struct ExternalInner {
     rpc_caller_external_batch_get_cancel: RPCCaller<ExternalBatchGetCancelReq>,
     rpc_caller_master_batch_get_start: RPCCaller<BatchGetStartReq>,
     rpc_caller_master_batch_get_plan: RPCCaller<BatchGetPlanReq>,
-    rpc_caller_master_batch_get_bind: RPCCaller<BatchGetBindReq>,
     rpc_caller_master_batch_get_done: RPCCaller<BatchGetDoneReq>,
     rpc_caller_master_batch_get_revoke: RPCCaller<BatchGetRevokeReq>,
+    rpc_caller_owner_segment_transfer: RPCCaller<OwnerSegmentTransferReq>,
+    owner_transfer_peer_tracker: OwnerTransferPeerTracker,
     rpc_caller_external_execute_planned_get: RPCCaller<ExternalExecutePlannedGetReq>,
     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
     rpc_caller_external_batch_put_commit: RPCCaller<ExternalBatchPutCommitReq>,
@@ -1089,6 +1335,8 @@ pub struct ExternalInner {
     pending_external_get_plan: DashMap<u64, PendingExternalGetPlan>,
     pending_external_gpu_get: DashMap<u64, PendingExternalGpuGet>,
     pending_external_planned_cpu_get: DashMap<u64, PendingExternalPlannedCpuGet>,
+    master_plan_hit_items: AtomicU64,
+    planned_cpu_direct_miss_items: AtomicU64,
     /// per-key semaphore (permits=1) to ensure single inflight per key
     inflight1_per_key: SemaphoreMap<String>,
     put_trace_log_window: Mutex<ExternalPutTraceLogWindow>,
@@ -1126,6 +1374,47 @@ async fn wait_external_planned_cpu_get_terminal(
                     .to_string(),
             }));
         }
+    }
+}
+
+fn external_planned_cpu_get_terminal_error(
+    terminal: &ExternalPlannedCpuGetTerminal,
+    handle: u64,
+) -> Option<KvError> {
+    match terminal {
+        ExternalPlannedCpuGetTerminal::Completed { .. } => None,
+        ExternalPlannedCpuGetTerminal::Miss { key } => {
+            Some(KvError::Api(ApiError::KeyNotFound { key: key.clone() }))
+        }
+        ExternalPlannedCpuGetTerminal::Revoked => Some(KvError::Api(ApiError::Unknown {
+            detail: format!("planned CPU Get was revoked: handle={handle}"),
+        })),
+        ExternalPlannedCpuGetTerminal::Failed { detail } => Some(KvError::Api(ApiError::Unknown {
+            detail: detail.clone(),
+        })),
+    }
+}
+
+fn external_gpu_get_terminal_error(
+    terminal: &ExternalGpuGetTerminal,
+    handle: u64,
+) -> Option<KvError> {
+    match terminal {
+        ExternalGpuGetTerminal::Completed { .. } => None,
+        ExternalGpuGetTerminal::Miss { key } => {
+            Some(KvError::Api(ApiError::KeyNotFound { key: key.clone() }))
+        }
+        ExternalGpuGetTerminal::Revoked { transfer_error } => {
+            Some(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "get_transfer_gpu was revoked: handle={} transfer_error={:?}",
+                    handle, transfer_error
+                ),
+            }))
+        }
+        ExternalGpuGetTerminal::Failed { detail } => Some(KvError::Api(ApiError::Unknown {
+            detail: detail.clone(),
+        })),
     }
 }
 
@@ -1374,18 +1663,17 @@ fn spawn_uncertain_planned_cpu_get_cleanup(
             if inner.current_owner_start_time().await != owner_start_time {
                 return;
             }
-            let attempt = inner
-                .rpc_caller_external_execute_planned_get
-                .call(
-                    inner.view.p2p_module(),
-                    owner.clone().into(),
-                    request.clone(),
-                    Some(Duration::from_secs(
-                        EXTERNAL_PLANNED_CPU_GET_REPLAY_RPC_TIMEOUT_SECS,
-                    )),
-                    0,
-                )
-                .await;
+            let attempt = call_control_plane_rpc(
+                &inner.rpc_caller_external_execute_planned_get,
+                inner.view.p2p_module(),
+                owner.clone().into(),
+                request.clone(),
+                Some(Duration::from_secs(
+                    EXTERNAL_PLANNED_CPU_GET_REPLAY_RPC_TIMEOUT_SECS,
+                )),
+                0,
+            )
+            .await;
             if let Ok(response) = attempt {
                 release_planned_cpu_response_holders(
                     inner,
@@ -1402,17 +1690,115 @@ fn spawn_uncertain_planned_cpu_get_cleanup(
     });
 }
 
+fn planned_cpu_get_error_direct_miss_key(
+    error_code: u32,
+    error_json: &str,
+    fallback_key: Option<&str>,
+) -> Option<String> {
+    if error_code == OK {
+        return None;
+    }
+    match KvError::from_json(error_code, error_json) {
+        KvError::Api(ApiError::KeyNotFound { key })
+        | KvError::Api(ApiError::StaleGetPlan { key, .. }) => Some(key),
+        _ if error_code
+            == crate::rpcresp_kvresult_convert::msg_and_error::codes_api::API_KEY_NOT_FOUND =>
+        {
+            error_json
+                .strip_prefix("Key not found: ")
+                .or_else(|| {
+                    error_json
+                        .strip_prefix("Key not found (")
+                        .and_then(|rest| rest.strip_suffix(')'))
+                })
+                .filter(|key| !key.is_empty())
+                .or(fallback_key)
+                .map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PlannedCpuGetDirectMiss {
+    key: String,
+    failed_items: u64,
+}
+
+fn planned_cpu_get_response_direct_miss(
+    response: &ExternalExecutePlannedGetResp,
+    plan_items: &[ExternalPlannedGetItem],
+) -> Option<PlannedCpuGetDirectMiss> {
+    if response.error_code != OK {
+        let key =
+            planned_cpu_get_error_direct_miss_key(response.error_code, &response.error_json, None)?;
+        return Some(PlannedCpuGetDirectMiss {
+            key,
+            failed_items: 1,
+        });
+    }
+    if response.items.len() != plan_items.len() {
+        return None;
+    }
+    let mut first_missing_key = None;
+    let mut failed_items = 0_u64;
+    for (index, item) in response.items.iter().enumerate() {
+        if item.error_code == OK {
+            if item.external_memholder_info.is_none() {
+                return None;
+            }
+            continue;
+        }
+        planned_cpu_get_error_direct_miss_key(
+            item.error_code,
+            &item.error_json,
+            Some(&plan_items[index].key),
+        )?;
+        failed_items = failed_items.saturating_add(1);
+        first_missing_key.get_or_insert_with(|| plan_items[index].key.clone());
+    }
+    first_missing_key.map(|key| PlannedCpuGetDirectMiss { key, failed_items })
+}
+
+fn planned_cpu_get_foreground_error_is_direct_miss(error: &crate::p2p::P2PError) -> bool {
+    matches!(error, crate::p2p::P2PError::Timeout { .. })
+}
+
+fn publish_planned_cpu_direct_miss(
+    inner: &ExternalInner,
+    plan_handle: u64,
+    execute_handle: u64,
+    miss: PlannedCpuGetDirectMiss,
+    miss_reason: &'static str,
+) -> ExternalPlannedCpuGetTerminal {
+    let direct_miss_items = inner
+        .planned_cpu_direct_miss_items
+        .fetch_add(miss.failed_items, Ordering::Relaxed)
+        .saturating_add(miss.failed_items);
+    tracing::info!(
+        plan_handle,
+        execute_handle,
+        failed_items = miss.failed_items,
+        direct_miss_items_total = direct_miss_items,
+        master_plan_hit_items_total = inner.master_plan_hit_items.load(Ordering::Relaxed),
+        key = %miss.key,
+        miss_reason,
+        "planned CPU Get first owner execution became a direct cache miss"
+    );
+    ExternalPlannedCpuGetTerminal::Miss { key: miss.key }
+}
+
 async fn run_external_planned_cpu_get(
     view: ExternalClientApiView,
     plan_handle: u64,
-    plan_items: Vec<(String, u64)>,
+    plan_items: Vec<ExternalPlannedGetItem>,
     skipped_get_ids: Vec<u64>,
     transfer_concurrency: usize,
     cancel_requested: Arc<AtomicBool>,
 ) -> ExternalPlannedCpuGetTerminal {
     let inner = view.external_client_api().inner();
     let mut all_plan_get_ids = skipped_get_ids.clone();
-    all_plan_get_ids.extend(plan_items.iter().map(|(_, get_id)| *get_id));
+    all_plan_get_ids.extend(plan_items.iter().map(|item| item.plan.get_id));
     if let Err(err) = inner.master_batch_gpu_get_revoke(skipped_get_ids).await {
         let cleanup = finish_planned_get_revoke_cleanup(
             view.clone(),
@@ -1428,63 +1814,71 @@ async fn run_external_planned_cpu_get(
             ),
         };
     }
-    if cancel_requested.load(Ordering::Acquire) {
-        let get_ids = plan_items.iter().map(|(_, get_id)| *get_id).collect();
-        return match finish_planned_get_revoke_cleanup(
-            view.clone(),
-            get_ids,
-            "planned CPU pre-owner cancel",
-        )
-        .await
-        {
-            Ok(()) => ExternalPlannedCpuGetTerminal::Revoked,
-            Err(err) => ExternalPlannedCpuGetTerminal::Failed {
-                detail: format!("planned CPU Get cancel cleanup failed: {err}"),
-            },
-        };
-    }
+    let current_plan_items = plan_items;
+    let execute_handle = plan_handle;
 
-    if plan_items.is_empty() {
-        return ExternalPlannedCpuGetTerminal::Completed {
-            items: Vec::new(),
-            owner_start_time: inner.current_owner_start_time().await,
-        };
-    }
-
-    let Some(owner) = inner.shared_storage_node_id().await else {
-        let get_ids = plan_items.iter().map(|(_, get_id)| *get_id).collect();
-        let cleanup =
-            finish_planned_get_revoke_cleanup(view.clone(), get_ids, "planned CPU missing owner")
-                .await
-                .err()
-                .map(|cleanup_err| cleanup_err.to_string());
-        return ExternalPlannedCpuGetTerminal::Failed {
-            detail: format!(
-                "planned CPU Get has no current share-group owner; cleanup_error={cleanup:?}"
-            ),
-        };
-    };
-    let owner_start_time = inner.current_owner_start_time().await;
-    let external_client_id = inner.view.cluster_manager().get_self_info().id;
-    let request = MsgPack {
-        serialize_part: ExternalExecutePlannedGetReq {
-            plan_handle,
-            items: plan_items
+    loop {
+        if current_plan_items.is_empty() {
+            return ExternalPlannedCpuGetTerminal::Completed {
+                items: Vec::new(),
+                owner_start_time: inner.current_owner_start_time().await,
+            };
+        }
+        if cancel_requested.load(Ordering::Acquire) {
+            let get_ids = current_plan_items
                 .iter()
-                .map(|(key, get_id)| ExternalPlannedGetItem {
-                    key: key.clone(),
-                    get_id: *get_id,
-                })
-                .collect(),
-            req_node_id: external_client_id,
-            started_time: owner_start_time,
-            transfer_concurrency,
-        },
-        raw_bytes: Vec::new(),
-    };
-    let response = match inner
-        .rpc_caller_external_execute_planned_get
-        .call(
+                .map(|item| item.plan.get_id)
+                .collect();
+            return match finish_planned_get_revoke_cleanup(
+                view.clone(),
+                get_ids,
+                "planned CPU pre-owner cancel",
+            )
+            .await
+            {
+                Ok(()) => ExternalPlannedCpuGetTerminal::Revoked,
+                Err(err) => ExternalPlannedCpuGetTerminal::Failed {
+                    detail: format!("planned CPU Get cancel cleanup failed: {err}"),
+                },
+            };
+        }
+
+        let Some(owner) = inner.shared_storage_node_id().await else {
+            let get_ids = current_plan_items
+                .iter()
+                .map(|item| item.plan.get_id)
+                .collect();
+            let cleanup = finish_planned_get_revoke_cleanup(
+                view.clone(),
+                get_ids,
+                "planned CPU missing owner",
+            )
+            .await
+            .err()
+            .map(|cleanup_err| cleanup_err.to_string());
+            return ExternalPlannedCpuGetTerminal::Failed {
+                detail: format!(
+                    "planned CPU Get has no current share-group owner; cleanup_error={cleanup:?}"
+                ),
+            };
+        };
+        let owner_start_time = inner.current_owner_start_time().await;
+        let external_client_id = inner.view.cluster_manager().get_self_info().id;
+        let request = MsgPack {
+            serialize_part: ExternalExecutePlannedGetReq {
+                plan_handle: execute_handle,
+                items: current_plan_items.clone(),
+                req_node_id: external_client_id,
+                started_time: owner_start_time,
+                transfer_concurrency,
+            },
+            raw_bytes: Vec::new(),
+        };
+        // The request and response are owner-coordination metadata. Keep them
+        // off the optional transfer-RPC fast path so queued bulk work cannot
+        // consume the foreground scheduler's entire timeout before dispatch.
+        let response = match call_control_plane_rpc(
+            &inner.rpc_caller_external_execute_planned_get,
             inner.view.p2p_module(),
             owner.clone().into(),
             request.clone(),
@@ -1494,162 +1888,430 @@ async fn run_external_planned_cpu_get(
             0,
         )
         .await
-    {
-        Ok(response) => response.serialize_part,
-        Err(err) => {
-            spawn_uncertain_planned_cpu_get_cleanup(view.clone(), owner, request, owner_start_time);
+        {
+            Ok(response) => response.serialize_part,
+            Err(err) => {
+                let foreground_timeout = planned_cpu_get_foreground_error_is_direct_miss(&err);
+                spawn_uncertain_planned_cpu_get_cleanup(
+                    view.clone(),
+                    owner,
+                    request,
+                    owner_start_time,
+                );
+                if foreground_timeout {
+                    if cancel_requested.load(Ordering::Acquire) {
+                        return ExternalPlannedCpuGetTerminal::Revoked;
+                    }
+                    let miss = PlannedCpuGetDirectMiss {
+                        key: current_plan_items
+                            .first()
+                            .expect("non-empty planned CPU owner request")
+                            .key
+                            .clone(),
+                        failed_items: u64::try_from(current_plan_items.len()).unwrap_or(u64::MAX),
+                    };
+                    tracing::warn!(
+                        plan_handle,
+                        execute_handle,
+                        failed_items = miss.failed_items,
+                        foreground_timeout_secs =
+                            EXTERNAL_PLANNED_CPU_GET_FOREGROUND_RPC_TIMEOUT_SECS,
+                        "planned CPU Get foreground owner RPC timed out; background replay owns cleanup"
+                    );
+                    return publish_planned_cpu_direct_miss(
+                        inner,
+                        plan_handle,
+                        execute_handle,
+                        miss,
+                        "foreground_owner_rpc_timeout",
+                    );
+                }
+                return ExternalPlannedCpuGetTerminal::Failed {
+                    detail: format!(
+                        "planned CPU Get owner RPC failed; replay cleanup continues in background: error={}",
+                        KvError::from(err)
+                    ),
+                };
+            }
+        };
+
+        if let Some(direct_miss) =
+            planned_cpu_get_response_direct_miss(&response, &current_plan_items)
+        {
+            release_planned_cpu_response_holders(inner, &response, owner_start_time);
+            if cancel_requested.load(Ordering::Acquire) {
+                return ExternalPlannedCpuGetTerminal::Revoked;
+            }
+            return publish_planned_cpu_direct_miss(
+                inner,
+                plan_handle,
+                execute_handle,
+                direct_miss,
+                "owner_direct_miss",
+            );
+        }
+
+        if response.error_code != OK || response.items.len() != current_plan_items.len() {
+            release_planned_cpu_response_holders(inner, &response, owner_start_time);
             return ExternalPlannedCpuGetTerminal::Failed {
                 detail: format!(
-                    "planned CPU Get owner RPC failed; replay cleanup continues in background: error={}",
-                    KvError::from(err)
+                    "planned CPU Get owner response failed or changed shape: error_code={} expected={} got={} error_json={}",
+                    response.error_code,
+                    current_plan_items.len(),
+                    response.items.len(),
+                    response.error_json
                 ),
             };
         }
-    };
-    if response.error_code != OK || response.items.len() != plan_items.len() {
-        release_planned_cpu_response_holders(inner, &response, owner_start_time);
-        return ExternalPlannedCpuGetTerminal::Failed {
-            detail: format!(
-                "planned CPU Get owner response failed or changed shape: error_code={} expected={} got={} error_json={}",
-                response.error_code,
-                plan_items.len(),
-                response.items.len(),
-                response.error_json
-            ),
+        if let Some((index, item)) = response
+            .items
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.error_code != OK || item.external_memholder_info.is_none())
+        {
+            release_planned_cpu_response_holders(inner, &response, owner_start_time);
+            return ExternalPlannedCpuGetTerminal::Failed {
+                detail: format!(
+                    "planned CPU Get item failed: index={} error_code={} error_json={}",
+                    index, item.error_code, item.error_json
+                ),
+            };
+        }
+        if cancel_requested.load(Ordering::Acquire) {
+            release_planned_cpu_response_holders(inner, &response, owner_start_time);
+            return ExternalPlannedCpuGetTerminal::Revoked;
+        }
+        return ExternalPlannedCpuGetTerminal::Completed {
+            items: response.items,
+            owner_start_time,
         };
     }
-    if let Some((index, item)) = response
-        .items
-        .iter()
-        .enumerate()
-        .find(|(_, item)| item.error_code != OK || item.external_memholder_info.is_none())
-    {
-        release_planned_cpu_response_holders(inner, &response, owner_start_time);
-        return ExternalPlannedCpuGetTerminal::Failed {
-            detail: format!(
-                "planned CPU Get item failed: index={} error_code={} error_json={}",
-                index, item.error_code, item.error_json
-            ),
+}
+
+fn external_source_lease_error(context: &str, detail: impl Into<String>) -> KvError {
+    KvError::Api(ApiError::Unknown {
+        detail: format!("{context}: {}", detail.into()),
+    })
+}
+
+struct PendingExternalGpuGetToTarget {
+    operation: OwnerTransferOpId,
+    destination: OwnerGetDestinationCapability,
+    source: crate::owner_segment::OwnerSourceRouteToken,
+    item: OwnerSegmentTransferItem,
+    /// Retains the exact caller registration until the source WRITE reaches a
+    /// terminal. The source sees only the serialized capability.
+    _gpu_guard: GpuMemoryGuard,
+}
+
+struct ExternalGpuGetToTargetExecution {
+    terminals: Vec<(OwnerGeneration, u64)>,
+    transfer_error: Option<KvError>,
+}
+
+async fn execute_external_gpu_get_to_targets(
+    view: &ExternalClientApiView,
+    transfer_items: Vec<ExternalGpuTransferItem>,
+) -> KvResult<ExternalGpuGetToTargetExecution> {
+    let inner = view.external_client_api().inner();
+    let self_info = inner.view.cluster_manager().get_self_info();
+    let coordinator = OwnerGeneration::new(self_info.id.clone(), self_info.node_start_time);
+    let mut by_source = HashMap::<OwnerGeneration, Vec<PendingExternalGpuGetToTarget>>::new();
+    let mut terminals = Vec::with_capacity(transfer_items.len());
+
+    // Validate the complete batch before starting any source task. A malformed
+    // item therefore cannot leave unrelated operations half-dispatched.
+    for transfer in transfer_items {
+        let source = transfer.start.source_route_token.clone().ok_or_else(|| {
+            external_source_lease_error(
+                "GPU GetToTarget",
+                format!(
+                    "owner source token is absent: key={} get_id={}",
+                    transfer.key, transfer.start.get_id
+                ),
+            )
+        })?;
+        let sink = match transfer.late_target.as_ref() {
+            Some(GetBindTarget::ExternalSink(sink)) => sink,
+            _ => {
+                return Err(external_source_lease_error(
+                    "GPU GetToTarget",
+                    format!(
+                        "external sink capability is absent: key={} get_id={}",
+                        transfer.key, transfer.start.get_id
+                    ),
+                ));
+            }
         };
+        let sequence = transfer.start.get_id.checked_add(1).ok_or_else(|| {
+            external_source_lease_error("GPU GetToTarget", "master Get id overflow")
+        })?;
+        let operation =
+            OwnerTransferOpId::new(coordinator.clone(), sequence, OwnerTransferOpKind::Get);
+        let destination =
+            OwnerGetDestinationCapability::ExternalGpu(OwnerExternalGpuWriteCapability {
+                operation: operation.clone(),
+                requester: coordinator.clone(),
+                addr: sink.addr,
+                capacity_bytes: sink.capacity,
+                registration_id: sink.registration_id,
+            });
+        if sink.requester_node_start_time != coordinator.node_start_time
+            || !destination.is_valid_for(&operation, transfer.start.len)
+            || source.key != transfer.key
+            || source.put_id != transfer.start.put_id
+            || source.source.addr != transfer.start.src_addr
+            || source.source.len != transfer.start.len
+            || source.plan_nonce != sequence
+        {
+            return Err(external_source_lease_error(
+                "GPU GetToTarget",
+                format!(
+                    "source plan or GPU capability changed: key={} get_id={}",
+                    transfer.key, transfer.start.get_id
+                ),
+            ));
+        }
+        by_source
+            .entry(source.source.owner.clone())
+            .or_default()
+            .push(PendingExternalGpuGetToTarget {
+                operation: operation.clone(),
+                destination: destination.clone(),
+                source: source.clone(),
+                item: OwnerSegmentTransferItem::GetToTarget {
+                    op_id: operation,
+                    source: OwnerGetSourceCapability::Memory(source),
+                    destination,
+                },
+                _gpu_guard: transfer.gpu_guard,
+            });
     }
-    if cancel_requested.load(Ordering::Acquire) {
-        release_planned_cpu_response_holders(inner, &response, owner_start_time);
-        return ExternalPlannedCpuGetTerminal::Revoked;
+
+    let mut first_error = None;
+    for (source_owner, pending) in by_source {
+        let items = pending
+            .iter()
+            .map(|pending| pending.item.clone())
+            .collect::<Vec<_>>();
+        match inner
+            .owner_segment_transfer_batch_until_definitive(
+                &source_owner,
+                items,
+                "external_gpu_get_to_target",
+            )
+            .await
+        {
+            Ok(responses) if responses.len() == pending.len() => {
+                for (pending, response) in pending.into_iter().zip(responses) {
+                    terminals.push((source_owner.clone(), response.terminal_sequence));
+                    match response.outcome {
+                        OwnerSegmentTransferOutcome::GetToTargetCompleted { receipt }
+                            if receipt.completion_id == pending.operation.sequence
+                                && receipt.bytes == pending.source.source.len
+                                && receipt.source == pending.source.source
+                                && receipt.destination == pending.destination => {}
+                        OwnerSegmentTransferOutcome::Error(error) => {
+                            first_error.get_or_insert_with(|| {
+                                external_source_lease_error(
+                                    "GPU GetToTarget",
+                                    format!("{:?}: {}", error.code, error.detail),
+                                )
+                            });
+                        }
+                        other => {
+                            first_error.get_or_insert_with(|| {
+                                external_source_lease_error(
+                                    "GPU GetToTarget",
+                                    format!("unexpected source terminal: {other:?}"),
+                                )
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(responses) => {
+                first_error.get_or_insert_with(|| {
+                    external_source_lease_error(
+                        "GPU GetToTarget",
+                        format!(
+                            "owner response length mismatch: expected={} got={}",
+                            pending.len(),
+                            responses.len()
+                        ),
+                    )
+                });
+            }
+            Err(error) => {
+                first_error.get_or_insert_with(|| {
+                    external_source_lease_error("GPU GetToTarget", error.to_string())
+                });
+            }
+        }
     }
-    ExternalPlannedCpuGetTerminal::Completed {
-        items: response.items,
-        owner_start_time,
-    }
+    Ok(ExternalGpuGetToTargetExecution {
+        terminals,
+        transfer_error: first_error,
+    })
 }
 
 async fn run_external_gpu_get_transfer(
     view: ExternalClientApiView,
-    transfer_items: Vec<(BatchGetStartItemResp, GpuMemoryGuard)>,
+    transfer_items: Vec<ExternalGpuTransferItem>,
     skipped_get_ids: Vec<u64>,
-    transfer_concurrency: usize,
+    _transfer_concurrency: usize,
     cancel_requested: Arc<AtomicBool>,
+    route_commit_mode: crate::owner_segment::OwnerRouteCommitMode,
 ) -> ExternalGpuGetTerminal {
-    let transfer_get_ids = transfer_items
+    let done_items = transfer_items
         .iter()
-        .map(|(item, _)| item.get_id)
+        .map(|item| BatchGetDoneItemReq {
+            get_id: item.start.get_id,
+            late_target: item.late_target.clone(),
+        })
+        .collect::<Vec<_>>();
+    let transfer_get_ids = done_items
+        .iter()
+        .map(|item| item.get_id)
         .collect::<Vec<_>>();
     let mut all_get_ids = skipped_get_ids.clone();
     all_get_ids.extend(transfer_get_ids.iter().copied());
 
-    let skipped_revoke_error = view
-        .external_client_api()
-        .inner()
-        .master_batch_gpu_get_revoke(skipped_get_ids)
-        .await
-        .err()
-        .map(|err| err.to_string());
+    if let Err(error) = finish_planned_get_revoke_cleanup(
+        view.clone(),
+        skipped_get_ids,
+        "GPU Get non-transferable tail",
+    )
+    .await
+    {
+        // The source batch has not been acquired yet. Retain every master
+        // identity for its existing cleanup/reconciliation path.
+        return ExternalGpuGetTerminal::Failed {
+            detail: format!("GPU Get could not revoke its non-transferable tail: {error}"),
+        };
+    }
 
     if transfer_items.is_empty() {
-        return match skipped_revoke_error {
-            Some(detail) => ExternalGpuGetTerminal::Failed {
-                detail: format!("GPU Get could not revoke non-transferable starts: {detail}"),
-            },
-            None => ExternalGpuGetTerminal::Revoked {
+        return ExternalGpuGetTerminal::Revoked {
+            transfer_error: None,
+        };
+    }
+
+    if cancel_requested.load(Ordering::Acquire) {
+        return match finish_planned_get_revoke_cleanup(
+            view.clone(),
+            transfer_get_ids,
+            "GPU Get pre-acquire cancel",
+        )
+        .await
+        {
+            Ok(()) => ExternalGpuGetTerminal::Revoked {
                 transfer_error: None,
+            },
+            Err(error) => ExternalGpuGetTerminal::Failed {
+                detail: format!("GPU Get pre-acquire cancel cleanup failed: {error}"),
             },
         };
     }
 
-    let transfer_futures = transfer_items.into_iter().map(|(item, gpu_guard)| {
-        let transfer_view = view.clone();
-        let cancel_requested = cancel_requested.clone();
-        async move {
-            if cancel_requested.load(Ordering::Acquire) {
-                return None;
-            }
-            transfer_view
-                .client_transfer_engine()
-                .transfer_data_no_copy_to_gpu(
-                    item.node_id.clone(),
-                    item.src_addr,
-                    item.target_addr,
-                    item.len,
-                    gpu_guard,
-                )
-                .await
-                .err()
-                .map(|err| {
-                    format!(
-                        "GPU Get transfer failed: get_id={} source={} src={:#x} target={:#x} len={} error={}",
-                        item.get_id,
-                        item.node_id,
-                        item.src_addr,
-                        item.target_addr,
-                        item.len,
-                        err
-                    )
-                })
+    // One source-side operation owns the internal read lease, WRITE and
+    // terminal replay. The source releases the lease after local WRITE
+    // completion, before returning the transfer terminal.
+    let execution = match execute_external_gpu_get_to_targets(&view, transfer_items).await {
+        Ok(execution) => execution,
+        Err(error) => {
+            let transfer_error = Some(error.to_string());
+            let revoke_result = finish_planned_get_revoke_cleanup(
+                view.clone(),
+                all_get_ids,
+                "GPU Get validation failure",
+            )
+            .await;
+            return match revoke_result {
+                Ok(()) => ExternalGpuGetTerminal::Revoked { transfer_error },
+                Err(revoke_error) => ExternalGpuGetTerminal::Failed {
+                    detail: format!(
+                        "GPU Get cleanup failed after validation: transfer_error={:?} revoke_error={revoke_error}",
+                        transfer_error
+                    ),
+                },
+            };
         }
-    });
-    let mut transfer_stream =
-        stream::iter(transfer_futures).buffer_unordered(transfer_concurrency.max(1));
-    let mut transfer_error = None;
-    while let Some(item_error) = transfer_stream.next().await {
-        if transfer_error.is_none() {
-            transfer_error = item_error;
-        }
-    }
+    };
+    let terminals = execution.terminals;
+    let transfer_error = execution.transfer_error.map(|error| error.to_string());
 
     let cancelled = cancel_requested.load(Ordering::Acquire);
-    if cancelled || transfer_error.is_some() || skipped_revoke_error.is_some() {
-        if let Err(err) = view
-            .external_client_api()
-            .inner()
-            .master_batch_gpu_get_revoke(all_get_ids)
-            .await
-        {
+    if cancelled || transfer_error.is_some() {
+        let revoke_result = finish_planned_get_revoke_cleanup(
+            view.clone(),
+            all_get_ids,
+            "GPU Get transfer/cancel failure",
+        )
+        .await;
+        if let Err(err) = revoke_result {
             return ExternalGpuGetTerminal::Failed {
                 detail: format!(
-                    "GPU Get cleanup failed after transfer/cancel: transfer_error={:?} skipped_revoke_error={:?} revoke_error={}",
-                    transfer_error, skipped_revoke_error, err
+                    "GPU Get cleanup failed after transfer/cancel: transfer_error={:?} revoke_error={}",
+                    transfer_error, err
                 ),
             };
         }
-        if let Some(detail) = skipped_revoke_error {
-            return ExternalGpuGetTerminal::Failed {
-                detail: format!(
-                    "GPU Get initially failed to revoke non-transferable starts: {detail}"
-                ),
-            };
+        for (source_owner, terminal_sequence) in terminals {
+            view.external_client_api()
+                .inner()
+                .owner_transfer_peer_tracker
+                .record_terminal(&source_owner, terminal_sequence);
         }
         return ExternalGpuGetTerminal::Revoked { transfer_error };
+    }
+
+    if route_commit_mode == crate::owner_segment::OwnerRouteCommitMode::Async {
+        let spawn_view = view.clone();
+        let worker_view = spawn_view.clone();
+        spawn_view.spawn("async_external_gpu_get_commit", async move {
+            if let Err(error) = worker_view
+                .external_client_api()
+                .inner()
+                .master_batch_gpu_get_done(done_items)
+                .await
+            {
+                tracing::error!(
+                    error = %error,
+                    "Async external GPU Get metadata commit did not reach success; transferred caller data remains valid"
+                );
+            }
+        });
+        for (source_owner, terminal_sequence) in terminals {
+            view.external_client_api()
+                .inner()
+                .owner_transfer_peer_tracker
+                .record_terminal(&source_owner, terminal_sequence);
+        }
+        return ExternalGpuGetTerminal::Completed {
+            planned_cpu_items: Vec::new(),
+            planned_cpu_owner_start_time: None,
+        };
     }
 
     match view
         .external_client_api()
         .inner()
-        .master_batch_gpu_get_done(transfer_get_ids)
+        .master_batch_gpu_get_done(done_items)
         .await
     {
-        Ok(()) => ExternalGpuGetTerminal::Completed {
-            planned_cpu_items: Vec::new(),
-            planned_cpu_owner_start_time: None,
-        },
+        Ok(()) => {
+            for (source_owner, terminal_sequence) in terminals {
+                view.external_client_api()
+                    .inner()
+                    .owner_transfer_peer_tracker
+                    .record_terminal(&source_owner, terminal_sequence);
+            }
+            ExternalGpuGetTerminal::Completed {
+                planned_cpu_items: Vec::new(),
+                planned_cpu_owner_start_time: None,
+            }
+        }
         Err(err) => ExternalGpuGetTerminal::Failed {
             detail: format!("GPU Get BatchDone failed: {err}"),
         },
@@ -1658,7 +2320,7 @@ async fn run_external_gpu_get_transfer(
 
 async fn run_external_gpu_get_transfer_timed(
     view: ExternalClientApiView,
-    transfer_items: Vec<(BatchGetStartItemResp, GpuMemoryGuard)>,
+    transfer_items: Vec<ExternalGpuTransferItem>,
     skipped_get_ids: Vec<u64>,
     transfer_concurrency: usize,
     cancel_requested: Arc<AtomicBool>,
@@ -1669,6 +2331,7 @@ async fn run_external_gpu_get_transfer_timed(
         skipped_get_ids,
         transfer_concurrency,
         cancel_requested,
+        crate::owner_segment::OwnerRouteCommitMode::Async,
     )
     .await;
     ExternalGpuGetTerminalEvent {
@@ -1680,8 +2343,8 @@ async fn run_external_gpu_get_transfer_timed(
 async fn run_external_mixed_gpu_get_transfer_timed(
     view: ExternalClientApiView,
     plan_handle: u64,
-    gpu_transfer_items: Vec<(BatchGetStartItemResp, GpuMemoryGuard)>,
-    planned_cpu_items: Vec<(String, u64)>,
+    gpu_transfer_items: Vec<ExternalGpuTransferItem>,
+    planned_cpu_items: Vec<ExternalPlannedGetItem>,
     skipped_get_ids: Vec<u64>,
     transfer_concurrency: usize,
     cancel_requested: Arc<AtomicBool>,
@@ -1706,6 +2369,7 @@ async fn run_external_mixed_gpu_get_transfer_timed(
         skipped_get_ids,
         transfer_concurrency,
         cancel_requested.clone(),
+        crate::owner_segment::OwnerRouteCommitMode::Async,
     );
     let cpu_future = run_external_planned_cpu_get(
         view.clone(),
@@ -1765,7 +2429,14 @@ async fn run_external_mixed_gpu_get_transfer_timed(
                 (_, ExternalPlannedCpuGetTerminal::Revoked) => ExternalGpuGetTerminal::Revoked {
                     transfer_error: Some("mixed Get CPU branch was revoked".to_string()),
                 },
-                _ => unreachable!("mixed Get non-completed branches must fail or revoke"),
+                (ExternalGpuGetTerminal::Miss { key }, _) => {
+                    ExternalGpuGetTerminal::Miss { key: key.clone() }
+                }
+                (
+                    ExternalGpuGetTerminal::Completed { .. },
+                    ExternalPlannedCpuGetTerminal::Miss { key },
+                ) => ExternalGpuGetTerminal::Miss { key: key.clone() },
+                _ => unreachable!("mixed Get non-completed branches must fail, revoke, or miss"),
             }
         }
     };
@@ -1779,6 +2450,13 @@ impl ExternalClientApi {
     /// Access inner external-only API. Safe to unwrap in external role.
     pub fn inner(&self) -> &ExternalInner {
         &self.0
+    }
+
+    pub fn planned_get_reliability_snapshot(&self) -> ExternalPlannedGetReliabilitySnapshot {
+        ExternalPlannedGetReliabilitySnapshot {
+            master_plan_hit_items: self.0.master_plan_hit_items.load(Ordering::Relaxed),
+            direct_miss_items: self.0.planned_cpu_direct_miss_items.load(Ordering::Relaxed),
+        }
     }
 
     pub fn attach_view(&self, view: ExternalClientApiView) {
@@ -1819,9 +2497,12 @@ impl ExternalClientApi {
             rpc_caller_external_batch_get_cancel: RPCCaller::<ExternalBatchGetCancelReq>::new(),
             rpc_caller_master_batch_get_start: RPCCaller::<BatchGetStartReq>::new(),
             rpc_caller_master_batch_get_plan: RPCCaller::<BatchGetPlanReq>::new(),
-            rpc_caller_master_batch_get_bind: RPCCaller::<BatchGetBindReq>::new(),
             rpc_caller_master_batch_get_done: RPCCaller::<BatchGetDoneReq>::new(),
             rpc_caller_master_batch_get_revoke: RPCCaller::<BatchGetRevokeReq>::new(),
+            rpc_caller_owner_segment_transfer: RPCCaller::<OwnerSegmentTransferReq>::new(),
+            owner_transfer_peer_tracker: OwnerTransferPeerTracker::new(
+                OWNER_TRANSFER_EXTERNAL_ACK_STREAM,
+            ),
             rpc_caller_external_execute_planned_get: RPCCaller::<ExternalExecutePlannedGetReq>::new(
             ),
             rpc_caller_external_put_commit: RPCCaller::<ExternalPutCommitReq>::new(),
@@ -1848,6 +2529,8 @@ impl ExternalClientApi {
             pending_external_get_plan: DashMap::new(),
             pending_external_gpu_get: DashMap::new(),
             pending_external_planned_cpu_get: DashMap::new(),
+            master_plan_hit_items: AtomicU64::new(0),
+            planned_cpu_direct_miss_items: AtomicU64::new(0),
             inflight1_per_key: SemaphoreMap::new(1, std::time::Duration::from_secs(120)),
             put_trace_log_window: Mutex::new(ExternalPutTraceLogWindow::new()),
             external_delete_ack_batch: ExternalDeleteAckBatchHandle::new(),
@@ -1933,11 +2616,11 @@ impl ExternalClientApi {
             .regist(ext.view.p2p_module());
         ext.rpc_caller_master_batch_get_plan
             .regist(ext.view.p2p_module());
-        ext.rpc_caller_master_batch_get_bind
-            .regist(ext.view.p2p_module());
         ext.rpc_caller_master_batch_get_done
             .regist(ext.view.p2p_module());
         ext.rpc_caller_master_batch_get_revoke
+            .regist(ext.view.p2p_module());
+        ext.rpc_caller_owner_segment_transfer
             .regist(ext.view.p2p_module());
         ext.rpc_caller_external_execute_planned_get
             .regist(ext.view.p2p_module());
@@ -3378,6 +4061,143 @@ impl ExternalInner {
         }
     }
 
+    fn owner_generation_is_current(&self, owner: &OwnerGeneration) -> bool {
+        self.view
+            .cluster_manager()
+            .get_member_info_cached(&owner.node_id)
+            .is_some_and(|member| member.node_start_time == owner.node_start_time)
+    }
+
+    async fn owner_segment_transfer(
+        &self,
+        target: &OwnerGeneration,
+        request: OwnerSegmentTransferReq,
+    ) -> KvResult<Vec<crate::owner_segment::OwnerSegmentTransferItemResp>> {
+        if request.items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let current = self
+            .view
+            .cluster_manager()
+            .get_member_info_cached(&target.node_id)
+            .ok_or_else(|| {
+                KvError::Api(ApiError::NodeNotFound {
+                    desc: target.node_id.clone(),
+                })
+            })?;
+        if current.node_start_time != target.node_start_time {
+            return Err(KvError::Api(ApiError::OwnerStartTimeMismatch {
+                expected: target.node_start_time,
+                got: current.node_start_time,
+            }));
+        }
+        let expected = request
+            .items
+            .iter()
+            .map(|item| (item.terminal_sequence, item.item.op_id().cloned()))
+            .collect::<Vec<_>>();
+        let response = call_control_plane_rpc(
+            &self.rpc_caller_owner_segment_transfer,
+            self.view.p2p_module(),
+            target.node_id.clone().into(),
+            MsgPack {
+                serialize_part: request,
+                raw_bytes: Vec::new(),
+            },
+            Some(Duration::from_secs(60)),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            response.serialize_part.error_code,
+            response.serialize_part.error_json.clone(),
+        )?;
+        if response.serialize_part.items.len() != expected.len()
+            || response
+                .serialize_part
+                .items
+                .iter()
+                .zip(expected)
+                .any(|(item, expected)| {
+                    item.terminal_sequence != expected.0 || item.op_id != expected.1
+                })
+        {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: "owner segment transfer response changed batch order or operation identity"
+                    .to_string(),
+            }));
+        }
+        Ok(response.serialize_part.items)
+    }
+
+    async fn owner_segment_transfer_batch_until_definitive(
+        &self,
+        target: &OwnerGeneration,
+        items: Vec<OwnerSegmentTransferItem>,
+        phase: &'static str,
+    ) -> KvResult<Vec<crate::owner_segment::OwnerSegmentTransferItemResp>> {
+        let self_info = self.view.cluster_manager().get_self_info();
+        let request = self.owner_transfer_peer_tracker.prepare_request(
+            OwnerGeneration::new(self_info.id.clone(), self_info.node_start_time),
+            target,
+            items,
+        );
+        crate::owner_segment::replay_owner_segment_batch_until_definitive(
+            target,
+            request,
+            phase,
+            |request| self.owner_segment_transfer(target, request),
+            || self.view.register_shutdown_poller().is_running(),
+            |owner| self.owner_generation_is_current(owner),
+        )
+        .await
+    }
+
+    async fn master_batch_get_plan(
+        &self,
+        keys: Vec<String>,
+    ) -> KvResult<Vec<BatchGetPlanItemResp>> {
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let response: MsgPack<BatchGetPlanResp> = call_control_plane_rpc(
+            &self.rpc_caller_master_batch_get_plan,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            MsgPack {
+                serialize_part: BatchGetPlanReq { keys },
+                raw_bytes: Vec::new(),
+            },
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            response.serialize_part.error_code,
+            response.serialize_part.error_json,
+        )?;
+        let items = response.serialize_part.items;
+        let hit_items = items.iter().filter(|item| item.error_code == OK).count() as u64;
+        if hit_items != 0 {
+            let master_plan_hit_items = self
+                .master_plan_hit_items
+                .fetch_add(hit_items, Ordering::Relaxed)
+                .saturating_add(hit_items);
+            tracing::info!(
+                hit_items,
+                master_plan_hit_items_total = master_plan_hit_items,
+                direct_miss_items_total =
+                    self.planned_cpu_direct_miss_items.load(Ordering::Relaxed),
+                "external master Get Plan hit-item counters"
+            );
+        }
+        Ok(items)
+    }
+
     async fn master_batch_gpu_get_revoke(&self, get_ids: Vec<u64>) -> KvResult<()> {
         if get_ids.is_empty() {
             return Ok(());
@@ -3431,141 +4251,93 @@ impl ExternalInner {
         Ok(())
     }
 
-    async fn master_batch_gpu_get_done(&self, get_ids: Vec<u64>) -> KvResult<()> {
-        if get_ids.is_empty() {
+    async fn master_batch_gpu_get_done(&self, items: Vec<BatchGetDoneItemReq>) -> KvResult<()> {
+        if items.is_empty() {
             return Ok(());
         }
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
-        let expected_get_ids = get_ids.clone();
-        let resp: MsgPack<BatchGetDoneResp> = call_control_plane_rpc(
-            &self.rpc_caller_master_batch_get_done,
-            self.view.p2p_module(),
-            master_node_id.into(),
-            MsgPack {
-                serialize_part: BatchGetDoneReq { get_ids },
-                raw_bytes: Vec::new(),
-            },
-            None,
-            0,
-        )
-        .await
-        .map_err(KvError::from)?;
-        crate::rpcresp_kvresult_convert::try_from_code(
-            resp.serialize_part.error_code,
-            resp.serialize_part.error_json.clone(),
-        )?;
-        if resp.serialize_part.items.len() != expected_get_ids.len() {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "GPU Get BatchDone response length mismatch: expected={} got={}",
-                    expected_get_ids.len(),
-                    resp.serialize_part.items.len()
-                ),
-            }));
-        }
-        for (expected_get_id, item) in expected_get_ids
-            .into_iter()
-            .zip(resp.serialize_part.items.into_iter())
-        {
-            if item.get_id != expected_get_id {
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "GPU Get BatchDone response identity mismatch: expected={} got={}",
-                        expected_get_id, item.get_id
-                    ),
-                }));
+        let expected_get_ids = items.iter().map(|item| item.get_id).collect::<Vec<_>>();
+        let mut attempt = 1u32;
+        let mut shutdown = self.view.register_shutdown_waiter();
+        loop {
+            let master_node_id = self
+                .view
+                .cluster_manager()
+                .find_or_wait_master_node()
+                .await?;
+            let response: Result<MsgPack<BatchGetDoneResp>, _> = call_control_plane_rpc(
+                &self.rpc_caller_master_batch_get_done,
+                self.view.p2p_module(),
+                master_node_id.into(),
+                MsgPack {
+                    serialize_part: BatchGetDoneReq {
+                        items: items.clone(),
+                    },
+                    raw_bytes: Vec::new(),
+                },
+                None,
+                0,
+            )
+            .await;
+            match response {
+                Ok(resp) => {
+                    crate::rpcresp_kvresult_convert::try_from_code(
+                        resp.serialize_part.error_code,
+                        resp.serialize_part.error_json.clone(),
+                    )?;
+                    let shape_matches = resp.serialize_part.items.len() == expected_get_ids.len()
+                        && resp
+                            .serialize_part
+                            .items
+                            .iter()
+                            .zip(&expected_get_ids)
+                            .all(|(item, expected)| item.get_id == *expected);
+                    if shape_matches {
+                        for item in resp.serialize_part.items {
+                            crate::rpcresp_kvresult_convert::try_from_code(
+                                item.error_code,
+                                item.error_json,
+                            )?;
+                            if item.holder_id != 0
+                                || item.allocation_mode != GetAllocationMode::ExternalSink
+                            {
+                                return Err(KvError::Api(ApiError::Unknown {
+                                    detail: format!(
+                                        "GPU Get BatchDone returned a cache-owned target: get_id={} holder_id={} allocation_mode={:?}",
+                                        item.get_id, item.holder_id, item.allocation_mode
+                                    ),
+                                }));
+                            }
+                        }
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        items = expected_get_ids.len(),
+                        got_items = resp.serialize_part.items.len(),
+                        attempt,
+                        "GPU Get BatchDone response identity is uncertain; replaying the same get_ids"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        items = expected_get_ids.len(),
+                        attempt,
+                        error = %KvError::from(error),
+                        "GPU Get BatchDone transport is uncertain; replaying the same get_ids"
+                    );
+                }
             }
-            crate::rpcresp_kvresult_convert::try_from_code(item.error_code, item.error_json)?;
-            if item.holder_id != 0 || item.allocation_mode != GetAllocationMode::ExternalSink {
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "GPU Get BatchDone returned a cache-owned target: get_id={} holder_id={} allocation_mode={:?}",
-                        item.get_id, item.holder_id, item.allocation_mode
-                    ),
-                }));
+            let retry_delay =
+                Duration::from_millis((10u64.saturating_mul(1u64 << attempt.min(8))).min(2_000));
+            attempt = attempt.saturating_add(1);
+            tokio::select! {
+                _ = tokio::time::sleep(retry_delay) => {}
+                _ = shutdown.wait() => {
+                    return Err(KvError::Api(ApiError::SystemShutdown {
+                        detail: "GPU Get BatchDone replay stopped during shutdown".to_string(),
+                    }));
+                }
             }
         }
-        Ok(())
-    }
-
-    async fn master_batch_get_bind_external(
-        &self,
-        plan_items: &[BatchGetPlanItemResp],
-        destinations: &[ExternalGpuDestination],
-        requester_node_start_time: i64,
-    ) -> KvResult<Vec<BatchGetStartItemResp>> {
-        if plan_items.len() != destinations.len() {
-            return Err(KvError::Api(ApiError::InvalidArgument {
-                detail: format!(
-                    "external GetBind plan/destination length mismatch: plan={} destinations={}",
-                    plan_items.len(),
-                    destinations.len()
-                ),
-            }));
-        }
-        let items = plan_items
-            .iter()
-            .zip(destinations)
-            .map(|(plan, destination)| BatchGetBindItemReq {
-                get_id: plan.get_id,
-                target: GetBindTarget::ExternalSink(GetExternalSinkTarget {
-                    addr: destination.addr,
-                    capacity: destination.capacity,
-                    registration_id: destination.registration_id,
-                    requester_node_start_time,
-                }),
-            })
-            .collect();
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
-        let response: MsgPack<BatchGetBindResp> = call_control_plane_rpc(
-            &self.rpc_caller_master_batch_get_bind,
-            self.view.p2p_module(),
-            master_node_id.into(),
-            MsgPack {
-                serialize_part: BatchGetBindReq { items },
-                raw_bytes: Vec::new(),
-            },
-            None,
-            0,
-        )
-        .await
-        .map_err(KvError::from)?;
-        crate::rpcresp_kvresult_convert::try_from_code(
-            response.serialize_part.error_code,
-            response.serialize_part.error_json.clone(),
-        )?;
-        if response.serialize_part.items.len() != plan_items.len() {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "external GetBind response length mismatch: expected={} got={}",
-                    plan_items.len(),
-                    response.serialize_part.items.len()
-                ),
-            }));
-        }
-        for (plan, bound) in plan_items.iter().zip(&response.serialize_part.items) {
-            if bound.get_id != plan.get_id {
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "external GetBind response identity mismatch: expected={} got={}",
-                        plan.get_id, bound.get_id
-                    ),
-                }));
-            }
-            crate::rpcresp_kvresult_convert::try_from_code(
-                bound.error_code,
-                bound.error_json.clone(),
-            )?;
-        }
-        Ok(response.serialize_part.items)
     }
 
     async fn probe_owner_local_gets(
@@ -3738,31 +4510,7 @@ impl ExternalInner {
         let plan_items = if remote_keys.is_empty() {
             Vec::new()
         } else {
-            let master_node_id = self
-                .view
-                .cluster_manager()
-                .find_or_wait_master_node()
-                .await?;
-            let response: MsgPack<BatchGetPlanResp> = call_control_plane_rpc(
-                &self.rpc_caller_master_batch_get_plan,
-                self.view.p2p_module(),
-                master_node_id.into(),
-                MsgPack {
-                    serialize_part: BatchGetPlanReq {
-                        keys: remote_keys.clone(),
-                    },
-                    raw_bytes: Vec::new(),
-                },
-                None,
-                0,
-            )
-            .await
-            .map_err(KvError::from)?;
-            crate::rpcresp_kvresult_convert::try_from_code(
-                response.serialize_part.error_code,
-                response.serialize_part.error_json.clone(),
-            )?;
-            response.serialize_part.items
+            self.master_batch_get_plan(remote_keys.clone()).await?
         };
         let started_get_ids = plan_items
             .iter()
@@ -4018,6 +4766,7 @@ impl ExternalInner {
             })
             .collect::<Vec<_>>();
         let mut remote_plans = Vec::with_capacity(destinations.len());
+        let mut remote_plan_keys = Vec::with_capacity(destinations.len());
         let mut planned_cpu_items = Vec::new();
         let mut planned_cpu_sources = Vec::new();
         let mut local_holders = Vec::new();
@@ -4037,6 +4786,7 @@ impl ExternalInner {
                     if plan.gpu_direct_eligible {
                         let destination = &destinations[destination_index];
                         value_ptrs.push(destination.addr);
+                        remote_plan_keys.push(key);
                         remote_plans.push(plan);
                         destination_index += 1;
                     } else {
@@ -4044,60 +4794,57 @@ impl ExternalInner {
                         // planned CPU branch reaches its terminal.
                         value_ptrs.push(0);
                         planned_cpu_sources.push((source_index, key.clone()));
-                        planned_cpu_items.push((key, plan.get_id));
+                        planned_cpu_items.push(ExternalPlannedGetItem { key, plan });
                     }
                 }
             }
         }
         assert_eq!(destination_index, destinations.len());
-        let bound_items = match self
-            .master_batch_get_bind_external(&remote_plans, &destinations, self_info.node_start_time)
-            .await
-        {
-            Ok(items) => items,
-            Err(err) => {
-                let cleanup = finish_planned_get_revoke_cleanup(
-                    self.view.clone_view(),
-                    all_get_ids,
-                    "execute_get_plan_gpu bind failure",
-                )
-                .await
-                .err()
-                .map(|cleanup_err| cleanup_err.to_string());
-                if cleanup.is_none() {
-                    cleanup_guard.disarm();
-                }
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "execute_get_plan_gpu bind failed: error={} cleanup_error={cleanup:?}",
-                        err
-                    ),
-                }));
-            }
-        };
         let mut transfer_items = Vec::with_capacity(destinations.len());
-        for (index, (((planned, bound), destination), guard)) in remote_plans
-            .iter()
-            .zip(bound_items)
+        for (index, (((planned, key), destination), guard)) in remote_plans
+            .into_iter()
+            .zip(remote_plan_keys)
             .zip(destinations.iter())
             .zip(guards)
             .enumerate()
         {
-            if bound.node_id != planned.node_id
-                || bound.src_addr != planned.src_addr
-                || bound.src_base_addr != planned.src_base_addr
-                || bound.len != planned.len
-                || !external_gpu_transfer_plan_geometry_is_valid(
-                    &bound,
-                    destination,
-                    guard.registration().registration_id,
-                )
-                || bound.node_id == self_info.id
+            let materialized = external_gpu_transfer_start_from_plan(
+                &key,
+                planned,
+                destination,
+                self_info.node_start_time,
+            );
+            let (start, late_target) = match materialized {
+                Ok(materialized) => materialized,
+                Err(err) => {
+                    let cleanup = finish_planned_get_revoke_cleanup(
+                        self.view.clone_view(),
+                        all_get_ids,
+                        "execute_get_plan_gpu invalid owner source",
+                    )
+                    .await
+                    .err()
+                    .map(|cleanup_err| cleanup_err.to_string());
+                    if cleanup.is_none() {
+                        cleanup_guard.disarm();
+                    }
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: format!(
+                            "execute_get_plan_gpu could not materialize late-bound item at index={index}: error={err} cleanup_error={cleanup:?}"
+                        ),
+                    }));
+                }
+            };
+            if !external_gpu_transfer_plan_geometry_is_valid(
+                &start,
+                destination,
+                guard.registration().registration_id,
+            ) || start.node_id == self_info.id
             {
                 let cleanup = finish_planned_get_revoke_cleanup(
                     self.view.clone_view(),
                     all_get_ids,
-                    "execute_get_plan_gpu changed bind",
+                    "execute_get_plan_gpu invalid late-bound geometry",
                 )
                 .await
                 .err()
@@ -4107,11 +4854,16 @@ impl ExternalInner {
                 }
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
-                        "execute_get_plan_gpu received a changed bind plan at index={index}; cleanup_error={cleanup:?}"
+                        "execute_get_plan_gpu received an invalid late-bound plan at index={index}; cleanup_error={cleanup:?}"
                     ),
                 }));
             }
-            transfer_items.push((bound, guard));
+            transfer_items.push(ExternalGpuTransferItem {
+                key,
+                start,
+                gpu_guard: guard,
+                late_target: Some(late_target),
+            });
         }
         let cancel_requested = Arc::new(AtomicBool::new(false));
         let (terminal_tx, terminal_rx) = watch::channel(None);
@@ -4196,7 +4948,10 @@ impl ExternalInner {
                     sources.push(PendingExternalCpuSource::Local { holder });
                 }
                 PendingExternalGetPlanItem::Remote { key, plan } => {
-                    plan_items.push((key.clone(), plan.get_id));
+                    plan_items.push(ExternalPlannedGetItem {
+                        key: key.clone(),
+                        plan,
+                    });
                     sources.push(PendingExternalCpuSource::Remote { key });
                 }
             }
@@ -4414,7 +5169,12 @@ impl ExternalInner {
                 continue;
             }
             if idx < transferable_len {
-                transfer_items.push((item, guard));
+                transfer_items.push(ExternalGpuTransferItem {
+                    key: keys[idx].clone(),
+                    start: item,
+                    gpu_guard: guard,
+                    late_target: None,
+                });
             } else {
                 skipped_get_ids.push(item.get_id);
             }
@@ -4423,7 +5183,7 @@ impl ExternalInner {
         let handle = self.next_gpu_get_handle.fetch_add(1, Ordering::Relaxed);
         if handle == 0 {
             let mut all_get_ids = skipped_get_ids.clone();
-            all_get_ids.extend(transfer_items.iter().map(|(item, _)| item.get_id));
+            all_get_ids.extend(transfer_items.iter().map(|item| item.start.get_id));
             let _ = self.master_batch_gpu_get_revoke(all_get_ids).await;
             return Err(KvError::Api(ApiError::Unknown {
                 detail: "get_start_gpu local handle space exhausted".to_string(),
@@ -4510,6 +5270,7 @@ impl ExternalInner {
         let outcome = match &terminal_event.outcome {
             ExternalGpuGetTerminal::Completed { .. } => "completed",
             ExternalGpuGetTerminal::Revoked { .. } => "revoked",
+            ExternalGpuGetTerminal::Miss { .. } => "miss",
             ExternalGpuGetTerminal::Failed { .. } => "failed",
         };
         let local_source_count = pending.local_holders.len();
@@ -4713,17 +5474,8 @@ impl ExternalInner {
                     terminal_to_consume_us: timing.terminal_to_consume_us,
                 })
             }
-            ExternalGpuGetTerminal::Revoked { transfer_error } => {
-                Err(KvError::Api(ApiError::Unknown {
-                    detail: format!(
-                        "get_transfer_gpu was revoked: handle={} transfer_error={:?}",
-                        handle, transfer_error
-                    ),
-                }))
-            }
-            ExternalGpuGetTerminal::Failed { detail } => {
-                Err(KvError::Api(ApiError::Unknown { detail }))
-            }
+            terminal => Err(external_gpu_get_terminal_error(&terminal, handle)
+                .expect("a non-completed GPU terminal must carry an error")),
         }
     }
 
@@ -4748,6 +5500,7 @@ impl ExternalInner {
                 Ok(())
             }
             ExternalGpuGetTerminal::Revoked { .. } => Ok(()),
+            ExternalGpuGetTerminal::Miss { .. } => Ok(()),
             ExternalGpuGetTerminal::Failed { detail } => {
                 Err(KvError::Api(ApiError::Unknown { detail }))
             }
@@ -5294,21 +6047,17 @@ impl ExternalInner {
                     return Err(err);
                 }
             };
-            let ExternalPlannedCpuGetTerminal::Completed {
-                items,
-                owner_start_time,
-            } = terminal
-            else {
-                let _ = pending_guard.take();
-                return Err(KvError::Api(ApiError::Unknown {
-                    detail: match terminal {
-                        ExternalPlannedCpuGetTerminal::Revoked => {
-                            format!("planned CPU Get was revoked: handle={handle}")
-                        }
-                        ExternalPlannedCpuGetTerminal::Failed { detail } => detail,
-                        ExternalPlannedCpuGetTerminal::Completed { .. } => unreachable!(),
-                    },
-                }));
+            let (items, owner_start_time) = match terminal {
+                ExternalPlannedCpuGetTerminal::Completed {
+                    items,
+                    owner_start_time,
+                } => (items, owner_start_time),
+                terminal => {
+                    let error = external_planned_cpu_get_terminal_error(&terminal, handle)
+                        .expect("a non-completed planned CPU terminal must carry an error");
+                    let _ = pending_guard.take();
+                    return Err(error);
+                }
             };
             let response = ExternalExecutePlannedGetResp {
                 items: items.clone(),
@@ -5536,6 +6285,7 @@ impl ExternalInner {
                     );
                     Ok(())
                 }
+                ExternalPlannedCpuGetTerminal::Miss { .. } => Ok(()),
                 ExternalPlannedCpuGetTerminal::Failed { detail } => {
                     Err(KvError::Api(ApiError::Unknown { detail }))
                 }
@@ -7470,6 +8220,12 @@ impl LogicalModule for ExternalClientApi {
     async fn shutdown(&self) -> Result<(), Self::Error> {
         // 只在ExternalClient模式下清理共享内存映射
         let ext = &self.0;
+        let reliability = self.planned_get_reliability_snapshot();
+        tracing::info!(
+            master_plan_hit_items_total = reliability.master_plan_hit_items,
+            direct_miss_items_total = reliability.direct_miss_items,
+            "external planned Get reliability final snapshot"
+        );
         if ext.shared_memory_path().is_empty() {
             tracing::info!("ExternalClientApi shutdown (no shared memory path configured)");
             return Ok(());

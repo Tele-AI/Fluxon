@@ -24,7 +24,7 @@ resources:
     publish_tags: [master, owner, external]
     published_by: ClusterManager.step.1.init2
     doc: |
-      - ClusterManager: member watch is established and continuous observation is available
+      - ClusterManager: the facade event subscriber is installed before the closed runtime joins, then the member watch is established
       - Provides: `ClusterManager.listen()` can continuously consume `ClusterEvent`
 
   - id: owner_shared_mem_bundle_ready
@@ -33,7 +33,7 @@ resources:
     published_by: ExternalClientApi.step.1.prepare
     doc: |
       - external: wait until owner `shared.json` is readable and passes metadata validation, then wait for `mmap.file` -> mmap -> owner member observability
-      - owner: `shared.json` is written by the owner's segment-registration flow and is not modeled explicitly inside the init DAG
+      - owner: `shared.json` is written only after `ClientSegPool.step.3.register_master` receives the master ACK
 
   - id: prom_remote_write_wait_ready
     tags: [owner, external]
@@ -213,8 +213,8 @@ steps:
     mode: Blocking
     deps: []
     doc: |
-      - Join the etcd cluster with lease and self member registration
-      - Start member and metadata watches plus event broadcast
+      - Install the facade event mirror before the closed runtime can publish its first event
+      - Join the etcd cluster with lease and self member registration, then start member and metadata watches
       - Produces readable and writable `cluster_state` plus `cluster_event`
     exec:
       kind: Call
@@ -253,11 +253,13 @@ steps:
     mode: Blocking
     deps:
       - ClusterManager.step.1.init2
-      - P2pModule.step.1.init2
+      - P2pModule.step.2.init3
+      - ClientTransferEngine.step.1.init2
+      - MasterSegManager.step.1.init2
     doc: |
       - Register master KV RPC handlers and callers
       - Start router tasks such as delete broadcast and cluster listener
-      - Depends on: `ClusterManager.step.1.init2` for membership observation and `P2pModule.step.1.init2` for RPC
+      - Depends on: the complete local P2P/transfer runtime and `MasterSegManager` RPC registration before the member-driven segment-registration actor starts
     exec:
       kind: Call
       call: "MasterKvRouter::init2_for_init_dag"
@@ -393,11 +395,28 @@ steps:
     mode: Blocking
     deps:
       - ClientTransferEngine.step.1.init2
+      - P2pModule.step.2.init3
     doc: |
       - Call the transfer engine to register segments and open the self segment
       - Write cluster state: publish `transfer_ready`
-      - Depends on: `ClientTransferEngine.step.1.init2` with the engine ready
+      - Depends on: the transfer engine and complete local P2P init3 state; this step establishes local segment readiness
     exec:
       kind: Call
       call: "ClientSegPool::init3_for_init_dag"
+    best_effort: null
+
+  - id: ClientSegPool.step.3.register_master
+    module: ClientSegPool
+    mode: Blocking
+    deps: []
+    doc: |
+      - Push the exact owner generation and segment geometry to the master through the metadata-only control RPC
+      - Fast branch: after both direct-graph directions are advertised, owner push completes only when the master idempotently records that generation and the owner receives its ACK
+      - Recovery branch: master pull installs the exact generation first, then sends `ConfirmNodeSegmentsRegistered`; the owner treats only that authenticated callback as the alternate terminal
+      - Local `send_ready`, direct-graph publication, preparing a pull response, and sending a pull response are not registration terminals by themselves
+      - Publish `shared.json` only after the ACK; master-pull registration remains recovery-only
+      - Depends implicitly on `ClientSegPool.step.2.init3`; this is the owner-side distributed registration DAG terminal
+    exec:
+      kind: Call
+      call: "ClientSegPool::register_master_for_init_dag"
     best_effort: null

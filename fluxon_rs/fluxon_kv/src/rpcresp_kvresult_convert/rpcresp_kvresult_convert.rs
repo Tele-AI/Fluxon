@@ -15,11 +15,12 @@ use crate::master_kv_router::msg_pack::{
     BatchDeleteAckResp, BatchDeleteClientKvMetaCacheResp, BatchIsExistResp,
     BatchPreparePutKeysResp, BatchReleasePutKeyReservationsResp, DeleteAckResp, DeleteResp,
     GetDoneResp, GetMasterOnlyMetricPartResp, GetMetaResp, GetRevokeResp, GetStartResp,
-    MemHolderKeepAliveResp, MemHolderReleaseResp, PutAppendDoneResp, PutAppendRevokeResp,
-    PutAppendStartResp, PutDoneResp, PutRevokeResp, PutStartResp, ReleaseLocalGrantResp,
-    ReserveLocalGrantResp,
+    MemHolderKeepAliveResp, MemHolderReleaseResp, OwnerLocalReserveControlResp, PutAppendDoneResp,
+    PutAppendRevokeResp, PutAppendStartResp, PutDoneResp, PutRevokeResp, PutStartResp,
 };
-use crate::master_seg_manager::msg_pack::RequestSegmentRegistrationResp;
+use crate::master_seg_manager::msg_pack::{
+    ConfirmNodeSegmentsRegisteredResp, RegisterNodeSegmentsResp, RequestSegmentRegistrationResp,
+};
 use crate::memholder::ExternalMemHolderInfo;
 
 /// Shared helpers to convert RPC response structs into KvResult types for KV APIs
@@ -186,6 +187,26 @@ impl FromError for RequestSegmentRegistrationResp {
         let code = e.code();
         Self {
             error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromError for RegisterNodeSegmentsResp {
+    fn from_error(e: &KvError) -> Self {
+        Self {
+            error_code: e.code(),
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromError for ConfirmNodeSegmentsRegisteredResp {
+    fn from_error(e: &KvError) -> Self {
+        Self {
+            error_code: e.code(),
             error_json: e.to_json(),
             ..Default::default()
         }
@@ -474,17 +495,7 @@ impl FromError for PutDoneResp {
         }
     }
 }
-impl FromError for ReserveLocalGrantResp {
-    fn from_error(e: &KvError) -> Self {
-        let code = e.code();
-        Self {
-            error_code: code,
-            error_json: e.to_json(),
-            ..Default::default()
-        }
-    }
-}
-impl FromError for ReleaseLocalGrantResp {
+impl FromError for OwnerLocalReserveControlResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
         Self {

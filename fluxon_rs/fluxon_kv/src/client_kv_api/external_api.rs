@@ -11,17 +11,17 @@ use crate::client_kv_api::msg_pack::{
     ExternalBatchPutTransferEndReq, ExternalBatchPutTransferEndResp, ExternalDeleteReq,
     ExternalDeleteResp, ExternalExecutePlannedGetReq, ExternalExecutePlannedGetResp,
     ExternalGetReq, ExternalGetResp, ExternalIsExistReq, ExternalIsExistResp,
-    ExternalObservabilitySnapshotReq, ExternalObservabilitySnapshotResp, ExternalPutCommitReq,
-    ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp, ExternalPutStartReq,
-    ExternalPutStartResp, ExternalPutTransferEndReq, ExternalPutTransferEndResp, TestPutPhaseTrace,
+    ExternalObservabilitySnapshotReq, ExternalObservabilitySnapshotResp, ExternalPlannedGetItem,
+    ExternalPutCommitReq, ExternalPutCommitResp, ExternalPutRevokeReq, ExternalPutRevokeResp,
+    ExternalPutStartReq, ExternalPutStartResp, ExternalPutTransferEndReq,
+    ExternalPutTransferEndResp, TestPutPhaseTrace,
 };
 use crate::client_kv_api::{
     self, ExternalGetKeyInterest, ExternalGetKeySharedOp, ExternalGetKeySharedPhase,
     ExternalGetStartEntry, ExternalGetStartOwnerItem, ExternalGetStartPrefixResult,
     ExternalGetStartSharedItemResult, ExternalGetStartTransferOutput,
     ExternalLocalFirstPutKeyReservation, ExternalPendingPutCtx, ExternalPutKeyOutcome,
-    OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerLocalReserveSlotLease,
-    OwnerLocalReserveSlotRef,
+    OwnerLocalPublishItem, OwnerLocalPublishJob, OwnerSlotLease, OwnerSlotRef,
 };
 use crate::client_seg_pool::{ResolveSideTransferLaneReq, parse_side_transfer_worker_lane_idx};
 use crate::cluster_manager::NodeIDString;
@@ -29,13 +29,14 @@ use crate::cluster_manager::{
     META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
 };
 use crate::master_kv_router::msg_pack::{
-    BatchGetStartItemResp, BatchGetStartResp, BatchPutDoneItemReq, BatchPutRevokeItemReq,
-    GetPreparedLocalReserveTarget, PutAtomicGroup, PutDoneCommittedSlot,
-    build_put_atomic_group_assignments,
+    BatchGetBindItemReq, BatchGetStartItemResp, BatchGetStartResp, BatchPutDoneItemReq,
+    BatchPutRevokeItemReq, GetBindTarget, GetPreparedLocalReserveTarget, GetSourceKind,
+    PutAtomicGroup, PutDoneCommittedSlot, build_put_atomic_group_assignments,
 };
 use crate::memholder::MemholderManagerTrait;
 use crate::memholder::NodeHolderKey;
 use crate::memholder::{UserMemHolder, UserMemHolderExposeKind};
+use crate::owner_segment::OwnerGeneration;
 use crate::p2p::msg_pack::MsgPack;
 use crate::rpcresp_kvresult_convert::FromError;
 use crate::rpcresp_kvresult_convert::ToResult;
@@ -380,6 +381,14 @@ async fn commit_external_local_first_pending(
             ),
         })
     })?;
+    if slot_ref.capacity_bytes != slot_size || slot_ref.len != req_len {
+        return Err(KvError::Api(ApiError::InvalidArgument {
+            detail: format!(
+                "{op} owner slot descriptor mismatches pending payload: key={} slot_capacity={} expected_capacity={} slot_len={} expected_len={}",
+                key, slot_ref.capacity_bytes, slot_size, slot_ref.len, req_len
+            ),
+        }));
+    }
     let len = u32::try_from(req_len).map_err(|_| {
         KvError::Api(ApiError::Unknown {
             detail: format!(
@@ -391,23 +400,16 @@ async fn commit_external_local_first_pending(
     let memory_info = inner
         .build_local_reserve_resident_memory_info(
             key,
-            slot_ref.ptr,
+            slot_ref.addr,
             len,
-            slot_size,
-            slot_ref.grant_id,
-            slot_ref.slot_index,
+            slot_ref.allocation_id,
+            slot_ref.segment_offset,
+            slot_ref.capacity_bytes,
         )
         .await;
     inner.install_precommit_local_visible_memory_info(key, memory_info.clone());
     ctx._pending_fence.disarm_local_slot_lease();
-    Ok(PutDoneCommittedSlot {
-        grant_id: slot_ref.grant_id,
-        slot_index: slot_ref.slot_index,
-        slot_size,
-        addr: slot_ref.ptr,
-        base_addr: slot_ref.base_addr,
-        len: req_len,
-    })
+    Ok(slot_ref.clone())
 }
 
 async fn release_external_local_first_pending_slot(
@@ -635,17 +637,9 @@ fn collect_all_local_external_get_start_infos(
         .collect()
 }
 
-fn prepared_target_from_slot(
-    slot_size: u64,
-    slot: &OwnerLocalReserveSlotRef,
-) -> GetPreparedLocalReserveTarget {
-    GetPreparedLocalReserveTarget {
-        grant_id: slot.grant_id,
-        slot_index: slot.slot_index,
-        slot_size,
-        addr: slot.ptr,
-        base_addr: slot.base_addr,
-    }
+fn prepared_target_from_slot(slot_size: u64, slot: &OwnerSlotRef) -> GetPreparedLocalReserveTarget {
+    debug_assert_eq!(slot.capacity_bytes, slot_size);
+    slot.clone()
 }
 
 async fn release_prepared_get_target(
@@ -653,15 +647,10 @@ async fn release_prepared_get_target(
     target: &GetPreparedLocalReserveTarget,
 ) -> KvResult<()> {
     inner
-        .owner_release_local_reserve_slot_lease(OwnerLocalReserveSlotLease {
-            value_len: target.slot_size,
-            slot_size: target.slot_size,
-            slots: vec![OwnerLocalReserveSlotRef {
-                grant_id: target.grant_id,
-                slot_index: target.slot_index,
-                ptr: target.addr,
-                base_addr: target.base_addr,
-            }],
+        .owner_release_local_reserve_slot_lease(OwnerSlotLease {
+            value_len: target.len,
+            slot_size: target.capacity_bytes,
+            slots: vec![target.clone()],
         })
         .await
 }
@@ -673,12 +662,12 @@ async fn release_prepared_get_target(
 /// state in the local-reserve pool.
 struct PreparedGetSlotClaimGuard {
     view: crate::client_kv_api::ClientKvApiView,
-    lease: Option<OwnerLocalReserveSlotLease>,
+    lease: Option<OwnerSlotLease>,
     drop_delay: Duration,
 }
 
 impl PreparedGetSlotClaimGuard {
-    fn new(view: crate::client_kv_api::ClientKvApiView, lease: OwnerLocalReserveSlotLease) -> Self {
+    fn new(view: crate::client_kv_api::ClientKvApiView, lease: OwnerSlotLease) -> Self {
         Self {
             view,
             lease: Some(lease),
@@ -686,16 +675,17 @@ impl PreparedGetSlotClaimGuard {
         }
     }
 
-    fn lease(&self) -> &OwnerLocalReserveSlotLease {
+    fn lease(&self) -> &OwnerSlotLease {
         self.lease.as_ref().expect("prepared slot claim is armed")
     }
 
     fn disarm_accepted(&mut self, target: &GetPreparedLocalReserveTarget) {
         let lease = self.lease.as_mut().expect("prepared slot claim is armed");
         lease.slots.retain(|slot| {
-            !(slot.grant_id == target.grant_id
-                && slot.slot_index == target.slot_index
-                && slot.ptr == target.addr
+            !(slot.allocation_id == target.allocation_id
+                && slot.segment_offset == target.segment_offset
+                && slot.capacity_bytes == target.capacity_bytes
+                && slot.addr == target.addr
                 && slot.base_addr == target.base_addr)
         });
     }
@@ -760,7 +750,7 @@ impl Drop for PreparedGetSlotClaimGuard {
     }
 }
 
-async fn batch_get_start_with_local_reserve_targets(
+pub(crate) async fn batch_get_start_with_local_reserve_targets(
     inner: &client_kv_api::ClientKvApiInner,
     keys: &[String],
 ) -> KvResult<BatchGetStartResp> {
@@ -812,13 +802,18 @@ async fn batch_get_start_with_local_reserve_targets(
         }));
     }
 
+    let self_node_id = inner.view.cluster_manager().get_self_info().id;
     let accepted_exactly =
         response
             .items
             .iter()
             .zip(prepared_targets.iter())
             .all(|(item, requested_target)| {
-                item.error_code != OK || item.prepared_target.as_ref() == requested_target.as_ref()
+                prepared_get_start_item_matches_requester_target(
+                    item,
+                    requested_target.as_ref(),
+                    self_node_id.as_ref(),
+                )
             });
     if !accepted_exactly {
         let started = claim_guard.handoff_started(&response.items);
@@ -828,7 +823,7 @@ async fn batch_get_start_with_local_reserve_targets(
         }));
     }
     for (item, requested_target) in response.items.iter().zip(prepared_targets.iter()) {
-        if item.error_code == OK {
+        if item.error_code == OK && item.prepared_target.as_ref() == requested_target.as_ref() {
             claim_guard.disarm_accepted(
                 requested_target
                     .as_ref()
@@ -839,50 +834,210 @@ async fn batch_get_start_with_local_reserve_targets(
     Ok(response)
 }
 
-async fn batch_get_bind_with_local_reserve_targets(
+fn prepared_get_start_item_matches_requester_target(
+    item: &BatchGetStartItemResp,
+    requested_target: Option<&GetPreparedLocalReserveTarget>,
+    requester_node_id: &str,
+) -> bool {
+    item.error_code != OK
+        || item.prepared_target.as_ref() == requested_target
+        || (item.prepared_target.is_none()
+            && item.reused_committed_slot.is_some()
+            && item.node_id.as_str() == requester_node_id
+            && item.src_addr == item.target_addr
+            && item.src_base_addr == item.target_base_addr)
+}
+
+#[derive(Clone)]
+struct OwnerPlannedGetStart {
+    item: BatchGetStartItemResp,
+    late_target: Option<GetBindTarget>,
+}
+
+/// A Plan is only a metadata snapshot.  Between Plan and owner execution the
+/// same generation can be demoted from LocalExclusive to GlobalShared on this
+/// requester.  In that case the existing owner slot is the destination: a
+/// new claim would race the exact manifest before master late-bind has a
+/// chance to promote its scope back to LocalExclusive.
+fn planned_get_can_reuse_exact_global_manifest(
+    item: &ExternalPlannedGetItem,
+    requester_owner: &OwnerGeneration,
+    manifest: Option<&crate::owner_segment::OwnerSlotManifestEntry>,
+) -> bool {
+    manifest.is_some_and(|manifest| {
+        manifest.key == item.key
+            && manifest.put_id == item.plan.put_id
+            && manifest.slot.owner == *requester_owner
+            && manifest.slot.len == item.plan.len
+            && manifest.slot.is_valid()
+            && manifest.scope == Some(crate::owner_segment::OwnerSlotScope::GlobalShared)
+            && manifest.disposition == crate::owner_segment::OwnerTargetDisposition::GlobalShared
+            && manifest.physical_state == crate::owner_segment::OwnerSlotPhysicalState::Committed
+            && manifest.route_epoch != 0
+    })
+}
+
+async fn prepare_planned_get_with_local_reserve_targets(
     inner: &client_kv_api::ClientKvApiInner,
-    get_ids: &[u64],
-) -> KvResult<Vec<BatchGetStartItemResp>> {
-    if get_ids.is_empty() {
-        return Ok(Vec::new());
+    items: &[ExternalPlannedGetItem],
+) -> KvResult<(Vec<OwnerPlannedGetStart>, Option<PreparedGetSlotClaimGuard>)> {
+    if items.is_empty() {
+        return Ok((Vec::new(), None));
     }
-    let Some(value_len) = inner
-        .test_spec_config
-        .owner_local_reserve_expected_capacity
-        .as_ref()
-        .map(|expected| expected.value_len)
-    else {
-        return Err(KvError::Api(ApiError::InvalidArgument {
-            detail: "planned external Get requires owner-local reserve capacity".to_string(),
-        }));
+    let self_info = inner.view.cluster_manager().get_self_info();
+    let requester_owner = OwnerGeneration::new(self_info.id.clone(), self_info.node_start_time);
+    let requester_local_reuse = {
+        let allocator = inner.owner_segment_allocator.lock();
+        items
+            .iter()
+            .map(|item| {
+                if item.plan.requester_local_borrow_eligible {
+                    return true;
+                }
+                let manifest = allocator.manifest_entry(&item.key, item.plan.put_id);
+                planned_get_can_reuse_exact_global_manifest(
+                    item,
+                    &requester_owner,
+                    manifest.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>()
     };
-    let lease = inner
-        .owner_claim_local_reserve_slot_lease(value_len, get_ids.len())
-        .await?;
-    let mut claim_guard = PreparedGetSlotClaimGuard::new(inner.view.clone_view(), lease);
-    let prepared_targets = claim_guard
-        .lease()
-        .slots
+    let stale_plan_local_rebinds = items
         .iter()
-        .map(|slot| prepared_target_from_slot(claim_guard.lease().slot_size, slot))
+        .zip(&requester_local_reuse)
+        .filter(|(item, reuse)| **reuse && !item.plan.requester_local_borrow_eligible)
+        .count();
+    if stale_plan_local_rebinds != 0 {
+        tracing::info!(
+            items = items.len(),
+            stale_plan_local_rebinds,
+            "planned Get found exact requester-local GlobalShared manifests before target claim"
+        );
+    }
+    let prepared_count = requester_local_reuse
+        .iter()
+        .filter(|reuse| !**reuse)
+        .count();
+    let mut claim_guard = if prepared_count == 0 {
+        None
+    } else {
+        let Some(value_len) = inner
+            .test_spec_config
+            .owner_local_reserve_expected_capacity
+            .as_ref()
+            .map(|expected| expected.value_len)
+        else {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: "planned external Get requires owner-local reserve capacity".to_string(),
+            }));
+        };
+        let lease = inner
+            .owner_claim_local_reserve_slot_lease(value_len, prepared_count)
+            .await?;
+        Some(PreparedGetSlotClaimGuard::new(
+            inner.view.clone_view(),
+            lease,
+        ))
+    };
+    let prepared_targets = claim_guard
+        .as_ref()
+        .map(|guard| {
+            guard
+                .lease()
+                .slots
+                .iter()
+                .map(|slot| prepared_target_from_slot(guard.lease().slot_size, slot))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut prepared_targets_iter = prepared_targets.iter();
+    let bind_targets = items
+        .iter()
+        .zip(&requester_local_reuse)
+        .map(|(_item, requester_local_reuse)| {
+            if *requester_local_reuse {
+                GetBindTarget::RequesterLocalSource
+            } else {
+                GetBindTarget::PreparedLocalReserve(
+                    prepared_targets_iter
+                        .next()
+                        .expect("prepared target count must match planned Get items")
+                        .clone(),
+                )
+            }
+        })
         .collect::<Vec<_>>();
+    assert!(prepared_targets_iter.next().is_none());
+
+    let mut starts = std::iter::repeat_with(|| None)
+        .take(items.len())
+        .collect::<Vec<Option<OwnerPlannedGetStart>>>();
+    let mut prebind = Vec::new();
+    for (index, (item, target)) in items.iter().zip(&bind_targets).enumerate() {
+        match item
+            .plan
+            .materialize_owner_source_late_target(target, Some(&requester_owner))
+        {
+            Ok(start) => {
+                starts[index] = Some(OwnerPlannedGetStart {
+                    item: start,
+                    late_target: Some(target.clone()),
+                });
+            }
+            Err(_) => prebind.push((index, item, target.clone())),
+        }
+    }
+
+    if prebind.is_empty() {
+        return Ok((
+            starts
+                .into_iter()
+                .map(|item| item.expect("every owner-backed Plan must be materialized"))
+                .collect(),
+            claim_guard,
+        ));
+    }
+
     let response = match inner
-        .batch_get_bind_prepared_targets(get_ids.to_vec(), prepared_targets.clone())
+        .batch_get_bind_targets(
+            prebind
+                .iter()
+                .map(|(_, item, target)| BatchGetBindItemReq {
+                    get_id: item.plan.get_id,
+                    target: target.clone(),
+                })
+                .collect(),
+        )
         .await
     {
         Ok(response) => {
-            claim_guard.mark_start_response_received();
+            if let Some(claim_guard) = claim_guard.as_mut() {
+                claim_guard.mark_start_response_received();
+            }
             response
         }
         Err(err) => return Err(err),
     };
-    if response.items.len() != get_ids.len() {
-        let started = claim_guard.handoff_started(&response.items);
+    if response.items.len() != prebind.len() {
+        let started = if let Some(claim_guard) = claim_guard.as_mut() {
+            claim_guard.handoff_started(&response.items)
+        } else {
+            response
+                .items
+                .iter()
+                .filter(|item| item.error_code == OK)
+                .map(|item| StartedGetRevokeCleanup {
+                    get_id: item.get_id,
+                    prepared_target: None,
+                })
+                .collect()
+        };
         finish_started_get_revoke_cleanup(inner, started, "BatchGetBind length mismatch").await;
         return Err(KvError::Api(ApiError::Unknown {
             detail: format!(
                 "planned BatchGetBind response length mismatch: expected={} got={}",
-                get_ids.len(),
+                prebind.len(),
                 response.items.len()
             ),
         }));
@@ -890,31 +1045,78 @@ async fn batch_get_bind_with_local_reserve_targets(
     let identities_match = response
         .items
         .iter()
-        .zip(get_ids)
-        .all(|(item, get_id)| item.get_id == *get_id);
-    let targets_match =
-        response
-            .items
-            .iter()
-            .zip(prepared_targets.iter())
-            .all(|(item, expected)| {
-                item.error_code != OK || item.prepared_target.as_ref() == Some(expected)
-            });
+        .zip(&prebind)
+        .all(|(response, (_, request, _))| response.get_id == request.plan.get_id);
+    let self_node_id = inner.view.cluster_manager().get_self_info().id;
+    let targets_match = response
+        .items
+        .iter()
+        .zip(&prebind)
+        .all(|(item, (_, _, expected))| {
+            item.error_code != OK
+                || match expected {
+                    GetBindTarget::PreparedLocalReserve(expected) => {
+                        item.prepared_target.as_ref() == Some(expected)
+                            && item.reused_committed_slot.is_none()
+                    }
+                    GetBindTarget::RequesterLocalSource => {
+                        item.prepared_target.is_none()
+                            && item.source_kind == GetSourceKind::Memory
+                            && item.node_id == self_node_id
+                            && item.src_addr == item.target_addr
+                            && item.src_base_addr == item.target_base_addr
+                            && item.reused_committed_slot.as_ref().is_none_or(|slot| {
+                                slot.addr == item.src_addr
+                                    && slot.base_addr == item.src_base_addr
+                                    && slot.capacity_bytes >= item.len
+                            })
+                    }
+                    GetBindTarget::ExternalSink(_) | GetBindTarget::Invalid => false,
+                }
+        });
     if !identities_match || !targets_match {
-        let started = claim_guard.handoff_started(&response.items);
+        let started = if let Some(claim_guard) = claim_guard.as_mut() {
+            claim_guard.handoff_started(&response.items)
+        } else {
+            response
+                .items
+                .iter()
+                .filter(|item| item.error_code == OK)
+                .map(|item| StartedGetRevokeCleanup {
+                    get_id: item.get_id,
+                    prepared_target: None,
+                })
+                .collect()
+        };
         finish_started_get_revoke_cleanup(inner, started, "BatchGetBind identity/target mismatch")
             .await;
         return Err(KvError::Api(ApiError::Unknown {
-            detail: "master did not replay the exact planned Get identity and prepared target"
+            detail: "master did not replay the exact planned Get identity and bind target"
                 .to_string(),
         }));
     }
-    for (item, target) in response.items.iter().zip(prepared_targets.iter()) {
-        if item.error_code == OK {
-            claim_guard.disarm_accepted(target);
+    if let Some(claim_guard) = claim_guard.as_mut() {
+        for (item, (_, _, target)) in response.items.iter().zip(&prebind) {
+            if item.error_code == OK
+                && let GetBindTarget::PreparedLocalReserve(target) = target
+            {
+                claim_guard.disarm_accepted(target);
+            }
         }
     }
-    Ok(response.items)
+    for ((index, _, _), item) in prebind.into_iter().zip(response.items) {
+        starts[index] = Some(OwnerPlannedGetStart {
+            item,
+            late_target: None,
+        });
+    }
+    Ok((
+        starts
+            .into_iter()
+            .map(|item| item.expect("planned Get start merge must preserve request shape"))
+            .collect(),
+        claim_guard,
+    ))
 }
 
 #[cfg(test)]
@@ -976,19 +1178,35 @@ mod external_get_start_batch_tests {
         cleanup_external_get_start_handles_for_generation, clear_external_get_key_marker_locked,
         collect_external_get_start_missing, compute_external_get_start_raw_prefix,
         compute_external_get_start_transfer_prefix, decide_external_get_key_item,
-        external_member_left_departed_epoch, normalize_external_put_start_group_lens,
-        observe_external_get_consume_phases, partition_external_get_finish_leaders,
-        register_external_get_key_under_fence, validate_external_get_consume_prefix,
+        external_member_left_departed_epoch, is_requester_local_visibility_race,
+        normalize_external_put_start_group_lens, observe_external_get_consume_phases,
+        partition_external_get_finish_leaders, plan_external_get_key_items,
+        planned_get_can_reuse_exact_global_manifest,
+        prepared_get_start_item_matches_requester_target, register_external_get_key_under_fence,
+        validate_external_get_consume_prefix,
     };
+    use crate::client_kv_api::msg_pack::ExternalPlannedGetItem;
     use crate::client_kv_api::{
         ExternalGetKeyInterest, ExternalGetKeySharedOp, ExternalGetKeySharedPhase,
         ExternalGetStartEntry, ExternalGetStartOwnerItem, ExternalGetStartSharedItemResult,
-        OwnerKeyControlState,
+        ExternalLocalFirstPutKeyReservation, GetCachedInfo, OwnerKeyControlState,
+        OwnerKeyMaterializationOutcome, OwnerKeyMaterializationReservation, PendingLocalGetInfo,
+        PendingLocalGetSource,
+    };
+    use crate::config::OwnerLocalReserveExpectedCapacity;
+    use crate::kvcore_test_lib::{
+        integration_test_lock, start_master_and_client_with_client_config, stop_master_and_client,
     };
     use crate::master_kv_router::msg_pack::{
-        BatchGetStartItemResp, PutAtomicGroup, PutAtomicGroupMember,
+        BatchGetPlanItemResp, BatchGetStartItemResp, GetBindTarget, GetStartResp, PutAtomicGroup,
+        PutAtomicGroupMember,
     };
-    use crate::rpcresp_kvresult_convert::msg_and_error::{OK, codes_api};
+    use crate::master_seg_manager::msg_pack::OwnerPlacementClass;
+    use crate::owner_segment::{
+        OwnerGeneration, OwnerSlotDesc, OwnerSlotManifestEntry, OwnerSlotPhysicalState,
+        OwnerSlotScope, OwnerTargetDisposition,
+    };
+    use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK, codes_api};
     use dashmap::DashMap;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1006,6 +1224,118 @@ mod external_get_start_batch_tests {
             atomic_group_lens: Vec::new(),
             created_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn prepared_get_accepts_requester_global_shared_reuse_and_classifies_local_race() {
+        let requested = OwnerSlotDesc {
+            owner: OwnerGeneration::new("requester-owner", 7),
+            allocation_id: 11,
+            segment_offset: 4096,
+            capacity_bytes: 4096,
+            addr: 0x3000,
+            base_addr: 0x1000,
+            len: 4096,
+            segment_registration_epoch: 2,
+        };
+        let reused = BatchGetStartItemResp {
+            node_id: "requester-owner".to_string().into(),
+            src_addr: requested.addr,
+            target_addr: requested.addr,
+            src_base_addr: requested.base_addr,
+            target_base_addr: requested.base_addr,
+            reused_committed_slot: Some(requested.clone()),
+            error_code: OK,
+            ..Default::default()
+        };
+        assert!(prepared_get_start_item_matches_requester_target(
+            &reused,
+            Some(&requested),
+            "requester-owner",
+        ));
+
+        let unrelated = BatchGetStartItemResp {
+            node_id: "another-owner".to_string().into(),
+            ..reused.clone()
+        };
+        assert!(!prepared_get_start_item_matches_requester_target(
+            &unrelated,
+            Some(&requested),
+            "requester-owner",
+        ));
+
+        let err = KvError::Api(ApiError::KeyAlreadyExists {
+            key: "race-key".to_string(),
+        });
+        let wire: GetStartResp = crate::rpcresp_kvresult_convert::FromError::from_error(&err);
+        let raced = BatchGetStartItemResp {
+            error_code: wire.error_code,
+            error_json: wire.error_json,
+            ..Default::default()
+        };
+        assert!(is_requester_local_visibility_race(&raced));
+    }
+
+    #[test]
+    fn stale_remote_plan_reuses_exact_global_manifest_before_claim() {
+        let requester = OwnerGeneration::new("requester-owner", 7);
+        let item = ExternalPlannedGetItem {
+            key: "demoted-key".to_string(),
+            plan: BatchGetPlanItemResp {
+                put_id: (31, 4),
+                len: 4096,
+                requester_local_borrow_eligible: false,
+                ..Default::default()
+            },
+        };
+        let manifest = OwnerSlotManifestEntry {
+            key: item.key.clone(),
+            put_id: item.plan.put_id,
+            slot: OwnerSlotDesc {
+                owner: requester.clone(),
+                allocation_id: 9,
+                segment_offset: 8192,
+                capacity_bytes: 4096,
+                addr: 0x3000,
+                base_addr: 0x1000,
+                len: item.plan.len,
+                segment_registration_epoch: 3,
+            },
+            scope: Some(OwnerSlotScope::GlobalShared),
+            disposition: OwnerTargetDisposition::GlobalShared,
+            route_epoch: 9,
+            physical_state: OwnerSlotPhysicalState::Committed,
+        };
+        assert!(planned_get_can_reuse_exact_global_manifest(
+            &item,
+            &requester,
+            Some(&manifest),
+        ));
+
+        let mut local = manifest.clone();
+        local.scope = Some(OwnerSlotScope::LocalExclusive);
+        local.disposition = OwnerTargetDisposition::LocalExclusive;
+        assert!(!planned_get_can_reuse_exact_global_manifest(
+            &item,
+            &requester,
+            Some(&local),
+        ));
+
+        let mut route_pending = manifest.clone();
+        route_pending.physical_state = OwnerSlotPhysicalState::RoutePending;
+        route_pending.route_epoch = 0;
+        assert!(!planned_get_can_reuse_exact_global_manifest(
+            &item,
+            &requester,
+            Some(&route_pending),
+        ));
+
+        let another_owner = OwnerGeneration::new("another-owner", 7);
+        assert!(!planned_get_can_reuse_exact_global_manifest(
+            &item,
+            &another_owner,
+            Some(&manifest),
+        ));
     }
 
     #[test]
@@ -1114,6 +1444,7 @@ mod external_get_start_batch_tests {
         let finishing = Arc::new(ExternalGetKeySharedOp::new("finishing".to_string()));
         finishing.state.lock().phase = ExternalGetKeySharedPhase::Finishing {
             item: BatchGetStartItemResp::default(),
+            late_target: None,
         };
         let ready = Arc::new(ExternalGetKeySharedOp::new("ready".to_string()));
         let observed_at = Instant::now();
@@ -1287,6 +1618,351 @@ mod external_get_start_batch_tests {
             .expect("interest Drop must wake the flight");
     }
 
+    #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn pending_local_get_is_reused_without_a_second_external_get_leader() {
+        let _test_guard = integration_test_lock().await;
+        let (master, owner) = start_master_and_client_with_client_config(
+            "pending_local_get_probe_master",
+            "pending_local_get_probe_owner",
+            |config| {
+                config.owner_placement_class = Some(OwnerPlacementClass::Inference);
+                config.replica_writeback_hot_capacity_ratio = Some(0.5);
+                config
+                    .test_spec_config
+                    .owner_local_reserve_expected_capacity =
+                    Some(OwnerLocalReserveExpectedCapacity {
+                        value_len: 4096,
+                        payload_capacity_bytes: config.contribute_to_cluster_pool_size.dram / 2,
+                    });
+            },
+        )
+        .await;
+        let owner_view = owner.client_kv_api_view();
+        let inner = owner_view.client_kv_api().inner();
+        let key = "pending-local-get-probe";
+        let put_id = (9000, 1);
+        let slot = inner
+            .owner_claim_local_reserve_slot_lease(4096, 1)
+            .await
+            .expect("claim one test owner slot")
+            .slots
+            .into_iter()
+            .next()
+            .expect("one requested test slot");
+        let memory_info = inner
+            .build_local_reserve_resident_memory_info(
+                key,
+                slot.addr,
+                4096,
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            )
+            .await;
+        inner.install_precommit_local_visible_memory_info(key, memory_info.clone());
+        inner
+            .promote_precommit_local_reserve_resident_slot_if_same(key, put_id, memory_info, None)
+            .expect("seed one committed owner-local page");
+
+        let pending_memory_info = {
+            let _controls = inner.owner_key_control.lock_key(key);
+            let (_, cached) = inner
+                .get_cached_info
+                .remove(key)
+                .expect("seeded page must have a committed local index");
+            assert_eq!((cached.put_time_ms, cached.put_version), put_id);
+            let memory_info = cached.mem_holder;
+            assert!(
+                inner
+                    .pending_local_get_info
+                    .insert(
+                        key.to_string(),
+                        PendingLocalGetInfo {
+                            get_id: 9001,
+                            put_id,
+                            mem_holder: memory_info.clone(),
+                            source: PendingLocalGetSource::ExistingGlobalShared,
+                            target_write_capability: None,
+                        },
+                    )
+                    .is_none()
+            );
+            memory_info
+        };
+        let used_slots_before = inner.owner_segment_allocator.lock().used_slot_count();
+
+        for _ in 0..2 {
+            let (items, leaders) = plan_external_get_key_items(inner, &[key.to_string()]).await;
+            assert!(
+                leaders.is_empty(),
+                "a DataReady/RoutePending local payload must not start another Get"
+            );
+            let [ExternalGetStartOwnerItem::Local { memory_info }] = items.as_slice() else {
+                panic!("pending local payload must resolve as one external local hit")
+            };
+            assert!(Arc::ptr_eq(memory_info, &pending_memory_info));
+        }
+        assert_eq!(
+            inner.owner_segment_allocator.lock().used_slot_count(),
+            used_slots_before,
+            "reusing a pending local result must not claim another owner slot"
+        );
+
+        {
+            let _controls = inner.owner_key_control.lock_key(key);
+            let (_, pending) = inner
+                .pending_local_get_info
+                .remove(key)
+                .expect("test pending entry must remain exact");
+            assert!(Arc::ptr_eq(&pending.mem_holder, &pending_memory_info));
+            assert_eq!(pending.put_id, put_id);
+            assert!(
+                inner
+                    .get_cached_info
+                    .insert(
+                        key.to_string(),
+                        GetCachedInfo {
+                            put_time_ms: put_id.0,
+                            put_version: put_id.1,
+                            mem_holder: pending.mem_holder,
+                        },
+                    )
+                    .is_none()
+            );
+        }
+        stop_master_and_client(master, owner).await;
+    }
+
+    #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn local_put_and_get_materialization_share_one_owner_key_flight() {
+        let _test_guard = integration_test_lock().await;
+        let (master, owner) = start_master_and_client_with_client_config(
+            "put_get_key_flight_master",
+            "put_get_key_flight_owner",
+            |_config| {},
+        )
+        .await;
+        let owner_view = owner.client_kv_api_view();
+        let inner = owner_view.client_kv_api().inner();
+
+        // Put wins first: a Get planner must wait without installing its own
+        // leader marker.  Dropping the uncommitted Put publishes Failed and
+        // lets the planner re-evaluate to one clean Get leader.
+        let put_first_key = "put-first-get-waits";
+        let put_leader = match inner
+            .reserve_external_local_first_put_key(put_first_key, true, true)
+            .expect("the first local Put must become leader")
+        {
+            ExternalLocalFirstPutKeyReservation::Leader(leader) => leader,
+            _ => panic!("an empty key must admit exactly one Put leader"),
+        };
+        let planner_view = inner.view.clone_view();
+        let planner_key = put_first_key.to_string();
+        let mut planner = ::tokio::spawn(async move {
+            let planner_api = planner_view.client_kv_api();
+            plan_external_get_key_items(planner_api.inner(), &[planner_key]).await
+        });
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(25), &mut planner)
+                .await
+                .is_err(),
+            "Get must not claim a target while the local Put flight is active"
+        );
+        assert!(
+            inner
+                .owner_key_control
+                .lock_key(put_first_key)
+                .get(put_first_key)
+                .is_some_and(|state| state.external_get.is_none()),
+            "waiting Get must not publish a competing key flight"
+        );
+        drop(put_leader);
+        let (items, leaders) = ::tokio::time::timeout(Duration::from_secs(1), planner)
+            .await
+            .expect("Get must resume when the Put flight terminates")
+            .expect("Get planner task must not panic");
+        assert_eq!(items.len(), 1);
+        assert_eq!(leaders.len(), 1);
+        for op in &leaders {
+            let notify = {
+                let mut controls = inner.owner_key_control.lock_key(&op.key);
+                abandon_unstarted_external_get_key_locked(&mut controls, op)
+            };
+            assert!(notify);
+            inner.untrack_external_get_flight(op);
+            op.notify.notify_waiters();
+        }
+        drop(items);
+        drop(leaders);
+
+        // Get wins first: a local Put must return an asynchronous Get waiter,
+        // not claim a second slot or install a second Put flight.
+        let get_first_key = "get-first-put-waits";
+        let get_op = Arc::new(ExternalGetKeySharedOp::new(get_first_key.to_string()));
+        {
+            let mut controls = inner.owner_key_control.lock_key(get_first_key);
+            controls
+                .entry(get_first_key.to_string())
+                .or_default()
+                .external_get = Some(get_op.clone());
+        }
+        inner.track_external_get_flight(&get_op);
+        match inner
+            .reserve_external_local_first_put_key(get_first_key, true, true)
+            .expect("idempotent Put must join the active Get")
+        {
+            ExternalLocalFirstPutKeyReservation::WaitForGet(waiter) => {
+                assert!(Arc::ptr_eq(&waiter, &get_op));
+            }
+            _ => panic!("Put must not become leader while a Get owns the key flight"),
+        }
+        assert!(
+            inner
+                .owner_key_control
+                .lock_key(get_first_key)
+                .get(get_first_key)
+                .is_some_and(|state| state.external_put.is_none() && state.local_puts == 0),
+            "Get waiter must not leave a partial Put reservation"
+        );
+        let notify = {
+            let mut controls = inner.owner_key_control.lock_key(get_first_key);
+            abandon_unstarted_external_get_key_locked(&mut controls, &get_op)
+        };
+        assert!(notify);
+        inner.untrack_external_get_flight(&get_op);
+        get_op.notify.notify_waiters();
+
+        // Incoming PutFromSource wins first: the Get planner must wait before
+        // it can claim any destination slot or install external_get.
+        let target_first_key = "target-put-first-get-waits";
+        let target_op = match inner.reserve_owner_key_materialization(target_first_key, (71, 1)) {
+            OwnerKeyMaterializationReservation::Leader(op) => op,
+            _ => panic!("an empty key must admit one target materialization leader"),
+        };
+        let planner_view = inner.view.clone_view();
+        let planner_key = target_first_key.to_string();
+        let mut planner = ::tokio::spawn(async move {
+            let planner_api = planner_view.client_kv_api();
+            plan_external_get_key_items(planner_api.inner(), &[planner_key]).await
+        });
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(25), &mut planner)
+                .await
+                .is_err(),
+            "Get must not plan or claim while PutFromSource materializes the key"
+        );
+        assert!(
+            inner
+                .owner_key_control
+                .lock_key(target_first_key)
+                .get(target_first_key)
+                .is_some_and(|state| state.external_get.is_none()),
+            "a Get waiting for target materialization must not publish a competing flight"
+        );
+
+        // The same PutFromSource leader must also fence a later external
+        // local-first Put.  The follower owns neither a local-Put counter nor
+        // a second slot while it waits for the shared terminal.
+        let local_put_waiter = match inner
+            .reserve_external_local_first_put_key(target_first_key, true, true)
+            .expect("local-first Put must join target materialization")
+        {
+            ExternalLocalFirstPutKeyReservation::WaitForMaterialization(op) => op,
+            _ => panic!("local-first Put must not claim while PutFromSource owns the key"),
+        };
+        assert!(Arc::ptr_eq(&local_put_waiter, &target_op));
+        assert!(
+            inner
+                .owner_key_control
+                .lock_key(target_first_key)
+                .get(target_first_key)
+                .is_some_and(|state| state.external_put.is_none() && state.local_puts == 0),
+            "materialization waiter must not leave a partial local-Put reservation"
+        );
+        assert!(inner.finish_owner_key_materialization(
+            &target_op,
+            OwnerKeyMaterializationOutcome::Committed,
+        ));
+        assert_eq!(
+            ::tokio::time::timeout(Duration::from_secs(1), local_put_waiter.wait())
+                .await
+                .expect("target terminal must wake the local-first Put waiter"),
+            OwnerKeyMaterializationOutcome::Committed
+        );
+        let (items, leaders) = ::tokio::time::timeout(Duration::from_secs(1), planner)
+            .await
+            .expect("Get must resume after target materialization")
+            .expect("Get planner task must not panic");
+        assert_eq!(items.len(), 1);
+        assert_eq!(leaders.len(), 1);
+        for op in &leaders {
+            let notify = {
+                let mut controls = inner.owner_key_control.lock_key(&op.key);
+                abandon_unstarted_external_get_key_locked(&mut controls, op)
+            };
+            assert!(notify);
+            inner.untrack_external_get_flight(op);
+            op.notify.notify_waiters();
+        }
+        drop(items);
+        drop(leaders);
+
+        // Get wins first and detaches CommitTarget: PutFromSource first waits
+        // for external_get, then for the route-completion extension.  Clearing
+        // external_get alone must not reopen physical materialization.
+        let get_route_key = "get-route-pending-put-waits";
+        let route_get_op = Arc::new(ExternalGetKeySharedOp::new(get_route_key.to_string()));
+        {
+            let mut controls = inner.owner_key_control.lock_key(get_route_key);
+            controls
+                .entry(get_route_key.to_string())
+                .or_default()
+                .external_get = Some(route_get_op.clone());
+        }
+        match inner.reserve_owner_key_materialization(get_route_key, (72, 1)) {
+            OwnerKeyMaterializationReservation::WaitForGet(op) => {
+                assert!(Arc::ptr_eq(&op, &route_get_op));
+            }
+            _ => panic!("PutFromSource must initially wait for the active Get"),
+        }
+        let mut route_guard = inner
+            .begin_async_get_key_materialization(get_route_key, (72, 1))
+            .expect("Get must extend its key fence through Async CommitTarget");
+        let route_waiter = match inner.reserve_owner_key_materialization(get_route_key, (72, 1)) {
+            OwnerKeyMaterializationReservation::Wait(op) => op,
+            _ => panic!("PutFromSource must join the Get route materialization"),
+        };
+        let notify = {
+            let mut controls = inner.owner_key_control.lock_key(get_route_key);
+            abandon_unstarted_external_get_key_locked(&mut controls, &route_get_op)
+        };
+        assert!(notify);
+        route_get_op.notify.notify_waiters();
+        let mut wait = Box::pin(route_waiter.wait());
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(25), &mut wait)
+                .await
+                .is_err(),
+            "external_get terminal alone must not release the route-pending key fence"
+        );
+        route_guard.finish(OwnerKeyMaterializationOutcome::Committed);
+        assert_eq!(
+            ::tokio::time::timeout(Duration::from_secs(1), &mut wait)
+                .await
+                .expect("route completion must wake PutFromSource"),
+            OwnerKeyMaterializationOutcome::Committed
+        );
+        assert!(
+            inner
+                .owner_key_control
+                .lock_key(get_route_key)
+                .get(get_route_key)
+                .is_none()
+        );
+
+        stop_master_and_client(master, owner).await;
+    }
+
     #[test]
     fn old_singleflight_cleanup_cannot_remove_new_generation() {
         let key = "aba-key".to_string();
@@ -1302,6 +1978,7 @@ mod external_get_start_batch_tests {
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: Some(old.clone()),
+                owner_materialization: None,
                 local_access_fence: None,
             },
         )]);
@@ -1334,6 +2011,7 @@ mod external_get_start_batch_tests {
                 source_eviction_selection: None,
                 reclaim: None,
                 external_get: Some(op.clone()),
+                owner_materialization: None,
                 local_access_fence: None,
             },
         )]);
@@ -1365,48 +2043,58 @@ mod external_get_start_batch_tests {
                 })
                 .collect(),
         };
-        let leader = |key: &str, atomic_group: Option<PutAtomicGroup>| {
+        let leader = |key: &str,
+                      atomic_group: Option<PutAtomicGroup>,
+                      late_target: Option<GetBindTarget>| {
             (
                 Arc::new(ExternalGetKeySharedOp::new(key.to_string())),
                 BatchGetStartItemResp {
                     atomic_group,
                     ..Default::default()
                 },
+                late_target,
             )
         };
         let batches = partition_external_get_finish_leaders(
             vec![
-                leader("single-a", None),
-                leader("group-0", Some(group.clone())),
-                leader("single-b", None),
-                leader("group-1", Some(group.clone())),
-                leader("group-2", Some(group.clone())),
-                leader("single-c", None),
+                leader("single-a", None, None),
+                leader("group-0", Some(group.clone()), None),
+                leader("single-b", None, None),
+                leader(
+                    "group-1",
+                    Some(group.clone()),
+                    Some(GetBindTarget::RequesterLocalSource),
+                ),
+                leader("group-2", Some(group.clone()), None),
+                leader("single-c", None, None),
             ],
             2,
         );
 
         let group_batch_count = batches
             .iter()
-            .filter(|batch| batch.iter().any(|(op, _)| op.key.starts_with("group-")))
+            .filter(|batch| batch.iter().any(|(op, _, _)| op.key.starts_with("group-")))
             .count();
         assert_eq!(group_batch_count, 1, "one atomic group must not be split");
         let group_batch = batches
             .iter()
-            .find(|batch| batch.iter().any(|(op, _)| op.key == "group-0"))
+            .find(|batch| batch.iter().any(|(op, _, _)| op.key == "group-0"))
             .unwrap();
         assert_eq!(
             group_batch
                 .iter()
-                .filter(|(op, _)| op.key.starts_with("group-"))
+                .filter(|(op, _, _)| op.key.starts_with("group-"))
                 .count(),
             3
         );
+        assert!(group_batch.iter().any(|(op, _, late_target)| {
+            op.key == "group-1" && matches!(late_target, Some(GetBindTarget::RequesterLocalSource))
+        }));
         assert!(batches.iter().all(|batch| {
             batch.len() <= 2
                 || batch
                     .iter()
-                    .all(|(_, item)| item.atomic_group.as_ref() == Some(&group))
+                    .all(|(_, item, _)| item.atomic_group.as_ref() == Some(&group))
         }));
     }
 }
@@ -1649,6 +2337,8 @@ async fn plan_external_get_key_items(
 ) {
     enum KeyAttempt {
         Wait(Arc<ExternalGetKeySharedOp>),
+        WaitForPut(Arc<crate::client_kv_api::ExternalPutKeySharedOp>),
+        WaitForMaterialization(Arc<crate::client_kv_api::OwnerKeyMaterializationOp>),
         Ready {
             item: ExternalGetStartOwnerItem,
             hot_touch: Option<(
@@ -1679,12 +2369,19 @@ async fn plan_external_get_key_items(
                     });
                 if let Some(op) = revoking {
                     KeyAttempt::Wait(op)
+                } else if let Some(op) = controls
+                    .get(key)
+                    .and_then(|state| state.owner_materialization.clone())
+                {
+                    KeyAttempt::WaitForMaterialization(op)
                 } else {
                     let fenced = controls
                         .get(key)
                         .is_some_and(|state| state.local_access_fenced());
                     if !fenced {
-                        if let Some(memory_info) = inner.local_visible_mem_holder_unfenced(key) {
+                        if let Some(memory_info) =
+                            inner.external_local_probe_mem_holder_unfenced(key)
+                        {
                             let hot_touch = inner.get_cached_info.get(key).and_then(|cached| {
                                 Arc::ptr_eq(&cached.mem_holder, &memory_info).then_some((
                                     (cached.put_time_ms, cached.put_version),
@@ -1695,6 +2392,16 @@ async fn plan_external_get_key_items(
                                 item: ExternalGetStartOwnerItem::Local { memory_info },
                                 hot_touch,
                             }
+                        } else if let Some(op) = controls
+                            .get(key)
+                            .and_then(|state| state.external_put.clone())
+                        {
+                            // Local-first Put and Get share the owner key
+                            // fence.  Whichever operation installed its
+                            // singleflight first owns physical materialization;
+                            // the later operation waits without claiming a
+                            // second slot, then re-evaluates local visibility.
+                            KeyAttempt::WaitForPut(op)
                         } else {
                             let control = controls.entry(key.clone()).or_default();
                             let leader_count = planning_leaders.leaders.len();
@@ -1732,6 +2439,12 @@ async fn plan_external_get_key_items(
 
             match attempt {
                 KeyAttempt::Wait(op) => wait_external_get_key_not_revoking(op).await,
+                KeyAttempt::WaitForPut(op) => {
+                    let _ = op.wait().await;
+                }
+                KeyAttempt::WaitForMaterialization(op) => {
+                    let _ = op.wait().await;
+                }
                 KeyAttempt::Ready { item, hot_touch } => {
                     if let Some((put_id, memory_info)) = hot_touch {
                         hot_touches.push((key.clone(), put_id, memory_info));
@@ -1821,11 +2534,12 @@ fn publish_external_get_key_failed(
 fn publish_external_get_key_started(
     op: &Arc<ExternalGetKeySharedOp>,
     item: crate::master_kv_router::msg_pack::BatchGetStartItemResp,
+    late_target: Option<GetBindTarget>,
 ) {
     {
         let mut state = op.state.lock();
         assert!(matches!(state.phase, ExternalGetKeySharedPhase::Starting));
-        state.phase = ExternalGetKeySharedPhase::Started { item };
+        state.phase = ExternalGetKeySharedPhase::Started { item, late_target };
     }
     op.notify.notify_waiters();
 }
@@ -1857,8 +2571,8 @@ async fn wait_external_get_key_start_code(
                     notified.as_mut().enable();
                     true
                 }
-                ExternalGetKeySharedPhase::Started { item }
-                | ExternalGetKeySharedPhase::Finishing { item } => {
+                ExternalGetKeySharedPhase::Started { item, .. }
+                | ExternalGetKeySharedPhase::Finishing { item, .. } => {
                     return Ok((item.error_code, item.error_json.clone()));
                 }
                 ExternalGetKeySharedPhase::Ready { result } => {
@@ -1939,15 +2653,30 @@ enum ExternalGetKeyLeaderAction {
     Finish {
         op: Arc<ExternalGetKeySharedOp>,
         item: crate::master_kv_router::msg_pack::BatchGetStartItemResp,
+        late_target: Option<GetBindTarget>,
     },
     Revoke {
         op: Arc<ExternalGetKeySharedOp>,
         item: crate::master_kv_router::msg_pack::BatchGetStartItemResp,
     },
+    ResolveRequesterLocal {
+        op: Arc<ExternalGetKeySharedOp>,
+    },
     Terminal,
 }
 
-type ExternalGetFinishLeader = (Arc<ExternalGetKeySharedOp>, BatchGetStartItemResp);
+fn is_requester_local_visibility_race(item: &BatchGetStartItemResp) -> bool {
+    matches!(
+        KvError::from_json(item.error_code, &item.error_json),
+        KvError::Api(ApiError::KeyAlreadyExists { .. })
+    )
+}
+
+type ExternalGetFinishLeader = (
+    Arc<ExternalGetKeySharedOp>,
+    BatchGetStartItemResp,
+    Option<GetBindTarget>,
+);
 
 struct ExternalGetFinishUnit {
     group: Option<PutAtomicGroup>,
@@ -2053,19 +2782,28 @@ async fn classify_external_get_key_leader(
             let mut controls = inner.owner_key_control.lock_key(&op.key);
             let mut state = op.state.lock();
             match &state.phase {
-                ExternalGetKeySharedPhase::Started { item } if state.undecided == 0 => {
+                ExternalGetKeySharedPhase::Started { item, late_target }
+                    if state.undecided == 0 =>
+                {
                     let item = item.clone();
+                    let late_target = late_target.clone();
                     if item.error_code != OK {
-                        state.phase = ExternalGetKeySharedPhase::Ready {
-                            result: external_get_key_ready_from_code(
-                                item.error_code,
-                                item.error_json,
-                            ),
-                        };
-                        state.terminal_at = Some(Instant::now());
-                        clear_external_get_key_marker_locked(&mut controls, &op);
-                        notify_terminal = true;
-                        Some(ExternalGetKeyLeaderAction::Terminal)
+                        if is_requester_local_visibility_race(&item) {
+                            Some(ExternalGetKeyLeaderAction::ResolveRequesterLocal {
+                                op: op.clone(),
+                            })
+                        } else {
+                            state.phase = ExternalGetKeySharedPhase::Ready {
+                                result: external_get_key_ready_from_code(
+                                    item.error_code,
+                                    item.error_json,
+                                ),
+                            };
+                            state.terminal_at = Some(Instant::now());
+                            clear_external_get_key_marker_locked(&mut controls, &op);
+                            notify_terminal = true;
+                            Some(ExternalGetKeyLeaderAction::Terminal)
+                        }
                     } else if state.retained == 0 {
                         state.phase = ExternalGetKeySharedPhase::Revoking { item: item.clone() };
                         Some(ExternalGetKeyLeaderAction::Revoke {
@@ -2073,10 +2811,14 @@ async fn classify_external_get_key_leader(
                             item,
                         })
                     } else {
-                        state.phase = ExternalGetKeySharedPhase::Finishing { item: item.clone() };
+                        state.phase = ExternalGetKeySharedPhase::Finishing {
+                            item: item.clone(),
+                            late_target: late_target.clone(),
+                        };
                         Some(ExternalGetKeyLeaderAction::Finish {
                             op: op.clone(),
                             item,
+                            late_target,
                         })
                     }
                 }
@@ -2111,12 +2853,46 @@ async fn finish_external_get_key_leaders(
     let inner = client_api.inner();
     let mut finish = Vec::new();
     let mut revoke = Vec::new();
+    let mut requester_local_races = Vec::new();
     for op in leaders {
         match classify_external_get_key_leader(inner, op).await {
-            ExternalGetKeyLeaderAction::Finish { op, item } => finish.push((op, item)),
+            ExternalGetKeyLeaderAction::Finish {
+                op,
+                item,
+                late_target,
+            } => finish.push((op, item, late_target)),
             ExternalGetKeyLeaderAction::Revoke { op, item } => revoke.push((op, item)),
+            ExternalGetKeyLeaderAction::ResolveRequesterLocal { op } => {
+                requester_local_races.push(op)
+            }
             ExternalGetKeyLeaderAction::Terminal => {}
         }
+    }
+
+    for op in requester_local_races {
+        let result = match inner.local_visible_mem_holder_waiting(&op.key).await {
+            Some(memory_info) => {
+                tracing::info!(
+                    key = op.key,
+                    "prepared Get target lost a race to requester-local publication; reusing the local terminal"
+                );
+                ExternalGetStartSharedItemResult::Hit {
+                    memholder: Arc::new(UserMemHolder::new(
+                        memory_info,
+                        inner.get_or_init_all_memholder_refcount(),
+                        UserMemHolderExposeKind::SegPtr,
+                    )),
+                }
+            }
+            None => {
+                tracing::info!(
+                    key = op.key,
+                    "prepared Get target lost a race but requester-local publication is no longer visible; returning a cache miss"
+                );
+                ExternalGetStartSharedItemResult::Miss
+            }
+        };
+        publish_external_get_key_terminal(inner, &op, ExternalGetKeySharedPhase::Ready { result });
     }
 
     if !revoke.is_empty() {
@@ -2244,16 +3020,25 @@ async fn finish_external_get_key_leaders(
         async move {
             let keys = batch
                 .iter()
-                .map(|(op, _)| op.key.clone())
+                .map(|(op, _, _)| op.key.clone())
                 .collect::<Vec<_>>();
             let start_items = batch
                 .iter()
-                .map(|(_, item)| item.clone())
+                .map(|(_, item, _)| item.clone())
+                .collect::<Vec<_>>();
+            let late_targets = batch
+                .iter()
+                .map(|(_, _, target)| target.clone())
                 .collect::<Vec<_>>();
             let result = batch_view
                 .client_kv_api()
                 .inner()
-                .batch_get_finish_started(keys, start_items, per_batch_transfer_concurrency)
+                .batch_get_finish_started(
+                    keys,
+                    start_items,
+                    late_targets,
+                    per_batch_transfer_concurrency,
+                )
                 .await;
             (batch, result)
         }
@@ -2266,7 +3051,7 @@ async fn finish_external_get_key_leaders(
                 // Publish each confirmed sub-batch immediately. A different
                 // uncertain Done atomic_batch therefore cannot retain these flights
                 // or their pending-visible slots.
-                for ((op, _), result) in batch.into_iter().zip(results) {
+                for ((op, _, _), result) in batch.into_iter().zip(results) {
                     let phase = match result {
                         Ok(Some((memholder, _))) => ExternalGetKeySharedPhase::Ready {
                             result: ExternalGetStartSharedItemResult::Hit { memholder },
@@ -2295,12 +3080,12 @@ async fn finish_external_get_key_leaders(
                         results.len()
                     ),
                 });
-                for (op, _) in batch {
+                for (op, _, _) in batch {
                     publish_external_get_key_failed(inner, &op, &err);
                 }
             }
             Err(err) => {
-                for (op, _) in batch {
+                for (op, _, _) in batch {
                     publish_external_get_key_failed(inner, &op, &err);
                 }
             }
@@ -2362,7 +3147,7 @@ async fn prepare_external_get_batch_plan(
                         batch_start_us,
                     );
                     for (op, item) in leaders.iter().zip(start_resp.items) {
-                        publish_external_get_key_started(op, item);
+                        publish_external_get_key_started(op, item, None);
                     }
                     finish_external_get_key_leaders(worker_view, leaders, transfer_concurrency)
                         .await;
@@ -2817,27 +3602,25 @@ impl HandlerForExternalClient for ClientKvApi {
 
         self.validate_requester_owner_status_updated(req.started_time)?;
 
-        let batch_results = inner.batch_get(req.keys, req.transfer_concurrency).await?;
+        let keys = req.keys;
+        let batch_results = inner
+            .batch_get(keys.clone(), req.transfer_concurrency)
+            .await?;
         let mut items = Vec::with_capacity(batch_results.len());
-        for item_result in batch_results {
+        for (key, item_result) in keys.into_iter().zip(batch_results) {
             match item_result {
                 Ok(Some((memholder, _))) => {
-                    let external_memholder_info = inner.install_external_get_holding(
-                        &req.req_node_id,
-                        memholder.memory_info(),
-                    );
+                    let external_memholder_info = inner
+                        .install_external_get_holding(&req.req_node_id, memholder.memory_info());
                     items.push(ExternalBatchGetItemResp {
                         error_code: OK,
                         error_json: String::new(),
                         external_memholder_info: Some(external_memholder_info),
                     });
                 }
-                Ok(None) => items.push(ExternalBatchGetItemResp {
-                    error_code:
-                        crate::rpcresp_kvresult_convert::msg_and_error::codes_api::API_KEY_NOT_FOUND,
-                    error_json: "Key not found".to_string(),
-                    external_memholder_info: None,
-                }),
+                Ok(None) => items.push(ExternalBatchGetItemResp::from_error(&KvError::Api(
+                    ApiError::KeyNotFound { key },
+                ))),
                 Err(err) => items.push(ExternalBatchGetItemResp {
                     external_memholder_info: None,
                     ..ExternalBatchGetItemResp::from_error(&err)
@@ -2905,7 +3688,9 @@ impl HandlerForExternalClient for ClientKvApi {
                     .is_some_and(|state| state.local_access_fenced())
                 {
                     (None, None)
-                } else if let Some(memory_info) = inner.local_visible_mem_holder_unfenced(key) {
+                } else if let Some(memory_info) =
+                    inner.external_local_probe_mem_holder_unfenced(key)
+                {
                     let hot_touch = inner.get_cached_info.get(key).and_then(|cached| {
                         Arc::ptr_eq(&cached.mem_holder, &memory_info).then_some((
                             (cached.put_time_ms, cached.put_version),
@@ -3188,11 +3973,9 @@ impl HandlerForExternalClient for ClientKvApi {
                 }
                 Ok(None) => {
                     misses = misses.saturating_add(1);
-                    items.push(ExternalBatchGetItemResp {
-                        error_code: codes_api::API_KEY_NOT_FOUND,
-                        error_json: format!("Key not found: {}", key),
-                        external_memholder_info: None,
-                    });
+                    items.push(ExternalBatchGetItemResp::from_error(&KvError::Api(
+                        ApiError::KeyNotFound { key: key.clone() },
+                    )));
                 }
                 Err(err) => {
                     errors = errors.saturating_add(1);
@@ -3273,7 +4056,7 @@ impl HandlerForExternalClient for ClientKvApi {
         for item in &req.items {
             if item.key.is_empty()
                 || requested_by_key
-                    .insert(item.key.clone(), item.get_id)
+                    .insert(item.key.clone(), item.clone())
                     .is_some()
             {
                 return Err(KvError::Api(ApiError::InvalidArgument {
@@ -3328,7 +4111,16 @@ impl HandlerForExternalClient for ClientKvApi {
             .map(|leader| {
                 requested_by_key
                     .get(&leader.key)
-                    .copied()
+                    .map(|item| item.plan.get_id)
+                    .expect("planned leader key must come from the request")
+            })
+            .collect::<Vec<_>>();
+        let leader_bind_items = leaders
+            .iter()
+            .map(|leader| {
+                requested_by_key
+                    .get(&leader.key)
+                    .cloned()
                     .expect("planned leader key must come from the request")
             })
             .collect::<Vec<_>>();
@@ -3339,15 +4131,15 @@ impl HandlerForExternalClient for ClientKvApi {
         let mut cleanup = req
             .items
             .iter()
-            .filter(|item| !leader_id_set.contains(&item.get_id))
+            .filter(|item| !leader_id_set.contains(&item.plan.get_id))
             .map(|item| StartedGetRevokeCleanup {
-                get_id: item.get_id,
+                get_id: item.plan.get_id,
                 prepared_target: None,
             })
             .collect::<Vec<_>>();
 
-        let bound_items =
-            match batch_get_bind_with_local_reserve_targets(inner, &leader_get_ids).await {
+        let (prepared_items, mut late_claim_guard) =
+            match prepare_planned_get_with_local_reserve_targets(inner, &leader_bind_items).await {
                 Ok(items) => items,
                 Err(err) => {
                     for leader in &leaders {
@@ -3362,7 +4154,7 @@ impl HandlerForExternalClient for ClientKvApi {
                     finish_started_get_revoke_cleanup(
                         inner,
                         cleanup,
-                        "planned external Get bind failure",
+                        "planned external Get prepare failure",
                     )
                     .await;
                     let response = ExternalExecutePlannedGetResp {
@@ -3377,16 +4169,23 @@ impl HandlerForExternalClient for ClientKvApi {
                     return Ok(response);
                 }
             };
-        assert_eq!(leaders.len(), bound_items.len());
-        for (leader, item) in leaders.iter().zip(bound_items) {
+        assert_eq!(leaders.len(), prepared_items.len());
+        for (leader, prepared) in leaders.iter().zip(prepared_items) {
+            let OwnerPlannedGetStart { item, late_target } = prepared;
             if item.error_code != OK {
                 cleanup.push(StartedGetRevokeCleanup {
                     get_id: item.get_id,
                     prepared_target: None,
                 });
             }
-            publish_external_get_key_started(leader, item);
+            publish_external_get_key_started(leader, item, late_target.clone());
+            if let (Some(claim_guard), Some(GetBindTarget::PreparedLocalReserve(target))) =
+                (late_claim_guard.as_mut(), late_target.as_ref())
+            {
+                claim_guard.disarm_accepted(target);
+            }
         }
+        drop(late_claim_guard);
         for item in &mut owner_items {
             decide_external_get_key_item(item, true);
         }
@@ -3446,11 +4245,9 @@ impl HandlerForExternalClient for ClientKvApi {
                         inner.install_external_get_holding(&req.req_node_id, holder.memory_info()),
                     ),
                 }),
-                Ok(None) => items.push(ExternalBatchGetItemResp {
-                    error_code: codes_api::API_KEY_NOT_FOUND,
-                    error_json: format!("Key not found: {key}"),
-                    external_memholder_info: None,
-                }),
+                Ok(None) => items.push(ExternalBatchGetItemResp::from_error(&KvError::Api(
+                    ApiError::KeyNotFound { key: key.clone() },
+                ))),
                 Err(err) => items.push(ExternalBatchGetItemResp {
                     external_memholder_info: None,
                     ..ExternalBatchGetItemResp::from_error(&err)
@@ -3687,6 +4484,8 @@ impl HandlerForExternalClient for ClientKvApi {
         let pending_fences = loop {
             let mut pending_fences = Vec::with_capacity(req.items.len());
             let mut wait_for = None;
+            let mut wait_for_materialization = None;
+            let mut wait_for_get = None;
             let mut wait_for_local_access = None;
             for item in &req.items {
                 match inner.reserve_external_local_first_put_key(
@@ -3713,6 +4512,14 @@ impl HandlerForExternalClient for ClientKvApi {
                             });
                         }
                         wait_for = Some((item.key.clone(), op));
+                        break;
+                    }
+                    Ok(ExternalLocalFirstPutKeyReservation::WaitForMaterialization(op)) => {
+                        wait_for_materialization = Some((item.key.clone(), op));
+                        break;
+                    }
+                    Ok(ExternalLocalFirstPutKeyReservation::WaitForGet(op)) => {
+                        wait_for_get = Some((item.key.clone(), op));
                         break;
                     }
                     Ok(ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(completion)) => {
@@ -3761,6 +4568,48 @@ impl HandlerForExternalClient for ClientKvApi {
                     items = req.items.len(),
                     wait_us = duration_to_i64_us(wait_started_at.elapsed()),
                     "external local-first Put resumed after owner source/reclaim fence"
+                );
+                continue;
+            }
+            if let Some((joined_key, op)) = wait_for_get {
+                // A partial batch cannot hold Put fences while waiting for a
+                // Get leader.  The Get publishes or clears its marker under
+                // the same owner-key shard before notification, so retrying
+                // the full batch observes either the canonical local value or
+                // a clean opportunity to become the Put leader.
+                drop(pending_fences);
+                let wait_started_at = Instant::now();
+                let outcome = wait_external_get_key_result(op).await;
+                tracing::info!(
+                    joined_key,
+                    items = req.items.len(),
+                    wait_us = duration_to_i64_us(wait_started_at.elapsed()),
+                    get_succeeded = outcome.as_ref().is_ok_and(|result| matches!(
+                        result,
+                        ExternalGetStartSharedItemResult::Hit { .. }
+                    )),
+                    "external local-first Put re-evaluating after owner Get singleflight"
+                );
+                continue;
+            }
+            if let Some((joined_key, op)) = wait_for_materialization {
+                // PutFromSource and detached Get CommitTarget publish their
+                // terminal through the owner materialization watch.  Do not
+                // retain partial atomic_batch fences while waiting: after
+                // either success or failure the entire batch must be
+                // classified again against the canonical local indexes.
+                drop(pending_fences);
+                let wait_started_at = Instant::now();
+                let outcome = op.wait().await;
+                tracing::info!(
+                    joined_key,
+                    items = req.items.len(),
+                    wait_us = duration_to_i64_us(wait_started_at.elapsed()),
+                    materialization_succeeded = matches!(
+                        outcome,
+                        client_kv_api::OwnerKeyMaterializationOutcome::Committed
+                    ),
+                    "external local-first Put re-evaluating after owner materialization"
                 );
                 continue;
             }
@@ -3825,7 +4674,7 @@ impl HandlerForExternalClient for ClientKvApi {
         let self_node_id = inner.view.cluster_manager().get_self_info().id.clone();
         let slot_size = slot_lease.slot_size;
         for (slot_ref, pending_fence) in slot_lease.slots.iter().zip(&pending_fences) {
-            pending_fence.attach_local_slot_lease(OwnerLocalReserveSlotLease {
+            pending_fence.attach_local_slot_lease(OwnerSlotLease {
                 value_len,
                 slot_size,
                 slots: vec![slot_ref.clone()],
@@ -3840,7 +4689,7 @@ impl HandlerForExternalClient for ClientKvApi {
             .enumerate()
         {
             let put_id = put_ids[idx];
-            let src_offset = slot_ref.ptr.saturating_sub(slot_ref.base_addr);
+            let src_offset = slot_ref.addr.saturating_sub(slot_ref.base_addr);
             inner.external_pending_puts.insert(
                 (req_item.key.clone(), put_id.0, put_id.1),
                 ExternalPendingPutCtx {

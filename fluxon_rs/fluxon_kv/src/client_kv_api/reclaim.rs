@@ -13,6 +13,12 @@ use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, OK};
 use limit_thirdparty::tokio;
 use std::{collections::HashMap, sync::Arc};
 
+/// Keep a route-deleted source readable long enough for an already-issued
+/// master Get plan to acquire its exact source lease. A reclaim batch waits
+/// once, then still commits every victim independently.
+pub(crate) const OWNER_RECLAIM_SOURCE_READ_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(50);
+
 fn item_resp(
     item: &OwnerReclaimItem,
     state: OwnerReclaimItemState,
@@ -43,14 +49,14 @@ fn memory_matches_reclaim_backing(
         OwnerReclaimBacking::Allocation => memory_info.local_reserve_resident_slot_ref().is_none(),
         OwnerReclaimBacking::UnindexedAllocation { .. } => false,
         OwnerReclaimBacking::CommittedSlot {
-            grant_id,
-            slot_index,
-            slot_size,
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
         } => memory_info.local_reserve_resident_slot_ref().is_some_and(
-            |(actual_slot_size, actual_grant_id, actual_slot_index)| {
-                actual_slot_size == *slot_size
-                    && actual_grant_id == *grant_id
-                    && actual_slot_index == *slot_index
+            |(actual_allocation_id, actual_segment_offset, actual_capacity_bytes)| {
+                actual_allocation_id == *allocation_id
+                    && actual_segment_offset == *segment_offset
+                    && actual_capacity_bytes == *capacity_bytes
             },
         ),
     }
@@ -248,6 +254,65 @@ fn prepare_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclai
             "master-owned Allocation source fenced",
         );
     }
+    if let OwnerReclaimBacking::CommittedSlot {
+        allocation_id,
+        segment_offset,
+        capacity_bytes,
+    } = &item.backing
+        && item.reason == OwnerReclaimReason::MasterAllocationCapacity
+        && !inner.get_cached_info.contains_key(&item.key)
+    {
+        // Do not nest the key-shard lock with the segment allocator lock.
+        // The master key-activity fence already serializes this exact route;
+        // after reacquiring the local key shard we recheck every local state.
+        drop(controls);
+        let route_only = inner
+            .owner_segment_allocator
+            .lock()
+            .committed_route_only_matches(*allocation_id, *segment_offset, *capacity_bytes);
+        let mut controls = inner.owner_key_control.lock_key(&item.key);
+        if !route_only
+            || inner.get_cached_info.contains_key(&item.key)
+            || inner.precommit_local_visible_info.contains_key(&item.key)
+            || inner.pending_local_get_info.contains_key(&item.key)
+        {
+            return item_resp(
+                item,
+                OwnerReclaimItemState::Busy,
+                "GlobalShared owner slot changed while installing its reclaim fence",
+            );
+        }
+        if let Some(state) = controls.get(&item.key) {
+            if let Some(detail) = reclaim_key_control_busy_detail(state) {
+                return item_resp(item, OwnerReclaimItemState::Busy, detail);
+            }
+            if state.reclaim.is_some() {
+                return item_resp(
+                    item,
+                    OwnerReclaimItemState::Busy,
+                    "another reclaim epoch owns the GlobalShared slot",
+                );
+            }
+        }
+        let state = controls.entry(item.key.clone()).or_default();
+        state.begin_local_access_fence();
+        state.reclaim = Some(OwnerReclaimRecord::Prepared(OwnerPreparedReclaim {
+            item: item.clone(),
+            source: OwnerPreparedReclaimSource::UnindexedOwnerSlot {
+                allocation_id: *allocation_id,
+                segment_offset: *segment_offset,
+                capacity_bytes: *capacity_bytes,
+            },
+            ssd_prepare_lock: Arc::new(tokio::sync::AMutex::new(())),
+            ssd_prepare_complete: true,
+            ssd_backing: None,
+        }));
+        return item_resp(
+            item,
+            OwnerReclaimItemState::Prepared,
+            "GlobalShared owner slot fenced for exact physical reclaim",
+        );
+    }
     let Some((_key, cached_info)) = inner.get_cached_info.remove_if(&item.key, |_, cached| {
         cached.put_time_ms == item.put_id.0
             && cached.put_version == item.put_id.1
@@ -376,6 +441,7 @@ async fn persist_prepared_reclaim_batch_to_ssd(
                 (holder.addr, u64::from(holder.len), Some(holder))
             }
             OwnerPreparedReclaimSource::UnindexedAllocation { addr, len } => (*addr, *len, None),
+            OwnerPreparedReclaimSource::UnindexedOwnerSlot { .. } => continue,
         };
         sources.push(crate::kv_ssd_storage::KvSsdPersistSource {
             key: item.key.clone(),
@@ -476,7 +542,11 @@ async fn persist_prepared_reclaim_batch_to_ssd(
     backing_lens
 }
 
-fn release_prepared_backing_now(inner: &ClientKvApiInner, prepared: OwnerPreparedReclaim) {
+fn release_prepared_backing_now(
+    inner: &ClientKvApiInner,
+    prepared: OwnerPreparedReclaim,
+    release_route: bool,
+) {
     match prepared.source {
         OwnerPreparedReclaimSource::Indexed { cached_info, .. } => {
             let mut memory_info = Arc::try_unwrap(cached_info.mem_holder).unwrap_or_else(|_| {
@@ -487,6 +557,7 @@ fn release_prepared_backing_now(inner: &ClientKvApiInner, prepared: OwnerPrepare
             });
             match &prepared.item.backing {
                 OwnerReclaimBacking::Allocation => {
+                    assert!(release_route, "Allocation cannot be metadata-only demoted");
                     assert!(
                         memory_info.local_reserve_resident_slot_ref().is_none(),
                         "allocation reclaim must not carry a local-reserve slot"
@@ -496,24 +567,35 @@ fn release_prepared_backing_now(inner: &ClientKvApiInner, prepared: OwnerPrepare
                     unreachable!("indexed reclaim source cannot name an unindexed Allocation")
                 }
                 OwnerReclaimBacking::CommittedSlot {
-                    grant_id,
-                    slot_index,
-                    slot_size,
+                    allocation_id,
+                    segment_offset,
+                    capacity_bytes,
                 } => {
-                    let (actual_slot_size, actual_grant_id, actual_slot_index) = memory_info
-                        .take_local_reserve_resident_slot_ref()
-                        .expect("committed-slot reclaim must carry a local-reserve slot");
-                    assert_eq!(actual_slot_size, *slot_size);
-                    assert_eq!(actual_grant_id, *grant_id);
-                    assert_eq!(actual_slot_index, *slot_index);
+                    let (actual_allocation_id, actual_segment_offset, actual_capacity_bytes) =
+                        memory_info
+                            .take_local_reserve_resident_slot_ref()
+                            .expect("committed-slot reclaim must carry a local-reserve slot");
+                    assert_eq!(actual_allocation_id, *allocation_id);
+                    assert_eq!(actual_segment_offset, *segment_offset);
+                    assert_eq!(actual_capacity_bytes, *capacity_bytes);
 
-                    inner
-                        .owner_release_local_reserve_committed_resident_slot(
-                            actual_slot_size,
-                            actual_grant_id,
-                            actual_slot_index,
-                        )
-                        .expect("owner reclaim committed resident slot release must succeed");
+                    if release_route {
+                        inner
+                            .owner_release_local_reserve_committed_resident_slot(
+                                actual_allocation_id,
+                                actual_segment_offset,
+                                actual_capacity_bytes,
+                            )
+                            .expect("owner reclaim committed resident slot release must succeed");
+                    } else {
+                        inner
+                            .owner_release_local_reserve_resident_slot_holder(
+                                actual_allocation_id,
+                                actual_segment_offset,
+                                actual_capacity_bytes,
+                            )
+                            .expect("owner scope demotion resident holder release must succeed");
+                    }
                 }
             }
             drop(memory_info);
@@ -525,6 +607,23 @@ fn release_prepared_backing_now(inner: &ClientKvApiInner, prepared: OwnerPrepare
             ));
             // The master route still owns the Allocation. It is removed only after this Commit
             // response, which releases the physical bytes on the master side.
+        }
+        OwnerPreparedReclaimSource::UnindexedOwnerSlot {
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        } => {
+            assert!(
+                release_route,
+                "GlobalShared owner slot can only be freed after master removes the exact route"
+            );
+            inner
+                .owner_release_local_reserve_committed_slot_route(
+                    allocation_id,
+                    segment_offset,
+                    capacity_bytes,
+                )
+                .expect("GlobalShared owner slot route release must succeed");
         }
     }
 }
@@ -547,7 +646,11 @@ fn reclaim_release_fence_is_intact(
         && state.local_access_fence.is_some()
 }
 
-fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
+fn commit_one_with_route_disposition(
+    inner: &ClientKvApiInner,
+    item: &OwnerReclaimItem,
+    release_route: bool,
+) -> OwnerReclaimItemResp {
     let mut controls = inner.owner_key_control.lock_key(&item.key);
     let Some(state) = controls.get_mut(&item.key) else {
         return item_resp(
@@ -597,7 +700,39 @@ fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaim
     // The Releasing marker keeps local Put/Get out. Drop the key-shard lock
     // before touching the slot pool so no synchronous locks are nested.
     drop(controls);
-    release_prepared_backing_now(inner, prepared);
+    if !release_route {
+        let OwnerReclaimBacking::CommittedSlot {
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        } = &prepared.item.backing
+        else {
+            unreachable!("metadata-only demotion requires an owner committed slot")
+        };
+        let mut allocator = inner.owner_segment_allocator.lock();
+        if inner.test_spec_config.legacy_a19_global_demotion_one_phase {
+            allocator
+                .commit_legacy_a19_global_demotion(
+                    &prepared.item.key,
+                    prepared.item.put_id,
+                    *allocation_id,
+                    *segment_offset,
+                    *capacity_bytes,
+                )
+                .expect("legacy a19 owner scope demotion must keep the exact slot stable");
+        } else {
+            allocator
+                .commit_reserved_global_demotion(
+                    &prepared.item.key,
+                    prepared.item.put_id,
+                    *allocation_id,
+                    *segment_offset,
+                    *capacity_bytes,
+                )
+                .expect("owner scope demotion reservation must remain valid through commit");
+        }
+    }
+    release_prepared_backing_now(inner, prepared, release_route);
 
     let mut controls = inner.owner_key_control.lock_key(&item.key);
     let state = controls
@@ -613,13 +748,28 @@ fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaim
     item_resp(
         item,
         OwnerReclaimItemState::Committed,
-        "owner committed slot released",
+        if release_route {
+            "owner committed slot route and resident holder released"
+        } else {
+            "owner slot resident holder released after GlobalShared demotion"
+        },
     )
+}
+
+fn commit_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
+    commit_one_with_route_disposition(inner, item, true)
+}
+
+fn commit_demoted_one(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> OwnerReclaimItemResp {
+    commit_one_with_route_disposition(inner, item, false)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{reclaim_key_control_busy_detail, reclaim_release_fence_is_intact};
+    use super::{
+        OWNER_RECLAIM_SOURCE_READ_GRACE, reclaim_key_control_busy_detail,
+        reclaim_release_fence_is_intact,
+    };
     use crate::client_kv_api::{
         ExternalGetKeySharedOp, OwnerKeyControlState, OwnerKeyControlTable, OwnerReclaimRecord,
         acquire_external_pending_put_fence_for_key,
@@ -642,15 +792,23 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_source_read_grace_is_short_and_bounded() {
+        assert_eq!(
+            OWNER_RECLAIM_SOURCE_READ_GRACE,
+            std::time::Duration::from_millis(50)
+        );
+    }
+
+    #[test]
     fn remote_get_marker_can_overlap_reclaim_commit() {
         let item = OwnerReclaimItem {
             key: "remote-during-reclaim".to_string(),
             put_id: (7, 1),
             epoch: 9,
             backing: OwnerReclaimBacking::CommittedSlot {
-                grant_id: 3,
-                slot_index: 4,
-                slot_size: 4096,
+                allocation_id: 3,
+                segment_offset: 4 * 4096,
+                capacity_bytes: 4096,
             },
             reason: OwnerReclaimReason::OwnerCapacityEviction,
         };
@@ -730,6 +888,9 @@ fn abort_one_fenced(inner: &ClientKvApiInner, item: &OwnerReclaimItem) -> AbortO
                 }
                 OwnerPreparedReclaimSource::UnindexedAllocation { .. } => {
                     "master-owned Allocation source fence rolled back"
+                }
+                OwnerPreparedReclaimSource::UnindexedOwnerSlot { .. } => {
+                    "GlobalShared owner slot reclaim fence rolled back"
                 }
             };
             state.finish_local_access_fence();
@@ -867,6 +1028,70 @@ pub(crate) fn complete_owner_source_eviction(
         .ok_or(finalized.detail)
 }
 
+pub(crate) fn complete_owner_source_demotion(
+    inner: &ClientKvApiInner,
+    victim: &OwnerSourceEvictionVictim,
+    epoch: u64,
+) -> Result<(), String> {
+    let OwnerReclaimBacking::CommittedSlot {
+        allocation_id,
+        segment_offset,
+        capacity_bytes,
+    } = &victim.backing
+    else {
+        return Err("metadata-only demotion requires an exact committed owner slot".to_string());
+    };
+    if !inner.test_spec_config.legacy_a19_global_demotion_one_phase {
+        match inner
+            .owner_segment_allocator
+            .lock()
+            .try_reserve_global_demotion(
+                &victim.key,
+                victim.put_id,
+                *allocation_id,
+                *segment_offset,
+                *capacity_bytes,
+            ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(
+                    "metadata-only demotion is waiting for exact GlobalShared owner headroom"
+                        .to_string(),
+                );
+            }
+            Err(error) => return Err(error.detail),
+        }
+    }
+    let item = OwnerReclaimItem {
+        key: victim.key.clone(),
+        put_id: victim.put_id,
+        epoch,
+        backing: victim.backing.clone(),
+        reason: OwnerReclaimReason::OwnerCapacityEviction,
+    };
+    let prepared = prepare_one(inner, &item);
+    match prepared.state {
+        OwnerReclaimItemState::Prepared => {}
+        OwnerReclaimItemState::Committed => {
+            let finalized = finalize_one(inner, &item);
+            return (finalized.state == OwnerReclaimItemState::Finalized)
+                .then_some(())
+                .ok_or(finalized.detail);
+        }
+        OwnerReclaimItemState::Finalized => return Ok(()),
+        _ => return Err(prepared.detail),
+    }
+
+    let committed = commit_demoted_one(inner, &item);
+    if committed.state != OwnerReclaimItemState::Committed {
+        return Err(committed.detail);
+    }
+    let finalized = finalize_one(inner, &item);
+    (finalized.state == OwnerReclaimItemState::Finalized)
+        .then_some(())
+        .ok_or(finalized.detail)
+}
+
 pub async fn handle_batch_owner_reclaim(
     view: &ClientKvApiView,
     req: MsgPack<BatchOwnerReclaimReq>,
@@ -921,12 +1146,21 @@ pub async fn handle_batch_owner_reclaim(
             }
             responses
         }
-        OwnerReclaimPhase::Commit => req
-            .serialize_part
-            .items
-            .iter()
-            .map(|item| commit_one(inner, item))
-            .collect(),
+        OwnerReclaimPhase::Commit => {
+            if !req.serialize_part.items.is_empty() {
+                tracing::debug!(
+                    items = req.serialize_part.items.len(),
+                    grace_ms = OWNER_RECLAIM_SOURCE_READ_GRACE.as_millis(),
+                    "owner reclaim retaining route-deleted sources for the read grace window"
+                );
+                tokio::time::sleep(OWNER_RECLAIM_SOURCE_READ_GRACE).await;
+            }
+            req.serialize_part
+                .items
+                .iter()
+                .map(|item| commit_one(inner, item))
+                .collect()
+        }
         OwnerReclaimPhase::Abort => {
             futures::future::join_all(
                 req.serialize_part

@@ -822,6 +822,64 @@ impl ClientTransferEngine {
             .map_err(KvError::from)
     }
 
+    /// Push owner CPU bytes directly into a caller-owned GPU registration.
+    /// The remote registration capability is validated by the Get protocol;
+    /// requiring the fast path prevents a GPU address from entering the CPU
+    /// P2P fallback when the RDMA/GDR peer is not ready yet.
+    pub async fn transfer_data_no_copy_to_remote_gpu(
+        &self,
+        peer_node: NodeIDString,
+        src_addr: u64,
+        target_addr: u64,
+        len: u64,
+    ) -> KvResult<TransferBreakdown> {
+        if len == 0 || src_addr == 0 || target_addr == 0 {
+            return Err(KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::InvalidArgument {
+                    detail: "remote GPU WRITE requires non-zero addresses and length".to_string(),
+                },
+            ));
+        }
+        const DIRECT_READY_TIMEOUT: Duration = Duration::from_secs(5);
+        const DIRECT_RETRY_DELAY: Duration = Duration::from_millis(10);
+        let started = Instant::now();
+        let mut attempt = 0_u32;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let result = self
+                .core
+                .transfer_data_no_copy(
+                    self.runtime(),
+                    Some(peer_node.clone()),
+                    false,
+                    src_addr,
+                    target_addr,
+                    len,
+                    None,
+                    true,
+                )
+                .await;
+            match result {
+                Ok(breakdown) => return Ok(breakdown),
+                Err(err)
+                    if err
+                        .to_string()
+                        .contains(CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER)
+                        && started.elapsed() < DIRECT_READY_TIMEOUT =>
+                {
+                    tracing::debug!(
+                        peer = %peer_node,
+                        attempt,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "remote GPU WRITE fast path is not ready; retrying"
+                    );
+                    tokio::time::sleep(DIRECT_RETRY_DELAY).await;
+                }
+                Err(err) => return Err(KvError::from(err)),
+            }
+        }
+    }
+
     /// Pull remote bytes into an explicitly validated caller-owned GPU range.
     ///
     /// Keeping this separate from the CPU entry point prevents a CUDA virtual

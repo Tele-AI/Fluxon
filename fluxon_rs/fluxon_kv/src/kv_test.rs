@@ -1037,6 +1037,7 @@ fn build_client_launch(
         protocol: options.protocol_config.unwrap_or_else(tcp_protocol_config),
         pprof_duration_seconds: None,
         replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: fluxonkv_etcd_addresses,

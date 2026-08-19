@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Weak};
+use std::time::Duration;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -33,7 +34,7 @@ use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
 use fluxon_framework_compiled::util::ViewSpawnHandle;
 use fluxon_observability::kv_metrics_actor::ObserveHandle;
 use limit_thirdparty::tokio::sync::{abroadcast, ampsc};
-use tokio::sync::watch;
+use tokio::sync::{Mutex, OnceCell, watch};
 use tokio::task::JoinHandle;
 
 use crate::closed_sdk::{
@@ -240,6 +241,9 @@ struct ClosedClusterManagerRuntime {
     is_watching: AtomicBool,
     event_tx: abroadcast::Sender<crate::ClusterEvent>,
     self_rdma_resolved_tx: watch::Sender<CommuMemberRdmaResolvedConfig>,
+    event_mirror_ready: OnceCell<()>,
+    snapshot_reconciler_started: AtomicBool,
+    authoritative_member_client: Arc<Mutex<EtcdClient>>,
     transfer_link_writer: CommuTransferLinkEtcdWriterHandle,
     transfer_link_p2p_snapshot_source: CommuTransferLinkP2pSnapshotSource,
 }
@@ -281,6 +285,13 @@ impl ClosedClusterManagerRuntime {
             connect_transfer_link_client(&arg.etcd_endpoints).await?,
             format!("/{}/transfer_link/p2p", cluster_name),
         );
+        // ClosedRuntimeClusterManagerCall::GetMembers reflects the closed facade's
+        // own event cache.  It cannot repair that same cache after the event stream
+        // has missed a join.  Keep an independent etcd client for an authoritative
+        // membership snapshot instead.
+        let authoritative_member_client = Arc::new(Mutex::new(
+            connect_transfer_link_client(&arg.etcd_endpoints).await?,
+        ));
         let transfer_link_writer = make_runtime_transfer_link_writer(handle);
         let runtime = Self {
             handle,
@@ -300,15 +311,109 @@ impl ClosedClusterManagerRuntime {
             is_watching: AtomicBool::new(false),
             event_tx,
             self_rdma_resolved_tx,
+            event_mirror_ready: OnceCell::new(),
+            snapshot_reconciler_started: AtomicBool::new(false),
+            authoritative_member_client,
             transfer_link_writer,
             transfer_link_p2p_snapshot_source,
         };
-        runtime.spawn_event_mirror();
         runtime.spawn_self_rdma_mirror();
         Ok(runtime)
     }
 
-    fn spawn_event_mirror(&self) {
+    fn spawn_snapshot_reconciler(&self) {
+        const SNAPSHOT_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+
+        if self
+            .snapshot_reconciler_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let self_member_id = self.self_member_id.clone();
+        let cluster_name = self.cluster_name.clone();
+        let members = Arc::downgrade(&self.members);
+        let prev_members = Arc::downgrade(&self.prev_members);
+        let self_info = Arc::downgrade(&self.self_info);
+        let authoritative_member_client = Arc::clone(&self.authoritative_member_client);
+        let event_tx = self.event_tx.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SNAPSHOT_RECONCILE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Construction already seeded the facade cache.  The first periodic
+            // snapshot is intentionally delayed so it cannot race that seed.
+            interval.tick().await;
+            let mut failure_reported = false;
+
+            loop {
+                interval.tick().await;
+                let (Some(members), Some(prev_members), Some(self_info)) = (
+                    members.upgrade(),
+                    prev_members.upgrade(),
+                    self_info.upgrade(),
+                ) else {
+                    break;
+                };
+
+                let snapshot = {
+                    let mut client = authoritative_member_client.lock().await;
+                    fetch_authoritative_cluster_member_snapshot(&mut client, &cluster_name).await
+                };
+                match snapshot {
+                    Ok(snapshot) => {
+                        if failure_reported {
+                            tracing::info!(
+                                "closed ClusterManager authoritative snapshot reconciliation recovered"
+                            );
+                            failure_reported = false;
+                        }
+                        let events = reconcile_cluster_member_snapshot(
+                            &members,
+                            &prev_members,
+                            &self_info,
+                            &self_member_id,
+                            snapshot,
+                        );
+                        if !events.is_empty() {
+                            tracing::warn!(
+                                repaired_events = events.len(),
+                                "closed ClusterManager event mirror drift repaired from authoritative snapshot"
+                            );
+                            for event in events {
+                                let _ = event_tx.send(event);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if !failure_reported {
+                            tracing::warn!(
+                                %error,
+                                "closed ClusterManager authoritative snapshot reconciliation failed"
+                            );
+                            failure_reported = true;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn start_event_mirror_for_init_dag(&self) -> crate::ClusterResult<()> {
+        self.event_mirror_ready
+            .get_or_try_init(|| async {
+                let stream_handle = subscribe_cluster_manager_events(self.handle)
+                    .await
+                    .map_err(cluster_manager_closed_sdk_error)?;
+                self.spawn_event_mirror(stream_handle);
+                Ok(())
+            })
+            .await
+            .map(|_| ())
+    }
+
+    fn spawn_event_mirror(&self, stream_handle: ClosedRuntimeHandle) {
         let handle = self.handle;
         let event_tx = self.event_tx.clone();
         let self_member_id = self.self_member_id.clone();
@@ -316,9 +421,6 @@ impl ClosedClusterManagerRuntime {
         let prev_members = Arc::clone(&self.prev_members);
         let self_info = Arc::clone(&self.self_info);
         tokio::spawn(async move {
-            let Ok(stream_handle) = subscribe_cluster_manager_events(handle).await else {
-                return;
-            };
             loop {
                 match recv_cluster_event_stream(stream_handle).await {
                     Ok(ClosedRuntimeClusterEventStreamItem::Event(event)) => {
@@ -398,6 +500,54 @@ async fn connect_transfer_link_client(
             endpoints: etcd_endpoints.to_vec(),
             error: error.to_string(),
         })
+}
+
+fn decode_authoritative_member_kv(
+    prefix: &str,
+    key: &[u8],
+    value: &[u8],
+) -> Result<Option<crate::ClusterMember>, String> {
+    let key =
+        std::str::from_utf8(key).map_err(|error| format!("member key is not UTF-8: {error}"))?;
+    let Some(member_id) = key.strip_prefix(prefix) else {
+        return Ok(None);
+    };
+    // Only the direct children of the base-members prefix are authoritative
+    // membership records.  Dynamic member extensions live under another prefix.
+    if member_id.is_empty() || member_id.contains('/') {
+        return Ok(None);
+    }
+    let member: crate::ClusterMember = serde_json::from_slice(value)
+        .map_err(|error| format!("failed to decode authoritative member {member_id}: {error}"))?;
+    if member.id != member_id {
+        return Err(format!(
+            "authoritative member key/value identity mismatch: key={member_id} value={}",
+            member.id
+        ));
+    }
+    Ok(Some(member))
+}
+
+async fn fetch_authoritative_cluster_member_snapshot(
+    client: &mut EtcdClient,
+    cluster_name: &str,
+) -> crate::ClusterResult<Vec<crate::ClusterMember>> {
+    let member_prefix = format!("{}/", crate::cluster_member_base_prefix(cluster_name));
+    let mut members = Vec::new();
+    crate::scan_etcd_prefix_paginated(client, &member_prefix, |key, value| {
+        if let Some(member) = decode_authoritative_member_kv(&member_prefix, key, value)? {
+            members.push(member);
+        }
+        Ok::<crate::EtcdPrefixScanAction, String>(crate::EtcdPrefixScanAction::Continue)
+    })
+    .await
+    .map_err(|error| {
+        crate::ClusterError::MemberSync(format!(
+            "authoritative membership scan failed for cluster {cluster_name}: {error}"
+        ))
+    })?;
+
+    Ok(members)
 }
 
 fn make_runtime_transfer_link_writer(
@@ -531,6 +681,93 @@ fn apply_cluster_event_cache(
             }
         }
     }
+}
+
+fn reconcile_cluster_member_snapshot(
+    members: &Arc<RwLock<HashMap<String, crate::ClusterMember>>>,
+    prev_members: &Arc<RwLock<HashMap<String, crate::ClusterMember>>>,
+    self_info: &Arc<RwLock<crate::ClusterMember>>,
+    self_member_id: &str,
+    snapshot: Vec<crate::ClusterMember>,
+) -> Vec<crate::ClusterEvent> {
+    let current_self = self_info.read().expect("self-info cache poisoned").clone();
+    let mut next: HashMap<String, crate::ClusterMember> = snapshot
+        .into_iter()
+        .map(|member| (member.id.to_string(), member))
+        .collect();
+    // Some closed runtimes omit the caller from GetMembers.  The facade has
+    // always promised that get_members() contains self, so reconciliation must
+    // preserve that contract instead of publishing a synthetic self-leave.
+    next.entry(self_member_id.to_string())
+        .or_insert(current_self);
+
+    let mut members_guard = members.write().expect("members cache poisoned");
+    // Base membership is the authority for presence and generation.  The closed
+    // event cache may already carry same-generation dynamic extension metadata
+    // (accessible IP, transfer readiness, share-group binding).  Preserve those
+    // fields when etcd's base record does not repeat them, but never carry them
+    // across an owner restart.
+    for (member_id, member) in &mut next {
+        let Some(previous) = members_guard.get(member_id) else {
+            continue;
+        };
+        if previous.node_start_time != member.node_start_time {
+            continue;
+        }
+        for (key, value) in &previous.metadata {
+            member
+                .metadata
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+    let mut events = Vec::new();
+    for (member_id, member) in &next {
+        match members_guard.get(member_id) {
+            None => events.push(crate::ClusterEvent::MemberJoined(member.clone())),
+            Some(previous) if previous != member => {
+                events.push(crate::ClusterEvent::MemberUpdated(member.clone()))
+            }
+            Some(_) => {}
+        }
+    }
+    for member_id in members_guard.keys() {
+        if !next.contains_key(member_id) {
+            events.push(crate::ClusterEvent::MemberLeft(member_id.clone()));
+        }
+    }
+
+    if events.is_empty() {
+        return events;
+    }
+
+    let mut prev_guard = prev_members.write().expect("prev-members cache poisoned");
+    for event in &events {
+        match event {
+            crate::ClusterEvent::MemberJoined(member) => {
+                prev_guard.remove(member.id.as_str());
+            }
+            crate::ClusterEvent::MemberUpdated(member) => {
+                if let Some(previous) = members_guard.get(member.id.as_str()) {
+                    prev_guard.insert(member.id.to_string(), previous.clone());
+                }
+            }
+            crate::ClusterEvent::MemberLeft(member_id) => {
+                if let Some(previous) = members_guard.get(member_id) {
+                    prev_guard.insert(member_id.clone(), previous.clone());
+                }
+            }
+        }
+    }
+
+    let next_self = next.get(self_member_id).cloned();
+    *members_guard = next;
+    drop(prev_guard);
+    drop(members_guard);
+    if let Some(next_self) = next_self {
+        *self_info.write().expect("self-info cache poisoned") = next_self;
+    }
+    events
 }
 
 async fn closed_cluster_manager_string_call(
@@ -721,6 +958,11 @@ impl ClusterManager {
 
     pub async fn init2_for_init_dag(&self) -> crate::ClusterResult<()> {
         {
+            // Install the facade subscriber before the closed runtime joins and starts
+            // publishing membership events.  The init DAG does not release
+            // `cluster_member_watch_ready` until this method returns, so downstream
+            // listeners cannot race an unobserved first snapshot.
+            self.closed.start_event_mirror_for_init_dag().await?;
             closed_cluster_manager_unit_call(
                 self.closed.handle,
                 ClosedRuntimeClusterManagerCall::Init2ForInitDag,
@@ -742,6 +984,10 @@ impl ClusterManager {
                 .into_iter()
                 .map(|member| (member.id.to_string(), member))
                 .collect();
+            // The closed event stream remains the low-latency path.  This base-member-only
+            // reconciliation repairs a stopped/lagged mirror; transfer/P2P readiness is
+            // deliberately owned by the P2P tier DAG rather than inferred from etcd keys.
+            self.closed.spawn_snapshot_reconciler();
             Ok(())
         }
     }
@@ -1180,6 +1426,143 @@ impl LogicalModule for ClusterManager {
                 Err(error) => Err(cluster_manager_closed_sdk_error(error)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_reconcile_tests {
+    use super::*;
+
+    fn member(id: &str, node_start_time: i64, port: u16) -> crate::ClusterMember {
+        crate::ClusterMember {
+            id: id.to_string(),
+            addresses: vec!["10.0.0.1".to_string()],
+            port: Some(port),
+            node_start_time,
+            metadata: HashMap::new(),
+            sub_cluster: None,
+            network: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_reconcile_repairs_missed_join_update_and_leave() {
+        let master = member("master", 1, 1000);
+        let owner1 = member("owner1", 2, 1001);
+        let owner0 = member("owner0", 3, 1002);
+        let members = Arc::new(RwLock::new(HashMap::from([
+            (master.id.clone(), master.clone()),
+            (owner1.id.clone(), owner1.clone()),
+        ])));
+        let prev_members = Arc::new(RwLock::new(HashMap::new()));
+        let self_info = Arc::new(RwLock::new(master.clone()));
+
+        let events = reconcile_cluster_member_snapshot(
+            &members,
+            &prev_members,
+            &self_info,
+            &master.id,
+            vec![master.clone(), owner1.clone(), owner0.clone()],
+        );
+        assert_eq!(
+            events,
+            vec![crate::ClusterEvent::MemberJoined(owner0.clone())]
+        );
+        assert_eq!(members.read().unwrap().get(&owner0.id), Some(&owner0));
+
+        let mut owner0_updated = owner0.clone();
+        owner0_updated.port = Some(2002);
+        let events = reconcile_cluster_member_snapshot(
+            &members,
+            &prev_members,
+            &self_info,
+            &master.id,
+            // Deliberately omit self: reconciliation must preserve it.
+            vec![owner0_updated.clone()],
+        );
+        assert_eq!(events.len(), 2);
+        assert!(events.contains(&crate::ClusterEvent::MemberUpdated(owner0_updated.clone())));
+        assert!(events.contains(&crate::ClusterEvent::MemberLeft(owner1.id.clone())));
+        let members = members.read().unwrap();
+        assert_eq!(members.get(&master.id), Some(&master));
+        assert_eq!(members.get(&owner0.id), Some(&owner0_updated));
+        assert!(!members.contains_key(&owner1.id));
+        drop(members);
+        let prev_members = prev_members.read().unwrap();
+        assert_eq!(prev_members.get(&owner0.id), Some(&owner0));
+        assert_eq!(prev_members.get(&owner1.id), Some(&owner1));
+    }
+
+    #[test]
+    fn authoritative_member_decoder_rejects_identity_mismatch() {
+        let prefix = "/fluxon_commu_member_base/cluster-a/members/";
+        let owner = member("owner0", 3, 1002);
+        let encoded = serde_json::to_vec(&owner).unwrap();
+        assert_eq!(
+            decode_authoritative_member_kv(
+                prefix,
+                b"/fluxon_commu_member_base/cluster-a/members/owner0",
+                &encoded,
+            )
+            .unwrap(),
+            Some(owner.clone())
+        );
+        let error = decode_authoritative_member_kv(
+            prefix,
+            b"/fluxon_commu_member_base/cluster-a/members/owner1",
+            &encoded,
+        )
+        .unwrap_err();
+        assert!(error.contains("identity mismatch"));
+    }
+
+    #[test]
+    fn snapshot_reconcile_preserves_only_same_generation_extensions() {
+        let master = member("master", 1, 1000);
+        let mut cached_owner = member("owner0", 3, 1002);
+        cached_owner
+            .metadata
+            .insert("accessible_ip".to_string(), "10.0.0.7".to_string());
+        let members = Arc::new(RwLock::new(HashMap::from([
+            (master.id.clone(), master.clone()),
+            (cached_owner.id.clone(), cached_owner.clone()),
+        ])));
+        let prev_members = Arc::new(RwLock::new(HashMap::new()));
+        let self_info = Arc::new(RwLock::new(master.clone()));
+
+        let base_owner = member("owner0", 3, 1002);
+        let events = reconcile_cluster_member_snapshot(
+            &members,
+            &prev_members,
+            &self_info,
+            &master.id,
+            vec![master.clone(), base_owner],
+        );
+        assert!(events.is_empty());
+        assert_eq!(
+            members
+                .read()
+                .unwrap()
+                .get("owner0")
+                .unwrap()
+                .metadata
+                .get("accessible_ip")
+                .map(String::as_str),
+            Some("10.0.0.7")
+        );
+
+        let restarted_owner = member("owner0", 4, 1002);
+        let events = reconcile_cluster_member_snapshot(
+            &members,
+            &prev_members,
+            &self_info,
+            &master.id,
+            vec![master.clone(), restarted_owner],
+        );
+        assert_eq!(events.len(), 1);
+        let owner = members.read().unwrap().get("owner0").unwrap().clone();
+        assert_eq!(owner.node_start_time, 4);
+        assert!(!owner.metadata.contains_key("accessible_ip"));
     }
 }
 

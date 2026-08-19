@@ -1,3 +1,4 @@
+use crate::client_kv_api::msg_pack::ExternalExecutePlannedGetReq;
 use crate::cluster_manager::NodeID;
 use crate::master_kv_router::msg_pack::{
     BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchEnqueueReplicaTaskReq,
@@ -7,10 +8,14 @@ use crate::master_kv_router::msg_pack::{
     BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq, CountPrefixReq,
     DeleteAckReq, DeleteReq, GetDoneReq, GetMasterOnlyMetricPartReq, GetMetaReq, GetRevokeReq,
     GetStartReq, GroupedBatchPutDoneReq, MemHolderKeepAliveReq, MemHolderReleaseReq,
-    PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq, PutDoneReq, PutRevokeReq, PutStartReq,
-    ReleaseLocalGrantReq, ReserveLocalGrantReq, SsdStageBeginReq, SsdStageDoneReq,
+    OwnerLocalReserveControlReq, PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq,
+    PutDoneReq, PutRevokeReq, PutStartReq, SsdStageBeginReq, SsdStageDoneReq,
 };
-use crate::master_seg_manager::msg_pack::RequestSegmentRegistrationReq;
+use crate::master_seg_manager::msg_pack::{
+    ConfirmNodeSegmentsRegisteredReq, OwnerCapacityReportReq, RegisterNodeSegmentsReq,
+    RequestSegmentRegistrationReq,
+};
+use crate::owner_segment::OwnerSegmentTransferReq;
 use crate::p2p::P2PResult;
 use crate::p2p::msg_pack::{MsgPack, RPCCaller, RPCReq, RPCResponsor};
 use crate::p2p::p2p_module::{P2pModule, RpcTransportPolicy};
@@ -35,6 +40,9 @@ macro_rules! impl_control_plane_rpc_req {
 
 impl_control_plane_rpc_req!(
     RequestSegmentRegistrationReq,
+    RegisterNodeSegmentsReq,
+    ConfirmNodeSegmentsRegisteredReq,
+    OwnerCapacityReportReq,
     GetStartReq,
     GetRevokeReq,
     GetDoneReq,
@@ -47,8 +55,7 @@ impl_control_plane_rpc_req!(
     BatchGetDoneReq,
     CountPrefixReq,
     GetMasterOnlyMetricPartReq,
-    ReserveLocalGrantReq,
-    ReleaseLocalGrantReq,
+    OwnerLocalReserveControlReq,
     BatchPreparePutKeysReq,
     BatchReleasePutKeyReservationsReq,
     BatchEvictOwnerSourceReq,
@@ -75,6 +82,8 @@ impl_control_plane_rpc_req!(
     BatchDeleteAckReq,
     GetMetaReq,
     BatchIsExistReq,
+    OwnerSegmentTransferReq,
+    ExternalExecutePlannedGetReq,
 );
 
 pub(crate) async fn call_control_plane_rpc<R: ControlPlaneRpcReq>(
@@ -119,6 +128,9 @@ mod tests {
             RpcTransportPolicy::ForceTransport
         );
         assert_control_plane_rpc::<RequestSegmentRegistrationReq>();
+        assert_control_plane_rpc::<RegisterNodeSegmentsReq>();
+        assert_control_plane_rpc::<ConfirmNodeSegmentsRegisteredReq>();
+        assert_control_plane_rpc::<OwnerCapacityReportReq>();
         assert_control_plane_rpc::<GetStartReq>();
         assert_control_plane_rpc::<GetRevokeReq>();
         assert_control_plane_rpc::<GetDoneReq>();
@@ -131,8 +143,7 @@ mod tests {
         assert_control_plane_rpc::<BatchGetDoneReq>();
         assert_control_plane_rpc::<CountPrefixReq>();
         assert_control_plane_rpc::<GetMasterOnlyMetricPartReq>();
-        assert_control_plane_rpc::<ReserveLocalGrantReq>();
-        assert_control_plane_rpc::<ReleaseLocalGrantReq>();
+        assert_control_plane_rpc::<OwnerLocalReserveControlReq>();
         assert_control_plane_rpc::<BatchPreparePutKeysReq>();
         assert_control_plane_rpc::<BatchReleasePutKeyReservationsReq>();
         assert_control_plane_rpc::<BatchEvictOwnerSourceReq>();
@@ -159,5 +170,7 @@ mod tests {
         assert_control_plane_rpc::<BatchDeleteAckReq>();
         assert_control_plane_rpc::<GetMetaReq>();
         assert_control_plane_rpc::<BatchIsExistReq>();
+        assert_control_plane_rpc::<OwnerSegmentTransferReq>();
+        assert_control_plane_rpc::<ExternalExecutePlannedGetReq>();
     }
 }

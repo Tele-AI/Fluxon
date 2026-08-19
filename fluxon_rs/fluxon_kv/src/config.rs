@@ -1,3 +1,4 @@
+use crate::master_seg_manager::msg_pack::OwnerPlacementClass;
 use crate::rpcresp_kvresult_convert::msg_and_error::{ConfigError, KvResult};
 use fluxon_commu::validate_ip_cidr;
 pub use fluxon_commu::{
@@ -179,6 +180,17 @@ pub struct TestSpecConfig {
     pub short_circuit_put_payload_path: bool,
     #[serde(default)]
     pub skip_put_end_commit: bool,
+    /// Back the owner-authoritative DRAM segment with memfd and publish a
+    /// generation-bound procfs fd symlink as mmap.file. External clients keep
+    /// using the existing pathname attach protocol.
+    #[serde(default)]
+    pub owner_segment_memfd: bool,
+    /// Explicit performance-recovery compatibility mode for the sealed a19
+    /// one-RPC LocalExclusive -> GlobalShared demotion path. The default keeps
+    /// the hard-reservation two-phase path; deployments must opt in on every
+    /// master and owner and retain the runtime overshoot gate.
+    #[serde(default)]
+    pub legacy_a19_global_demotion_one_phase: bool,
     #[serde(default)]
     pub ssd_read_source_policy: SsdReadSourcePolicy,
     #[serde(default)]
@@ -243,6 +255,8 @@ impl Default for TestSpecConfig {
             prefer_local_placement: false,
             short_circuit_put_payload_path: false,
             skip_put_end_commit: false,
+            owner_segment_memfd: false,
+            legacy_a19_global_demotion_one_phase: false,
             ssd_read_source_policy: SsdReadSourcePolicy::default(),
             post_read_remote_policy: PostReadRemotePolicy::default(),
             owner_local_reserve_soft_wait_timeout_ms: None,
@@ -427,17 +441,11 @@ fn validate_owner_local_reserve_expected_capacity(
         }
         .into_kverror());
     }
-    if crate::owner_local_reserve_expected_grant_count(
-        expected.value_len,
-        expected.payload_capacity_bytes,
-    )
-    .is_none()
-    {
+    if crate::owner_segment_allocation_capacity_bytes(expected.value_len).is_none() {
         return Err(ConfigError::InvalidClientConfig {
             detail: format!(
-                "test_spec_config.owner_local_reserve_expected_capacity.value_len={} cannot be represented by a local-reserve slot no larger than {} bytes",
-                expected.value_len,
-                crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
+                "test_spec_config.owner_local_reserve_expected_capacity.value_len={} cannot be represented by the owner segment allocator",
+                expected.value_len
             ),
         }
         .into_kverror());
@@ -1036,6 +1044,10 @@ pub struct ClientConfigYaml {
     /// logical tier schedules an asynchronous remote replica write-back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_writeback_hot_capacity_ratio: Option<f64>,
+    /// Explicit owner placement role.  Omission keeps the legacy migration
+    /// behavior; new owner-authoritative deployments must set this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_placement_class: Option<OwnerPlacementClass>,
     pub fluxonkv_spec: FluxonKvSpecYaml,
     #[serde(default)]
     pub test_spec_config: TestSpecConfig,
@@ -1169,6 +1181,7 @@ pub struct ClientConfig {
     pub protocol: ProtocolConfig,
     pub pprof_duration_seconds: Option<u64>,
     pub replica_writeback_hot_capacity_ratio: Option<f64>,
+    pub owner_placement_class: Option<OwnerPlacementClass>,
     pub redis_compat_listen_addr: Option<std::net::SocketAddr>,
     pub fluxonkv_spec: FluxonKvSpec,
     pub share_mem_path: String,           // Mandatory shared bundle path
@@ -1417,9 +1430,9 @@ impl ClientConfigYaml {
         }
 
         if let Some(hot_ratio) = self.replica_writeback_hot_capacity_ratio {
-            if !hot_ratio.is_finite() || hot_ratio <= 0.0 || hot_ratio >= 1.0 {
+            if !hot_ratio.is_finite() || hot_ratio <= 0.0 || hot_ratio > 1.0 {
                 return Err(ConfigError::InvalidClientConfig {
-                    detail: "replica_writeback_hot_capacity_ratio must be finite and in (0, 1)"
+                    detail: "replica_writeback_hot_capacity_ratio must be finite and in (0, 1]"
                         .to_string(),
                 }
                 .into_kverror());
@@ -1433,6 +1446,47 @@ impl ClientConfigYaml {
             }
         }
 
+        if is_external && self.owner_placement_class.is_some() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "owner_placement_class is only valid on owner configs".to_string(),
+            }
+            .into_kverror());
+        }
+        if is_external && test_spec_config.owner_segment_memfd {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "test_spec_config.owner_segment_memfd is only valid on owner configs"
+                    .to_string(),
+            }
+            .into_kverror());
+        }
+        match self.owner_placement_class {
+            Some(OwnerPlacementClass::Inference)
+                if self.replica_writeback_hot_capacity_ratio.is_none() =>
+            {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "owner_placement_class=inference requires replica_writeback_hot_capacity_ratio"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
+            Some(OwnerPlacementClass::RemoteCpu)
+                if self.replica_writeback_hot_capacity_ratio.is_some() =>
+            {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "owner_placement_class=remote_cpu requires replica_writeback_hot_capacity_ratio to be omitted"
+                        .to_string(),
+                }
+                .into_kverror());
+            }
+            Some(OwnerPlacementClass::Invalid) => {
+                return Err(ConfigError::InvalidClientConfig {
+                    detail: "owner_placement_class must be inference or remote_cpu".to_string(),
+                }
+                .into_kverror());
+            }
+            _ => {}
+        }
+
         if let Some(expected) = &test_spec_config.owner_local_reserve_expected_capacity {
             if is_external {
                 return Err(ConfigError::InvalidClientConfig {
@@ -1441,26 +1495,17 @@ impl ClientConfigYaml {
                 }
                 .into_kverror());
             }
-            let expected_grants = crate::owner_local_reserve_expected_grant_count(
-                expected.value_len,
-                expected.payload_capacity_bytes,
-            )
-            .expect("owner local-reserve expected capacity was validated");
-            let physical_reserve_bytes = expected_grants
-                .checked_mul(crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES)
-                .ok_or_else(|| {
-                    ConfigError::InvalidClientConfig {
-                        detail: "test_spec_config.owner_local_reserve_expected_capacity physical reserve size overflows u64"
-                            .to_string(),
-                    }
-                    .into_kverror()
-                })?;
-            if physical_reserve_bytes > contribute_to_cluster_pool_size.dram {
+            let allocation_capacity =
+                crate::owner_segment_allocation_capacity_bytes(expected.value_len)
+                    .expect("owner segment allocation size was validated");
+            if expected.payload_capacity_bytes > contribute_to_cluster_pool_size.dram
+                || allocation_capacity > contribute_to_cluster_pool_size.dram
+            {
                 return Err(ConfigError::InvalidClientConfig {
                     detail: format!(
-                        "test_spec_config.owner_local_reserve_expected_capacity requires {} physical bytes across {} grants, exceeding owner dram contribution {}",
-                        physical_reserve_bytes,
-                        expected_grants,
+                        "test_spec_config.owner_local_reserve_expected_capacity payload={} allocation_capacity={} exceeds owner segment {}",
+                        expected.payload_capacity_bytes,
+                        allocation_capacity,
                         contribute_to_cluster_pool_size.dram
                     ),
                 }
@@ -1799,6 +1844,7 @@ impl ClientConfigYaml {
             protocol,
             pprof_duration_seconds,
             replica_writeback_hot_capacity_ratio: self.replica_writeback_hot_capacity_ratio,
+            owner_placement_class: self.owner_placement_class,
             redis_compat_listen_addr,
             fluxonkv_spec,
             share_mem_path,
@@ -2134,6 +2180,13 @@ impl MasterConfigYaml {
             }
             .into_kverror());
         }
+        if test_spec_config.owner_segment_memfd {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: "test_spec_config.owner_segment_memfd is only valid on owner configs"
+                    .to_string(),
+            }
+            .into_kverror());
+        }
         validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
         let protocol = apply_test_spec_rdma_device_names_to_protocol(
             self.protocol.unwrap_or(ProtocolConfig {
@@ -2198,6 +2251,21 @@ mod tests {
         let parsed: TestSpecConfig =
             serde_yaml::from_str("post_read_remote_policy: drop\n").unwrap();
         assert_eq!(parsed.post_read_remote_policy, PostReadRemotePolicy::Drop);
+    }
+
+    #[test]
+    fn owner_segment_memfd_defaults_off_and_parses_true() {
+        assert!(!TestSpecConfig::default().owner_segment_memfd);
+        let parsed: TestSpecConfig = serde_yaml::from_str("owner_segment_memfd: true\n").unwrap();
+        assert!(parsed.owner_segment_memfd);
+    }
+
+    #[test]
+    fn legacy_a19_global_demotion_is_explicit_and_defaults_off() {
+        assert!(!TestSpecConfig::default().legacy_a19_global_demotion_one_phase);
+        let parsed: TestSpecConfig =
+            serde_yaml::from_str("legacy_a19_global_demotion_one_phase: true\n").unwrap();
+        assert!(parsed.legacy_a19_global_demotion_one_phase);
     }
 
     #[test]
@@ -2322,7 +2390,13 @@ fluxonkv_spec:
             .unwrap();
         assert_eq!(verified.replica_writeback_hot_capacity_ratio, Some(0.75));
 
-        for invalid in ["0", "1", "-0.1", ".nan"] {
+        let exact_local = ClientConfigYaml::from_str(&owner.replace("RATIO", "1"))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(exact_local.replica_writeback_hot_capacity_ratio, Some(1.0));
+
+        for invalid in ["0", "1.1", "-0.1", ".nan"] {
             let err = ClientConfigYaml::from_str(&owner.replace("RATIO", invalid))
                 .unwrap()
                 .verify()
@@ -2348,6 +2422,60 @@ fluxonkv_spec:
             err.to_string()
                 .contains("replica_writeback_hot_capacity_ratio is only valid on owner configs")
         );
+    }
+
+    #[test]
+    fn explicit_owner_placement_class_separates_remote_cpu_from_inference() {
+        let base = r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+OWNER_FIELDS
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner_class
+  large_file_paths: [/tmp/test_owner_class_large]
+  sub_cluster: rack-a
+"#;
+
+        let remote_cpu = ClientConfigYaml::from_str(
+            &base.replace("OWNER_FIELDS", "owner_placement_class: remote_cpu"),
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            remote_cpu.owner_placement_class,
+            Some(OwnerPlacementClass::RemoteCpu)
+        );
+        assert_eq!(remote_cpu.replica_writeback_hot_capacity_ratio, None);
+
+        let inference = ClientConfigYaml::from_str(&base.replace(
+            "OWNER_FIELDS",
+            "owner_placement_class: inference\nreplica_writeback_hot_capacity_ratio: 0.75",
+        ))
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            inference.owner_placement_class,
+            Some(OwnerPlacementClass::Inference)
+        );
+
+        for fields in [
+            "owner_placement_class: inference",
+            "owner_placement_class: remote_cpu\nreplica_writeback_hot_capacity_ratio: 0.75",
+            "owner_placement_class: invalid",
+        ] {
+            assert!(
+                ClientConfigYaml::from_str(&base.replace("OWNER_FIELDS", fields))
+                    .unwrap()
+                    .verify()
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -2379,11 +2507,8 @@ test_spec_config:
         assert_eq!(expected.value_len, 4_718_592);
         assert_eq!(expected.payload_capacity_bytes, 109_951_162_777);
         assert_eq!(
-            crate::owner_local_reserve_expected_grant_count(
-                expected.value_len,
-                expected.payload_capacity_bytes,
-            ),
-            Some(207)
+            crate::owner_segment_allocation_capacity_bytes(expected.value_len),
+            Some(4_718_592)
         );
     }
 
@@ -2415,7 +2540,7 @@ test_spec_config:
     }
 
     #[test]
-    fn owner_local_reserve_expected_capacity_rejects_physical_target_over_owner_capacity() {
+    fn owner_segment_capacity_has_no_fixed_grant_floor() {
         let cfg = ClientConfigYaml::from_str(
             r#"
 instance_key: test_owner
@@ -2435,11 +2560,40 @@ test_spec_config:
 "#,
         )
         .unwrap();
-        let err = cfg.verify().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("exceeding owner dram contribution")
+        let verified = cfg.verify().unwrap();
+        assert_eq!(
+            verified
+                .test_spec_config
+                .owner_local_reserve_expected_capacity
+                .expect("expected-capacity config")
+                .payload_capacity_bytes,
+            4096,
         );
+    }
+
+    #[test]
+    fn owner_local_reserve_expected_capacity_rejects_payload_over_segment() {
+        let cfg = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /tmp/test_owner_expected_too_large
+  large_file_paths: [/tmp/test_owner_expected_too_large_large]
+  sub_cluster: rack-a
+test_spec_config:
+  owner_local_reserve_expected_capacity:
+    value_len: 4096
+    payload_capacity_bytes: 16777217
+"#,
+        )
+        .unwrap();
+        let err = cfg.verify().unwrap_err();
+        assert!(err.to_string().contains("exceeds owner segment"));
     }
 
     #[test]

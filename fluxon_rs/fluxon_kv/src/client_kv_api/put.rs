@@ -1,20 +1,24 @@
 use super::{
     ClientKvApiInner, OwnerHotEvictionEvent, OwnerHotEvictionPreparation,
-    OwnerHotSelectionFenceOutcome, OwnerLocalReserveGrantState, OwnerLocalReservePoolState,
-    OwnerLocalReserveSlotLease, OwnerLocalReserveSlotRef, OwnerLocalSsdPutOutcome,
-    OwnerLocalSsdPutReservation, OwnerLocalSsdPutSharedOp, OwnerRemotePutAdmissionPermit,
+    OwnerHotSelectionFenceOutcome, OwnerLocalSsdPutOutcome, OwnerLocalSsdPutReservation,
+    OwnerLocalSsdPutSharedOp, OwnerPressureBatchReclaim, OwnerRemotePutAdmissionPermit,
     OwnerRemotePutOutcome, OwnerRemotePutReservation, OwnerRemotePutSharedOp,
+    OwnerSegmentAllocator, OwnerSlotLease, OwnerSlotRef,
     local_reserve_rebalance::{owner_local_reserve_timeout_config, wait_owner_local_reserve_ready},
 };
-use crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
-use crate::cluster_manager::NodeIDString;
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+use crate::cluster_manager::{NodeID, NodeIDString};
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::p2p::control_plane_rpc::{CONTROL_PLANE_RPC_TRANSPORT_POLICY, call_control_plane_rpc};
 // no StageScope; timestamps-based metrics only
 use crate::memholder::kvclient_encode::{calc_flat_dict_encoded_len, write_flat_dict_ptrs_to_ptr};
 use crate::observe_kvope::{
     obe_put_start_error_rpc, obe_put_start_error_status, obe_put_start_success,
+};
+use crate::owner_segment::{
+    OwnerRouteCommitMode, OwnerSegmentTransferItem, OwnerSegmentTransferOutcome, OwnerSlotDesc,
+    OwnerSourceReadCapability, OwnerSourceRouteToken, OwnerTargetDisposition,
+    OwnerTransferDirection, OwnerTransferErrorCode,
 };
 use crate::{
     client_kv_api::ClientKvApiView,
@@ -33,8 +37,7 @@ use crate::{
         OwnerSourceSsdPolicy, OwnerSsdPublishItem, OwnerSsdPublishOutcome, PutAppendDoneReq,
         PutAppendDoneResp, PutAppendRevokeReq, PutAppendStartOutcome, PutAppendStartReq,
         PutAppendStartResp, PutAtomicGroup, PutDoneCommittedSlot, PutDoneReq, PutRevokeReq,
-        PutStartReq, PutStartResp, RadixKvMetadata, ReleaseLocalGrantReq, ReserveLocalGrantOutcome,
-        ReserveLocalGrantReq, owner_source_eviction_epoch,
+        PutStartReq, PutStartResp, RadixKvMetadata, owner_source_eviction_epoch,
     },
     memholder::{UserMemHolder, UserMemHolderExposeKind},
     p2p::msg_pack::MsgPack,
@@ -53,51 +56,35 @@ fn duration_to_i64_us(duration: std::time::Duration) -> i64 {
 }
 
 fn owner_local_reserve_slot_size(value_len: u64) -> KvResult<u64> {
-    crate::owner_local_reserve_slot_size_bytes(value_len).ok_or_else(|| {
+    crate::owner_segment_allocation_capacity_bytes(value_len).ok_or_else(|| {
         KvError::Api(ApiError::InvalidArgument {
             detail: format!(
-                "value_len={} cannot be represented by a resident local-reserve slot no larger than {} bytes",
-                value_len, OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
+                "value_len={} cannot be represented by the owner segment allocator",
+                value_len
             ),
         })
     })
 }
 
-fn owner_local_reserve_install_grant(
-    pool: &mut OwnerLocalReservePoolState,
-    grant: OwnerLocalReserveGrantState,
-) {
-    pool.install_grant(grant);
-}
-
 fn owner_local_reserve_try_claim(
-    pool: &mut OwnerLocalReservePoolState,
+    pool: &mut OwnerSegmentAllocator,
     slot_size: u64,
     value_len: u64,
     key_count: usize,
-) -> Option<OwnerLocalReserveSlotLease> {
-    let slots = owner_local_reserve_claim_available(pool, slot_size, key_count);
+) -> Option<OwnerSlotLease> {
+    let slots = owner_local_reserve_claim_available(pool, slot_size, value_len, key_count);
     if slots.len() != key_count {
-        let missing = key_count - slots.len();
-        // Generic grants can hold floor(512 MiB / slot_size) allocations.
-        // Byte division is insufficient: 227 x 4.5 MiB needs three grants
-        // even though its aggregate bytes are less than two 512 MiB grants.
-        let slots_per_grant = u64::from(
-            crate::owner_local_reserve_slots_per_grant(slot_size)
-                .expect("validated local-reserve slot size must fit in a grant"),
-        );
-        let missing = u64::try_from(missing).unwrap_or(u64::MAX);
-        let required_grants = missing / slots_per_grant + u64::from(missing % slots_per_grant != 0);
-        pool.record_failed_claim(
-            slot_size,
-            usize::try_from(required_grants.max(1)).unwrap_or(usize::MAX),
-        );
+        pool.record_failed_claim(slot_size);
         for slot in &slots {
-            assert!(pool.release_prepared_slot(slot_size, slot.grant_id, slot.slot_index));
+            assert!(pool.release_prepared_slot(
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            ));
         }
         return None;
     }
-    Some(OwnerLocalReserveSlotLease {
+    Some(OwnerSlotLease {
         value_len,
         slot_size,
         slots,
@@ -105,11 +92,16 @@ fn owner_local_reserve_try_claim(
 }
 
 fn owner_local_reserve_claim_available(
-    pool: &mut OwnerLocalReservePoolState,
+    pool: &mut OwnerSegmentAllocator,
     slot_size: u64,
+    value_len: u64,
     max_slots: usize,
-) -> Vec<OwnerLocalReserveSlotRef> {
-    pool.claim_available(slot_size, max_slots)
+) -> Vec<OwnerSlotRef> {
+    debug_assert_eq!(
+        crate::owner_segment_allocation_capacity_bytes(value_len),
+        Some(slot_size)
+    );
+    pool.claim_value(value_len, max_slots)
 }
 
 struct OwnerLocalReservePendingDemandGuard<'a> {
@@ -161,15 +153,20 @@ impl Drop for OwnerLocalReservePendingDemandGuard<'_> {
 #[cfg(test)]
 mod local_reserve_claim_tests {
     use super::{
-        OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES, OwnerLocalReserveGrantState,
-        OwnerLocalReservePoolState, owner_local_reserve_claim_available,
-        owner_local_reserve_install_grant, owner_local_reserve_slot_size,
+        OwnerSegmentAllocator, owner_local_reserve_claim_available, owner_local_reserve_slot_size,
         owner_local_reserve_try_claim,
     };
     use crate::client_kv_api::{ClientKvApi, ClientKvApiNewArg};
     use crate::config::TestSpecConfig;
     use std::sync::Arc;
     use std::time::Duration;
+
+    fn segment_pool(bytes: u64) -> OwnerSegmentAllocator {
+        let mut pool = OwnerSegmentAllocator::default();
+        pool.install_test_segment("put-test-owner", 1_000_000, 1_000_000, bytes, bytes, None)
+            .expect("install test owner segment");
+        pool
+    }
 
     #[test]
     fn slot_size_uses_page_aligned_exact_fit() {
@@ -181,52 +178,41 @@ mod local_reserve_claim_tests {
     }
 
     #[test]
-    fn failed_claim_counts_per_size_capacity_of_generic_grants() {
+    fn failed_claim_is_recorded_for_the_exact_size_class() {
         const SGLANG_KV_PAGE_BYTES: u64 = 4_718_592;
-        let mut pool = OwnerLocalReservePoolState::default();
-        pool.grant_size_bytes = Some(OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES);
+        let mut pool = segment_pool(2 * SGLANG_KV_PAGE_BYTES);
 
         assert!(
             owner_local_reserve_try_claim(
                 &mut pool,
                 SGLANG_KV_PAGE_BYTES,
                 SGLANG_KV_PAGE_BYTES,
-                227,
+                3,
             )
             .is_none()
         );
-        // 113 slots fit per generic grant, so 227 slots require three grants.
-        // Dividing aggregate bytes by 512 MiB incorrectly produces two.
-        assert_eq!(pool.failed_claim_refill_grants(), 3);
         assert!(pool.slot_size_has_failed_claim(SGLANG_KV_PAGE_BYTES));
+        assert_eq!(pool.total_free_bytes(), 2 * SGLANG_KV_PAGE_BYTES);
     }
 
     #[test]
     fn partial_claim_keeps_progress_for_large_waiters() {
         const SLOT_SIZE: u64 = 4 * 1024;
-        let mut pool = OwnerLocalReservePoolState::default();
-        owner_local_reserve_install_grant(
-            &mut pool,
-            OwnerLocalReserveGrantState::new(1, 1000, 1000, 4 * SLOT_SIZE),
-        );
+        let mut pool = segment_pool(4 * SLOT_SIZE);
 
-        let first = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 3);
+        let first = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOT_SIZE, 3);
         assert_eq!(first.len(), 3);
         assert_eq!(pool.total_free_bytes(), SLOT_SIZE);
 
-        let second = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 3);
+        let second = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOT_SIZE, 3);
         assert_eq!(second.len(), 1);
         assert_eq!(pool.total_free_bytes(), 0);
     }
 
     #[test]
-    fn mixed_sizes_share_one_grant_and_keep_4k_offset_indices() {
+    fn mixed_sizes_share_one_segment_and_keep_byte_offsets() {
         const KIB: u64 = 1024;
-        let mut pool = OwnerLocalReservePoolState::default();
-        owner_local_reserve_install_grant(
-            &mut pool,
-            OwnerLocalReserveGrantState::new(1, 1_000_000, 1_000_000, 64 * KIB),
-        );
+        let mut pool = segment_pool(64 * KIB);
 
         let first = owner_local_reserve_try_claim(&mut pool, 12 * KIB, 12 * KIB, 1)
             .unwrap()
@@ -239,26 +225,26 @@ mod local_reserve_claim_tests {
             .pop()
             .unwrap();
 
-        assert_eq!(first.slot_index, 0);
-        assert_eq!(second.slot_index, 3);
-        assert_eq!(second.ptr - first.ptr, 12 * KIB);
-        assert_eq!(pool.grant_count(), 1);
+        assert_eq!(first.segment_offset, 0);
+        assert_eq!(second.segment_offset, 12 * KIB);
+        assert_eq!(second.addr - first.addr, 12 * KIB);
         assert_eq!(pool.total_used_bytes(), 32 * KIB);
     }
 
     #[test]
     fn allocatable_report_excludes_free_bubbles_smaller_than_one_slot() {
         const KIB: u64 = 1024;
-        let mut pool = OwnerLocalReservePoolState::default();
-        owner_local_reserve_install_grant(
-            &mut pool,
-            OwnerLocalReserveGrantState::new(1, 1_000_000, 1_000_000, 64 * KIB),
-        );
+        let mut pool = segment_pool(64 * KIB);
 
         let slots = pool.claim_available(16 * KIB, 4);
         assert_eq!(slots.len(), 4);
-        assert!(pool.release_prepared_slot(16 * KIB, slots[1].grant_id, slots[1].slot_index));
-        assert!(pool.release_prepared_slot(16 * KIB, slots[3].grant_id, slots[3].slot_index));
+        for slot in [&slots[1], &slots[3]] {
+            assert!(pool.release_prepared_slot(
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            ));
+        }
 
         let report = pool.allocatable_report(24 * KIB);
         assert_eq!(report.raw_free_bytes, 32 * KIB);
@@ -268,19 +254,19 @@ mod local_reserve_claim_tests {
     }
 
     #[test]
-    fn minimum_sized_allocations_can_fill_and_restore_an_entire_grant() {
+    fn minimum_sized_allocations_can_fill_and_restore_the_segment() {
         const KIB: u64 = 1024;
-        let mut pool = OwnerLocalReservePoolState::default();
-        owner_local_reserve_install_grant(
-            &mut pool,
-            OwnerLocalReserveGrantState::new(1, 1_000_000, 1_000_000, 64 * KIB),
-        );
+        let mut pool = segment_pool(64 * KIB);
 
         let slots = pool.claim_available(4 * KIB, 16);
         assert_eq!(slots.len(), 16);
         assert_eq!(pool.total_free_bytes(), 0);
         for slot in slots {
-            assert!(pool.release_prepared_slot(4 * KIB, slot.grant_id, slot.slot_index));
+            assert!(pool.release_prepared_slot(
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            ));
         }
         assert_eq!(pool.total_free_bytes(), 64 * KIB);
         assert_eq!(pool.largest_free_bytes(), 64 * KIB);
@@ -289,148 +275,108 @@ mod local_reserve_claim_tests {
     #[test]
     fn failed_batch_claim_rolls_back_every_offset_allocation() {
         const KIB: u64 = 1024;
-        let mut pool = OwnerLocalReservePoolState::default();
-        owner_local_reserve_install_grant(
-            &mut pool,
-            OwnerLocalReserveGrantState::new(1, 1_000_000, 1_000_000, 64 * KIB),
-        );
+        let mut pool = segment_pool(64 * KIB);
 
         assert!(owner_local_reserve_try_claim(&mut pool, 24 * KIB, 24 * KIB, 3).is_none());
         assert_eq!(pool.used_slot_count(), 0);
         assert_eq!(pool.total_free_bytes(), 64 * KIB);
         assert_eq!(pool.largest_free_bytes(), 64 * KIB);
-        assert_eq!(pool.failed_claim_refill_grants(), 1);
+        assert!(pool.slot_size_has_failed_claim(24 * KIB));
     }
 
     #[test]
-    fn grant_index_and_cached_counters_survive_swap_remove_and_reinstall() {
+    fn stale_allocation_id_cannot_release_a_reused_offset() {
         const SLOT_SIZE: u64 = 4 * 1024;
-        let mut pool = OwnerLocalReservePoolState::default();
-        for grant_id in 1..=3 {
-            owner_local_reserve_install_grant(
-                &mut pool,
-                OwnerLocalReserveGrantState::new(
-                    grant_id,
-                    grant_id * 1000,
-                    grant_id * 1000,
-                    SLOT_SIZE * 4,
-                ),
-            );
-        }
-
-        assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 12);
-        assert_eq!(pool.used_slot_count(), 0);
-        let detached = pool
-            .detach_fully_free_grant(2)
-            .expect("middle grant must be indexed");
-        assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 8);
-        assert_eq!(pool.grant_count(), 2);
-
-        // Removing the middle Vec entry swap-moves grant 3. A subsequent state
-        // transition by grant id proves that its repaired index is authoritative.
-        let claimed = pool.claim_available(SLOT_SIZE, 5);
-        assert_eq!(claimed.len(), 5);
-        assert_eq!(claimed[4].grant_id, 3);
-        assert_eq!(pool.prepared_slot_count(), 5);
-        for slot in claimed {
-            assert!(pool.release_prepared_slot(SLOT_SIZE, slot.grant_id, slot.slot_index));
-        }
-        assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 8);
-        assert_eq!(pool.prepared_slot_count(), 0);
-
-        pool.install_grant(detached);
-        assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 12);
-        assert_eq!(pool.used_slot_count(), 0);
-        assert_eq!(pool.grant_count(), 3);
+        let mut pool = segment_pool(SLOT_SIZE);
+        let old = pool.claim_available(SLOT_SIZE, 1).pop().unwrap();
+        assert!(pool.release_prepared_slot(
+            old.allocation_id,
+            old.segment_offset,
+            old.capacity_bytes,
+        ));
+        let current = pool.claim_available(SLOT_SIZE, 1).pop().unwrap();
+        assert_eq!(current.segment_offset, old.segment_offset);
+        assert_ne!(current.allocation_id, old.allocation_id);
+        assert!(!pool.release_prepared_slot(
+            old.allocation_id,
+            old.segment_offset,
+            old.capacity_bytes,
+        ));
+        assert_eq!(pool.prepared_slot_count(), 1);
     }
 
     #[test]
-    fn committed_slots_are_reclaimed_and_reused_independently_across_grants() {
+    fn committed_slots_are_reclaimed_and_reused_independently_in_one_segment() {
         const SLOT_SIZE: u64 = 4 * 1024;
+        let mut pool = segment_pool(SLOT_SIZE * 8);
 
-        let mut pool = OwnerLocalReservePoolState::default();
-        for (grant_id, addr) in [(1, 1000), (2, 2000)] {
-            owner_local_reserve_install_grant(
-                &mut pool,
-                OwnerLocalReserveGrantState::new(grant_id, addr, addr, SLOT_SIZE * 4),
-            );
-        }
-
-        let initial = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 8);
+        let initial = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOT_SIZE, 8);
         assert_eq!(initial.len(), 8);
         for slot in &initial {
             assert!(pool.mark_prepared_slot_pending_visible(
-                SLOT_SIZE,
-                slot.grant_id,
-                slot.slot_index
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
             ));
-            assert!(pool.retain_resident_slot_holder(SLOT_SIZE, slot.grant_id, slot.slot_index));
+            assert!(pool.retain_resident_slot_holder(
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            ));
             assert!(pool.promote_pending_visible_slot_to_committed(
-                SLOT_SIZE,
-                slot.grant_id,
-                slot.slot_index
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
             ));
         }
 
         let victims = [initial[1].clone(), initial[5].clone()];
         for victim in &victims {
             assert!(pool.release_committed_slot_route(
-                SLOT_SIZE,
-                victim.grant_id,
-                victim.slot_index
+                victim.allocation_id,
+                victim.segment_offset,
+                victim.capacity_bytes,
             ));
             assert!(pool.release_resident_slot_holder(
-                SLOT_SIZE,
-                victim.grant_id,
-                victim.slot_index
+                victim.allocation_id,
+                victim.segment_offset,
+                victim.capacity_bytes,
             ));
         }
         assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 2);
-        assert_eq!(pool.grant_count(), 2);
-        assert!(pool.grants.iter().all(|grant| !grant.is_fully_free()));
-        assert!(
-            pool.grants
-                .iter()
-                .all(|grant| grant.total_free_bytes() == SLOT_SIZE)
-        );
 
         for cycle in 0..10 {
-            let reused = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 2);
+            let reused = owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOT_SIZE, 2);
             assert_eq!(reused.len(), 2, "cycle {cycle} did not reuse both slots");
-            let mut reused_grant_ids = reused.iter().map(|slot| slot.grant_id).collect::<Vec<_>>();
-            reused_grant_ids.sort_unstable();
-            assert_eq!(reused_grant_ids, vec![1, 2]);
 
             for slot in reused {
                 assert!(pool.mark_prepared_slot_pending_visible(
-                    SLOT_SIZE,
-                    slot.grant_id,
-                    slot.slot_index
+                    slot.allocation_id,
+                    slot.segment_offset,
+                    slot.capacity_bytes,
                 ));
                 assert!(pool.retain_resident_slot_holder(
-                    SLOT_SIZE,
-                    slot.grant_id,
-                    slot.slot_index
+                    slot.allocation_id,
+                    slot.segment_offset,
+                    slot.capacity_bytes,
                 ));
                 assert!(pool.promote_pending_visible_slot_to_committed(
-                    SLOT_SIZE,
-                    slot.grant_id,
-                    slot.slot_index
+                    slot.allocation_id,
+                    slot.segment_offset,
+                    slot.capacity_bytes,
                 ));
                 assert!(pool.release_committed_slot_route(
-                    SLOT_SIZE,
-                    slot.grant_id,
-                    slot.slot_index
+                    slot.allocation_id,
+                    slot.segment_offset,
+                    slot.capacity_bytes,
                 ));
                 assert!(pool.release_resident_slot_holder(
-                    SLOT_SIZE,
-                    slot.grant_id,
-                    slot.slot_index
+                    slot.allocation_id,
+                    slot.segment_offset,
+                    slot.capacity_bytes,
                 ));
             }
             assert_eq!(pool.total_free_bytes(), SLOT_SIZE * 2);
-            assert_eq!(pool.grant_count(), 2);
-            assert!(pool.grants.iter().all(|grant| !grant.is_fully_free()));
         }
     }
 
@@ -443,29 +389,38 @@ mod local_reserve_claim_tests {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
                 owner_local_reserve_physical_capacity_bytes: 0,
+                allocation_authority:
+                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+                owner_placement_class:
+                    crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
                 ssd_storage: None,
             })
             .await
             .expect("construct test ClientKvApi"),
         );
         {
-            let mut pool = api.inner().owner_local_reserve_pool.lock();
-            owner_local_reserve_install_grant(
-                &mut pool,
-                OwnerLocalReserveGrantState::new(1, 1000, 1000, SLOT_SIZE * 4),
-            );
+            let mut pool = api.inner().owner_segment_allocator.lock();
+            pool.install_test_segment(
+                "put-test-owner",
+                1000,
+                1000,
+                SLOT_SIZE * 8,
+                SLOT_SIZE * 8,
+                None,
+            )
+            .unwrap();
         }
 
         // Model a five-slot waiter that has made partial progress while owning the claim turn.
         let claim_lock = api.inner().owner_local_reserve_claim_lock(SLOT_SIZE);
         let current_claim_turn = claim_lock.lock().await;
         let first_partial = {
-            let mut pool = api.inner().owner_local_reserve_pool.lock();
-            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 3)
+            let mut pool = api.inner().owner_segment_allocator.lock();
+            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOT_SIZE, 3)
         };
         assert_eq!(first_partial.len(), 3);
 
-        // A later one-slot request must queue even though one slot is currently free.
+        // A later one-slot request must queue even though physical slots are free.
         let later_api = Arc::clone(&api);
         let mut later_waiter = tokio::spawn(async move {
             later_api
@@ -481,21 +436,17 @@ mod local_reserve_claim_tests {
         );
         assert_eq!(
             api.inner()
-                .owner_local_reserve_pool
+                .owner_segment_allocator
                 .lock()
                 .total_free_bytes(),
-            SLOT_SIZE,
+            SLOT_SIZE * 5,
             "later waiter stole the current waiter's remaining free slot"
         );
 
-        // Refill lets the current waiter reach all five slots before handing off the turn.
+        // The current waiter reaches all five slots before handing off the turn.
         let first_remainder = {
-            let mut pool = api.inner().owner_local_reserve_pool.lock();
-            owner_local_reserve_install_grant(
-                &mut pool,
-                OwnerLocalReserveGrantState::new(2, 2000, 2000, SLOT_SIZE * 4),
-            );
-            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, 2)
+            let mut pool = api.inner().owner_segment_allocator.lock();
+            owner_local_reserve_claim_available(&mut pool, SLOT_SIZE, SLOT_SIZE, 2)
         };
         assert_eq!(first_partial.len() + first_remainder.len(), 5);
         drop(current_claim_turn);
@@ -518,6 +469,10 @@ mod local_reserve_claim_tests {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
                 owner_local_reserve_physical_capacity_bytes: 0,
+                allocation_authority:
+                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+                owner_placement_class:
+                    crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
                 ssd_storage: None,
             })
             .await
@@ -573,6 +528,10 @@ mod local_reserve_claim_tests {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
                 owner_local_reserve_physical_capacity_bytes: 0,
+                allocation_authority:
+                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+                owner_placement_class:
+                    crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
                 ssd_storage: None,
             })
             .await
@@ -583,11 +542,16 @@ mod local_reserve_claim_tests {
             .owner_local_reserve_claim_lock(BLOCKED_SLOT_SIZE);
         let _blocked_turn = blocked_lock.lock().await;
         {
-            let mut pool = api.inner().owner_local_reserve_pool.lock();
-            owner_local_reserve_install_grant(
-                &mut pool,
-                OwnerLocalReserveGrantState::new(1, 1000, 1000, READY_SLOT_SIZE * 2),
-            );
+            let mut pool = api.inner().owner_segment_allocator.lock();
+            pool.install_test_segment(
+                "put-test-owner",
+                1000,
+                1000,
+                READY_SLOT_SIZE * 2,
+                READY_SLOT_SIZE * 2,
+                None,
+            )
+            .unwrap();
         }
 
         let ready_api = Arc::clone(&api);
@@ -613,6 +577,10 @@ mod local_reserve_claim_tests {
                 test_spec_config: TestSpecConfig::default(),
                 owner_hot_cache_capacity_bytes: None,
                 owner_local_reserve_physical_capacity_bytes: 0,
+                allocation_authority:
+                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+                owner_placement_class:
+                    crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
                 ssd_storage: None,
             })
             .await
@@ -640,7 +608,7 @@ mod local_reserve_claim_tests {
             loop {
                 let pending = api
                     .inner()
-                    .owner_local_reserve_pool
+                    .owner_segment_allocator
                     .lock()
                     .pending_demand_slots(SLOT_SIZE);
                 if pending == 5 {
@@ -658,7 +626,7 @@ mod local_reserve_claim_tests {
         let _ = second.await;
         assert_eq!(
             api.inner()
-                .owner_local_reserve_pool
+                .owner_segment_allocator
                 .lock()
                 .pending_demand_slots(SLOT_SIZE),
             0,
@@ -744,7 +712,7 @@ struct OwnerLocalSsdPutLeader {
 
 fn owner_reclaim_backing_len(backing: &OwnerReclaimBacking) -> u64 {
     match backing {
-        OwnerReclaimBacking::CommittedSlot { slot_size, .. } => *slot_size,
+        OwnerReclaimBacking::CommittedSlot { capacity_bytes, .. } => *capacity_bytes,
         OwnerReclaimBacking::Allocation | OwnerReclaimBacking::UnindexedAllocation { .. } => 0,
     }
 }
@@ -775,10 +743,9 @@ fn owner_local_reserve_timeout_error(
         allocatable_slots,
         slot_unallocatable_bytes,
         pending_slots,
-        grants,
-        expected_grants,
+        segment_bytes,
     ) = {
-        let pool = inner.owner_local_reserve_pool.lock();
+        let pool = inner.owner_segment_allocator.lock();
         let allocatable = pool.allocatable_report(slot_size);
         (
             pool.used_slot_count(),
@@ -786,13 +753,12 @@ fn owner_local_reserve_timeout_error(
             allocatable.allocatable_slots,
             allocatable.slot_unallocatable_bytes,
             pool.pending_demand_slots(slot_size),
-            pool.grant_count(),
-            pool.expected_grant_count,
+            pool.physical_capacity_bytes(),
         )
     };
     KvError::Api(ApiError::Unknown {
         detail: format!(
-            "owner local reserve refill timeout: stage={} slot_size={} key_count={} used_allocations={} raw_free_bytes={} allocatable_slots={} slot_unallocatable_bytes={} pending_slots={} grants={} expected_grants={} waited_ms={} soft_wait_timeout_ms={} hard_timeout_ms={}",
+            "owner segment allocation timeout: stage={} slot_size={} key_count={} used_allocations={} raw_free_bytes={} allocatable_slots={} slot_unallocatable_bytes={} pending_slots={} segment_bytes={} waited_ms={} soft_wait_timeout_ms={} hard_timeout_ms={}",
             stage,
             slot_size,
             key_count,
@@ -801,8 +767,7 @@ fn owner_local_reserve_timeout_error(
             allocatable_slots,
             slot_unallocatable_bytes,
             pending_slots,
-            grants,
-            expected_grants,
+            segment_bytes,
             request_started_at.elapsed().as_millis(),
             soft_wait_timeout.as_millis(),
             hard_wait_timeout.as_millis()
@@ -820,11 +785,92 @@ enum OwnerRemotePutStart {
 }
 
 impl ClientKvApiInner {
+    pub(crate) async fn owner_segment_transfer(
+        &self,
+        target: &crate::owner_segment::OwnerGeneration,
+        request: crate::owner_segment::OwnerSegmentTransferReq,
+    ) -> KvResult<Vec<crate::owner_segment::OwnerSegmentTransferItemResp>> {
+        if request.items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let self_info = self.view.cluster_manager().get_self_info();
+        let expected = request
+            .items
+            .iter()
+            .map(|item| (item.terminal_sequence, item.item.op_id().cloned()))
+            .collect::<Vec<_>>();
+        if target.node_id == self_info.id && target.node_start_time == self_info.node_start_time {
+            let caller: NodeID = self_info.id.clone().into();
+            let response = super::handle_owner_segment_transfer(
+                &self.view,
+                caller,
+                MsgPack {
+                    serialize_part: request,
+                    raw_bytes: Vec::new(),
+                },
+            )
+            .await;
+            crate::rpcresp_kvresult_convert::try_from_code(
+                response.serialize_part.error_code,
+                response.serialize_part.error_json.clone(),
+            )?;
+            return Ok(response.serialize_part.items);
+        }
+        let current = self
+            .view
+            .cluster_manager()
+            .get_member_info_cached(&target.node_id)
+            .ok_or_else(|| {
+                KvError::Api(ApiError::NodeNotFound {
+                    desc: target.node_id.clone(),
+                })
+            })?;
+        if current.node_start_time != target.node_start_time {
+            return Err(KvError::Api(ApiError::OwnerStartTimeMismatch {
+                expected: target.node_start_time,
+                got: current.node_start_time,
+            }));
+        }
+        let response = call_control_plane_rpc(
+            &self.rpc_caller_owner_segment_transfer,
+            self.view.p2p_module(),
+            target.node_id.clone().into(),
+            MsgPack {
+                serialize_part: request,
+                raw_bytes: Vec::new(),
+            },
+            Some(Duration::from_secs(60)),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            response.serialize_part.error_code,
+            response.serialize_part.error_json.clone(),
+        )?;
+        if response.serialize_part.items.len() != expected.len()
+            || response
+                .serialize_part
+                .items
+                .iter()
+                .zip(expected)
+                .any(|(item, expected)| {
+                    item.terminal_sequence != expected.0 || item.op_id != expected.1
+                })
+        {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: "owner segment transfer response changed batch order or operation identity"
+                    .to_string(),
+            }));
+        }
+        Ok(response.serialize_part.items)
+    }
+
     pub async fn owner_claim_local_reserve_slot_lease(
         &self,
         value_len: u64,
         key_count: usize,
-    ) -> KvResult<OwnerLocalReserveSlotLease> {
+    ) -> KvResult<OwnerSlotLease> {
         let slot_size = owner_local_reserve_slot_size(value_len)?;
         let (soft_wait_timeout, hard_wait_timeout) = owner_local_reserve_timeout_config(self);
         let request_started_at = Instant::now();
@@ -870,7 +916,7 @@ impl ClientKvApiInner {
 
         loop {
             let claim = {
-                let mut pool = self.owner_local_reserve_pool.lock();
+                let mut pool = self.owner_segment_allocator.lock();
                 let claim =
                     owner_local_reserve_try_claim(&mut pool, slot_size, value_len, key_count);
                 if claim.is_some() {
@@ -918,20 +964,20 @@ impl ClientKvApiInner {
 
     pub async fn owner_release_local_reserve_slot_lease(
         &self,
-        lease: OwnerLocalReserveSlotLease,
+        lease: OwnerSlotLease,
     ) -> KvResult<()> {
         {
-            let mut pool = self.owner_local_reserve_pool.lock();
+            let mut pool = self.owner_segment_allocator.lock();
             for slot_ref in &lease.slots {
                 if !pool.release_prepared_slot(
-                    lease.slot_size,
-                    slot_ref.grant_id,
-                    slot_ref.slot_index,
+                    slot_ref.allocation_id,
+                    slot_ref.segment_offset,
+                    slot_ref.capacity_bytes,
                 ) {
                     return Err(KvError::Api(ApiError::Unknown {
                         detail: format!(
-                            "resident local reserve grant missing while releasing slot lease: grant_id={}",
-                            slot_ref.grant_id
+                            "owner allocation identity mismatch while releasing slot lease: allocation_id={}",
+                            slot_ref.allocation_id
                         ),
                     }));
                 }
@@ -943,16 +989,16 @@ impl ClientKvApiInner {
 
     pub fn owner_mark_local_reserve_slot_pending_visible(
         &self,
-        slot_size: u64,
-        grant_id: u64,
-        slot_index: u32,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     ) -> KvResult<()> {
-        let mut pool = self.owner_local_reserve_pool.lock();
-        if !pool.mark_prepared_slot_pending_visible(slot_size, grant_id, slot_index) {
+        let mut pool = self.owner_segment_allocator.lock();
+        if !pool.mark_prepared_slot_pending_visible(allocation_id, segment_offset, capacity_bytes) {
             return Err(KvError::Api(ApiError::Unknown {
                 detail: format!(
-                    "local reserve grant missing while marking pending slot: grant_id={}",
-                    grant_id
+                    "owner allocation identity mismatch while marking pending slot: allocation_id={}",
+                    allocation_id
                 ),
             }));
         }
@@ -961,16 +1007,20 @@ impl ClientKvApiInner {
 
     pub fn owner_promote_local_reserve_pending_slot_to_committed(
         &self,
-        slot_size: u64,
-        grant_id: u64,
-        slot_index: u32,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     ) -> KvResult<()> {
-        let mut pool = self.owner_local_reserve_pool.lock();
-        if !pool.promote_pending_visible_slot_to_committed(slot_size, grant_id, slot_index) {
+        let mut pool = self.owner_segment_allocator.lock();
+        if !pool.promote_pending_visible_slot_to_committed(
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        ) {
             return Err(KvError::Api(ApiError::Unknown {
                 detail: format!(
-                    "local reserve grant missing while promoting pending slot: grant_id={}",
-                    grant_id
+                    "owner allocation identity mismatch while committing slot: allocation_id={}",
+                    allocation_id
                 ),
             }));
         }
@@ -979,16 +1029,38 @@ impl ClientKvApiInner {
 
     pub fn owner_retain_local_reserve_resident_slot_holder(
         &self,
-        slot_size: u64,
-        grant_id: u64,
-        slot_index: u32,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     ) -> KvResult<()> {
-        let mut pool = self.owner_local_reserve_pool.lock();
-        if !pool.retain_resident_slot_holder(slot_size, grant_id, slot_index) {
+        let mut pool = self.owner_segment_allocator.lock();
+        if !pool.retain_resident_slot_holder(allocation_id, segment_offset, capacity_bytes) {
             return Err(KvError::Api(ApiError::Unknown {
                 detail: format!(
-                    "local reserve grant missing while retaining resident slot holder: grant_id={}",
-                    grant_id
+                    "owner allocation identity mismatch while retaining holder: allocation_id={}",
+                    allocation_id
+                ),
+            }));
+        }
+        Ok(())
+    }
+
+    pub fn owner_retain_global_shared_slot_holder(
+        &self,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
+    ) -> KvResult<()> {
+        let mut allocator = self.owner_segment_allocator.lock();
+        if !allocator.retain_committed_route_only_holder(
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        ) {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "GlobalShared owner slot is no longer route-only: allocation_id={} offset={} capacity={}",
+                    allocation_id, segment_offset, capacity_bytes
                 ),
             }));
         }
@@ -997,17 +1069,17 @@ impl ClientKvApiInner {
 
     pub fn owner_release_local_reserve_resident_slot_holder(
         &self,
-        slot_size: u64,
-        grant_id: u64,
-        slot_index: u32,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     ) -> KvResult<()> {
         {
-            let mut pool = self.owner_local_reserve_pool.lock();
-            if !pool.release_resident_slot_holder(slot_size, grant_id, slot_index) {
+            let mut pool = self.owner_segment_allocator.lock();
+            if !pool.release_resident_slot_holder(allocation_id, segment_offset, capacity_bytes) {
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
-                        "local reserve grant missing while releasing resident slot holder: grant_id={}",
-                        grant_id
+                        "owner allocation identity mismatch while releasing holder: allocation_id={}",
+                        allocation_id
                     ),
                 }));
             }
@@ -1018,17 +1090,17 @@ impl ClientKvApiInner {
 
     pub fn owner_release_local_reserve_committed_slot_route(
         &self,
-        slot_size: u64,
-        grant_id: u64,
-        slot_index: u32,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     ) -> KvResult<()> {
         {
-            let mut pool = self.owner_local_reserve_pool.lock();
-            if !pool.release_committed_slot_route(slot_size, grant_id, slot_index) {
+            let mut pool = self.owner_segment_allocator.lock();
+            if !pool.release_committed_slot_route(allocation_id, segment_offset, capacity_bytes) {
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
-                        "local reserve grant missing while releasing committed slot route: grant_id={}",
-                        grant_id
+                        "owner allocation identity mismatch while releasing route: allocation_id={}",
+                        allocation_id
                     ),
                 }));
             }
@@ -1039,17 +1111,18 @@ impl ClientKvApiInner {
 
     pub fn owner_release_local_reserve_committed_resident_slot(
         &self,
-        slot_size: u64,
-        grant_id: u64,
-        slot_index: u32,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     ) -> KvResult<()> {
         {
-            let mut pool = self.owner_local_reserve_pool.lock();
-            if !pool.release_committed_resident_slot(slot_size, grant_id, slot_index) {
+            let mut pool = self.owner_segment_allocator.lock();
+            if !pool.release_committed_resident_slot(allocation_id, segment_offset, capacity_bytes)
+            {
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
-                        "local reserve grant missing while reclaiming committed resident slot: grant_id={}",
-                        grant_id
+                        "owner allocation identity mismatch while reclaiming slot: allocation_id={}",
+                        allocation_id
                     ),
                 }));
             }
@@ -1059,25 +1132,13 @@ impl ClientKvApiInner {
     }
 
     pub async fn owner_shutdown_local_reserve_pool(&self) -> KvResult<()> {
-        let grants = {
-            let mut pool = self.owner_local_reserve_pool.lock();
-            pool.take_all_grants()
-        };
-        let mut first_err = None;
-        for grant in grants {
-            if let Err(err) = self.release_local_grant(grant.grant_id).await {
-                if first_err.is_none() {
-                    first_err = Some(err);
-                } else {
-                    tracing::warn!(
-                        "owner_shutdown_local_reserve_pool dropped additional release error after the first one: {}",
-                        err
-                    );
-                }
-            }
-        }
-        if let Some(err) = first_err {
-            return Err(err);
+        let pool = self.owner_segment_allocator.lock();
+        if pool.used_slot_count() != 0 {
+            tracing::warn!(
+                live_allocations = pool.used_slot_count(),
+                used_bytes = pool.total_used_bytes(),
+                "owner segment allocator is shutting down with live allocations"
+            );
         }
         Ok(())
     }
@@ -2242,79 +2303,6 @@ impl ClientKvApiInner {
         .await
     }
 
-    pub async fn reserve_local_grant(&self) -> KvResult<ReserveLocalGrantOutcome> {
-        if !self.view.register_shutdown_poller().is_running() {
-            return Err(KvError::Api(ApiError::SystemShutdown {
-                detail: "ClientKvApi is shutting down; rejecting reserve_local_grant".to_string(),
-            }));
-        }
-        let req = MsgPack {
-            serialize_part: ReserveLocalGrantReq {},
-            raw_bytes: Vec::new(),
-        };
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
-        // Local grants bootstrap the owner's allocatable pool. They cannot rely on the direct
-        // transfer-RPC path whose usable segments are established by this control sequence.
-        let resp = self
-            .rpc_caller_reserve_local_grant
-            .call_with_transport_policy(
-                self.view.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                CONTROL_PLANE_RPC_TRANSPORT_POLICY,
-                2,
-            )
-            .await
-            .map_err(KvError::from)?;
-        crate::rpcresp_kvresult_convert::try_from_code(
-            resp.serialize_part.error_code,
-            resp.serialize_part.error_json.clone(),
-        )?;
-        match resp.serialize_part.outcome {
-            ReserveLocalGrantOutcome::None => Err(KvError::Api(ApiError::Unknown {
-                detail: "reserve_local_grant returned success without an outcome".to_string(),
-            })),
-            outcome => Ok(outcome),
-        }
-    }
-
-    pub async fn release_local_grant(&self, grant_id: u64) -> KvResult<()> {
-        if !self.view.register_shutdown_poller().is_running() {
-            return Err(KvError::Api(ApiError::SystemShutdown {
-                detail: "ClientKvApi is shutting down; rejecting release_local_grant".to_string(),
-            }));
-        }
-        let req = MsgPack {
-            serialize_part: ReleaseLocalGrantReq { grant_id },
-            raw_bytes: Vec::new(),
-        };
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
-        let resp = call_control_plane_rpc(
-            &self.rpc_caller_release_local_grant,
-            self.view.p2p_module(),
-            master_node_id.into(),
-            req,
-            Some(std::time::Duration::from_secs(60)),
-            2,
-        )
-        .await
-        .map_err(KvError::from)?;
-        crate::rpcresp_kvresult_convert::try_from_code(
-            resp.serialize_part.error_code,
-            resp.serialize_part.error_json.clone(),
-        )?;
-        Ok(())
-    }
-
     /// 撤销 Put 操作，释放已分配的资源
     pub async fn put_revoke(&self, key: &str, put_id: PutIDForAKey) -> KvResult<()> {
         if !self.view.register_shutdown_poller().is_running() {
@@ -2448,11 +2436,78 @@ impl ClientKvApiInner {
 
     pub async fn batch_evict_owner_source(
         &self,
-        victims: Vec<OwnerSourceEvictionVictim>,
+        mut victims: Vec<OwnerSourceEvictionVictim>,
+        global_reclaim_requested_bytes: u64,
+        reserve_global_demotion: bool,
     ) -> KvResult<BatchEvictOwnerSourceResp> {
+        let mut global_demotion_reserved_bytes = 0u64;
+        if reserve_global_demotion && !self.test_spec_config.legacy_a19_global_demotion_one_phase {
+            let mut allocator = self.owner_segment_allocator.lock();
+            for victim in &mut victims {
+                let OwnerReclaimBacking::CommittedSlot {
+                    allocation_id,
+                    segment_offset,
+                    capacity_bytes,
+                } = &victim.backing
+                else {
+                    victim.global_demotion_reserved = false;
+                    continue;
+                };
+                victim.global_demotion_reserved = match allocator.try_reserve_global_demotion(
+                    &victim.key,
+                    victim.put_id,
+                    *allocation_id,
+                    *segment_offset,
+                    *capacity_bytes,
+                ) {
+                    Ok(reserved) => reserved,
+                    Err(error) => {
+                        tracing::debug!(
+                            key = victim.key,
+                            put_time_ms = victim.put_id.0,
+                            put_version = victim.put_id.1,
+                            allocation_id,
+                            error = %error.detail,
+                            "exact owner victim could not reserve GlobalShared budget"
+                        );
+                        false
+                    }
+                };
+                if victim.global_demotion_reserved {
+                    global_demotion_reserved_bytes =
+                        global_demotion_reserved_bytes.saturating_add(*capacity_bytes);
+                }
+            }
+        } else {
+            for victim in &mut victims {
+                victim.global_demotion_reserved = false;
+            }
+        }
+        let prepared_bytes = victims
+            .iter()
+            .map(|victim| owner_reclaim_backing_len(&victim.backing))
+            .fold(0u64, u64::saturating_add);
+        if global_reclaim_requested_bytes > prepared_bytes {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "owner source eviction requested {} GlobalShared reclaim bytes from only {} exact prepared bytes",
+                    global_reclaim_requested_bytes, prepared_bytes
+                ),
+            }));
+        }
         if victims.is_empty() {
+            if global_reclaim_requested_bytes != 0 {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "owner source eviction cannot request {} GlobalShared reclaim bytes without exact victims",
+                        global_reclaim_requested_bytes
+                    ),
+                }));
+            }
             return Ok(BatchEvictOwnerSourceResp {
                 operation_id: 0,
+                global_reclaim_requested_bytes: 0,
+                global_reclaim_selected_bytes: 0,
                 victims: Vec::new(),
                 error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
                 error_json: String::new(),
@@ -2471,10 +2526,19 @@ impl ClientKvApiInner {
             serialize_part: BatchEvictOwnerSourceReq {
                 operation_id,
                 owner_node_start_time: self_info.node_start_time,
+                global_reclaim_requested_bytes,
                 victims,
             },
             raw_bytes: Vec::new(),
         };
+        tracing::debug!(
+            victims = req.serialize_part.victims.len(),
+            prepared_bytes,
+            global_demotion_reserved_bytes,
+            global_reclaim_requested_bytes,
+            reserve_global_demotion,
+            "owner source eviction prepared master-screened GlobalShared reservation phase"
+        );
         let master_node_id = self
             .view
             .cluster_manager()
@@ -2501,6 +2565,15 @@ impl ClientKvApiInner {
                 detail: format!(
                     "owner source-eviction operation id mismatch: requested={} response={}",
                     operation_id, resp.serialize_part.operation_id
+                ),
+            }));
+        }
+        if resp.serialize_part.global_reclaim_requested_bytes != global_reclaim_requested_bytes {
+            return Err(KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "owner source-eviction GlobalShared reclaim echo mismatch: requested={} response={}",
+                    global_reclaim_requested_bytes,
+                    resp.serialize_part.global_reclaim_requested_bytes
                 ),
             }));
         }
@@ -2599,6 +2672,8 @@ impl ClientKvApiInner {
         key: &str,
         put_id: PutIDForAKey,
         operation_id: u64,
+        committed_slot: Option<crate::owner_segment::OwnerSlotDesc>,
+        route_token: Option<crate::owner_segment::OwnerTargetRouteToken>,
     ) -> KvResult<PutAppendDoneResp> {
         if !self.view.register_shutdown_poller().is_running() {
             return Err(KvError::Api(ApiError::SystemShutdown {
@@ -2610,6 +2685,8 @@ impl ClientKvApiInner {
                 key: key.to_string(),
                 put_id,
                 operation_id,
+                committed_slot,
+                route_token,
             },
             raw_bytes: Vec::new(),
         };
@@ -3253,12 +3330,103 @@ async fn start_replica_append_with_retry(
         .await
 }
 
-struct RemotePutTarget {
-    operation_id: u64,
-    node_id: String,
-    target_offset: u64,
-    target_base_addr: u64,
-    len: u64,
+fn owner_generation_is_current(
+    inner: &ClientKvApiInner,
+    owner: &crate::owner_segment::OwnerGeneration,
+) -> bool {
+    inner
+        .view
+        .cluster_manager()
+        .get_member_info_cached(&owner.node_id)
+        .is_some_and(|member| member.node_start_time == owner.node_start_time)
+}
+
+/// Retry one generation-safe owner operation until its per-item result is
+/// known. A transport error is ambiguous: the remote handler may already have
+/// installed a lease or committed a route, so callers must not switch targets
+/// or free state based on that error.
+async fn owner_segment_transfer_one_until_definitive(
+    inner: &ClientKvApiInner,
+    target: &crate::owner_segment::OwnerGeneration,
+    item: OwnerSegmentTransferItem,
+    phase: &'static str,
+) -> KvResult<crate::owner_segment::OwnerSegmentTransferItemResp> {
+    let mut responses =
+        owner_segment_transfer_batch_until_definitive(inner, target, vec![item], phase).await?;
+    responses.pop().ok_or_else(|| {
+        KvError::Api(ApiError::Unknown {
+            detail: format!(
+                "owner segment transfer returned no item for phase={phase} target={}",
+                target.node_id
+            ),
+        })
+    })
+}
+
+/// Replay one exact owner-RPC batch after an ambiguous transport result. The
+/// request vector and operation identities never change across attempts.
+pub(super) async fn owner_segment_transfer_batch_until_definitive(
+    inner: &ClientKvApiInner,
+    target: &crate::owner_segment::OwnerGeneration,
+    items: Vec<OwnerSegmentTransferItem>,
+    phase: &'static str,
+) -> KvResult<Vec<crate::owner_segment::OwnerSegmentTransferItemResp>> {
+    let self_info = inner.view.cluster_manager().get_self_info();
+    let request = inner.owner_transfer_peer_tracker.prepare_request(
+        crate::owner_segment::OwnerGeneration::new(self_info.id.clone(), self_info.node_start_time),
+        target,
+        items,
+    );
+    crate::owner_segment::replay_owner_segment_batch_until_definitive(
+        target,
+        request,
+        phase,
+        |request| inner.owner_segment_transfer(target, request),
+        || inner.view.register_shutdown_poller().is_running(),
+        |owner| owner_generation_is_current(inner, owner),
+    )
+    .await
+}
+
+fn owner_remote_put_source_slot(
+    inner: &ClientKvApiInner,
+    op: &OwnerRemotePutSharedOp,
+    holder: &UserMemHolder,
+) -> KvResult<(OwnerSlotDesc, u64)> {
+    let manifest = inner
+        .owner_segment_allocator
+        .lock()
+        .manifest_entry(&op.key, op.put_id)
+        .ok_or_else(|| {
+            KvError::Api(ApiError::Unknown {
+                detail: format!(
+                    "owner remote Put source is absent from the owner manifest: key={} put_id=({},{})",
+                    op.key, op.put_id.0, op.put_id.1
+                ),
+            })
+        })?;
+    let memory = holder.memory_info();
+    if manifest.physical_state != crate::owner_segment::OwnerSlotPhysicalState::Committed
+        || manifest.route_epoch == 0
+        || manifest.slot.addr != memory.addr
+        || manifest.slot.segment_offset != memory.offset
+        || manifest.slot.len != u64::from(memory.len)
+    {
+        return Err(KvError::Api(ApiError::Unknown {
+            detail: format!(
+                "owner remote Put source holder does not match the committed manifest: key={} put_id=({},{}) allocation_id={} slot_addr={:#x} holder_addr={:#x} slot_len={} holder_len={}",
+                op.key,
+                op.put_id.0,
+                op.put_id.1,
+                manifest.slot.allocation_id,
+                manifest.slot.addr,
+                memory.addr,
+                manifest.slot.len,
+                memory.len,
+            ),
+        }));
+    }
+    Ok((manifest.slot, manifest.route_epoch))
 }
 
 fn owner_source_eviction_identity(
@@ -3284,15 +3452,17 @@ fn owner_source_eviction_victim(
     memory_info: &crate::memholder::MemoryInfo,
     ssd_capacity_writeback_enabled: bool,
 ) -> Option<OwnerSourceEvictionVictim> {
-    let (slot_size, grant_id, slot_index) = memory_info.local_reserve_resident_slot_ref()?;
+    let (allocation_id, segment_offset, capacity_bytes) =
+        memory_info.local_reserve_resident_slot_ref()?;
     Some(OwnerSourceEvictionVictim {
         key: identity.key.clone(),
         put_id: (identity.put_time_ms, identity.put_version),
         backing: OwnerReclaimBacking::CommittedSlot {
-            grant_id,
-            slot_index,
-            slot_size,
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
         },
+        global_demotion_reserved: false,
         ssd_backing_len: None,
         ssd_policy: owner_source_ssd_policy(ssd_capacity_writeback_enabled),
     })
@@ -3304,6 +3474,23 @@ fn finish_owner_source_selection(
     restore_current: bool,
     reason: &str,
 ) {
+    if let OwnerReclaimBacking::CommittedSlot {
+        allocation_id,
+        segment_offset,
+        capacity_bytes,
+    } = &victim.backing
+    {
+        inner
+            .owner_segment_allocator
+            .lock()
+            .release_global_demotion_reservation(
+                &victim.key,
+                victim.put_id,
+                *allocation_id,
+                *segment_offset,
+                *capacity_bytes,
+            );
+    }
     let identity = owner_source_eviction_identity(victim);
     if let Some(debt) = inner.owner_hot_remove_source_selection_debt(&identity) {
         debt.release();
@@ -3496,7 +3683,8 @@ async fn finish_owner_source_eviction_result(
         && !result.ssd_backing_committed
         && matches!(
             result.outcome,
-            OwnerSourceEvictionOutcome::Completed
+            OwnerSourceEvictionOutcome::DemotedGlobal
+                | OwnerSourceEvictionOutcome::Completed
                 | OwnerSourceEvictionOutcome::Stale
                 | OwnerSourceEvictionOutcome::RejectedNotEvictable
         )
@@ -3512,7 +3700,50 @@ async fn finish_owner_source_eviction_result(
                 .source_evict_handoff_members
                 .fetch_add(1, Ordering::Relaxed);
         }
+        OwnerSourceEvictionOutcome::DemotedGlobal => {
+            let epoch = owner_source_eviction_epoch(operation_id, index);
+            match super::reclaim::complete_owner_source_demotion(inner, &victim, epoch) {
+                Ok(()) => {
+                    inner
+                        .owner_hot_counters
+                        .source_evict_handoff_members
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(detail) => {
+                    tracing::warn!(
+                        key = victim.key,
+                        put_time_ms = victim.put_id.0,
+                        put_version = victim.put_id.1,
+                        detail,
+                        "master demoted source route but owner local-index release must retry"
+                    );
+                    schedule_owner_source_eviction_retry(
+                        inner,
+                        event,
+                        victim,
+                        "owner local-index release after metadata-only demotion is temporarily busy",
+                    );
+                }
+            }
+        }
         OwnerSourceEvictionOutcome::Completed => {
+            if let OwnerReclaimBacking::CommittedSlot {
+                allocation_id,
+                segment_offset,
+                capacity_bytes,
+            } = &victim.backing
+            {
+                inner
+                    .owner_segment_allocator
+                    .lock()
+                    .release_global_demotion_reservation(
+                        &victim.key,
+                        victim.put_id,
+                        *allocation_id,
+                        *segment_offset,
+                        *capacity_bytes,
+                    );
+            }
             let epoch = owner_source_eviction_epoch(operation_id, index);
             match super::reclaim::complete_owner_source_eviction(inner, &victim, epoch) {
                 Ok(()) => {
@@ -3559,6 +3790,14 @@ async fn finish_owner_source_eviction_result(
                 "master source reclaim is temporarily busy",
             );
         }
+        OwnerSourceEvictionOutcome::NeedsGlobalReservation => {
+            schedule_owner_source_eviction_retry(
+                inner,
+                event,
+                victim,
+                "master-screened last backing is waiting for exact GlobalShared reservation",
+            );
+        }
         OwnerSourceEvictionOutcome::Stale => {
             finish_owner_source_selection(
                 inner,
@@ -3590,38 +3829,92 @@ async fn submit_owner_source_eviction_decisions(
     response_length_reason: &'static str,
     response_identity_reason: &'static str,
 ) {
-    if prepared.is_empty() {
-        return;
-    }
-    let response = inner
-        .batch_evict_owner_source(
-            prepared
-                .iter()
-                .map(|(_, victim)| victim.as_ref().clone())
-                .collect(),
-        )
-        .await;
-    let Ok(response) = response else {
-        for (event, victim) in prepared {
-            schedule_owner_source_eviction_retry(inner, event, victim, rpc_failure_reason);
+    submit_owner_source_eviction_decisions_with_followup(
+        inner,
+        prepared,
+        true,
+        rpc_failure_reason,
+        response_length_reason,
+        response_identity_reason,
+    )
+    .await;
+}
+
+async fn submit_owner_source_eviction_decisions_with_followup(
+    inner: &ClientKvApiInner,
+    mut prepared: Vec<(OwnerHotEvictionEvent, Arc<OwnerSourceEvictionVictim>)>,
+    mut allow_global_reservation_followup: bool,
+    rpc_failure_reason: &'static str,
+    response_length_reason: &'static str,
+    response_identity_reason: &'static str,
+) {
+    loop {
+        if prepared.is_empty() {
+            return;
         }
-        return;
-    };
-    if response.victims.len() != prepared.len() {
-        for (event, victim) in prepared {
-            schedule_owner_source_eviction_retry(inner, event, victim, response_length_reason);
-        }
-        return;
-    }
-    let operation_id = response.operation_id;
-    for (index, ((event, victim), result)) in prepared.into_iter().zip(response.victims).enumerate()
-    {
-        if result.victim_index != u32::try_from(index).unwrap_or(u32::MAX) {
-            schedule_owner_source_eviction_retry(inner, event, victim, response_identity_reason);
-            continue;
-        }
-        finish_owner_source_eviction_result(inner, operation_id, index, event, victim, result)
+        let response = inner
+            .batch_evict_owner_source(
+                prepared
+                    .iter()
+                    .map(|(_, victim)| victim.as_ref().clone())
+                    .collect(),
+                0,
+                !allow_global_reservation_followup,
+            )
             .await;
+        let Ok(response) = response else {
+            for (event, victim) in prepared {
+                schedule_owner_source_eviction_retry(inner, event, victim, rpc_failure_reason);
+            }
+            return;
+        };
+        if response.victims.len() != prepared.len() {
+            for (event, victim) in prepared {
+                schedule_owner_source_eviction_retry(inner, event, victim, response_length_reason);
+            }
+            return;
+        }
+        let operation_id = response.operation_id;
+        let mut reservation_candidates = Vec::new();
+        for (index, ((event, victim), result)) in
+            prepared.into_iter().zip(response.victims).enumerate()
+        {
+            if result.victim_index != u32::try_from(index).unwrap_or(u32::MAX) {
+                schedule_owner_source_eviction_retry(
+                    inner,
+                    event,
+                    victim,
+                    response_identity_reason,
+                );
+                continue;
+            }
+            if result.outcome == OwnerSourceEvictionOutcome::NeedsGlobalReservation {
+                reservation_candidates.push((event, victim));
+                continue;
+            }
+            finish_owner_source_eviction_result(inner, operation_id, index, event, victim, result)
+                .await;
+        }
+        if reservation_candidates.is_empty() {
+            return;
+        }
+        if !allow_global_reservation_followup {
+            for (event, victim) in reservation_candidates {
+                schedule_owner_source_eviction_retry(
+                    inner,
+                    event,
+                    victim,
+                    "master-screened last backing still lacks exact GlobalShared headroom",
+                );
+            }
+            return;
+        }
+        tracing::info!(
+            candidates = reservation_candidates.len(),
+            "retrying only master-screened last backings after direct-delete reservations were released"
+        );
+        prepared = reservation_candidates;
+        allow_global_reservation_followup = false;
     }
 }
 
@@ -3685,15 +3978,22 @@ mod owner_ssd_fast_drop_tests {
 async fn process_owner_source_eviction_events(
     view: &ClientKvApiView,
     events: Vec<OwnerHotEvictionEvent>,
-) {
+    pressure_global_headroom_before: Option<u64>,
+) -> OwnerPressureBatchReclaim {
     let inner = view.client_kv_api().inner();
     let prepared = events
         .into_iter()
         .filter_map(|event| prepare_owner_source_eviction_event(inner, event))
         .collect::<Vec<_>>();
     if prepared.is_empty() {
-        return;
+        return OwnerPressureBatchReclaim::default();
     }
+    let prepared_bytes = prepared
+        .iter()
+        .map(|(_, victim)| owner_reclaim_backing_len(&victim.backing))
+        .fold(0u64, u64::saturating_add);
+    let global_reclaim_requested_bytes =
+        owner_pressure_global_reclaim_request(prepared_bytes, pressure_global_headroom_before);
     // The first pass never touches SSD. Master deletes sources that already
     // have another live backing and returns only exact last-copy candidates.
     let response = inner
@@ -3702,6 +4002,8 @@ async fn process_owner_source_eviction_events(
                 .iter()
                 .map(|(_, victim)| victim.as_ref().clone())
                 .collect(),
+            global_reclaim_requested_bytes,
+            false,
         )
         .await;
     let Ok(response) = response else {
@@ -3713,8 +4015,22 @@ async fn process_owner_source_eviction_events(
                 "owner source-eviction RPC failed",
             );
         }
-        return;
+        return OwnerPressureBatchReclaim {
+            requested_bytes: global_reclaim_requested_bytes,
+            selected_bytes: 0,
+        };
     };
+    let pressure_reclaim = OwnerPressureBatchReclaim {
+        requested_bytes: response.global_reclaim_requested_bytes,
+        selected_bytes: response.global_reclaim_selected_bytes,
+    };
+    tracing::info!(
+        prepared_bytes,
+        pressure_global_headroom_before,
+        global_reclaim_requested_bytes = response.global_reclaim_requested_bytes,
+        global_reclaim_selected_bytes = response.global_reclaim_selected_bytes,
+        "owner pressure batch GlobalShared selection completed"
+    );
     if response.victims.len() != prepared.len() {
         for (event, victim) in prepared {
             schedule_owner_source_eviction_retry(
@@ -3724,7 +4040,7 @@ async fn process_owner_source_eviction_events(
                 "owner source-eviction response length mismatch",
             );
         }
-        return;
+        return pressure_reclaim;
     }
 
     let retryable = response
@@ -3761,6 +4077,7 @@ async fn process_owner_source_eviction_events(
 
     let first_operation_id = response.operation_id;
     let mut candidates = Vec::new();
+    let mut reservation_candidates = Vec::new();
     for (index, ((event, victim), result)) in prepared
         .into_iter()
         .zip(response.victims.into_iter())
@@ -3781,6 +4098,10 @@ async fn process_owner_source_eviction_events(
             candidates.push((event, victim));
             continue;
         }
+        if result.outcome == OwnerSourceEvictionOutcome::NeedsGlobalReservation {
+            reservation_candidates.push((event, victim));
+            continue;
+        }
         finish_owner_source_eviction_result(
             inner,
             first_operation_id,
@@ -3792,8 +4113,25 @@ async fn process_owner_source_eviction_events(
         .await;
     }
 
+    // The first master pass has now completed all direct deletes, so their
+    // speculative reservations have been released.  Retry only the exact
+    // last-live subset in one batch; batch_evict_owner_source() can reserve
+    // those candidates without letting the much larger duplicate-backed set
+    // consume GlobalShared headroom first.  One immediate follow-up is
+    // enough; candidates still waiting for a real Free enter the bounded
+    // retry queue instead of spinning here.
+    submit_owner_source_eviction_decisions_with_followup(
+        inner,
+        reservation_candidates,
+        false,
+        "master-screened GlobalShared reservation follow-up RPC failed",
+        "master-screened GlobalShared reservation response length mismatch",
+        "master-screened GlobalShared reservation response identity mismatch",
+    )
+    .await;
+
     if candidates.is_empty() {
-        return;
+        return pressure_reclaim;
     }
     let candidate_lengths = candidates
         .iter()
@@ -3889,6 +4227,29 @@ async fn process_owner_source_eviction_events(
         "owner SSD persisted decision response identity mismatch",
     )
     .await;
+    pressure_reclaim
+}
+
+fn owner_pressure_global_reclaim_request(
+    prepared_bytes: u64,
+    pressure_global_headroom_before: Option<u64>,
+) -> u64 {
+    pressure_global_headroom_before
+        .map(|headroom| prepared_bytes.saturating_sub(headroom))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod owner_pressure_global_reclaim_tests {
+    use super::owner_pressure_global_reclaim_request;
+
+    #[test]
+    fn only_exact_prepared_bytes_beyond_global_headroom_request_reclaim() {
+        assert_eq!(owner_pressure_global_reclaim_request(64, None), 0);
+        assert_eq!(owner_pressure_global_reclaim_request(64, Some(96)), 0);
+        assert_eq!(owner_pressure_global_reclaim_request(64, Some(16)), 48);
+        assert_eq!(owner_pressure_global_reclaim_request(64, Some(0)), 64);
+    }
 }
 
 pub fn spawn_owner_source_eviction_dispatcher(
@@ -3922,6 +4283,7 @@ pub fn spawn_owner_source_eviction_dispatcher(
                         process_owner_source_eviction_events(
                             &view_task,
                             std::mem::take(&mut events),
+                            None,
                         )
                         .await;
                         continue;
@@ -3930,8 +4292,12 @@ pub fn spawn_owner_source_eviction_dispatcher(
             };
             let Some(dispatch) = dispatch else {
                 if !events.is_empty() {
-                    process_owner_source_eviction_events(&view_task, std::mem::take(&mut events))
-                        .await;
+                    process_owner_source_eviction_events(
+                        &view_task,
+                        std::mem::take(&mut events),
+                        None,
+                    )
+                    .await;
                 }
                 break;
             };
@@ -3948,6 +4314,7 @@ pub fn spawn_owner_source_eviction_dispatcher(
                         process_owner_source_eviction_events(
                             &view_task,
                             std::mem::take(&mut events),
+                            None,
                         )
                         .await;
                     }
@@ -3955,8 +4322,14 @@ pub fn spawn_owner_source_eviction_dispatcher(
                 }
                 super::OwnerHotEvictionDispatch::EndPressure {
                     selected_bytes,
+                    global_headroom_before,
                     completion,
                 } => {
+                    let pressure_global_headroom_before = if pressure_open {
+                        Some(global_headroom_before)
+                    } else {
+                        None
+                    };
                     if !pressure_open {
                         tracing::warn!(
                             selected_bytes,
@@ -3964,11 +4337,17 @@ pub fn spawn_owner_source_eviction_dispatcher(
                         );
                     }
                     pressure_open = false;
-                    process_owner_source_eviction_events(&view_task, std::mem::take(&mut events))
-                        .await;
-                    if completion.send(()).is_err() {
+                    let global_reclaim = process_owner_source_eviction_events(
+                        &view_task,
+                        std::mem::take(&mut events),
+                        pressure_global_headroom_before,
+                    )
+                    .await;
+                    if completion.send(global_reclaim).is_err() {
                         tracing::debug!(
                             selected_bytes,
+                            global_reclaim_requested_bytes = global_reclaim.requested_bytes,
+                            global_reclaim_selected_bytes = global_reclaim.selected_bytes,
                             "owner pressure producer stopped before batch completion ACK"
                         );
                     }
@@ -3978,6 +4357,7 @@ pub fn spawn_owner_source_eviction_dispatcher(
                         process_owner_source_eviction_events(
                             &view_task,
                             std::mem::take(&mut events),
+                            None,
                         )
                         .await;
                     }
@@ -4259,15 +4639,6 @@ impl OwnerRemotePutTaskGuard {
         self.finished = true;
         drop(self.admission_permit.take());
     }
-
-    fn release_transfer_bytes(&mut self) {
-        let released = self
-            .admission_permit
-            .as_mut()
-            .expect("remote Put admission permit missing before task terminal")
-            .release_transfer_bytes();
-        debug_assert!(released, "remote Put transfer bytes released twice");
-    }
 }
 
 impl Drop for OwnerRemotePutTaskGuard {
@@ -4299,7 +4670,6 @@ async fn run_owner_remote_put(
     mut task_guard: OwnerRemotePutTaskGuard,
 ) {
     let inner = view.client_kv_api().inner();
-    let src_offset = holder.memory_info().offset;
     let len = holder.get_length() as u64;
     let len_u32 = match u32::try_from(len) {
         Ok(len_u32) => len_u32,
@@ -4313,6 +4683,23 @@ async fn run_owner_remote_put(
             );
             drop(holder);
             revoke_owner_remote_put(&view, &op, None, "length does not fit u32").await;
+            task_guard.finish(OwnerRemotePutOutcome::Failed);
+            return;
+        }
+    };
+
+    let (source_slot, source_route_epoch) = match owner_remote_put_source_slot(inner, &op, &holder)
+    {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!(
+                key = op.key,
+                put_time_ms = op.put_id.0,
+                put_version = op.put_id.1,
+                error = %error,
+                "owner remote Put cannot identify its exact source slot"
+            );
+            drop(holder);
             task_guard.finish(OwnerRemotePutOutcome::Failed);
             return;
         }
@@ -4360,89 +4747,240 @@ async fn run_owner_remote_put(
         }
     }
 
-    let target = RemotePutTarget {
-        operation_id: append_start.operation_id,
-        node_id: append_start.node_id,
-        target_offset: append_start.target_addr - append_start.target_base_addr,
-        target_base_addr: append_start.target_base_addr,
-        len: append_start.len,
-    };
-    if len != target.len {
+    let operation_id = append_start.operation_id;
+    if operation_id == 0 || append_start.len != len || append_start.owner_candidates.is_empty() {
         tracing::warn!(
-            "owner remote Put length mismatch: key={} put_id=({},{}) src_len={} target_len={}",
-            op.key,
-            op.put_id.0,
-            op.put_id.1,
-            len,
-            target.len
+            key = op.key,
+            put_time_ms = op.put_id.0,
+            put_version = op.put_id.1,
+            operation_id,
+            source_len = len,
+            planned_len = append_start.len,
+            candidate_count = append_start.owner_candidates.len(),
+            "owner remote Put received an invalid owner-target plan"
         );
         drop(holder);
-        revoke_owner_remote_put(&view, &op, Some(target.operation_id), "length mismatch").await;
+        revoke_owner_remote_put(&view, &op, Some(operation_id), "invalid owner-target plan").await;
         task_guard.finish(OwnerRemotePutOutcome::Failed);
         return;
     }
 
-    inner.record_owner_remote_put_transfer();
-    let transfer_result = inner
-        .put_transfer(
-            &op.key,
-            op.put_id,
-            src_offset,
-            target.target_offset,
-            len,
-            Some(target.node_id),
-            Some(target.target_base_addr),
-        )
-        .await;
-    // The payload and byte admission credit cover only the transfer. Keep the
-    // item credit and generation flight through Done/Revoke so a slow control
-    // response cannot block unrelated payloads from entering the data plane.
-    drop(holder);
-    task_guard.release_transfer_bytes();
-    if let Err(err) = transfer_result {
-        tracing::warn!(
-            "owner remote Put transfer failed: key={} put_id=({},{}) err={}",
-            op.key,
-            op.put_id.0,
-            op.put_id.1,
-            err
-        );
-        revoke_owner_remote_put(&view, &op, Some(target.operation_id), "transfer error").await;
-        task_guard.finish(OwnerRemotePutOutcome::Failed);
-        return;
-    }
-
-    match inner
-        .put_append_done(&op.key, op.put_id, target.operation_id)
-        .await
-    {
-        Ok(resp) => {
-            let outcome = if resp.appended {
-                OwnerRemotePutOutcome::Published
-            } else {
-                OwnerRemotePutOutcome::AlreadySatisfied
-            };
-            tracing::debug!(
-                "owner remote Put done: key={} put_id=({},{}) appended={}",
-                op.key,
-                op.put_id.0,
-                op.put_id.1,
-                resp.appended
-            );
-            task_guard.finish(outcome);
-        }
-        Err(err) => {
+    let mut published = false;
+    for (candidate_index, target_plan) in append_start.owner_candidates.into_iter().enumerate() {
+        let Ok(target_attempt) = u32::try_from(candidate_index.saturating_add(1)) else {
             tracing::warn!(
-                "owner remote Put done failed: key={} put_id=({},{}) err={}",
-                op.key,
-                op.put_id.0,
-                op.put_id.1,
-                err
+                key = op.key,
+                put_time_ms = op.put_id.0,
+                put_version = op.put_id.1,
+                operation_id,
+                "owner remote Put candidate count exceeded target-attempt identity space"
             );
-            revoke_owner_remote_put(&view, &op, Some(target.operation_id), "done error").await;
-            task_guard.finish(OwnerRemotePutOutcome::Failed);
+            break;
+        };
+        if target_plan.key != op.key
+            || target_plan.put_id != op.put_id
+            || target_plan.operation.sequence != operation_id
+            || target_plan.operation.coordinator != source_slot.owner
+            || target_plan.target_owner == source_slot.owner
+            || target_plan.plan_nonce != operation_id
+        {
+            tracing::warn!(
+                key = op.key,
+                put_time_ms = op.put_id.0,
+                put_version = op.put_id.1,
+                operation_id,
+                target_attempt,
+                target_node_id = target_plan.target_owner.node_id,
+                "owner remote Put candidate token does not match its source operation"
+            );
+            break;
+        }
+        let source_capability = OwnerSourceReadCapability {
+            operation: target_plan.operation.clone(),
+            target_owner: target_plan.target_owner.clone(),
+            target_attempt,
+            route: OwnerSourceRouteToken {
+                key: op.key.clone(),
+                put_id: op.put_id,
+                route_epoch: source_route_epoch,
+                source: source_slot.clone(),
+                atomic_batch: target_plan.atomic_batch.clone(),
+                plan_nonce: operation_id,
+            },
+        };
+        let outcome = owner_segment_transfer_one_until_definitive(
+            inner,
+            &target_plan.target_owner,
+            OwnerSegmentTransferItem::PutFromSource {
+                op_id: target_plan.operation.clone(),
+                target_attempt,
+                target_plan: target_plan.clone(),
+                source: source_capability,
+                disposition: OwnerTargetDisposition::GlobalShared,
+                route_commit_mode: OwnerRouteCommitMode::Async,
+            },
+            "put_from_source",
+        )
+        .await
+        .map(|response| {
+            inner
+                .owner_transfer_peer_tracker
+                .record_terminal(&target_plan.target_owner, response.terminal_sequence);
+            response.outcome
+        });
+        match outcome {
+            Ok(OwnerSegmentTransferOutcome::PutFromSourceAcceptedRoutePending {
+                target_attempt: completed_attempt,
+                source,
+                target,
+                receipt,
+            }) if completed_attempt == target_attempt
+                && source == source_slot
+                && target.owner == target_plan.target_owner
+                && target.len == len
+                && receipt.completion_id == operation_id
+                && receipt.direction == OwnerTransferDirection::RdmaRead
+                && receipt.bytes == len
+                && receipt.source.as_ref() == Some(&source_slot)
+                && receipt.target == target
+                && receipt.source_registration_epoch == source_slot.segment_registration_epoch
+                && receipt.target_registration_epoch == target.segment_registration_epoch =>
+            {
+                tracing::debug!(
+                    key = op.key,
+                    put_time_ms = op.put_id.0,
+                    put_version = op.put_id.1,
+                    operation_id,
+                    target_attempt,
+                    target_node_id = target_plan.target_owner.node_id,
+                    "owner remote Put payload accepted; route commit continues asynchronously"
+                );
+                published = true;
+                break;
+            }
+            Ok(OwnerSegmentTransferOutcome::PutFromSourceCompleted {
+                target_attempt: completed_attempt,
+                source,
+                target,
+                receipt,
+                route_epoch,
+            }) if completed_attempt == target_attempt
+                && source == source_slot
+                && target.owner == target_plan.target_owner
+                && target.len == len
+                && receipt.completion_id == operation_id
+                && receipt.direction == OwnerTransferDirection::RdmaRead
+                && receipt.bytes == len
+                && receipt.source.as_ref() == Some(&source_slot)
+                && receipt.target == target
+                && receipt.source_registration_epoch == source_slot.segment_registration_epoch
+                && receipt.target_registration_epoch == target.segment_registration_epoch
+                && route_epoch != 0 =>
+            {
+                tracing::debug!(
+                    key = op.key,
+                    put_time_ms = op.put_id.0,
+                    put_version = op.put_id.1,
+                    operation_id,
+                    target_attempt,
+                    target_node_id = target_plan.target_owner.node_id,
+                    route_epoch,
+                    "owner remote Put completed through one target-side PutFromSource RPC"
+                );
+                published = true;
+                break;
+            }
+            Ok(OwnerSegmentTransferOutcome::TargetAborted) => {
+                tracing::debug!(
+                    key = op.key,
+                    put_time_ms = op.put_id.0,
+                    put_version = op.put_id.1,
+                    operation_id,
+                    target_attempt,
+                    target_node_id = target_plan.target_owner.node_id,
+                    "PutFromSource target aborted before route publication"
+                );
+            }
+            Ok(OwnerSegmentTransferOutcome::Error(error))
+                if matches!(
+                    error.code,
+                    OwnerTransferErrorCode::NoSpace
+                        | OwnerTransferErrorCode::Busy
+                        | OwnerTransferErrorCode::StaleGeneration
+                ) =>
+            {
+                tracing::debug!(
+                    key = op.key,
+                    put_time_ms = op.put_id.0,
+                    put_version = op.put_id.1,
+                    operation_id,
+                    target_attempt,
+                    target_node_id = target_plan.target_owner.node_id,
+                    code = ?error.code,
+                    detail = error.detail,
+                    "PutFromSource candidate rejected before a committed transfer"
+                );
+            }
+            Ok(OwnerSegmentTransferOutcome::Error(error)) => {
+                tracing::warn!(
+                    key = op.key,
+                    put_time_ms = op.put_id.0,
+                    put_version = op.put_id.1,
+                    operation_id,
+                    target_attempt,
+                    target_node_id = target_plan.target_owner.node_id,
+                    code = ?error.code,
+                    detail = error.detail,
+                    "PutFromSource returned a non-retryable terminal"
+                );
+                break;
+            }
+            Ok(other) => {
+                tracing::warn!(
+                    key = op.key,
+                    put_time_ms = op.put_id.0,
+                    put_version = op.put_id.1,
+                    operation_id,
+                    target_attempt,
+                    target_node_id = target_plan.target_owner.node_id,
+                    outcome = ?other,
+                    "PutFromSource returned an invalid terminal"
+                );
+                break;
+            }
+            Err(error) => {
+                let target_current = owner_generation_is_current(inner, &target_plan.target_owner);
+                tracing::warn!(
+                    key = op.key,
+                    put_time_ms = op.put_id.0,
+                    put_version = op.put_id.1,
+                    operation_id,
+                    target_attempt,
+                    target_node_id = target_plan.target_owner.node_id,
+                    target_current,
+                    error = %error,
+                    "PutFromSource did not reach a live target generation"
+                );
+                if !inner.view.register_shutdown_poller().is_running() || target_current {
+                    break;
+                }
+            }
         }
     }
+
+    drop(holder);
+    if published {
+        task_guard.finish(OwnerRemotePutOutcome::Published);
+        return;
+    }
+    revoke_owner_remote_put(
+        &view,
+        &op,
+        Some(operation_id),
+        "no PutFromSource target committed",
+    )
+    .await;
+    task_guard.finish(OwnerRemotePutOutcome::Failed);
 }
 
 pub async fn handle_batch_enqueue_replica_tasks(

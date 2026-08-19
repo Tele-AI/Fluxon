@@ -1,55 +1,64 @@
 use super::{
-    ClientKvApiInner, ClientKvApiView, OwnerHotEvictionDispatch, OwnerLocalReserveGrantState,
-    OwnerLocalReservePoolState,
+    ClientKvApiInner, ClientKvApiView, OwnerHotEvictionDispatch, OwnerPressureBatchReclaim,
+    OwnerSegmentAllocator,
 };
-use crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
-use crate::master_kv_router::msg_pack::ReserveLocalGrantOutcome;
+use crate::client_seg_pool::ClientSegPoolAccessTrait;
+use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+use crate::master_seg_manager::msg_pack::{
+    OwnerCapacityReport, OwnerCapacityReportReq, OwnerPlacementClass, OwnerSizeClassCapacity,
+    SegmentAllocationAuthority,
+};
+use crate::p2p::control_plane_rpc::call_control_plane_rpc;
+use crate::p2p::msg_pack::MsgPack;
+use crate::p2p::p2p_module::P2pModuleAccessTrait;
+use crate::rpcresp_kvresult_convert::msg_and_error::{KvError, OK};
 use limit_thirdparty::tokio;
 use std::{
     collections::BTreeSet,
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
-const OWNER_LOCAL_RESERVE_REBALANCE_INTERVAL: Duration = Duration::from_millis(200);
-const OWNER_LOCAL_RESERVE_SHRINK_IDLE_COOLDOWN: Duration = Duration::from_secs(5);
-const OWNER_LOCAL_RESERVE_SHRINK_GROW_COOLDOWN: Duration = Duration::from_secs(1);
+const OWNER_SEGMENT_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+const OWNER_CAPACITY_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+// The unified RPC contract rejects explicit timeouts below ten seconds.
+// Successful periodic reports still return immediately; this is only the
+// transport failure bound and is independent from the five-second freshness
+// gate used by placement.
+const OWNER_CAPACITY_REPORT_TIMEOUT: Duration = Duration::from_secs(10);
 const OWNER_LOCAL_RESERVE_DEFAULT_SOFT_WAIT_TIMEOUT: Duration = Duration::from_millis(10);
-// AtomicBatch-safe master route deletion plus owner slot release is asynchronous.
-// Thirty seconds turns a recoverable pressure burst into a storage exception that
-// can wedge SGLang's detokenizer.  This remains well below the external request
-// timeout while allowing bounded backpressure to finish reclaiming slots.
 const OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT: Duration = Duration::from_secs(30);
-const OWNER_LOCAL_RESERVE_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 const OWNER_SLOT_PRESSURE_INTERVAL: Duration = Duration::from_millis(10);
-// Source deletion now has an exact, idempotent owner -> master transaction and
-// selection debt accounts for candidates until their slots are physically Free.
-// Keep pressure retries responsive: a 200 ms gate used to surface directly as
-// local_fast_put_start tail latency whenever one bounded kick was insufficient.
 const OWNER_SLOT_PRESSURE_MIN_KICK_INTERVAL: Duration = Duration::from_millis(25);
-// Start with enough exact missing bytes, but avoid tiny victim-at-a-time loops
-// by selecting up to 64 MiB for a small claimant. A still-failed real claim
-// doubles the next round; no one round may select more than eight grants.
 const OWNER_SLOT_PRESSURE_INITIAL_COARSE_BYTES: u64 = 64 * 1024 * 1024;
-const OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES: u64 = OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES * 8;
+// Bound one pressure round in bytes. Physical ownership is one complete segment.
+const OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct ExpectedCapacityLayout {
     value_len: u64,
     slot_size: u64,
     payload_capacity_bytes: u64,
-    payload_grant_count: usize,
     physical_capacity_bytes: u64,
-    physical_grant_count: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+struct SlotPressureCapacity {
+    accounting_slot_size: u64,
+    allocatable_slots: u64,
+    allocatable_bytes: u64,
+    slot_unallocatable_bytes: u64,
+    pending_size_classes: usize,
+    initial_pop_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 struct RebalanceSnapshot {
     used_bytes: u64,
     free_bytes: u64,
     largest_free_bytes: u64,
     pending_bytes: u64,
     largest_pending_slot_size: u64,
-    grant_size_bytes: u64,
     accounting_slot_size: u64,
     allocatable_slots: u64,
     allocatable_bytes: u64,
@@ -57,14 +66,432 @@ struct RebalanceSnapshot {
     pending_size_classes: usize,
     pressure_initial_pop_bytes: u64,
     claim_progress_epoch: u64,
-    grant_count: usize,
-    expected_grant_count: usize,
-    forced_refill_grants: usize,
+    physical_free_epoch: u64,
+    physical_capacity_bytes: u64,
+    local_target_bytes: u64,
+    global_accounted_bytes: u64,
 }
 
-fn div_ceil_usize_bytes(bytes: u64, quantum: u64) -> usize {
-    let count = bytes / quantum + u64::from(bytes % quantum != 0);
-    usize::try_from(count).unwrap_or(usize::MAX)
+fn expected_capacity_layout(
+    value_len: u64,
+    payload_capacity_bytes: u64,
+    physical_capacity_bytes: u64,
+) -> ExpectedCapacityLayout {
+    let slot_size = crate::owner_segment_allocation_capacity_bytes(value_len)
+        .expect("owner expected slot size must be config-validated");
+    assert!(
+        payload_capacity_bytes <= physical_capacity_bytes,
+        "logical owner-local capacity must fit the physical segment"
+    );
+    ExpectedCapacityLayout {
+        value_len,
+        slot_size,
+        payload_capacity_bytes,
+        physical_capacity_bytes,
+    }
+}
+
+fn configured_expected_capacity(inner: &ClientKvApiInner) -> Option<ExpectedCapacityLayout> {
+    let expected = inner
+        .test_spec_config
+        .owner_local_reserve_expected_capacity
+        .as_ref()?;
+    Some(expected_capacity_layout(
+        expected.value_len,
+        expected.payload_capacity_bytes,
+        inner.owner_local_reserve_physical_capacity_bytes,
+    ))
+}
+
+async fn install_owner_segment_allocator(view: &ClientKvApiView) -> Result<(), String> {
+    let inner = view.client_kv_api().inner();
+    if inner.allocation_authority != SegmentAllocationAuthority::Owner {
+        if inner.owner_hot_cache.is_some() {
+            return Err(
+                "owner-local Moka requires owner allocation authority for the complete segment"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    if !inner.owner_placement_class.is_valid() {
+        return Err(
+            "owner allocation authority requires an explicit inference or remote_cpu placement class"
+                .to_string(),
+        );
+    }
+
+    let segment = view
+        .client_seg_pool()
+        .cpu_mem_read_guard()
+        .await
+        .map_err(|err| format!("owner allocator cannot read the registered segment: {err}"))?;
+    let base_addr = segment.allocated_addr;
+    let segment_bytes = segment.allocated_size;
+    drop(segment);
+    if segment_bytes != inner.owner_local_reserve_physical_capacity_bytes {
+        return Err(format!(
+            "owner segment/config mismatch: segment_bytes={} configured_bytes={}",
+            segment_bytes, inner.owner_local_reserve_physical_capacity_bytes
+        ));
+    }
+    if segment_bytes == 0 || segment_bytes % crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES != 0
+    {
+        return Err(format!(
+            "owner segment must be a non-zero multiple of {} bytes: segment_bytes={}",
+            crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES,
+            segment_bytes
+        ));
+    }
+
+    let local_target_bytes = match inner.owner_placement_class {
+        OwnerPlacementClass::Inference => inner
+            .owner_hot_cache
+            .as_ref()
+            .and_then(|cache| cache.max_capacity())
+            .ok_or_else(|| "inference owner requires owner-local Moka".to_string())?,
+        OwnerPlacementClass::RemoteCpu => {
+            if inner.owner_hot_cache.is_some() {
+                return Err("remote_cpu owner must not create owner-local Moka".to_string());
+            }
+            0
+        }
+        OwnerPlacementClass::Invalid => unreachable!("validated owner placement class"),
+    };
+    let expected_slot_size = configured_expected_capacity(inner).map(|layout| layout.slot_size);
+    let self_info = view.cluster_manager().get_self_info();
+    let registration_epoch = u64::try_from(self_info.node_start_time).map_err(|_| {
+        format!(
+            "owner segment registration epoch must be non-negative: owner={} node_start_time={}",
+            self_info.id, self_info.node_start_time
+        )
+    })?;
+    inner.owner_segment_allocator.lock().install_segment(
+        crate::owner_segment::OwnerGeneration::new(
+            self_info.id.to_string(),
+            self_info.node_start_time,
+        ),
+        registration_epoch,
+        base_addr,
+        base_addr,
+        segment_bytes,
+        local_target_bytes,
+        expected_slot_size,
+    )?;
+    tracing::info!(
+        base_addr,
+        segment_bytes,
+        local_target_bytes,
+        global_target_bytes = segment_bytes.saturating_sub(local_target_bytes),
+        allocator_unit_bytes = crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES,
+        allocator_max_metadata_nodes = 128 * 1024,
+        "installed one allocator over the complete owner-authoritative DRAM segment"
+    );
+    Ok(())
+}
+
+fn slot_pressure_capacity(pool: &OwnerSegmentAllocator) -> SlotPressureCapacity {
+    let slot_sizes = BTreeSet::from_iter(pool.pending_demand_by_slot_size.iter().filter_map(
+        |(slot_size, count)| {
+            (*count != 0 && pool.slot_size_has_failed_claim(*slot_size)).then_some(*slot_size)
+        },
+    ));
+    let Some(accounting_slot_size) = pool
+        .expected_slot_size
+        .filter(|slot_size| slot_sizes.contains(slot_size))
+        .or_else(|| slot_sizes.iter().next_back().copied())
+    else {
+        return SlotPressureCapacity::default();
+    };
+    let accounting_report = pool.allocatable_report(accounting_slot_size);
+    let mut initial_pop_bytes = 0u64;
+    for slot_size in slot_sizes {
+        let report = if slot_size == accounting_slot_size {
+            accounting_report
+        } else {
+            pool.allocatable_report(slot_size)
+        };
+        let pending_slots = u64::try_from(pool.pending_demand_slots(slot_size)).unwrap_or(u64::MAX);
+        if pending_slots > report.allocatable_slots {
+            let missing_bytes = pending_slots
+                .saturating_sub(report.allocatable_slots)
+                .saturating_mul(slot_size);
+            let pending_batch_bytes = pending_slots
+                .saturating_mul(slot_size)
+                .min(OWNER_SLOT_PRESSURE_INITIAL_COARSE_BYTES);
+            // Size classes view the same free extents, so the maximum shortage
+            // is the one shared pressure budget. Summing would double count.
+            // Reclaim one additional bounded copy of the currently pending
+            // batch.  This leaves real allocator headroom for the next
+            // request instead of forcing every request to start a separate
+            // pressure RPC.  Victims remain independent single KVs; this is
+            // only byte-budget coalescing, never atomic-batch eviction.
+            let pressure_bytes = missing_bytes.saturating_add(pending_batch_bytes);
+            initial_pop_bytes = initial_pop_bytes.max(pressure_bytes);
+        }
+    }
+    SlotPressureCapacity {
+        accounting_slot_size,
+        allocatable_slots: accounting_report.allocatable_slots,
+        allocatable_bytes: accounting_report.allocatable_bytes,
+        slot_unallocatable_bytes: accounting_report.slot_unallocatable_bytes,
+        pending_size_classes: pool
+            .pending_demand_by_slot_size
+            .values()
+            .filter(|count| **count != 0)
+            .count(),
+        initial_pop_bytes,
+    }
+}
+
+fn snapshot_rebalance(inner: &ClientKvApiInner) -> RebalanceSnapshot {
+    let pool = inner.owner_segment_allocator.lock();
+    let pressure = slot_pressure_capacity(&pool);
+    RebalanceSnapshot {
+        used_bytes: pool.total_used_bytes(),
+        free_bytes: pool.total_free_bytes(),
+        largest_free_bytes: pool.largest_free_bytes(),
+        pending_bytes: pool.total_pending_bytes(),
+        largest_pending_slot_size: pool.largest_pending_slot_size(),
+        accounting_slot_size: pressure.accounting_slot_size,
+        allocatable_slots: pressure.allocatable_slots,
+        allocatable_bytes: pressure.allocatable_bytes,
+        slot_unallocatable_bytes: pressure.slot_unallocatable_bytes,
+        pending_size_classes: pressure.pending_size_classes,
+        pressure_initial_pop_bytes: pressure.initial_pop_bytes,
+        claim_progress_epoch: pool.claim_progress_epoch,
+        physical_free_epoch: pool.physical_free_epoch(),
+        physical_capacity_bytes: pool.physical_capacity_bytes(),
+        local_target_bytes: pool.local_target_bytes,
+        global_accounted_bytes: pool.global_accounted_bytes(),
+    }
+}
+
+pub(crate) fn owner_local_reserve_timeout_config(inner: &ClientKvApiInner) -> (Duration, Duration) {
+    let soft_wait_timeout = inner
+        .test_spec_config
+        .owner_local_reserve_soft_wait_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(OWNER_LOCAL_RESERVE_DEFAULT_SOFT_WAIT_TIMEOUT);
+    let hard_timeout = inner
+        .test_spec_config
+        .owner_local_reserve_hard_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT);
+    (soft_wait_timeout, hard_timeout)
+}
+
+fn report_owner_segment_state(inner: &ClientKvApiInner) {
+    let snapshot = snapshot_rebalance(inner);
+    let expected = configured_expected_capacity(inner);
+    let moka_weighted_bytes = inner
+        .owner_hot_cache
+        .as_ref()
+        .map(|cache| cache.weighted_size())
+        .unwrap_or(0);
+    let global_target_bytes = snapshot
+        .physical_capacity_bytes
+        .saturating_sub(snapshot.local_target_bytes);
+    let global_budget_overshoot_bytes = snapshot
+        .global_accounted_bytes
+        .saturating_sub(global_target_bytes);
+    tracing::info!(
+        physical_capacity_bytes = snapshot.physical_capacity_bytes,
+        local_target_bytes = snapshot.local_target_bytes,
+        global_target_bytes,
+        global_accounted_bytes = snapshot.global_accounted_bytes,
+        global_budget_overshoot_bytes,
+        expected_value_len = expected.map(|layout| layout.value_len).unwrap_or(0),
+        expected_slot_size = expected.map(|layout| layout.slot_size).unwrap_or(0),
+        logical_payload_capacity_bytes = expected
+            .map(|layout| layout.payload_capacity_bytes)
+            .unwrap_or(0),
+        configured_physical_capacity_bytes = expected
+            .map(|layout| layout.physical_capacity_bytes)
+            .unwrap_or(0),
+        moka_weighted_bytes,
+        used_bytes = snapshot.used_bytes,
+        free_bytes = snapshot.free_bytes,
+        largest_free_bytes = snapshot.largest_free_bytes,
+        pending_bytes = snapshot.pending_bytes,
+        largest_pending_slot_size = snapshot.largest_pending_slot_size,
+        accounting_slot_size = snapshot.accounting_slot_size,
+        allocatable_slots = snapshot.allocatable_slots,
+        allocatable_bytes = snapshot.allocatable_bytes,
+        slot_unallocatable_bytes = snapshot.slot_unallocatable_bytes,
+        pending_size_classes = snapshot.pending_size_classes,
+        pressure_initial_pop_bytes = snapshot.pressure_initial_pop_bytes,
+        claim_progress_epoch = snapshot.claim_progress_epoch,
+        physical_free_epoch = snapshot.physical_free_epoch,
+        "owner segment allocator state"
+    );
+}
+
+fn build_owner_capacity_report(inner: &ClientKvApiInner, report_epoch: u64) -> OwnerCapacityReport {
+    let local_weighted_bytes = inner
+        .owner_hot_cache
+        .as_ref()
+        .map(|cache| cache.weighted_size())
+        .unwrap_or(0);
+    let selected_fence_bytes = inner
+        .owner_hot_counters
+        .source_eviction_selected_bytes
+        .load(Ordering::Acquire);
+    let pool = inner.owner_segment_allocator.lock();
+    let physical_capacity_bytes = pool.physical_capacity_bytes();
+    let local_target_bytes = pool.local_target_bytes;
+    let raw_free_bytes = pool.total_free_bytes();
+    let size_classes = pool
+        .capacity_report_size_classes()
+        .into_iter()
+        .map(|allocation_size_bytes| OwnerSizeClassCapacity {
+            allocation_size_bytes,
+            allocatable_bytes: pool
+                .allocatable_report(allocation_size_bytes)
+                .allocatable_bytes,
+        })
+        .collect();
+    OwnerCapacityReport {
+        owner_node_start_time: inner.view.cluster_manager().get_self_info().node_start_time,
+        placement_class: inner.owner_placement_class,
+        controller_epoch: pool.controller_epoch,
+        report_epoch,
+        physical_capacity_bytes,
+        local_target_bytes,
+        global_target_bytes: physical_capacity_bytes.saturating_sub(local_target_bytes),
+        allocated_bytes: pool.total_used_bytes(),
+        raw_free_bytes,
+        largest_free_bytes: pool.largest_free_bytes(),
+        global_accounted_bytes: pool.global_accounted_bytes(),
+        local_weighted_bytes,
+        settled: pool.controller_epoch != 0
+            && match inner.owner_placement_class {
+                OwnerPlacementClass::Inference => {
+                    local_target_bytes
+                        == inner
+                            .owner_hot_cache
+                            .as_ref()
+                            .and_then(|cache| cache.max_capacity())
+                            .unwrap_or(0)
+                        && local_weighted_bytes <= local_target_bytes
+                }
+                OwnerPlacementClass::RemoteCpu => {
+                    local_target_bytes == 0 && local_weighted_bytes == 0
+                }
+                OwnerPlacementClass::Invalid => false,
+            }
+            && selected_fence_bytes == 0
+            && inner.owner_hot_retry_queue.len() == 0,
+        size_classes,
+    }
+}
+
+pub(super) async fn publish_owner_capacity_report(view: &ClientKvApiView) -> Result<u64, String> {
+    let inner = view.client_kv_api().inner();
+    if inner.allocation_authority != SegmentAllocationAuthority::Owner {
+        return Err("capacity reports require owner allocation authority".to_string());
+    }
+    let report_epoch = inner
+        .owner_capacity_report_epoch
+        .fetch_add(1, Ordering::AcqRel)
+        .checked_add(1)
+        .expect("owner capacity report epoch exhausted");
+    let report = build_owner_capacity_report(inner, report_epoch);
+    if report.physical_capacity_bytes == 0 {
+        return Err("owner capacity report cannot publish a zero-sized segment".to_string());
+    }
+    let master_node_id = view
+        .cluster_manager()
+        .find_or_wait_master_node()
+        .await
+        .map_err(|error| format!("owner capacity report is waiting for master: {error}"))?;
+    let response = call_control_plane_rpc(
+        &inner.rpc_caller_owner_capacity_report,
+        view.p2p_module(),
+        master_node_id.into(),
+        MsgPack {
+            serialize_part: OwnerCapacityReportReq { report },
+            raw_bytes: Vec::new(),
+        },
+        Some(OWNER_CAPACITY_REPORT_TIMEOUT),
+        0,
+    )
+    .await
+    .map_err(|error| format!("owner capacity report transport failed: {error}"))?;
+    match response {
+        response
+            if response.serialize_part.error_code == OK
+                && response.serialize_part.accepted_report_epoch == report_epoch =>
+        {
+            let requested = &response.serialize_part.requested_size_classes;
+            let learned = inner
+                .owner_segment_allocator
+                .lock()
+                .track_capacity_report_size_classes(requested)
+                .map_err(|error| {
+                    format!("master returned an invalid owner capacity-report size class: {error}")
+                })?;
+            if learned {
+                tracing::info!(
+                    report_epoch,
+                    requested_size_classes = ?requested,
+                    "owner learned new exact capacity-report size classes"
+                );
+            }
+            Ok(report_epoch)
+        }
+        response => {
+            let error = KvError::from_json(
+                response.serialize_part.error_code,
+                &response.serialize_part.error_json,
+            );
+            Err(format!(
+                "master rejected owner capacity report: report_epoch={} accepted_report_epoch={} error={}",
+                report_epoch, response.serialize_part.accepted_report_epoch, error
+            ))
+        }
+    }
+}
+
+pub fn spawn_owner_local_reserve_rebalance_actor(view: ClientKvApiView) {
+    let view_task = view.clone();
+    view.spawn("owner_segment_allocator_actor", async move {
+        if let Err(err) = install_owner_segment_allocator(&view_task).await {
+            tracing::error!(error = %err, "failed to initialize owner segment allocator");
+            return;
+        }
+        let shutdown_poller = view_task.register_shutdown_poller();
+        let mut shutdown_waiter = view_task.register_shutdown_waiter();
+        let mut log_tick = tokio::time::interval(OWNER_SEGMENT_REPORT_INTERVAL);
+        let mut capacity_tick = tokio::time::interval(OWNER_CAPACITY_REPORT_INTERVAL);
+        capacity_tick.set_missed_tick_behavior(::tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_waiter.wait() => return,
+                _ = capacity_tick.tick() => {
+                    if !shutdown_poller.is_running() {
+                        return;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_waiter.wait() => return,
+                        result = publish_owner_capacity_report(&view_task) => {
+                            if let Err(error) = result {
+                                tracing::debug!(%error, "periodic owner capacity report did not converge");
+                            }
+                        }
+                    }
+                }
+                _ = log_tick.tick() => {
+                    if !shutdown_poller.is_running() {
+                        return;
+                    }
+                    report_owner_segment_state(view_task.client_kv_api().inner());
+                }
+            }
+        }
+    });
 }
 
 fn owner_slot_pressure_round_bytes(initial_bytes: u64, round: u32) -> u64 {
@@ -74,32 +501,44 @@ fn owner_slot_pressure_round_bytes(initial_bytes: u64, round: u32) -> u64 {
         .min(OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES)
 }
 
-fn owner_slot_pressure_initial_bytes(snapshot: RebalanceSnapshot) -> u64 {
-    // `slot_pressure_capacity` includes only size classes with a failed real
-    // OffsetAllocator claim, so queue visibility alone leaves this at zero.
-    snapshot.pressure_initial_pop_bytes
-}
-
-fn owner_slot_pressure_selected_fence_bytes(inner: &ClientKvApiInner) -> u64 {
-    // Candidate debt starts in Moka's synchronous eviction listener. A
-    // candidate that is stale, pinned, or waiting in the retry queue has
-    // no installed owner fence and cannot release a slot. Only exact selected
-    // source debt is valid projected reclaim credit.
-    inner
-        .owner_hot_counters
-        .source_eviction_selected_bytes
-        .load(std::sync::atomic::Ordering::Acquire)
-}
-
-fn owner_slot_pressure_can_select(selected_fence_bytes: u64) -> bool {
-    selected_fence_bytes == 0
-}
-
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 struct OwnerPressureBackoff {
     round: u32,
     base_bytes: u64,
     observed_claim_progress_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct OwnerPressureProgressBaseline {
+    claim_progress_epoch: u64,
+    physical_free_epoch: u64,
+    free_bytes: u64,
+    allocatable_slots: u64,
+}
+
+impl OwnerPressureProgressBaseline {
+    fn from_snapshot(snapshot: RebalanceSnapshot) -> Self {
+        Self {
+            claim_progress_epoch: snapshot.claim_progress_epoch,
+            physical_free_epoch: snapshot.physical_free_epoch,
+            free_bytes: snapshot.free_bytes,
+            allocatable_slots: snapshot.allocatable_slots,
+        }
+    }
+
+    fn observed_physical_progress(self, snapshot: RebalanceSnapshot) -> bool {
+        snapshot.physical_free_epoch != self.physical_free_epoch
+            || snapshot.claim_progress_epoch != self.claim_progress_epoch
+            || snapshot.free_bytes > self.free_bytes
+            || snapshot.allocatable_slots > self.allocatable_slots
+    }
+}
+
+fn owner_pressure_global_headroom(snapshot: RebalanceSnapshot) -> u64 {
+    snapshot
+        .physical_capacity_bytes
+        .saturating_sub(snapshot.local_target_bytes)
+        .saturating_sub(snapshot.global_accounted_bytes)
 }
 
 impl OwnerPressureBackoff {
@@ -133,17 +572,15 @@ enum OwnerPressureBatchDispatchError {
     CompletionDropped,
 }
 
-/// Close one Moka pressure-selection batch and wait until the dispatcher has
-/// processed it.  The synchronous eviction listener still uses a nonblocking
-/// metadata channel, but the pressure producer may have only one selected
-/// batch outstanding at a time.
 async fn finish_owner_pressure_batch(
     tx: &limit_thirdparty::tokio::sync::ampsc::UnboundedSender<OwnerHotEvictionDispatch>,
     selected_bytes: u64,
-) -> Result<(), OwnerPressureBatchDispatchError> {
+    global_headroom_before: u64,
+) -> Result<OwnerPressureBatchReclaim, OwnerPressureBatchDispatchError> {
     let (completion, completed) = ::tokio::sync::oneshot::channel();
     tx.send(OwnerHotEvictionDispatch::EndPressure {
         selected_bytes,
+        global_headroom_before,
         completion,
     })
     .map_err(|_| OwnerPressureBatchDispatchError::DispatcherClosed)?;
@@ -152,842 +589,6 @@ async fn finish_owner_pressure_batch(
         .map_err(|_| OwnerPressureBatchDispatchError::CompletionDropped)
 }
 
-fn expected_capacity_layout(
-    value_len: u64,
-    payload_capacity_bytes: u64,
-    physical_capacity_bytes: u64,
-) -> ExpectedCapacityLayout {
-    let payload_grant_count = usize::try_from(
-        crate::owner_local_reserve_expected_grant_count(value_len, payload_capacity_bytes)
-            .expect("owner local-reserve expected capacity must be config-validated"),
-    )
-    .expect("owner local-reserve expected grant count must fit usize");
-    let slot_size = crate::owner_local_reserve_slot_size_bytes(value_len)
-        .expect("owner local-reserve expected slot size must be config-validated");
-    let physical_grant_count = usize::try_from(crate::owner_local_reserve_physical_grant_count(
-        physical_capacity_bytes,
-    ))
-    .expect("owner local-reserve physical grant count must fit usize");
-    assert!(
-        physical_grant_count >= payload_grant_count,
-        "config validation must fit the expected payload layout in physical owner DRAM"
-    );
-    ExpectedCapacityLayout {
-        value_len,
-        slot_size,
-        payload_capacity_bytes,
-        payload_grant_count,
-        physical_capacity_bytes,
-        physical_grant_count,
-    }
-}
-
-fn configured_expected_capacity(inner: &ClientKvApiInner) -> Option<ExpectedCapacityLayout> {
-    let expected = inner
-        .test_spec_config
-        .owner_local_reserve_expected_capacity
-        .as_ref()?;
-    Some(expected_capacity_layout(
-        expected.value_len,
-        expected.payload_capacity_bytes,
-        inner.owner_local_reserve_physical_capacity_bytes,
-    ))
-}
-
-fn install_expected_capacity(inner: &ClientKvApiInner) -> Option<ExpectedCapacityLayout> {
-    let expected = configured_expected_capacity(inner)?;
-    let mut pool = inner.owner_local_reserve_pool.lock();
-    assert!(
-        pool.grants.is_empty(),
-        "expected local-reserve layout must be installed before grants"
-    );
-    // Prewarm every whole grant in the physical owner contribution. Moka's
-    // smaller byte capacity remains the logical resident-set boundary; the
-    // extra grants absorb publication/reclaim overlap without becoming cache
-    // entries or projected reclaim credit.
-    pool.expected_grant_count = expected.physical_grant_count;
-    pool.expected_slot_size = Some(expected.slot_size);
-    pool.grant_size_bytes = Some(OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES);
-    Some(expected)
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct SlotPressureCapacity {
-    accounting_slot_size: u64,
-    allocatable_slots: u64,
-    allocatable_bytes: u64,
-    slot_unallocatable_bytes: u64,
-    pending_size_classes: usize,
-    initial_pop_bytes: u64,
-}
-
-fn slot_pressure_capacity(pool: &OwnerLocalReservePoolState) -> SlotPressureCapacity {
-    let slot_sizes = BTreeSet::from_iter(pool.pending_demand_by_slot_size.iter().filter_map(
-        |(slot_size, count)| {
-            (*count != 0 && pool.slot_size_has_failed_claim(*slot_size)).then_some(*slot_size)
-        },
-    ));
-    let Some(accounting_slot_size) = pool
-        .expected_slot_size
-        .filter(|slot_size| slot_sizes.contains(slot_size))
-        .or_else(|| slot_sizes.iter().next_back().copied())
-    else {
-        return SlotPressureCapacity::default();
-    };
-    let accounting_report = pool.allocatable_report(accounting_slot_size);
-    let mut initial_pop_bytes = 0u64;
-
-    for slot_size in slot_sizes {
-        let report = if slot_size == accounting_slot_size {
-            accounting_report
-        } else {
-            pool.allocatable_report(slot_size)
-        };
-        let pending_slots = u64::try_from(pool.pending_demand_slots(slot_size)).unwrap_or(u64::MAX);
-        if pending_slots > report.allocatable_slots {
-            let missing_bytes = pending_slots
-                .saturating_sub(report.allocatable_slots)
-                .saturating_mul(slot_size);
-            let coarse_bytes = pending_slots
-                .saturating_mul(slot_size)
-                .min(OWNER_SLOT_PRESSURE_INITIAL_COARSE_BYTES);
-            // All size classes share the same free extents, so their byte
-            // shortages are alternative views of one pool. Summing them would
-            // double-count capacity; the largest class budget is sufficient
-            // for this coarse round.
-            initial_pop_bytes = initial_pop_bytes.max(missing_bytes.max(coarse_bytes));
-        }
-    }
-
-    SlotPressureCapacity {
-        accounting_slot_size,
-        allocatable_slots: accounting_report.allocatable_slots,
-        allocatable_bytes: accounting_report.allocatable_bytes,
-        slot_unallocatable_bytes: accounting_report.slot_unallocatable_bytes,
-        pending_size_classes: pool
-            .pending_demand_by_slot_size
-            .values()
-            .filter(|count| **count != 0)
-            .count(),
-        initial_pop_bytes,
-    }
-}
-
-fn snapshot_rebalance(inner: &ClientKvApiInner) -> RebalanceSnapshot {
-    let pool = inner.owner_local_reserve_pool.lock();
-    let pressure = slot_pressure_capacity(&pool);
-    RebalanceSnapshot {
-        used_bytes: pool.total_used_bytes(),
-        free_bytes: pool.total_free_bytes(),
-        largest_free_bytes: pool.largest_free_bytes(),
-        pending_bytes: pool.total_pending_bytes(),
-        largest_pending_slot_size: pool.largest_pending_slot_size(),
-        grant_size_bytes: pool
-            .grant_size_bytes
-            .unwrap_or(OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES),
-        accounting_slot_size: pressure.accounting_slot_size,
-        allocatable_slots: pressure.allocatable_slots,
-        allocatable_bytes: pressure.allocatable_bytes,
-        slot_unallocatable_bytes: pressure.slot_unallocatable_bytes,
-        pending_size_classes: pressure.pending_size_classes,
-        pressure_initial_pop_bytes: pressure.initial_pop_bytes,
-        claim_progress_epoch: pool.claim_progress_epoch,
-        grant_count: pool.grant_count(),
-        expected_grant_count: pool.expected_grant_count,
-        forced_refill_grants: pool.failed_claim_refill_grants(),
-    }
-}
-
-fn target_grant_count(snapshot: RebalanceSnapshot) -> usize {
-    if snapshot.expected_grant_count != 0 {
-        return snapshot.expected_grant_count;
-    }
-    let demand_target = div_ceil_usize_bytes(
-        snapshot.used_bytes.saturating_add(snapshot.pending_bytes),
-        snapshot.grant_size_bytes,
-    );
-    let fragmentation_target = if snapshot.pending_bytes != 0
-        && snapshot.largest_free_bytes < snapshot.largest_pending_slot_size
-    {
-        snapshot.grant_count.saturating_add(1)
-    } else {
-        snapshot.grant_count
-    };
-    demand_target.max(fragmentation_target).max(
-        snapshot
-            .grant_count
-            .saturating_add(snapshot.forced_refill_grants),
-    )
-}
-
-pub(crate) fn owner_local_reserve_timeout_config(inner: &ClientKvApiInner) -> (Duration, Duration) {
-    let soft_wait_timeout = inner
-        .test_spec_config
-        .owner_local_reserve_soft_wait_timeout_ms
-        .map(Duration::from_millis)
-        .unwrap_or(OWNER_LOCAL_RESERVE_DEFAULT_SOFT_WAIT_TIMEOUT);
-    let hard_timeout = inner
-        .test_spec_config
-        .owner_local_reserve_hard_timeout_ms
-        .map(Duration::from_millis)
-        .unwrap_or(OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT);
-    (soft_wait_timeout, hard_timeout)
-}
-
-async fn try_refill_once(inner: &ClientKvApiInner, snapshot: RebalanceSnapshot) {
-    let target_grants = target_grant_count(snapshot);
-    if snapshot.grant_count >= target_grants {
-        return;
-    }
-    let additional_grants = target_grants - snapshot.grant_count;
-    let batch_started_at = Instant::now();
-    let mut added_grants = 0usize;
-    let mut total_rpc_latency = Duration::ZERO;
-    let mut max_rpc_latency = Duration::ZERO;
-    for _ in 0..additional_grants {
-        let rpc_started_at = Instant::now();
-        let outcome = match inner.reserve_local_grant().await {
-            Ok(outcome) => {
-                let rpc_latency = rpc_started_at.elapsed();
-                total_rpc_latency = total_rpc_latency.saturating_add(rpc_latency);
-                max_rpc_latency = max_rpc_latency.max(rpc_latency);
-                outcome
-            }
-            Err(err) => {
-                let rpc_latency = rpc_started_at.elapsed();
-                tracing::warn!(
-                    grants = snapshot.grant_count,
-                    target_grants,
-                    added_grants,
-                    pending_bytes = snapshot.pending_bytes,
-                    rpc_latency_ms = rpc_latency.as_millis(),
-                    error = %err,
-                    "owner local reserve offset-pool refill failed"
-                );
-                return;
-            }
-        };
-        let (grant_id, base_addr, addr, len) = match outcome {
-            ReserveLocalGrantOutcome::Granted {
-                grant_id,
-                node_id: _,
-                addr,
-                base_addr,
-                len,
-            } => (grant_id, base_addr, addr, len),
-            ReserveLocalGrantOutcome::None => {
-                unreachable!("reserve_local_grant filters empty successful outcomes")
-            }
-        };
-        if len != snapshot.grant_size_bytes {
-            tracing::warn!(
-                requested = snapshot.grant_size_bytes,
-                received = len,
-                grant_id,
-                "owner local reserve offset-pool received an unexpected grant size"
-            );
-            if let Err(release_err) = inner.release_local_grant(grant_id).await {
-                tracing::warn!(
-                    grant_id,
-                    error = %release_err,
-                    "failed to release mismatched local-reserve grant"
-                );
-            }
-            return;
-        }
-        {
-            let mut pool = inner.owner_local_reserve_pool.lock();
-            pool.install_grant(OwnerLocalReserveGrantState::new(
-                grant_id, base_addr, addr, len,
-            ));
-            pool.record_refill_grant_installed();
-        }
-        added_grants += 1;
-        inner
-            .owner_local_reserve_rebalance_notify()
-            .notify_waiters();
-    }
-    if added_grants != 0 {
-        let average_rpc_latency_ms = total_rpc_latency.as_secs_f64() * 1000.0 / added_grants as f64;
-        tracing::info!(
-            added_grants,
-            grants_after = snapshot.grant_count.saturating_add(added_grants),
-            target_grants,
-            pending_bytes = snapshot.pending_bytes,
-            elapsed_ms = batch_started_at.elapsed().as_millis(),
-            rpc_avg_ms = average_rpc_latency_ms,
-            rpc_max_ms = max_rpc_latency.as_millis(),
-            "owner local reserve offset-pool refill completed"
-        );
-    }
-}
-
-fn shrink_target_grants(snapshot: RebalanceSnapshot) -> usize {
-    if snapshot.expected_grant_count != 0 {
-        snapshot.expected_grant_count
-    } else {
-        div_ceil_usize_bytes(
-            snapshot.used_bytes.saturating_add(snapshot.pending_bytes),
-            snapshot.grant_size_bytes,
-        )
-    }
-}
-
-async fn try_shrink_once(inner: &ClientKvApiInner, snapshot: RebalanceSnapshot) {
-    if snapshot.grant_count <= shrink_target_grants(snapshot) {
-        return;
-    }
-    let detached = {
-        let mut pool = inner.owner_local_reserve_pool.lock();
-        if pool
-            .last_grow_at
-            .is_some_and(|last| last.elapsed() < OWNER_LOCAL_RESERVE_SHRINK_GROW_COOLDOWN)
-        {
-            return;
-        }
-        let candidate = pool.grants.iter().rev().find_map(|grant| {
-            (grant.is_fully_free()
-                && grant.fully_free_since.is_some_and(|since| {
-                    since.elapsed() >= OWNER_LOCAL_RESERVE_SHRINK_IDLE_COOLDOWN
-                }))
-            .then_some(grant.grant_id)
-        });
-        candidate.and_then(|grant_id| pool.detach_fully_free_grant(grant_id))
-    };
-    let Some(grant) = detached else {
-        return;
-    };
-    let grant_id = grant.grant_id;
-    if let Err(err) = inner.release_local_grant(grant_id).await {
-        tracing::warn!(
-            grant_id,
-            error = %err,
-            "owner offset-pool grant release failed"
-        );
-        inner.owner_local_reserve_pool.lock().install_grant(grant);
-    } else {
-        tracing::info!(grant_id, "owner offset-pool released an idle grant");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT, OWNER_LOCAL_RESERVE_SHRINK_IDLE_COOLDOWN,
-        OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES, OwnerPressureBackoff, RebalanceSnapshot,
-        expected_capacity_layout, finish_owner_pressure_batch, owner_slot_pressure_can_select,
-        owner_slot_pressure_initial_bytes, owner_slot_pressure_round_bytes, slot_pressure_capacity,
-        target_grant_count,
-    };
-    use crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES;
-    use crate::client_kv_api::{
-        OwnerHotEvictionDispatch, OwnerLocalReserveGrantState, OwnerLocalReservePoolState,
-    };
-    use std::time::Duration;
-
-    fn empty_snapshot() -> RebalanceSnapshot {
-        RebalanceSnapshot {
-            used_bytes: 0,
-            free_bytes: 0,
-            largest_free_bytes: 0,
-            pending_bytes: 0,
-            largest_pending_slot_size: 0,
-            grant_size_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES,
-            accounting_slot_size: 0,
-            allocatable_slots: 0,
-            allocatable_bytes: 0,
-            slot_unallocatable_bytes: 0,
-            pending_size_classes: 0,
-            pressure_initial_pop_bytes: 0,
-            claim_progress_epoch: 0,
-            grant_count: 0,
-            expected_grant_count: 0,
-            forced_refill_grants: 0,
-        }
-    }
-
-    #[test]
-    fn target_grants_cover_used_and_pending_without_double_reserving() {
-        assert_eq!(
-            target_grant_count(RebalanceSnapshot {
-                used_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES * 2,
-                pending_bytes: 1,
-                grant_count: 2,
-                ..empty_snapshot()
-            }),
-            3
-        );
-        assert_eq!(
-            target_grant_count(RebalanceSnapshot {
-                used_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES * 2,
-                grant_count: 2,
-                ..empty_snapshot()
-            }),
-            2
-        );
-        assert_eq!(target_grant_count(empty_snapshot()), 0);
-    }
-
-    #[test]
-    fn exact_fit_target_counts_whole_slots_per_generic_grant() {
-        const VALUE_LEN: u64 = 4_718_592;
-        const EXPECTED_PAYLOAD_BYTES: u64 = 109_951_162_777;
-        let slot_size = crate::owner_local_reserve_slot_size_bytes(VALUE_LEN).unwrap();
-        let slots_per_grant = crate::owner_local_reserve_slots_per_grant(slot_size).unwrap();
-        let expected_grants =
-            crate::owner_local_reserve_expected_grant_count(VALUE_LEN, EXPECTED_PAYLOAD_BYTES)
-                .unwrap();
-        assert_eq!(slot_size, VALUE_LEN);
-        assert_eq!(slots_per_grant, 113);
-        assert_eq!(expected_grants, 207);
-        assert_eq!(
-            target_grant_count(RebalanceSnapshot {
-                expected_grant_count: expected_grants as usize,
-                ..empty_snapshot()
-            }),
-            207
-        );
-    }
-
-    #[test]
-    fn logical_payload_and_physical_burst_pool_have_independent_boundaries() {
-        const VALUE_LEN: u64 = 4_718_592;
-        const PHYSICAL_CAPACITY_BYTES: u64 = 128 * 1024 * 1024 * 1024;
-        const PAYLOAD_CAPACITY_BYTES: u64 = 123_695_058_124;
-
-        let layout =
-            expected_capacity_layout(VALUE_LEN, PAYLOAD_CAPACITY_BYTES, PHYSICAL_CAPACITY_BYTES);
-        assert_eq!(layout.payload_grant_count, 232);
-        assert_eq!(layout.physical_grant_count, 256);
-        assert_eq!(layout.physical_grant_count - layout.payload_grant_count, 24);
-        assert_eq!(
-            target_grant_count(RebalanceSnapshot {
-                expected_grant_count: layout.physical_grant_count,
-                ..empty_snapshot()
-            }),
-            256
-        );
-    }
-
-    #[test]
-    fn generic_grant_pressure_counts_real_slots_and_size_relative_tail() {
-        const SLOT_SIZE: u64 = 4_718_592;
-        let mut pool = OwnerLocalReservePoolState {
-            expected_slot_size: Some(SLOT_SIZE),
-            grant_size_bytes: Some(OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES),
-            ..Default::default()
-        };
-        pool.install_grant(OwnerLocalReserveGrantState::new(
-            1,
-            1_000_000,
-            1_000_000,
-            OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES,
-        ));
-        let claimed = pool.claim_available(SLOT_SIZE, 110);
-        assert_eq!(claimed.len(), 110);
-        pool.pending_demand_by_slot_size.insert(SLOT_SIZE, 13);
-        pool.record_failed_claim(SLOT_SIZE, 1);
-        let pressure = slot_pressure_capacity(&pool);
-        assert_eq!(pressure.allocatable_slots, 3);
-        assert_eq!(pressure.allocatable_bytes, 3 * SLOT_SIZE);
-        assert_eq!(pressure.slot_unallocatable_bytes, 3_670_016);
-        assert_eq!(pressure.initial_pop_bytes, 13 * SLOT_SIZE);
-
-        // The 3.5 MiB tail is unavailable to a 4.5 MiB request, but remains
-        // useful generic extent capacity for a smaller request.
-        assert_eq!(pool.claim_available(3 * 1024 * 1024, 1).len(), 1);
-    }
-
-    #[test]
-    fn default_hard_timeout_covers_owner_source_eviction_transaction() {
-        assert_eq!(
-            OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT,
-            Duration::from_secs(30)
-        );
-        assert!(
-            OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT > OWNER_LOCAL_RESERVE_SHRINK_IDLE_COOLDOWN
-        );
-    }
-
-    #[test]
-    fn configured_pool_refills_before_pending_claims_consume_headroom() {
-        let configured = RebalanceSnapshot {
-            used_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES * 228,
-            free_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES * 4,
-            largest_free_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES,
-            grant_count: 232,
-            expected_grant_count: 232,
-            ..empty_snapshot()
-        };
-        assert_eq!(target_grant_count(configured), 232);
-
-        let pressured = RebalanceSnapshot {
-            used_bytes: configured.used_bytes + 4 * 1024,
-            free_bytes: configured.free_bytes - 4 * 1024,
-            ..configured
-        };
-        assert_eq!(target_grant_count(pressured), 232);
-    }
-
-    #[test]
-    fn configured_expected_grants_are_a_hard_upper_bound() {
-        assert_eq!(
-            target_grant_count(RebalanceSnapshot {
-                used_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES * 300,
-                pending_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES,
-                grant_count: 300,
-                expected_grant_count: 232,
-                forced_refill_grants: 20,
-                ..empty_snapshot()
-            }),
-            232
-        );
-        assert_eq!(
-            target_grant_count(RebalanceSnapshot {
-                used_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES * 300,
-                pending_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES,
-                largest_pending_slot_size: 64 * 1024 * 1024,
-                grant_count: 300,
-                ..empty_snapshot()
-            }),
-            301
-        );
-    }
-
-    #[test]
-    fn fragmented_pending_request_forces_another_grant() {
-        let snapshot = RebalanceSnapshot {
-            used_bytes: OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES - 64 * 1024 * 1024,
-            free_bytes: 64 * 1024 * 1024,
-            largest_free_bytes: 32 * 1024 * 1024,
-            pending_bytes: 48 * 1024 * 1024,
-            largest_pending_slot_size: 48 * 1024 * 1024,
-            grant_count: 1,
-            ..empty_snapshot()
-        };
-        assert_eq!(target_grant_count(snapshot), 2);
-    }
-
-    #[test]
-    fn raw_free_bubble_uses_exact_allocatable_slots_for_pressure() {
-        const SLOT_SIZE: u64 = 4_718_592;
-        const PENDING_SLOTS: u64 = 261;
-        const ALLOCATABLE_SLOTS: u64 = 150;
-        let snapshot = RebalanceSnapshot {
-            used_bytes: 122_994_819_072,
-            free_bytes: 1_559_232_512,
-            largest_free_bytes: 218_103_808,
-            pending_bytes: PENDING_SLOTS * SLOT_SIZE,
-            largest_pending_slot_size: SLOT_SIZE,
-            accounting_slot_size: SLOT_SIZE,
-            allocatable_slots: ALLOCATABLE_SLOTS,
-            allocatable_bytes: ALLOCATABLE_SLOTS * SLOT_SIZE,
-            slot_unallocatable_bytes: 851_443_712,
-            pending_size_classes: 1,
-            pressure_initial_pop_bytes: (PENDING_SLOTS - ALLOCATABLE_SLOTS) * SLOT_SIZE,
-            grant_count: 232,
-            expected_grant_count: 232,
-            forced_refill_grants: 1,
-            ..empty_snapshot()
-        };
-        assert!(snapshot.pending_bytes < snapshot.free_bytes);
-        assert!(snapshot.largest_free_bytes > snapshot.largest_pending_slot_size);
-        assert!(snapshot.allocatable_bytes < snapshot.pending_bytes);
-        assert_eq!(
-            owner_slot_pressure_initial_bytes(snapshot),
-            523_763_712,
-            "raw free bytes must not suppress size-relative slot pressure"
-        );
-    }
-
-    #[test]
-    fn pending_visibility_without_a_real_claim_failure_does_not_start_pressure() {
-        const SLOT_SIZE: u64 = 4 * 1024 * 1024;
-        let mut pool = OwnerLocalReservePoolState::default();
-        pool.pending_demand_by_slot_size.insert(SLOT_SIZE, 16);
-        assert_eq!(slot_pressure_capacity(&pool).initial_pop_bytes, 0);
-
-        pool.record_failed_claim(SLOT_SIZE, 1);
-        assert_eq!(
-            slot_pressure_capacity(&pool).initial_pop_bytes,
-            64 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn multiple_size_classes_take_the_maximum_instead_of_summing_shared_free_space() {
-        const KIB: u64 = 1024;
-        let mut pool = OwnerLocalReservePoolState::default();
-        pool.install_grant(OwnerLocalReserveGrantState::new(
-            1,
-            1_000_000,
-            1_000_000,
-            64 * KIB,
-        ));
-        pool.pending_demand_by_slot_size.insert(20 * KIB, 4);
-        pool.pending_demand_by_slot_size.insert(24 * KIB, 3);
-        pool.record_failed_claim(20 * KIB, 1);
-
-        let only_failed_class = slot_pressure_capacity(&pool);
-        assert_eq!(only_failed_class.accounting_slot_size, 20 * KIB);
-        assert_eq!(only_failed_class.initial_pop_bytes, 80 * KIB);
-
-        // A queued class that has not attempted a real claim cannot borrow
-        // another class's failure authorization.
-        pool.record_failed_claim(24 * KIB, 1);
-
-        let pressure = slot_pressure_capacity(&pool);
-        // 20 KiB: 4 pending vs 3 allocatable => max(20, 80) KiB.
-        // 24 KiB: 3 pending vs 2 allocatable => max(24, 72) KiB.
-        // Shared capacity means max(80, 72), not their sum.
-        assert_eq!(pressure.initial_pop_bytes, 80 * KIB);
-    }
-
-    #[test]
-    fn pressure_backoff_doubles_and_saturates_then_resets_on_claim_progress() {
-        const BASE: u64 = 64 * 1024 * 1024;
-        assert_eq!(owner_slot_pressure_round_bytes(BASE, 0), BASE);
-        assert_eq!(owner_slot_pressure_round_bytes(BASE, 1), 2 * BASE);
-        assert_eq!(owner_slot_pressure_round_bytes(BASE, 2), 4 * BASE);
-        assert_eq!(
-            owner_slot_pressure_round_bytes(BASE, 20),
-            OWNER_SLOT_PRESSURE_MAX_EVICT_BYTES
-        );
-
-        let mut backoff = OwnerPressureBackoff::default();
-        backoff.finish_round(BASE);
-        backoff.finish_round(2 * BASE);
-        assert_eq!(backoff.request_bytes(BASE), 4 * BASE);
-        backoff.sync_claim_progress(7);
-        assert_eq!(backoff.request_bytes(BASE), BASE);
-        assert_eq!(backoff.observed_claim_progress_epoch, 7);
-    }
-
-    #[test]
-    fn installed_source_fence_debt_blocks_the_next_round() {
-        assert!(owner_slot_pressure_can_select(0));
-        assert!(!owner_slot_pressure_can_select(1));
-    }
-
-    #[test]
-    fn successful_real_claim_clears_old_failure_debt_and_advances_progress() {
-        let mut pool = OwnerLocalReservePoolState {
-            claim_progress_epoch: 9,
-            ..Default::default()
-        };
-        pool.record_failed_claim(4 * 1024 * 1024, 3);
-        pool.record_failed_claim(8 * 1024 * 1024, 2);
-        pool.record_successful_claim(4 * 1024 * 1024);
-        assert!(!pool.slot_size_has_failed_claim(4 * 1024 * 1024));
-        assert!(pool.slot_size_has_failed_claim(8 * 1024 * 1024));
-        assert_eq!(pool.failed_claim_refill_grants(), 2);
-        assert_eq!(pool.claim_progress_epoch, 10);
-    }
-
-    #[test]
-    fn installed_refill_grant_consumes_count_but_keeps_failure_authorization() {
-        const SLOT_SIZE: u64 = 4 * 1024 * 1024;
-        let mut pool = OwnerLocalReservePoolState::default();
-        pool.record_failed_claim(SLOT_SIZE, 1);
-        pool.record_refill_grant_installed();
-
-        assert_eq!(pool.failed_claim_refill_grants(), 0);
-        assert!(pool.slot_size_has_failed_claim(SLOT_SIZE));
-        pool.record_successful_claim(SLOT_SIZE);
-        assert!(!pool.slot_size_has_failed_claim(SLOT_SIZE));
-    }
-
-    #[limit_thirdparty::tokio::test]
-    async fn pressure_batch_finish_waits_for_dispatcher_ack() {
-        let (dispatch_tx, mut dispatch_rx) =
-            limit_thirdparty::tokio::sync::ampsc::unbounded_channel();
-        let producer_tx = dispatch_tx.clone();
-        let producer = ::tokio::spawn(async move {
-            assert_eq!(
-                finish_owner_pressure_batch(&producer_tx, 4096).await,
-                Ok(())
-            );
-            assert!(
-                producer_tx
-                    .send(OwnerHotEvictionDispatch::BeginPressure {
-                        requested_bytes: 8192,
-                    })
-                    .is_ok()
-            );
-        });
-
-        let first = dispatch_rx.recv().await.expect("pressure batch end");
-        let OwnerHotEvictionDispatch::EndPressure {
-            selected_bytes,
-            completion,
-        } = first
-        else {
-            panic!("first dispatch must close the selected pressure batch");
-        };
-        assert_eq!(selected_bytes, 4096);
-        ::tokio::task::yield_now().await;
-        assert!(
-            dispatch_rx.try_recv().is_err(),
-            "producer must not start another pressure batch before completion"
-        );
-
-        assert!(completion.send(()).is_ok());
-        let second = dispatch_rx.recv().await.expect("next pressure batch begin");
-        assert!(matches!(
-            second,
-            OwnerHotEvictionDispatch::BeginPressure {
-                requested_bytes: 8192
-            }
-        ));
-        producer.await.expect("pressure producer task");
-    }
-}
-
-async fn owner_local_reserve_rebalance_once(view: &ClientKvApiView) {
-    let inner = view.client_kv_api().inner();
-    let snapshot = snapshot_rebalance(inner);
-    try_refill_once(inner, snapshot).await;
-    try_shrink_once(inner, snapshot_rebalance(inner)).await;
-}
-
-fn report_owner_local_reserve_state(inner: &ClientKvApiInner) {
-    let snapshot = snapshot_rebalance(inner);
-    let expected = configured_expected_capacity(inner);
-    let moka_weighted_bytes = inner
-        .owner_hot_cache
-        .as_ref()
-        .map(|cache| cache.weighted_size())
-        .unwrap_or(0);
-    let pool = inner.owner_local_reserve_pool.lock();
-    let accounting_slot_size = pool
-        .expected_slot_size
-        .unwrap_or(snapshot.accounting_slot_size);
-    let capacity_report = pool.allocatable_report(accounting_slot_size);
-    let slot_unallocatable_ratio_ppm = if accounting_slot_size == 0 || snapshot.free_bytes == 0 {
-        0
-    } else {
-        capacity_report
-            .slot_unallocatable_bytes
-            .saturating_mul(1_000_000)
-            / snapshot.free_bytes
-    };
-    tracing::info!(
-        grants = snapshot.grant_count,
-        expected_grants = snapshot.expected_grant_count,
-        payload_grants = expected
-            .map(|layout| layout.payload_grant_count)
-            .unwrap_or(0),
-        physical_target_grants = expected
-            .map(|layout| layout.physical_grant_count)
-            .unwrap_or(0),
-        burst_grants = expected
-            .map(|layout| {
-                layout
-                    .physical_grant_count
-                    .saturating_sub(layout.payload_grant_count)
-            })
-            .unwrap_or(0),
-        logical_payload_capacity_bytes = expected
-            .map(|layout| layout.payload_capacity_bytes)
-            .unwrap_or(0),
-        moka_weighted_bytes,
-        allocator_over_moka_bytes = snapshot.used_bytes.saturating_sub(moka_weighted_bytes),
-        allocator_over_logical_payload_bytes = snapshot.used_bytes.saturating_sub(
-            expected
-                .map(|layout| layout.payload_capacity_bytes)
-                .unwrap_or(0),
-        ),
-        used_allocations = pool.used_slot_count(),
-        prepared_allocations = pool.prepared_slot_count(),
-        pending_visible_allocations = pool.pending_visible_slot_count(),
-        committed_allocations = pool.committed_slot_count(),
-        used_bytes = snapshot.used_bytes,
-        free_bytes = snapshot.free_bytes,
-        largest_free_bytes = snapshot.largest_free_bytes,
-        pending_bytes = snapshot.pending_bytes,
-        largest_pending_slot_size = snapshot.largest_pending_slot_size,
-        grant_size_bytes = snapshot.grant_size_bytes,
-        accounting_slot_size,
-        allocatable_slots = capacity_report.allocatable_slots,
-        allocatable_bytes = capacity_report.allocatable_bytes,
-        slot_unallocatable_bytes = capacity_report.slot_unallocatable_bytes,
-        slot_unallocatable_ratio_ppm,
-        pending_size_classes = snapshot.pending_size_classes,
-        pressure_initial_pop_bytes = snapshot.pressure_initial_pop_bytes,
-        claim_progress_epoch = snapshot.claim_progress_epoch,
-        forced_refill_grants = snapshot.forced_refill_grants,
-        "owner local reserve offset-pool state"
-    );
-}
-
-pub fn spawn_owner_local_reserve_rebalance_actor(view: ClientKvApiView) {
-    let view_task = view.clone();
-    view.spawn("owner_local_reserve_rebalance_actor", async move {
-        let expected = install_expected_capacity(view_task.client_kv_api().inner());
-        if let Some(expected) = expected {
-            let physical_reserved_target_bytes = u64::try_from(expected.physical_grant_count)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES);
-            let burst_grants = expected
-                .physical_grant_count
-                .saturating_sub(expected.payload_grant_count);
-            tracing::info!(
-                value_len = expected.value_len,
-                slot_size = expected.slot_size,
-                grant_size_bytes = OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES,
-                payload_capacity_bytes = expected.payload_capacity_bytes,
-                payload_grants = expected.payload_grant_count,
-                physical_capacity_bytes = expected.physical_capacity_bytes,
-                physical_target_grants = expected.physical_grant_count,
-                expected_grants = expected.physical_grant_count,
-                physical_reserved_target_bytes,
-                physical_capacity_tail_bytes = expected
-                    .physical_capacity_bytes
-                    .saturating_sub(physical_reserved_target_bytes),
-                burst_grants,
-                logical_physical_headroom_bytes =
-                    physical_reserved_target_bytes.saturating_sub(expected.payload_capacity_bytes),
-                "owner local reserve offset-pool expected capacity configured"
-            );
-        }
-        let shutdown_poller = view_task.register_shutdown_poller();
-        let mut shutdown_waiter = view_task.register_shutdown_waiter();
-        let notify = view_task
-            .client_kv_api()
-            .inner()
-            .owner_local_reserve_rebalance_notify();
-        let mut tick = tokio::time::interval(OWNER_LOCAL_RESERVE_REBALANCE_INTERVAL);
-        let mut last_report_at = Instant::now();
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown_waiter.wait() => {
-                    tracing::info!("owner local reserve rebalance actor stopped by shutdown");
-                    return;
-                }
-                _ = tick.tick() => {}
-                _ = notify.notified() => {}
-            }
-
-            if !shutdown_poller.is_running() {
-                tracing::info!("owner local reserve rebalance actor stopped by shutdown");
-                return;
-            }
-
-            owner_local_reserve_rebalance_once(&view_task).await;
-            if last_report_at.elapsed() >= OWNER_LOCAL_RESERVE_REPORT_INTERVAL {
-                report_owner_local_reserve_state(view_task.client_kv_api().inner());
-                last_report_at = Instant::now();
-            }
-        }
-    });
-}
-
-/// Drive owner slot pressure outside RPC handlers and outside Tokio's worker
-/// threads.  This is the sole production call site for Moka's synchronous
-/// `evict_some`: selection is deliberately bounded, and the returned weight
-/// means only "source-eviction candidates selected", never "slots reclaimed".
 pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
     let view_task = view.clone();
     view.spawn("owner_slot_pressure_actor", async move {
@@ -1004,11 +605,8 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown_waiter.wait() => {
-                    tracing::info!("owner slot pressure actor stopped by shutdown");
-                    return;
-                }
-                _ = tick.tick() => {}
+                _ = shutdown_waiter.wait() => return,
+                _ = tick.tick() => {},
                 _ = notify.notified() => {}
             }
             if !shutdown_poller.is_running() {
@@ -1016,19 +614,11 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
             }
 
             let inner = view_task.client_kv_api().inner();
-            let pressure_snapshot = snapshot_rebalance(inner);
-            backoff.sync_claim_progress(pressure_snapshot.claim_progress_epoch);
-            let initial_bytes = owner_slot_pressure_initial_bytes(pressure_snapshot);
+            let snapshot = snapshot_rebalance(inner);
+            backoff.sync_claim_progress(snapshot.claim_progress_epoch);
+            let initial_bytes = snapshot.pressure_initial_pop_bytes;
             if initial_bytes == 0 {
-                backoff.reset(pressure_snapshot.claim_progress_epoch);
-                continue;
-            }
-            let selected_fence_bytes = owner_slot_pressure_selected_fence_bytes(inner);
-            if !owner_slot_pressure_can_select(selected_fence_bytes) {
-                // These bytes already have exact source fences and may still
-                // be in master retry/owner release handling. They are not
-                // projected free capacity, but selecting another round before
-                // they finish would duplicate pressure work.
+                backoff.reset(snapshot.claim_progress_epoch);
                 continue;
             }
             if last_kick_at
@@ -1037,87 +627,85 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
                 continue;
             }
             let pressure_round = backoff.round;
-            let requested_bytes = backoff.request_bytes(initial_bytes);
+            let exponential_request_bytes = backoff.request_bytes(initial_bytes);
+            let global_headroom_bytes = owner_pressure_global_headroom(snapshot);
+            // One closed batch that did not make an allocation possible is
+            // followed by B, 2B, 4B... selection.  Logical scope changes,
+            // Moka selection, retry debt and an installed source fence are
+            // deliberately not capacity credit.  Only a real allocator Free
+            // or a successful claim can reset this exponential loop.
+            let requested_bytes = exponential_request_bytes;
             let Some(cache) = inner.owner_hot_cache.clone() else {
                 continue;
             };
+            let _selection_guard = inner.owner_hot_selection_lock.lock().await;
             if inner
                 .owner_hot_eviction_tx
                 .send(OwnerHotEvictionDispatch::BeginPressure { requested_bytes })
                 .is_err()
             {
-                tracing::warn!(
-                    requested_bytes,
-                    "owner slot pressure dispatcher is closed before Moka selection"
-                );
                 return;
             }
-            let selected_bytes = match limit_thirdparty::tokio::task::spawn_blocking(move || {
+            let selected_bytes = limit_thirdparty::tokio::task::spawn_blocking(move || {
                 cache.evict_some(requested_bytes)
             })
             .await
-            {
-                Ok(selected_bytes) => selected_bytes,
-                Err(err) => {
-                    tracing::warn!(
-                        requested_bytes,
-                        err = ?err,
-                        "owner slot pressure Moka selection task failed"
-                    );
-                    0
-                }
-            };
+            .unwrap_or(0);
             last_kick_at = Some(Instant::now());
-            let dispatch_started_at = Instant::now();
-            let dispatch_result = tokio::select! {
+            let result = tokio::select! {
                 biased;
-                _ = shutdown_waiter.wait() => {
-                    tracing::info!(
-                        requested_bytes,
-                        selected_bytes,
-                        "owner slot pressure actor stopped while waiting for batch completion"
-                    );
-                    return;
-                }
+                _ = shutdown_waiter.wait() => return,
                 result = finish_owner_pressure_batch(
                     &inner.owner_hot_eviction_tx,
                     selected_bytes,
+                    global_headroom_bytes,
                 ) => result,
             };
-            if let Err(err) = dispatch_result {
-                tracing::warn!(
-                    requested_bytes,
-                    selected_bytes,
-                    err = ?err,
-                    "owner slot pressure dispatcher failed to complete selected batch"
-                );
-                return;
-            }
+            let global_reclaim = match result {
+                Ok(global_reclaim) => global_reclaim,
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        requested_bytes,
+                        selected_bytes,
+                        "owner pressure batch failed"
+                    );
+                    return;
+                }
+            };
+            let completed_snapshot = snapshot_rebalance(inner);
+            let physical_progress = OwnerPressureProgressBaseline::from_snapshot(snapshot)
+                .observed_physical_progress(completed_snapshot);
+            let logical_progress =
+                completed_snapshot.global_accounted_bytes != snapshot.global_accounted_bytes;
+            // Advance after every closed non-empty pop. If this batch really
+            // enabled a claim, claim_progress_epoch resets the backoff on the
+            // next observation. If it only selected busy candidates, the next
+            // round must continue instead of waiting on imaginary Free slots.
             backoff.finish_round(selected_bytes);
             tracing::debug!(
                 requested_bytes,
+                exponential_request_bytes,
                 selected_bytes,
                 pressure_round,
                 pressure_initial_pop_bytes = initial_bytes,
-                pressure_base_bytes = backoff.base_bytes,
-                accounting_slot_size = pressure_snapshot.accounting_slot_size,
-                raw_free_bytes = pressure_snapshot.free_bytes,
-                allocatable_slots = pressure_snapshot.allocatable_slots,
-                allocatable_bytes = pressure_snapshot.allocatable_bytes,
-                slot_unallocatable_bytes = pressure_snapshot.slot_unallocatable_bytes,
-                slot_unallocatable_ratio_ppm = if pressure_snapshot.free_bytes == 0 {
-                    0
-                } else {
-                    pressure_snapshot
-                        .slot_unallocatable_bytes
-                        .saturating_mul(1_000_000)
-                        / pressure_snapshot.free_bytes
-                },
-                pending_bytes = pressure_snapshot.pending_bytes,
-                pending_size_classes = pressure_snapshot.pending_size_classes,
-                claim_progress_epoch = pressure_snapshot.claim_progress_epoch,
-                dispatch_elapsed_ms = dispatch_started_at.elapsed().as_millis(),
-                "owner slot pressure completed exponential source-eviction round"
+                accounting_slot_size = snapshot.accounting_slot_size,
+                raw_free_bytes = snapshot.free_bytes,
+                allocatable_slots = snapshot.allocatable_slots,
+                allocatable_bytes = snapshot.allocatable_bytes,
+                slot_unallocatable_bytes = snapshot.slot_unallocatable_bytes,
+                pending_bytes = snapshot.pending_bytes,
+                pending_size_classes = snapshot.pending_size_classes,
+                claim_progress_epoch = snapshot.claim_progress_epoch,
+                physical_free_epoch = snapshot.physical_free_epoch,
+                global_accounted_bytes = snapshot.global_accounted_bytes,
+                global_headroom_bytes,
+                global_reclaim_requested_bytes = global_reclaim.requested_bytes,
+                global_reclaim_selected_bytes = global_reclaim.selected_bytes,
+                physical_progress,
+                logical_progress,
+                candidate_only_selection = global_reclaim.selected_bytes != 0 && !physical_progress,
+                "owner segment pressure completed exponential single-KV eviction round"
             );
         }
     });
@@ -1135,24 +723,134 @@ pub async fn wait_owner_local_reserve_ready(
     let required_slots = u64::try_from(key_count).unwrap_or(u64::MAX);
     loop {
         let notified = notify.notified();
+        if inner
+            .owner_segment_allocator
+            .lock()
+            .allocatable_report(slot_size)
+            .allocatable_slots
+            >= required_slots
         {
-            let pool = inner.owner_local_reserve_pool.lock();
-            if pool.allocatable_report(slot_size).allocatable_slots >= required_slots {
-                return true;
-            }
+            return true;
         }
-
         let Some(remaining_hard) = hard_deadline.checked_duration_since(Instant::now()) else {
             return false;
         };
         let wait_budget = remaining_hard.min(soft_wait_timeout);
-
         tokio::select! {
             _ = shutdown_waiter.wait() => return false,
             _ = tokio::time::sleep(wait_budget) => {
-                inner.owner_local_reserve_rebalance_notify().notify_waiters();
+                notify.notify_waiters();
             }
             _ = notified => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pressure_backoff_is_byte_bounded() {
+        assert_eq!(
+            owner_slot_pressure_round_bytes(64 * 1024 * 1024, 0),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            owner_slot_pressure_round_bytes(64 * 1024 * 1024, 3),
+            512 * 1024 * 1024
+        );
+        assert_eq!(
+            owner_slot_pressure_round_bytes(64 * 1024 * 1024, 20),
+            4 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn first_pressure_round_reclaims_one_bounded_pending_batch_of_headroom() {
+        let slot_size = 4 * 1024 * 1024;
+        let mut pool = OwnerSegmentAllocator::default();
+        pool.expected_slot_size = Some(slot_size);
+        pool.pending_demand_by_slot_size.insert(slot_size, 13);
+        pool.failed_claim_slot_sizes.insert(slot_size);
+
+        // With no currently allocatable slot, the exact shortage is 52 MiB
+        // and the bounded next-batch headroom is another 52 MiB.
+        let pressure = slot_pressure_capacity(&pool);
+        assert_eq!(pressure.initial_pop_bytes, 104 * 1024 * 1024);
+
+        // Large batches add at most 64 MiB of look-ahead headroom.
+        pool.pending_demand_by_slot_size.insert(slot_size, 32);
+        let pressure = slot_pressure_capacity(&pool);
+        assert_eq!(pressure.initial_pop_bytes, 192 * 1024 * 1024);
+    }
+
+    fn pressure_snapshot(
+        free_bytes: u64,
+        allocatable_slots: u64,
+        claim_progress_epoch: u64,
+        physical_free_epoch: u64,
+        global_accounted_bytes: u64,
+    ) -> RebalanceSnapshot {
+        RebalanceSnapshot {
+            free_bytes,
+            allocatable_slots,
+            claim_progress_epoch,
+            physical_free_epoch,
+            physical_capacity_bytes: 128 * 1024 * 1024,
+            local_target_bytes: 96 * 1024 * 1024,
+            global_accounted_bytes,
+            ..RebalanceSnapshot::default()
+        }
+    }
+
+    #[test]
+    fn metadata_only_demotion_is_not_allocator_progress() {
+        let before = pressure_snapshot(4096, 0, 7, 11, 24 * 1024 * 1024);
+        let after = pressure_snapshot(4096, 0, 7, 11, 25 * 1024 * 1024);
+        let baseline = OwnerPressureProgressBaseline::from_snapshot(before);
+        assert!(!baseline.observed_physical_progress(after));
+
+        let freed = pressure_snapshot(8192, 1, 7, 12, 25 * 1024 * 1024);
+        assert!(baseline.observed_physical_progress(freed));
+        let claimed = pressure_snapshot(4096, 0, 8, 11, 25 * 1024 * 1024);
+        assert!(baseline.observed_physical_progress(claimed));
+
+        // Another allocator user may consume the newly freed extent before
+        // the pressure actor samples aggregate bytes.  Exact Free still has
+        // to count as progress so the remaining shortage is replanned.
+        let free_masked_by_claim = pressure_snapshot(2048, 0, 7, 12, 25 * 1024 * 1024);
+        assert!(baseline.observed_physical_progress(free_masked_by_claim));
+    }
+
+    #[test]
+    fn candidate_only_round_keeps_exponential_replan_open() {
+        let base = 64 * 1024 * 1024;
+        let mut backoff = OwnerPressureBackoff::default();
+        assert_eq!(backoff.request_bytes(base), base);
+
+        // Closing a batch with selected candidates is not a reason to wait.
+        // If no claim follows, the next round doubles even when those
+        // candidates later become retry-only debt.
+        backoff.finish_round(base);
+        assert_eq!(backoff.request_bytes(base), 2 * base);
+        backoff.finish_round(base);
+        assert_eq!(backoff.request_bytes(base), 4 * base);
+
+        // Only allocator claim progress resets the pressure sequence.
+        backoff.sync_claim_progress(1);
+        assert_eq!(backoff.request_bytes(base), base);
+    }
+
+    #[test]
+    fn expected_layout_keeps_logical_and_physical_bytes_separate() {
+        let layout = expected_capacity_layout(
+            4_718_592,
+            100 * 1024 * 1024 * 1024,
+            128 * 1024 * 1024 * 1024,
+        );
+        assert_eq!(layout.slot_size, 4_718_592);
+        assert_eq!(layout.payload_capacity_bytes, 100 * 1024 * 1024 * 1024);
+        assert_eq!(layout.physical_capacity_bytes, 128 * 1024 * 1024 * 1024);
     }
 }

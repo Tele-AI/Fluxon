@@ -74,7 +74,7 @@ impl MasterOffsetAllocator {
         }
         let usable_size_bytes = u64::from(allocation_units) * MASTER_OFFSET_ALLOCATION_UNIT_BYTES;
         // Small segments can reserve one node per unit. Large owner mappings cap metadata at a
-        // level still far above their possible 512 MiB grant count.
+        // level still far above the expected concurrent allocation count.
         let max_allocation_nodes = allocation_units
             .saturating_add(2)
             .min(MASTER_OFFSET_MAX_ALLOCATION_NODES);
@@ -601,15 +601,11 @@ mod tests {
     fn master_offset_allocator_supports_a_324_gib_owner_without_per_page_metadata() {
         let owner_bytes = 324 * 1024 * 1024 * 1024_u64;
         let allocator = MasterOffsetAllocator::new(owner_bytes).unwrap();
-        let grant = allocator
-            .allocate(crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES)
-            .unwrap();
-        assert_eq!(grant.offset_bytes, 0);
-        assert_eq!(
-            grant.capacity_bytes,
-            crate::OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
-        );
-        allocator.free(grant.allocation, grant.capacity_bytes);
+        let extent_bytes = 512 * 1024 * 1024;
+        let allocation = allocator.allocate(extent_bytes).unwrap();
+        assert_eq!(allocation.offset_bytes, 0);
+        assert_eq!(allocation.capacity_bytes, extent_bytes);
+        allocator.free(allocation.allocation, allocation.capacity_bytes);
         assert_eq!(allocator.allocated_size_bytes(), 0);
     }
 

@@ -67,7 +67,8 @@ protocol:                              # Transport protocol override (dict(optio
   rdma_device_names:                   # Explicit RDMA devices for protocol config (['{str}'](optional))
   tcp_thread_reactor:                  # busy_poll|event_driven; defaults to busy_poll (str(optional))
 pprof_duration_seconds:                # Dump pprof flamegraph after N seconds (int(optional))
-replica_writeback_hot_capacity_ratio: 0.75 # Owner-local hot working-set ratio in the open interval zero to one (float(optional))
+owner_placement_class:                 # inference|remote_cpu; explicit owner capacity role (str(optional))
+replica_writeback_hot_capacity_ratio: 0.75 # Owner-local hot working-set ratio greater than zero and at most one (float(optional))
 contribute_to_cluster_pool_size:       # Capacity contributed to cluster pool (dict(optional))
   dram: 1677721600                     # - DRAM contribution (int(multiple of 16777216))
   vram:                                # - VRAM contribution per GPU (dict(dynamic_key))
@@ -84,6 +85,8 @@ test_spec_config:                      # Test-only config overrides (dict(option
   prefer_local_placement: false        # Prefer placing new KV writes on the requester-local owner when possible (bool(optional))
   short_circuit_put_payload_path: false # Keep large put_start allocation but skip payload memcpy + transfer (bool(optional))
   skip_put_end_commit: false           # Return success after payload transfer without put_done commit; inflight_put TTL cleanup only (bool(optional))
+  owner_segment_memfd: false           # Owner DRAM segment uses memfd + procfs pathname attach (bool(optional))
+  legacy_a19_global_demotion_one_phase: false # Explicit a19 one-RPC demotion recovery mode; default keeps exact owner reservation (bool(optional))
   ssd_read_source_policy: legacy_remote_first # legacy_remote_first|local_ssd_only_first (str(optional))
   post_read_remote_policy: retain      # retain|drop exact remote DRAM source after a local Get backing commits (str(optional))
   owner_local_reserve_soft_wait_timeout_ms: # Local-reserve polling interval, >0 (int(optional))
@@ -177,6 +180,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "prefer_local_placement",
         "short_circuit_put_payload_path",
         "skip_put_end_commit",
+        "owner_segment_memfd",
+        "legacy_a19_global_demotion_one_phase",
         "ssd_read_source_policy",
         "post_read_remote_policy",
         "owner_local_reserve_soft_wait_timeout_ms",
@@ -214,6 +219,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "prefer_local_placement",
         "short_circuit_put_payload_path",
         "skip_put_end_commit",
+        "owner_segment_memfd",
+        "legacy_a19_global_demotion_one_phase",
         "enable_side_transfer",
     ):
         value = raw.get(key)
@@ -493,19 +500,29 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
     is_zero_contribution = _is_zero_contribution_fluxonkv_config(cfg)
     test_spec_config = cfg.get("test_spec_config") or {}
     expected_capacity = test_spec_config.get("owner_local_reserve_expected_capacity")
+    owner_segment_memfd = test_spec_config.get("owner_segment_memfd", False)
+    owner_placement_class = cfg.get("owner_placement_class")
     hot_capacity_ratio = cfg.get("replica_writeback_hot_capacity_ratio")
+
+    if owner_placement_class is not None:
+        if not isinstance(owner_placement_class, str):
+            raise ValueError("owner_placement_class must be a string")
+        if owner_placement_class not in {"inference", "remote_cpu"}:
+            raise ValueError(
+                "owner_placement_class must be one of ['inference', 'remote_cpu']"
+            )
 
     if hot_capacity_ratio is not None:
         if isinstance(hot_capacity_ratio, bool) or not isinstance(
             hot_capacity_ratio, (int, float)
         ):
             raise ValueError(
-                "replica_writeback_hot_capacity_ratio must be a number in (0, 1)"
+                "replica_writeback_hot_capacity_ratio must be a number in (0, 1]"
             )
         hot_capacity_ratio = float(hot_capacity_ratio)
-        if not 0.0 < hot_capacity_ratio < 1.0:
+        if not 0.0 < hot_capacity_ratio <= 1.0:
             raise ValueError(
-                "replica_writeback_hot_capacity_ratio must be finite and in (0, 1)"
+                "replica_writeback_hot_capacity_ratio must be finite and in (0, 1]"
             )
         cfg["replica_writeback_hot_capacity_ratio"] = hot_capacity_ratio
 
@@ -520,6 +537,8 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
         raise ValueError("fluxonkv_spec.transfer_engine has been removed from Fluxon KV config")
 
     if is_zero_contribution:
+        if owner_placement_class is not None:
+            raise ValueError("owner_placement_class is only valid on owner configs")
         if hot_capacity_ratio is not None:
             raise ValueError(
                 "replica_writeback_hot_capacity_ratio is only valid on owner configs"
@@ -527,6 +546,10 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
         if expected_capacity is not None:
             raise ValueError(
                 "test_spec_config.owner_local_reserve_expected_capacity is only valid on owner configs"
+            )
+        if owner_segment_memfd:
+            raise ValueError(
+                "test_spec_config.owner_segment_memfd is only valid on owner configs"
             )
         forbidden_spec_keys = [
             "etcd_addresses",
@@ -551,21 +574,22 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
     if int(contrib["dram"]) == 0:
         raise ValueError("owner mode requires non-zero contribute_to_cluster_pool_size.dram")
 
+    if owner_placement_class == "inference" and hot_capacity_ratio is None:
+        raise ValueError(
+            "owner_placement_class=inference requires replica_writeback_hot_capacity_ratio"
+        )
+    if owner_placement_class == "remote_cpu" and hot_capacity_ratio is not None:
+        raise ValueError(
+            "owner_placement_class=remote_cpu requires replica_writeback_hot_capacity_ratio to be omitted"
+        )
+
     if expected_capacity is not None:
-        value_len = int(expected_capacity["value_len"])
         payload_capacity_bytes = int(expected_capacity["payload_capacity_bytes"])
-        slot_size = max(value_len, 4096)
-        slot_size = (slot_size + 4095) & ~4095
-        slots_per_grant = (512 * 1024 * 1024) // slot_size
-        value_count = (payload_capacity_bytes + value_len - 1) // value_len
-        expected_grants = (value_count + slots_per_grant - 1) // slots_per_grant
-        physical_reserve_bytes = expected_grants * 512 * 1024 * 1024
         owner_dram_bytes = int(contrib["dram"])
-        if physical_reserve_bytes > owner_dram_bytes:
+        if payload_capacity_bytes > owner_dram_bytes:
             raise ValueError(
-                "test_spec_config.owner_local_reserve_expected_capacity requires "
-                f"{physical_reserve_bytes} physical bytes across {expected_grants} grants, "
-                f"exceeding owner dram contribution {owner_dram_bytes}"
+                "test_spec_config.owner_local_reserve_expected_capacity.payload_capacity_bytes "
+                f"{payload_capacity_bytes} exceeds owner segment {owner_dram_bytes}"
             )
 
     if "etcd_addresses" not in spec:
@@ -659,6 +683,8 @@ class FluxonKvClientConfig():
             raise ValueError(
                 "replica_writeback_hot_capacity_ratio requires fluxonkv_spec"
             )
+        if "owner_placement_class" in plain and not has_fluxon:
+            raise ValueError("owner_placement_class requires fluxonkv_spec")
 
         pprof_duration_seconds = plain.get("pprof_duration_seconds")
         if pprof_duration_seconds is None:
@@ -684,6 +710,13 @@ class FluxonKvClientConfig():
         if v is None:
             return None
         return int(v)
+
+    @property
+    def owner_placement_class(self) -> Optional[str]:
+        value = self.config_dict.get("owner_placement_class")
+        if value is None:
+            return None
+        return str(value)
     
     @property
     def contribute_to_cluster_pool_size(self):

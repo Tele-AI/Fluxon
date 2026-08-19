@@ -29,9 +29,10 @@ use self::{
         BatchPutAppendStartReq, BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq,
         BatchReleasePutKeyReservationsReq, CountPrefixReq, CountPrefixResp, DeleteAckReq,
         DeleteReq, GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetRevokeReq,
-        GetSourceKind, GetStartReq, GroupedBatchPutDoneReq, OwnerReclaimItem, PutAppendDoneReq,
-        PutAppendRevokeReq, PutAppendStartReq, PutAtomicGroup, PutDoneReq, PutRevokeReq,
-        PutStartReq, ReleaseLocalGrantReq, ReserveLocalGrantReq, SsdStageBeginReq, SsdStageDoneReq,
+        GetSourceKind, GetStartReq, GroupedBatchPutDoneReq, OwnerLocalReserveControlOp,
+        OwnerLocalReserveControlReq, OwnerLocalReserveControlResp, OwnerReclaimItem,
+        PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq, PutAtomicGroup, PutDoneReq,
+        PutRevokeReq, PutStartReq, SsdStageBeginReq, SsdStageDoneReq,
     },
     placement::{PlacementPolicy, build_placement_policy},
     put::{
@@ -40,7 +41,6 @@ use self::{
         handle_batch_put_revoke, handle_batch_put_start, handle_batch_release_put_key_reservations,
         handle_grouped_batch_put_done, handle_put_append_done, handle_put_append_revoke,
         handle_put_append_start, handle_put_done, handle_put_revoke, handle_put_start,
-        handle_release_local_grant, handle_reserve_local_grant,
     },
     reclaim::handle_batch_evict_owner_source,
 };
@@ -59,7 +59,7 @@ use crate::master_seg_manager::NodeTombTag;
 use crate::master_seg_manager::one_seg_allocator::{Allocation, NodePoolCapacitySnapshot};
 use crate::memholder::{EnsureMemholderMgmtDeleteHandle, MasterOwnerMemMgr, MemholderManagerTrait};
 use crate::metric_reporter::{MetricReporter, MetricReporterAccessTrait};
-use crate::p2p::control_plane_rpc::send_control_plane_rpc_response;
+use crate::p2p::control_plane_rpc::{call_control_plane_rpc, send_control_plane_rpc_response};
 use crate::p2p::msg_pack::{MsgPack, RPCCaller, RPCHandler};
 use crate::p2p::p2p_module::{
     P2pModule, P2pModuleAccessTrait, UserRpcAsyncHandler, UserRpcFuture,
@@ -95,9 +95,12 @@ const INFLIGHT_PUT_TTL_SECONDS_SKIP_PUT_END_COMMIT: u64 = 5;
 // closed-runtime data plane well beyond one RPC timeout under burst load. Keep
 // the master operation identity alive long enough for Done/Revoke to close it.
 const INFLIGHT_REPLICA_TASK_TTL_SECONDS: u64 = 5 * 60;
+const OWNER_SOURCE_RECLAIM_REPLAY_TTL_SECONDS: u64 = 10 * 60;
+const OWNER_SOURCE_RECLAIM_REPLAY_MAX_ENTRIES: u64 = 262_144;
 const POST_ROUTE_MAINTENANCE_QUEUE_CAPACITY: usize = 512;
 const TIER1_WRITEBACK_QUEUE_CAPACITY: usize = 4096;
 pub const NODE_POOL_CAPACITY_USER_RPC_PATH: &str = "fluxon_kv/node_pool_capacity";
+pub const OWNER_LOCAL_RESERVE_USER_RPC_PATH: &str = "fluxon_kv/owner_local_reserve";
 
 fn subtract_pending_eviction_weight(
     pending_weight: &AtomicU64,
@@ -162,7 +165,7 @@ pub enum PutPlacementMode {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ReservedCapacityReason {
-    LocalReserveGrant,
+    LocalExclusiveBudget,
     OwnerIndexedAllocation,
     LeaseBoundKv,
 }
@@ -190,12 +193,27 @@ fn node_cache_capacity_boundaries(
     }
 }
 
+fn owner_local_reserve_growth_exhausts_ring_b(
+    current_local_reserved: u64,
+    requested_local_reserved: u64,
+    total_reserved: u64,
+    ring_b_base: u64,
+) -> bool {
+    if requested_local_reserved <= current_local_reserved {
+        return false;
+    }
+    total_reserved
+        .saturating_sub(current_local_reserved)
+        .saturating_add(requested_local_reserved)
+        >= ring_b_base
+}
+
 #[derive(Debug)]
 pub struct NodeCacheReservedCapacity {
     /// Exact node registration generation owning these counters.
     generation: NodeTombTag,
     pub total_bytes: AtomicU64,
-    pub local_reserve_grant_bytes: AtomicU64,
+    pub local_exclusive_budget_bytes: AtomicU64,
     pub owner_indexed_allocation_bytes: AtomicU64,
     pub lease_bound_kv_bytes: AtomicU64,
 }
@@ -205,7 +223,7 @@ impl NodeCacheReservedCapacity {
         Self {
             generation,
             total_bytes: AtomicU64::new(0),
-            local_reserve_grant_bytes: AtomicU64::new(0),
+            local_exclusive_budget_bytes: AtomicU64::new(0),
             owner_indexed_allocation_bytes: AtomicU64::new(0),
             lease_bound_kv_bytes: AtomicU64::new(0),
         }
@@ -216,8 +234,8 @@ impl NodeCacheReservedCapacity {
             let delta = delta_bytes as u64;
             self.total_bytes.fetch_add(delta, Ordering::Relaxed);
             match reason {
-                ReservedCapacityReason::LocalReserveGrant => {
-                    self.local_reserve_grant_bytes
+                ReservedCapacityReason::LocalExclusiveBudget => {
+                    self.local_exclusive_budget_bytes
                         .fetch_add(delta, Ordering::Relaxed);
                 }
                 ReservedCapacityReason::OwnerIndexedAllocation => {
@@ -233,8 +251,8 @@ impl NodeCacheReservedCapacity {
             let delta = (-delta_bytes) as u64;
             self.total_bytes.fetch_sub(delta, Ordering::Relaxed);
             match reason {
-                ReservedCapacityReason::LocalReserveGrant => {
-                    self.local_reserve_grant_bytes
+                ReservedCapacityReason::LocalExclusiveBudget => {
+                    self.local_exclusive_budget_bytes
                         .fetch_sub(delta, Ordering::Relaxed);
                 }
                 ReservedCapacityReason::OwnerIndexedAllocation => {
@@ -324,6 +342,8 @@ pub struct ReplicaCacheNodeObserveSnapshot {
     pub pool_capacity_epoch: u64,
     pub entries: u64,
     pub weighted_bytes: u64,
+    pub resident_weighted_bytes: u64,
+    pub resident_overshoot_bytes: u64,
     pub effective_capacity_bytes: u64,
     pub reserved_capacity_bytes: u64,
     pub base_capacity_bytes: u64,
@@ -456,6 +476,62 @@ impl UserRpcAsyncHandler for NodePoolCapacityUserRpcHandler {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OwnerLocalReserveUserRequest {
+    Get {
+        owner_node_id: String,
+    },
+    SetLocalTarget {
+        owner_node_id: String,
+        expected_owner_node_start_time: i64,
+        controller_epoch: u64,
+        local_target_bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerLocalReserveUserResponse {
+    pub owner_node_id: String,
+    pub owner: OwnerLocalReserveControlResp,
+    pub ring_b_base_capacity_bytes: u64,
+    pub ring_b_effective_capacity_bytes: u64,
+    pub ring_b_weighted_bytes: u64,
+    pub ring_b_pending_reclaim_bytes: u64,
+    pub local_reserve_reserved_bytes: u64,
+    pub global_settled: bool,
+    pub settled: bool,
+}
+
+struct OwnerLocalReserveUserRpcHandler {
+    view: MasterKvRouterView,
+}
+
+impl UserRpcAsyncHandler for OwnerLocalReserveUserRpcHandler {
+    fn handle(&self, from_node: NodeID, payload: Vec<u8>) -> UserRpcFuture {
+        let view = self.view.clone();
+        Box::pin(async move {
+            let request: OwnerLocalReserveUserRequest =
+                serde_json::from_slice(&payload).map_err(|err| {
+                    KvError::Api(ApiError::InvalidArgument {
+                        detail: format!("invalid owner local-reserve request: {err}"),
+                    })
+                })?;
+            tracing::info!(caller = %from_node, request = ?request, "applying owner local-reserve control");
+            let response = view
+                .master_kv_router()
+                .owner_local_reserve_control(request)
+                .await?;
+            serde_json::to_vec(&response).map_err(|err| {
+                KvError::Api(ApiError::Unknown {
+                    detail: format!("serialize owner local-reserve response failed: {err}"),
+                })
+            })
+        })
+    }
+}
+
 impl RequesterTargetPair {
     fn new(requester_node_id: &str, target_node_id: &str) -> Self {
         Self {
@@ -469,18 +545,7 @@ impl RequesterTargetPair {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct CommittedSlotReplica {
-    pub owner_node_id: NodeID,
-    pub grant_id: u64,
-    /// Grant-relative offset in 4 KiB allocation units.
-    pub slot_index: u32,
-    /// 4 KiB-aligned allocation capacity in bytes.
-    pub slot_size: u64,
-    pub addr: u64,
-    pub len: u64,
-    pub base_addr: u64,
-}
+pub type CommittedSlotReplica = crate::owner_segment::OwnerSlotDesc;
 
 /// Information about a `put` operation that is currently in progress.
 pub enum InflightPutAllocation {
@@ -518,13 +583,17 @@ pub struct InflightReplicaTaskInfo {
     /// another append while the previous attempt's replayable terminal result
     /// is still cached.
     pub operation_id: u64,
-    pub node_id: NodeID,
-    /// Exact target registration generation that owns `target_allocation`.
-    pub target_tomb_tag: NodeTombTag,
+    pub coordinator_generation: crate::owner_segment::OwnerGeneration,
+    pub target: InflightReplicaTarget,
     pub source_node_id: NodeID,
     pub key: String,
     pub put_id: PutIDForAKey,
-    pub target_allocation: Arc<Mutex<Option<Allocation>>>,
+    pub len: u64,
+    /// Immutable atomic publication identity captured when this replica
+    /// operation is reserved.  Start replays and Done validation must use
+    /// this snapshot instead of re-reading a route that may have advanced to
+    /// a newer generation while the target performs its transfer.
+    pub atomic_batch: Option<Arc<PutAtomicGroup>>,
     /// Protect the source-owner copy only after this inclusive replica has been
     /// published successfully.  Backend-admitted replicas set this bit; tiered
     /// write-back and owner-hot exclusive demotion deliberately do not.
@@ -533,8 +602,39 @@ pub struct InflightReplicaTaskInfo {
 }
 
 #[derive(Clone, Debug)]
+pub struct OwnerPlacementCandidate {
+    pub owner: crate::owner_segment::OwnerGeneration,
+    pub placement_class: crate::master_seg_manager::msg_pack::OwnerPlacementClass,
+    pub capacity_report_epoch: u64,
+    pub weight_bytes: u64,
+    pub rank: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct OwnerPlacementPlan {
+    pub policy_epoch: u64,
+    pub capacity_snapshot_id: u64,
+    pub allocation_size_bytes: u64,
+    pub candidates: Vec<OwnerPlacementCandidate>,
+}
+
+#[derive(Clone)]
+pub enum InflightReplicaTarget {
+    /// Transitional normal-Put path. Stage D removes this branch after normal
+    /// Put also uses owner PrepareTarget.
+    MasterAllocation {
+        node_id: NodeID,
+        target_tomb_tag: NodeTombTag,
+        target_allocation: Arc<Mutex<Option<Allocation>>>,
+    },
+    /// Ordered placement hints only. The target owner performs the real claim.
+    OwnerCandidates { plan: OwnerPlacementPlan },
+}
+
+#[derive(Clone, Debug)]
 pub struct CompletedReplicaTaskInfo {
     pub appended: bool,
+    pub route_epoch: u64,
 }
 
 /// Information about a `get` operation that is currently in progress.
@@ -551,8 +651,10 @@ pub struct InflightGetInfo {
     pub src_addr: u64,
     pub src_base_addr: u64,
     pub source_kind: crate::master_kv_router::msg_pack::GetSourceKind,
-    /// Registered source staging owned by the master only for SSD reads.
-    pub ssd_source_allocation: Option<Arc<Allocation>>,
+    /// Exact owner-managed source selected for this operation. Transitional
+    /// master Allocation and SSD staging sources leave this empty.
+    pub source_route_token: Option<crate::owner_segment::OwnerSourceRouteToken>,
+    pub ssd_source_route_token: Option<crate::owner_segment::OwnerSsdSourceRouteToken>,
     pub(crate) ssd_stage_lifecycle: Option<Arc<SsdStageLifecycle>>,
     pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
     pub target: InflightGetTarget,
@@ -651,6 +753,8 @@ pub struct PlannedGetInfo {
     pub src_addr: u64,
     pub src_base_addr: u64,
     pub source_kind: crate::master_kv_router::msg_pack::GetSourceKind,
+    pub source_route_token: Option<crate::owner_segment::OwnerSourceRouteToken>,
+    pub ssd_source_route_token: Option<crate::owner_segment::OwnerSsdSourceRouteToken>,
     pub atomic_group: Option<crate::master_kv_router::msg_pack::PutAtomicGroup>,
 }
 
@@ -664,6 +768,7 @@ pub struct CompletedGetInfo {
 pub enum InflightGetTarget {
     Allocation(Arc<Allocation>),
     PreparedLocalReserveSlot(CommittedSlotReplica),
+    ReusedCommittedSlot(CommittedSlotReplica),
     ExternalSink(crate::master_kv_router::msg_pack::GetExternalSinkTarget),
 }
 
@@ -671,7 +776,7 @@ impl InflightGetTarget {
     pub fn abs_addr(&self) -> u64 {
         match self {
             Self::Allocation(allocation) => allocation.base_addr() + allocation.addr(),
-            Self::PreparedLocalReserveSlot(slot) => slot.addr,
+            Self::PreparedLocalReserveSlot(slot) | Self::ReusedCommittedSlot(slot) => slot.addr,
             Self::ExternalSink(target) => target.addr,
         }
     }
@@ -679,7 +784,9 @@ impl InflightGetTarget {
     pub fn base_addr(&self) -> u64 {
         match self {
             Self::Allocation(allocation) => allocation.base_addr(),
-            Self::PreparedLocalReserveSlot(slot) => slot.base_addr,
+            Self::PreparedLocalReserveSlot(slot) | Self::ReusedCommittedSlot(slot) => {
+                slot.base_addr
+            }
             Self::ExternalSink(target) => target.addr,
         }
     }
@@ -687,7 +794,9 @@ impl InflightGetTarget {
     pub fn capacity(&self) -> u64 {
         match self {
             Self::Allocation(allocation) => allocation.capcity(),
-            Self::PreparedLocalReserveSlot(slot) => slot.slot_size,
+            Self::PreparedLocalReserveSlot(slot) | Self::ReusedCommittedSlot(slot) => {
+                slot.capacity_bytes
+            }
             Self::ExternalSink(target) => target.capacity,
         }
     }
@@ -706,15 +815,6 @@ pub struct OwnerHoldingGetInfo {
     pub holding_node_id: NodeID, // The node that requested the get (holder of the memory)
     pub len: u64,
     pub allocation: Arc<Allocation>, // The target allocation where data was transferred
-}
-
-pub struct LocalReserveGrantInfo {
-    pub owner_node_id: NodeID,
-    /// Exact owner registration generation that owns the grant allocation.
-    pub tomb_tag: NodeTombTag,
-    pub allocation: Allocation,
-    /// Excludes this whole grant from the master unindexed-Allocation domain.
-    pub capacity_reservation: Option<Arc<NodeCacheCapacityReservation>>,
 }
 
 pub struct PreparedPutKeyReservationInfo {
@@ -759,6 +859,39 @@ pub(crate) struct EvictionReclaimCounters {
     pub post_read_duplicate_enqueued_bytes: AtomicU64,
     pub post_read_duplicate_reclaimed_items: AtomicU64,
     pub post_read_duplicate_reclaimed_bytes: AtomicU64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct OwnerSourceReclaimOperationIdentity {
+    pub owner_node_id: NodeIDString,
+    pub owner_node_start_time: i64,
+    pub operation_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OwnerSourceGlobalReclaimTerminal {
+    pub requested_bytes: u64,
+    pub selected_bytes: u64,
+}
+
+fn select_owner_global_reclaim_once(
+    terminals: &moka::sync::Cache<
+        OwnerSourceReclaimOperationIdentity,
+        OwnerSourceGlobalReclaimTerminal,
+    >,
+    identity: OwnerSourceReclaimOperationIdentity,
+    requested_bytes: u64,
+    select: impl FnOnce(u64) -> u64,
+) -> Result<OwnerSourceGlobalReclaimTerminal, u64> {
+    let terminal = terminals.get_with(identity, || OwnerSourceGlobalReclaimTerminal {
+        requested_bytes,
+        selected_bytes: select(requested_bytes),
+    });
+    if terminal.requested_bytes == requested_bytes {
+        Ok(terminal)
+    } else {
+        Err(terminal.requested_bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1216,7 +1349,7 @@ impl KvReplicaBacking {
     pub fn capacity_bytes(&self) -> u64 {
         match self {
             Self::Allocation(allocation) => allocation.capcity(),
-            Self::CommittedSlot(slot) => slot.slot_size,
+            Self::CommittedSlot(slot) => slot.capacity_bytes,
         }
     }
 }
@@ -1414,9 +1547,8 @@ impl OneKvNodesRoutes {
     }
 }
 
-/// Ring B contains exactly master-only, unindexed Allocation routes.  Node
-/// role is deliberately absent from this predicate: placement and capacity
-/// ownership are orthogonal.
+/// Ring B contains globally shared memory routes. They may be master-owned
+/// Allocations or owner-owned slots whose LocalExclusive index was demoted.
 fn ring_b_route_replica_desc(
     route: &OneKvNodesRoutes,
     node_id: &str,
@@ -1427,10 +1559,7 @@ fn ring_b_route_replica_desc(
     let replicas = route.node_replicas.read();
     let node_replicas = replicas.get(node_id)?;
     let replica = node_replicas.memory.as_ref()?;
-    if node_replicas.tomb_tag.is_tomb()
-        || replica.owner_local_indexed
-        || !matches!(&replica.backing, KvReplicaBacking::Allocation(_))
-    {
+    if node_replicas.tomb_tag.is_tomb() || replica.owner_local_indexed {
         return None;
     }
     Some(NodeValueReplicaDesc {
@@ -1668,38 +1797,6 @@ async fn cleanup_departed_generation_routes(
     node_id: NodeIDString,
     departed_tag: NodeTombTag,
 ) {
-    // Grants own master-side Allocation guards and therefore must be released
-    // for the exact departed generation as well.  Collect ids without keeping
-    // DashMap guards across a removal or yield.
-    let departed_grant_ids: Vec<u64> = view
-        .master_kv_router()
-        .inner()
-        .local_reserve_grants
-        .iter()
-        .filter_map(|entry| {
-            (entry.value().owner_node_id.as_ref() == node_id.as_str()
-                && entry.value().tomb_tag.is_tomb()
-                && entry.value().tomb_tag.same_generation(&departed_tag))
-            .then_some(*entry.key())
-        })
-        .collect();
-    let mut removed_grants = 0usize;
-    for grant_id in departed_grant_ids {
-        if view
-            .master_kv_router()
-            .inner()
-            .local_reserve_grants
-            .remove_if(&grant_id, |_, grant| {
-                grant.owner_node_id.as_ref() == node_id.as_str()
-                    && grant.tomb_tag.is_tomb()
-                    && grant.tomb_tag.same_generation(&departed_tag)
-            })
-            .is_some()
-        {
-            removed_grants = removed_grants.saturating_add(1);
-        }
-    }
-
     // Weak snapshots avoid pinning every route Allocation for the duration of a large scan.
     // No DashMap guard or replica lock is held across an await.
     let route_snapshot: Vec<(String, Weak<OneKvNodesRoutes>)> = view
@@ -1755,9 +1852,8 @@ async fn cleanup_departed_generation_routes(
     }
 
     info!(
-        "MemberLeft route cleanup completed: node={} removed_grants={} removed_replicas={} removed_empty_routes={}",
+        "MemberLeft route cleanup completed: node={} removed_replicas={} removed_empty_routes={}",
         node_id,
-        removed_grants,
         removed_replicas,
         removed_empty_routes.len()
     );
@@ -1921,9 +2017,9 @@ mod tests {
             put_id: (7, 3),
             epoch: 11,
             backing: OwnerReclaimBacking::CommittedSlot {
-                grant_id: 13,
-                slot_index: 17,
-                slot_size: 8 * 1024 * 1024,
+                allocation_id: 13,
+                segment_offset: 17 * 8 * 1024 * 1024,
+                capacity_bytes: 8 * 1024 * 1024,
             },
             reason: OwnerReclaimReason::OwnerCapacityEviction,
         };
@@ -1992,9 +2088,9 @@ mod tests {
             put_id: (9, 1),
             epoch: 17,
             backing: OwnerReclaimBacking::CommittedSlot {
-                grant_id: 19,
-                slot_index: 23,
-                slot_size: 8 * 1024 * 1024,
+                allocation_id: 19,
+                segment_offset: 23 * 8 * 1024 * 1024,
+                capacity_bytes: 8 * 1024 * 1024,
             },
             reason: OwnerReclaimReason::OwnerCapacityEviction,
         };
@@ -2056,7 +2152,10 @@ mod tests {
 
         terminals.insert(
             (key.clone(), put_id.0, put_id.1, first_operation_id),
-            CompletedReplicaTaskInfo { appended: true },
+            CompletedReplicaTaskInfo {
+                appended: true,
+                route_epoch: 7,
+            },
         );
 
         assert!(
@@ -2073,16 +2172,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn owner_global_reclaim_selection_replays_without_a_second_pop() {
+        let terminals = moka::sync::Cache::builder()
+            .time_to_live(Duration::from_secs(120))
+            .build();
+        let identity = OwnerSourceReclaimOperationIdentity {
+            owner_node_id: "owner".to_string(),
+            owner_node_start_time: 17,
+            operation_id: 41,
+        };
+        let calls = AtomicU64::new(0);
+
+        let first = select_owner_global_reclaim_once(&terminals, identity.clone(), 64, |bytes| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            bytes + 8
+        })
+        .expect("first operation selects GlobalShared victims");
+        let replay = select_owner_global_reclaim_once(&terminals, identity.clone(), 64, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            u64::MAX
+        })
+        .expect("same operation replays its selection terminal");
+
+        assert_eq!(first.selected_bytes, 72);
+        assert_eq!(replay, first);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            select_owner_global_reclaim_once(&terminals, identity, 32, |_| u64::MAX),
+            Err(64),
+            "one operation identity cannot change its requested reclaim bytes"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
     fn test_memory_replica(node_id: &str) -> KvMemoryReplica {
         KvMemoryReplica {
             backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
-                owner_node_id: node_id.to_string().into(),
-                grant_id: 1,
-                slot_index: 0,
-                slot_size: 1024,
+                owner: crate::owner_segment::OwnerGeneration::new(node_id, 1),
+                allocation_id: 1,
+                segment_offset: 0,
+                capacity_bytes: 4096,
                 addr: 0,
                 len: 1024,
                 base_addr: 0,
+                segment_registration_epoch: 1,
             }),
             owner_local_indexed: true,
             get_durable_reservation: None,
@@ -2177,7 +2311,10 @@ mod tests {
             .expect("test route has memory")
             .owner_local_indexed = false;
         let committed = make_route(None, committed);
-        assert!(ring_b_route_replica_desc(&committed, "same-node").is_none());
+        let desc = ring_b_route_replica_desc(&committed, "same-node")
+            .expect("demoted owner slot must enter GlobalShared ring B");
+        assert_eq!(desc.put_id, (91, 3));
+        assert_eq!(desc.weight_bytes, 4096);
     }
 
     #[test]
@@ -2614,6 +2751,33 @@ mod tests {
     }
 
     #[test]
+    fn ring_b_zero_capacity_keeps_the_bounded_reclaim_controller() {
+        let selected = Arc::new(AtomicU64::new(0));
+        let selected_for_listener = selected.clone();
+        let cache = MasterNodeCache::builder(0)
+            .weigher(|_key: &String, desc: &NodeValueReplicaDesc| desc.weight_bytes)
+            .eviction_listener(move |_key, _desc, cause| {
+                assert_eq!(cause, RemovalCause::Size);
+                selected_for_listener.fetch_add(1, Ordering::Relaxed);
+            })
+            .build();
+
+        assert_eq!(cache.max_capacity(), Some(0));
+        insert_master_cache_entry(
+            &cache,
+            "key".to_string(),
+            NodeValueReplicaDesc {
+                weight_bytes: 4096,
+                put_id: (10, 1),
+            },
+        );
+        cache.run_pending_tasks();
+        assert_eq!(cache.weighted_size(), 0);
+        assert_eq!(cache.resident_weighted_size(), 4096);
+        assert_eq!(selected.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn ring_b_shrink_selects_single_entries_to_the_new_active_boundary() {
         let selected = Arc::new(AtomicU64::new(0));
         let selected_for_listener = selected.clone();
@@ -2657,6 +2821,57 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(json["operation"], "set_active");
         assert_eq!(json["expected_capacity_epoch"], 3);
+    }
+
+    #[test]
+    fn owner_scope_budget_control_json_keeps_one_explicit_byte_target() {
+        let request = OwnerLocalReserveUserRequest::SetLocalTarget {
+            owner_node_id: "gpu-owner".to_string(),
+            expected_owner_node_start_time: 19,
+            controller_epoch: 4,
+            local_target_bytes: 88 * 1024 * 1024 * 1024,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let decoded: OwnerLocalReserveUserRequest = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, request);
+        let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["operation"], "set_local_target");
+        assert_eq!(json["owner_node_id"], "gpu-owner");
+        assert_eq!(json["expected_owner_node_start_time"], 19);
+        assert_eq!(json["controller_epoch"], 4);
+        assert_eq!(json["local_target_bytes"], 88 * 1024 * 1024 * 1024_u64);
+        assert!(json.get("moka_capacity_bytes").is_none());
+    }
+
+    #[test]
+    fn owner_local_reserve_ring_b_guard_only_rejects_real_growth() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // A full-local initial state must still be allowed to shrink even
+        // while its current reservation is above ring-B's nominal base.
+        assert!(!owner_local_reserve_growth_exhausts_ring_b(
+            128 * GIB,
+            120 * GIB,
+            128 * GIB,
+            121 * GIB,
+        ));
+        assert!(!owner_local_reserve_growth_exhausts_ring_b(
+            128 * GIB,
+            128 * GIB,
+            128 * GIB,
+            121 * GIB,
+        ));
+        assert!(owner_local_reserve_growth_exhausts_ring_b(
+            112 * GIB,
+            122 * GIB,
+            112 * GIB,
+            121 * GIB,
+        ));
+        assert!(!owner_local_reserve_growth_exhausts_ring_b(
+            104 * GIB,
+            112 * GIB,
+            104 * GIB,
+            121 * GIB,
+        ));
     }
 
     #[test]
@@ -2819,16 +3034,74 @@ mod tests {
         }
     }
 
+    fn peer_dag_snapshot(
+        member: &ClusterMember,
+        peer_start_time: i64,
+        direct_ready: bool,
+        transfer_backend_epoch: Option<u64>,
+        transfer_rpc_ready_backend_epoch: Option<u64>,
+    ) -> fluxon_commu::p2p::TierSnapshot {
+        let peer_id: NodeID = member.id.clone().into();
+        let peer_gen = fluxon_commu::p2p::PeerGen {
+            peer_id: peer_id.clone(),
+            node_start_time: peer_start_time,
+        };
+        fluxon_commu::p2p::TierSnapshot {
+            self_peer_gen: fluxon_commu::p2p::PeerGen {
+                peer_id: "master".to_string().into(),
+                node_start_time: 10,
+            },
+            disable_crossowner_ipc: false,
+            peers: HashMap::from([(
+                peer_id,
+                fluxon_commu::p2p::TierPeerView {
+                    peer_gen: Some(peer_gen),
+                    intra_conn_ready: false,
+                    direct_conn_ready: direct_ready,
+                    transfer_backend_epoch,
+                    transfer_rpc_ready_backend_epoch,
+                    share_group_owner: None,
+                    is_p2p_relay: true,
+                },
+            )]),
+            relay_set_snapshot: Vec::new(),
+            relay_caps_by_hop: HashMap::new(),
+            direct_graph: HashMap::new(),
+        }
+    }
+
     #[test]
-    fn segment_registration_readiness_accepts_owner_without_local_ipc_root() {
+    fn segment_registration_recovery_requires_exact_generation_and_send_lane() {
         let member = new_test_member(HashMap::from([
             ("client".to_string(), "true".to_string()),
             ("p2p_relay".to_string(), "true".to_string()),
         ]));
 
-        assert!(MasterKvRouter::member_ready_for_segment_registration(
-            &member
-        ));
+        assert!(MasterKvRouter::member_role_eligible_for_segment_registration(&member));
+        assert!(
+            MasterKvRouter::member_ready_for_segment_registration_in_peer_dag(
+                &member,
+                &peer_dag_snapshot(&member, 1, true, Some(7), Some(7)),
+            )
+        );
+        assert!(
+            !MasterKvRouter::member_ready_for_segment_registration_in_peer_dag(
+                &member,
+                &peer_dag_snapshot(&member, 2, true, Some(7), Some(7)),
+            )
+        );
+        assert!(
+            !MasterKvRouter::member_ready_for_segment_registration_in_peer_dag(
+                &member,
+                &peer_dag_snapshot(&member, 1, false, Some(7), Some(7)),
+            )
+        );
+        assert!(
+            MasterKvRouter::member_ready_for_segment_registration_in_peer_dag(
+                &member,
+                &peer_dag_snapshot(&member, 1, true, None, None),
+            )
+        );
     }
 
     #[test]
@@ -2837,18 +3110,14 @@ mod tests {
             "external_client".to_string(),
             "true".to_string(),
         )]));
-        assert!(!MasterKvRouter::member_ready_for_segment_registration(
-            &external
-        ));
+        assert!(!MasterKvRouter::member_role_eligible_for_segment_registration(&external));
 
         let side_worker = new_test_member(HashMap::from([
             ("client".to_string(), "true".to_string()),
             ("side_transfer_worker".to_string(), "true".to_string()),
             ("p2p_relay".to_string(), "true".to_string()),
         ]));
-        assert!(!MasterKvRouter::member_ready_for_segment_registration(
-            &side_worker
-        ));
+        assert!(!MasterKvRouter::member_role_eligible_for_segment_registration(&side_worker));
     }
 
     #[test]
@@ -2909,6 +3178,11 @@ pub struct MasterKvRouterInner {
     pub get_done_locks: AMapLock<u64>,
     pub(crate) key_activity: Arc<MasterKeyActivityTable>,
     pub(crate) prepared_get_requesters: Arc<PreparedGetRequesterTable>,
+    /// Makes the explicit GlobalShared pop idempotent across transport retries
+    /// of one owner source-eviction operation.  Victim route deletion remains
+    /// generation-fenced by the existing per-key reclaim state machine.
+    pub(crate) owner_source_global_reclaim_terminals:
+        moka::sync::Cache<OwnerSourceReclaimOperationIdentity, OwnerSourceGlobalReclaimTerminal>,
 
     /// Cache for holding get operations (owned, flattened by (node_id, holder_id))
     pub get_holding: MasterOwnerMemMgr,
@@ -2918,9 +3192,6 @@ pub struct MasterKvRouterInner {
 
     /// Counter for holder_id
     pub next_holder_id: AtomicU64,
-
-    /// Counter for local reserve grant identifiers.
-    pub next_local_reserve_grant_id: AtomicU64,
 
     /// Counter for prepared put-key reservation identifiers.
     pub next_prepared_put_key_reservation_id: AtomicU64,
@@ -2938,9 +3209,6 @@ pub struct MasterKvRouterInner {
 
     /// Interns recent multi-key put groups so all member routes share one descriptor.
     put_atomic_groups: moka::sync::SegmentedCache<(String, u64, u32), Arc<PutAtomicGroup>>,
-
-    /// Grants reserved for owner-local hot-path staging.
-    pub local_reserve_grants: DashMap<u64, LocalReserveGrantInfo>,
 
     /// Prepared key reservations for owner-local hot-path staging.
     pub prepared_put_key_reservations: DashMap<u64, PreparedPutKeyReservationInfo>,
@@ -3065,7 +3333,7 @@ impl LogicalModule for MasterKvRouter {
 }
 
 impl MasterKvRouter {
-    fn member_ready_for_segment_registration(
+    fn member_role_eligible_for_segment_registration(
         member: &crate::cluster_manager::ClusterMember,
     ) -> bool {
         // Segment registration must follow owner role semantics, not local IPC capability.
@@ -3091,6 +3359,32 @@ impl MasterKvRouter {
                 .metadata
                 .get("side_transfer_worker")
                 .is_some_and(|v| v == "true")
+    }
+
+    fn member_ready_for_segment_registration_in_peer_dag(
+        member: &crate::cluster_manager::ClusterMember,
+        snapshot: &fluxon_commu::p2p::TierSnapshot,
+    ) -> bool {
+        if !Self::member_role_eligible_for_segment_registration(member) {
+            return false;
+        }
+
+        let peer_id: NodeID = member.id.clone().into();
+        let Some(peer_gen) = snapshot.peer_gen(&peer_id) else {
+            return false;
+        };
+        // Owner push is the canonical startup DAG. The master-pull recovery
+        // path only needs an exact-generation control lane; the owner handler
+        // returns NotConfigured until local segment registration has completed.
+        peer_gen.node_start_time == member.node_start_time && snapshot.is_any_send_ready(&peer_gen)
+    }
+
+    fn member_ready_for_segment_registration(
+        view: &MasterKvRouterView,
+        member: &crate::cluster_manager::ClusterMember,
+    ) -> bool {
+        let snapshot = view.p2p_module().tier_snapshot();
+        Self::member_ready_for_segment_registration_in_peer_dag(member, &snapshot)
     }
 
     pub fn attach_view(&self, view: MasterKvRouterView) {
@@ -3145,13 +3439,23 @@ impl MasterKvRouter {
                  inflight_info: InflightReplicaTaskInfo,
                  cause| {
                     if cause == RemovalCause::Expired {
+                        let target_node_id = match &inflight_info.target {
+                            InflightReplicaTarget::MasterAllocation { node_id, .. } => {
+                                node_id.as_ref()
+                            }
+                            InflightReplicaTarget::OwnerCandidates { plan } => plan
+                                .candidates
+                                .first()
+                                .map(|candidate| candidate.owner.node_id.as_str())
+                                .unwrap_or("<none>"),
+                        };
                         warn!(
                             key = %identity.0,
                             put_time_ms = identity.1,
                             put_version = identity.2,
                             operation_id = inflight_info.operation_id,
                             source_node_id = %inflight_info.source_node_id,
-                            target_node_id = %inflight_info.node_id,
+                            target_node_id,
                             ttl_seconds = INFLIGHT_REPLICA_TASK_TTL_SECONDS,
                             "inflight replica append expired before terminal Done/Revoke"
                         );
@@ -3162,6 +3466,10 @@ impl MasterKvRouter {
             .build();
         let completed_replica_tasks = moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(120))
+            .build();
+        let owner_source_global_reclaim_terminals = moka::sync::Cache::builder()
+            .max_capacity(OWNER_SOURCE_RECLAIM_REPLAY_MAX_ENTRIES)
+            .time_to_live(Duration::from_secs(OWNER_SOURCE_RECLAIM_REPLAY_TTL_SECONDS))
             .build();
         // A synchronous Moka listener must perform only constant-size metadata
         // work and must never block or drop an Allocation reclaim event.  The
@@ -3190,10 +3498,10 @@ impl MasterKvRouter {
             get_done_locks: AMapLock::new(Duration::from_secs(10 * 60)),
             key_activity,
             prepared_get_requesters,
+            owner_source_global_reclaim_terminals,
             get_holding: MasterOwnerMemMgr::default(),
             next_get_id: AtomicU64::new(0),
             next_holder_id: AtomicU64::new(0),
-            next_local_reserve_grant_id: AtomicU64::new(1),
             next_prepared_put_key_reservation_id: AtomicU64::new(1),
             next_replica_operation_id: AtomicU64::new(1),
             next_owner_reclaim_epoch: AtomicU64::new(1),
@@ -3202,7 +3510,6 @@ impl MasterKvRouter {
                 .max_capacity(262_144)
                 .time_to_idle(Duration::from_secs(30 * 60))
                 .build(),
-            local_reserve_grants: DashMap::new(),
             prepared_put_key_reservations: DashMap::new(),
             prefix_index: ARwLock::new(PrefixRadixTree::new()),
             node_kv_cache_controller: DashMap::new(),
@@ -3409,6 +3716,31 @@ impl MasterKvRouter {
             );
             return;
         }
+        if let Some(local_target_bytes) = self
+            .inner()
+            .view()
+            .master_seg_manager()
+            .get_owner_local_target_bytes(node_id)
+        {
+            let physical_bytes = self
+                .inner()
+                .view()
+                .master_seg_manager()
+                .get_node_active_space_size(node_id);
+            let ring_b_base = self.replica_cache_base_capacity(physical_bytes);
+            let global_target_bytes = physical_bytes.saturating_sub(local_target_bytes);
+            let local_budget_reservation = ring_b_base.saturating_sub(global_target_bytes);
+            if let Err(err) = self.set_owner_local_budget_reservation(
+                &node_id.to_string().into(),
+                local_budget_reservation,
+            ) {
+                error!(
+                    "failed to install initial owner scope budget: node={} local_target={} global_target={} err={}",
+                    node_id, local_target_bytes, global_target_bytes, err
+                );
+                return;
+            }
+        }
         if let Err(err) = self.apply_node_cache_capacity(node_id) {
             error!(
                 "failed to refresh node cache capacity: node={} err={}",
@@ -3610,6 +3942,209 @@ impl MasterKvRouter {
             "node pool active capacity applied"
         );
         Ok(response)
+    }
+
+    pub async fn owner_local_reserve_control(
+        &self,
+        request: OwnerLocalReserveUserRequest,
+    ) -> KvResult<OwnerLocalReserveUserResponse> {
+        let (owner_node_id, expected_owner_node_start_time, operation) = match request {
+            OwnerLocalReserveUserRequest::Get { owner_node_id } => {
+                let member = self
+                    .inner()
+                    .view()
+                    .cluster_manager()
+                    .get_member_info_cached(&owner_node_id)
+                    .ok_or_else(|| {
+                        KvError::Api(ApiError::NodeNotFound {
+                            desc: owner_node_id.clone(),
+                        })
+                    })?;
+                (
+                    owner_node_id,
+                    member.node_start_time,
+                    OwnerLocalReserveControlOp::Get,
+                )
+            }
+            OwnerLocalReserveUserRequest::SetLocalTarget {
+                owner_node_id,
+                expected_owner_node_start_time,
+                controller_epoch,
+                local_target_bytes,
+            } => (
+                owner_node_id,
+                expected_owner_node_start_time,
+                OwnerLocalReserveControlOp::SetLocalTarget {
+                    controller_epoch,
+                    local_target_bytes,
+                },
+            ),
+        };
+        let member = self
+            .inner()
+            .view()
+            .cluster_manager()
+            .get_member_info_cached(&owner_node_id)
+            .ok_or_else(|| {
+                KvError::Api(ApiError::NodeNotFound {
+                    desc: owner_node_id.clone(),
+                })
+            })?;
+        if member.node_start_time != expected_owner_node_start_time {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "owner local-reserve generation mismatch: owner={} expected={} actual={}",
+                    owner_node_id, expected_owner_node_start_time, member.node_start_time
+                ),
+            }));
+        }
+
+        let operation_lock = self
+            .inner()
+            .owner_cache_operation_locks
+            .get_lock(owner_node_id.clone());
+        let _operation_guard = operation_lock.lock().await;
+        if let OwnerLocalReserveControlOp::SetLocalTarget {
+            local_target_bytes, ..
+        } = operation
+        {
+            let (_, pool) = self
+                .inner()
+                .view()
+                .master_seg_manager()
+                .get_node_pool_capacity(&owner_node_id)
+                .ok_or_else(|| {
+                    KvError::Api(ApiError::NodeNotFound {
+                        desc: format!("{} (no live owner pool)", owner_node_id),
+                    })
+                })?;
+            let (total_reserved, current_local_reserved) = self
+                .inner()
+                .node_cache_reserved_capacity
+                .get(&owner_node_id)
+                .filter(|reserved| !reserved.generation.is_tomb())
+                .map(|reserved| {
+                    (
+                        reserved.total_reserved_bytes(),
+                        reserved
+                            .local_exclusive_budget_bytes
+                            .load(Ordering::Relaxed),
+                    )
+                })
+                .unwrap_or_default();
+            let ring_b_base = self.replica_cache_base_capacity(pool.active_capacity_bytes);
+            let requested_global_target = pool
+                .active_capacity_bytes
+                .saturating_sub(local_target_bytes);
+            let requested_local_reserved = ring_b_base.saturating_sub(requested_global_target);
+            if self.replica_cache_enabled()
+                && owner_local_reserve_growth_exhausts_ring_b(
+                    current_local_reserved,
+                    requested_local_reserved,
+                    total_reserved,
+                    ring_b_base,
+                )
+            {
+                let prospective_reserved = total_reserved
+                    .saturating_sub(current_local_reserved)
+                    .saturating_add(requested_local_reserved);
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: format!(
+                        "owner local target leaves no global ring-B capacity: owner={} local_target_bytes={} ring_b_base={} prospective_reserved={}",
+                        owner_node_id, local_target_bytes, ring_b_base, prospective_reserved
+                    ),
+                }));
+            }
+        }
+
+        let caller = RPCCaller::<OwnerLocalReserveControlReq>::new();
+        caller.regist(self.inner().view().p2p_module());
+        let response = call_control_plane_rpc(
+            &caller,
+            self.inner().view().p2p_module(),
+            NodeID::from(owner_node_id.clone()),
+            MsgPack {
+                serialize_part: OwnerLocalReserveControlReq {
+                    expected_owner_node_start_time,
+                    operation,
+                },
+                raw_bytes: Vec::new(),
+            },
+            Some(Duration::from_secs(60)),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            response.serialize_part.error_code,
+            response.serialize_part.error_json.clone(),
+        )?;
+        let owner = response.serialize_part;
+        if owner.owner_node_start_time != expected_owner_node_start_time {
+            return Err(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "owner local-reserve response generation mismatch: owner={} expected={} actual={}",
+                    owner_node_id, expected_owner_node_start_time, owner.owner_node_start_time
+                ),
+            }));
+        }
+
+        if matches!(operation, OwnerLocalReserveControlOp::SetLocalTarget { .. }) {
+            let (_, pool) = self
+                .inner()
+                .view()
+                .master_seg_manager()
+                .get_node_pool_capacity(&owner_node_id)
+                .ok_or_else(|| {
+                    KvError::Api(ApiError::NodeNotFound {
+                        desc: format!("{} (no live owner pool)", owner_node_id),
+                    })
+                })?;
+            let ring_b_base = self.replica_cache_base_capacity(pool.active_capacity_bytes);
+            let requested_reserved = ring_b_base.saturating_sub(owner.global_target_bytes);
+            self.set_owner_local_budget_reservation(
+                &owner_node_id.clone().into(),
+                requested_reserved,
+            )?;
+        }
+
+        let (_, pool) = self
+            .inner()
+            .view()
+            .master_seg_manager()
+            .get_node_pool_capacity(&owner_node_id)
+            .ok_or_else(|| {
+                KvError::Api(ApiError::NodeNotFound {
+                    desc: format!("{} (no live owner pool)", owner_node_id),
+                })
+            })?;
+        let global =
+            self.node_pool_capacity_response(&owner_node_id, expected_owner_node_start_time, pool);
+        let local_reserve_reserved_bytes = self
+            .inner()
+            .node_cache_reserved_capacity
+            .get(&owner_node_id)
+            .filter(|reserved| !reserved.generation.is_tomb())
+            .map(|reserved| {
+                reserved
+                    .local_exclusive_budget_bytes
+                    .load(Ordering::Relaxed)
+            })
+            .unwrap_or(0);
+        let global_settled = global.ring_b_weighted_bytes <= global.ring_b_effective_capacity_bytes
+            && global.ring_b_pending_reclaim_bytes == 0;
+        let settled = owner.settled && global_settled;
+        Ok(OwnerLocalReserveUserResponse {
+            owner_node_id,
+            owner,
+            ring_b_base_capacity_bytes: global.ring_b_base_capacity_bytes,
+            ring_b_effective_capacity_bytes: global.ring_b_effective_capacity_bytes,
+            ring_b_weighted_bytes: global.ring_b_weighted_bytes,
+            ring_b_pending_reclaim_bytes: global.ring_b_pending_reclaim_bytes,
+            local_reserve_reserved_bytes,
+            global_settled,
+            settled,
+        })
     }
 
     pub fn tiered_writeback_enabled(&self) -> bool {
@@ -4312,6 +4847,13 @@ impl MasterKvRouter {
                 view: self.0.view().clone(),
             }),
         );
+        user_rpc_register_handler_async(
+            p2p,
+            OWNER_LOCAL_RESERVE_USER_RPC_PATH.to_string(),
+            Arc::new(OwnerLocalReserveUserRpcHandler {
+                view: self.0.view().clone(),
+            }),
+        );
 
         // --- Get Handlers ---
         let view = self.0.view().clone();
@@ -4420,46 +4962,6 @@ impl MasterKvRouter {
         crate::metrics::datasource::register_master_only_metric_handler(self.0.view());
 
         // --- Put Handlers ---
-        let view = self.0.view().clone();
-        RPCHandler::<ReserveLocalGrantReq>::new().regist(p2p, move |resp, msg| {
-            let view = view.clone();
-            let view2 = view.clone();
-            let req_node_id = resp.node_id().clone();
-            let view_task = view2.clone();
-            let _ = view.spawn("rpc_reserve_local_grant", async move {
-                let t0 = Utc::now().timestamp_micros();
-                let (grant_id, mut ack) =
-                    handle_reserve_local_grant(view_task.clone(), msg, req_node_id).await;
-                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
-                    error!("Failed to send ReserveLocalGrantResp: {:?}", e);
-                    if grant_id != 0 {
-                        let _ = view_task
-                            .master_kv_router()
-                            .take_local_reserve_grant(grant_id);
-                    }
-                }
-            });
-            Ok(())
-        });
-
-        let view = self.0.view().clone();
-        RPCHandler::<ReleaseLocalGrantReq>::new().regist(p2p, move |resp, msg| {
-            let view = view.clone();
-            let view2 = view.clone();
-            let req_node_id = resp.node_id().clone();
-            let view_task = view2.clone();
-            let _ = view.spawn("rpc_release_local_grant", async move {
-                let t0 = Utc::now().timestamp_micros();
-                let mut ack = handle_release_local_grant(view_task, msg, req_node_id).await;
-                ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
-                if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
-                    error!("Failed to send ReleaseLocalGrantResp: {:?}", e);
-                }
-            });
-            Ok(())
-        });
-
         let view = self.0.view().clone();
         RPCHandler::<BatchPreparePutKeysReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
@@ -4735,10 +5237,11 @@ impl MasterKvRouter {
         RPCHandler::<PutAppendDoneReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
             let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
             let view_task = view2.clone();
             let _ = view.spawn("rpc_put_append_done", async move {
                 let t0 = Utc::now().timestamp_micros();
-                let mut ack = handle_put_append_done(view_task, msg).await;
+                let mut ack = handle_put_append_done(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send PutAppendDoneResp: {:?}", e);
@@ -4751,10 +5254,11 @@ impl MasterKvRouter {
         RPCHandler::<BatchPutAppendDoneReq>::new().regist(p2p, move |resp, msg| {
             let view = view.clone();
             let view2 = view.clone();
+            let req_node_id = resp.node_id().clone();
             let view_task = view2.clone();
             let _ = view.spawn("rpc_batch_put_append_done", async move {
                 let t0 = Utc::now().timestamp_micros();
-                let mut ack = handle_batch_put_append_done(view_task, msg).await;
+                let mut ack = handle_batch_put_append_done(view_task, msg, req_node_id).await;
                 ack.serialize_part.server_process_us = Utc::now().timestamp_micros() - t0;
                 if let Err(e) = send_control_plane_rpc_response(&resp, ack).await {
                     error!("Failed to send BatchPutAppendDoneResp: {:?}", e);
@@ -5116,7 +5620,7 @@ impl MasterKvRouter {
 	                if registered_epoch == Some(epoch) {
 	                    return None;
 	                }
-	                if !MasterKvRouter::member_ready_for_segment_registration(member) {
+		                if !MasterKvRouter::member_ready_for_segment_registration(view, member) {
 	                    return None;
 	                }
 	                Some(epoch)
@@ -5208,7 +5712,7 @@ impl MasterKvRouter {
 	                                desired_epoch = None;
 	                                continue;
 	                            }
-	                            if !MasterKvRouter::member_ready_for_segment_registration(&member) {
+		                            if !MasterKvRouter::member_ready_for_segment_registration(&view_task, &member) {
 	                                desired_epoch = None;
 	                                continue;
 	                            }
@@ -5648,6 +6152,8 @@ impl MasterKvRouter {
             GetAllocationMode::DurableReplica => "durable_replica",
             GetAllocationMode::LocalCommittedSlot => "local_committed_slot",
             GetAllocationMode::ExternalSink => "external_sink",
+            GetAllocationMode::RequesterLocalBorrow => "requester_local_borrow",
+            GetAllocationMode::RequesterLocalPromote => "requester_local_promote",
         };
         let mode_count = self
             .inner()
@@ -6176,37 +6682,87 @@ impl MasterKvRouter {
         })))
     }
 
-    pub fn next_local_reserve_grant_id(&self) -> u64 {
-        self.inner()
-            .next_local_reserve_grant_id
-            .fetch_add(1, Ordering::Relaxed)
+    fn set_owner_local_budget_reservation(
+        &self,
+        node_id: &NodeID,
+        target_bytes: u64,
+    ) -> crate::rpcresp_kvresult_convert::msg_and_error::KvResult<()> {
+        if !self.replica_cache_enabled() {
+            return Ok(());
+        }
+        let generation = self
+            .inner()
+            .view()
+            .master_seg_manager()
+            .get_node_tomb_tag(node_id)
+            .filter(|generation| !generation.is_tomb())
+            .ok_or_else(|| {
+                KvError::Api(ApiError::InvalidPutMasterState {
+                    detail: format!(
+                        "cannot set owner scope budget for an unregistered generation: node={}",
+                        node_id
+                    ),
+                })
+            })?;
+        let reserved_capacity = match self
+            .inner()
+            .node_cache_reserved_capacity
+            .entry(node_id.to_string())
+        {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if entry.get().generation.same_generation(&generation) {
+                    entry.get().clone()
+                } else if entry.get().generation.is_tomb() {
+                    let replacement = Arc::new(NodeCacheReservedCapacity::new(generation.clone()));
+                    entry.insert(replacement.clone());
+                    replacement
+                } else {
+                    return Err(KvError::Api(ApiError::InvalidPutMasterState {
+                        detail: format!(
+                            "owner scope budget counter belongs to another live generation: node={}",
+                            node_id
+                        ),
+                    }));
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let counter = Arc::new(NodeCacheReservedCapacity::new(generation.clone()));
+                entry.insert(counter.clone());
+                counter
+            }
+        };
+        let current = reserved_capacity
+            .local_exclusive_budget_bytes
+            .load(Ordering::Relaxed);
+        if current == target_bytes {
+            return Ok(());
+        }
+        let delta = if target_bytes > current {
+            i64::try_from(target_bytes - current).map_err(|_| {
+                KvError::Api(ApiError::InvalidArgument {
+                    detail: "owner scope budget increase exceeds i64".to_string(),
+                })
+            })?
+        } else {
+            -i64::try_from(current - target_bytes).map_err(|_| {
+                KvError::Api(ApiError::InvalidArgument {
+                    detail: "owner scope budget decrease exceeds i64".to_string(),
+                })
+            })?
+        };
+        self.adjust_node_cache_reserved_capacity_identity(
+            node_id.as_ref(),
+            &generation,
+            &reserved_capacity,
+            ReservedCapacityReason::LocalExclusiveBudget,
+            delta,
+        )
     }
 
     pub fn next_prepared_put_key_reservation_id(&self) -> u64 {
         self.inner()
             .next_prepared_put_key_reservation_id
             .fetch_add(1, Ordering::Relaxed)
-    }
-
-    pub fn install_local_reserve_grant(&self, grant_id: u64, grant: LocalReserveGrantInfo) {
-        if self
-            .inner()
-            .local_reserve_grants
-            .insert(grant_id, grant)
-            .is_some()
-        {
-            panic!(
-                "duplicate local reserve grant id indicates a logic bug: grant_id={}",
-                grant_id
-            );
-        }
-    }
-
-    pub fn take_local_reserve_grant(&self, grant_id: u64) -> Option<LocalReserveGrantInfo> {
-        self.inner()
-            .local_reserve_grants
-            .remove(&grant_id)
-            .map(|(_, grant)| grant)
     }
 
     pub fn install_prepared_put_key_reservation(
@@ -6277,6 +6833,7 @@ impl MasterKvRouter {
                 .node_writeback_tier1_controller
                 .get(owner_node.as_str())
                 .map(|entry| entry.value().clone());
+            let resident_weighted_bytes = cache.resident_weighted_size();
             replica_cache_nodes.push(ReplicaCacheNodeObserveSnapshot {
                 owner_node: owner_node.clone(),
                 owner_node_start_time,
@@ -6289,6 +6846,9 @@ impl MasterKvRouter {
                 pool_capacity_epoch: pool_capacity.capacity_epoch,
                 entries: cache.entry_count(),
                 weighted_bytes: cache.weighted_size(),
+                resident_weighted_bytes,
+                resident_overshoot_bytes: resident_weighted_bytes
+                    .saturating_sub(effective_capacity_bytes),
                 effective_capacity_bytes,
                 reserved_capacity_bytes,
                 base_capacity_bytes,
@@ -6602,10 +7162,12 @@ impl MasterKvRouter {
                                 node.pool_available_capacity_bytes,
                             );
                             tracing::info!(
-                                "replica cache runtime: owner={} entries={} weighted_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_victims={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} last_route_removed_members={} last_route_removed_bytes={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={} post_read_duplicate_enqueued_items={} post_read_duplicate_enqueued_bytes={} post_read_duplicate_reclaimed_items={} post_read_duplicate_reclaimed_bytes={}",
+                                "replica cache runtime: owner={} entries={} weighted_bytes={} resident_weighted_bytes={} resident_overshoot_bytes={} effective_capacity_bytes={} base_capacity_bytes={} reserved_capacity_bytes={} pending_eviction_reclaim_bytes={} writeback_tier1_entries={} writeback_tier1_weighted_bytes={} writeback_tier1_capacity_bytes={} writeback_tier1_triggered={} writeback_tier1_owner_accepted={} writeback_tier1_failed={} reclaim_master_activity_deferred={} reclaim_owner_holder_deferred={} reclaim_owner_other_deferred={} reclaim_route_changed={} reclaim_retry_queued={} reclaim_retry_completed={} reclaim_retry_restored={} reclaim_completed={} source_evict_rpc_requests={} source_evict_victims={} source_evict_requested_bytes={} source_evict_accepted={} source_evict_in_progress={} source_evict_completed={} source_evict_retryable_busy={} source_evict_stale={} source_evict_rejected={} last_route_removed_members={} last_route_removed_bytes={} capacity_eviction_non_ring_b_entry_total={} capacity_eviction_hit_committed_slot={} eviction_reclaim_deduplicated={} post_read_duplicate_enqueued_items={} post_read_duplicate_enqueued_bytes={} post_read_duplicate_reclaimed_items={} post_read_duplicate_reclaimed_bytes={}",
                                 node.owner_node,
                                 node.entries,
                                 node.weighted_bytes,
+                                node.resident_weighted_bytes,
+                                node.resident_overshoot_bytes,
                                 node.effective_capacity_bytes,
                                 node.base_capacity_bytes,
                                 node.reserved_capacity_bytes,

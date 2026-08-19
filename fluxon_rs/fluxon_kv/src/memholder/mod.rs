@@ -30,9 +30,9 @@ pub enum MemoryInfoDropAction {
     None,
     OwnerDeleteAck,
     ReleaseLocalReserveResidentSlot {
-        slot_size: u64,
-        grant_id: u64,
-        slot_index: u32,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     },
 }
 
@@ -193,9 +193,9 @@ impl MemoryInfo {
         key: String,
         master_node_id: NodeID,
         view: ClientKvApiView,
-        slot_size: u64,
-        grant_id: u64,
-        slot_index: u32,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     ) -> Self {
         let base_addr = {
             let base_guard = view
@@ -212,9 +212,9 @@ impl MemoryInfo {
             key,
             master_node_id,
             view,
-            slot_size,
-            grant_id,
-            slot_index,
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
         )
     }
 
@@ -225,9 +225,9 @@ impl MemoryInfo {
         key: String,
         master_node_id: NodeID,
         view: ClientKvApiView,
-        slot_size: u64,
-        grant_id: u64,
-        slot_index: u32,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     ) -> Self {
         assert!(
             addr >= base_addr,
@@ -244,9 +244,9 @@ impl MemoryInfo {
             master_node_id,
             view,
             drop_action: MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
-                slot_size,
-                grant_id,
-                slot_index,
+                allocation_id,
+                segment_offset,
+                capacity_bytes,
             },
         }
     }
@@ -260,25 +260,25 @@ impl MemoryInfo {
         unsafe { std::slice::from_raw_parts(self.addr as *const u8, self.len as usize) }
     }
 
-    pub fn local_reserve_resident_slot_ref(&self) -> Option<(u64, u64, u32)> {
+    pub fn local_reserve_resident_slot_ref(&self) -> Option<(u64, u64, u64)> {
         match self.drop_action {
             MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
-                slot_size,
-                grant_id,
-                slot_index,
-            } => Some((slot_size, grant_id, slot_index)),
+                allocation_id,
+                segment_offset,
+                capacity_bytes,
+            } => Some((allocation_id, segment_offset, capacity_bytes)),
             MemoryInfoDropAction::None | MemoryInfoDropAction::OwnerDeleteAck => None,
         }
     }
 
-    pub(crate) fn take_local_reserve_resident_slot_ref(&mut self) -> Option<(u64, u64, u32)> {
+    pub(crate) fn take_local_reserve_resident_slot_ref(&mut self) -> Option<(u64, u64, u64)> {
         let action = std::mem::replace(&mut self.drop_action, MemoryInfoDropAction::None);
         match action {
             MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
-                slot_size,
-                grant_id,
-                slot_index,
-            } => Some((slot_size, grant_id, slot_index)),
+                allocation_id,
+                segment_offset,
+                capacity_bytes,
+            } => Some((allocation_id, segment_offset, capacity_bytes)),
             other => {
                 self.drop_action = other;
                 None
@@ -301,9 +301,9 @@ impl Drop for MemoryInfo {
                 ctx.run_drop_ack();
             }
             MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
-                slot_size,
-                grant_id,
-                slot_index,
+                allocation_id,
+                segment_offset,
+                capacity_bytes,
             } => {
                 let Some(_view_guard) = self.view.try_upgrade() else {
                     tracing::debug!(
@@ -324,17 +324,17 @@ impl Drop for MemoryInfo {
                     .client_kv_api()
                     .inner()
                     .owner_release_local_reserve_resident_slot_holder(
-                        *slot_size,
-                        *grant_id,
-                        *slot_index,
+                        *allocation_id,
+                        *segment_offset,
+                        *capacity_bytes,
                     )
                 {
                     tracing::warn!(
-                        "failed to release resident local reserve slot holder on MemoryInfo drop: key={} slot_size={} grant_id={} slot_index={} err={}",
+                        "failed to release resident owner slot holder on MemoryInfo drop: key={} allocation_id={} segment_offset={} capacity_bytes={} err={}",
                         self.key,
-                        slot_size,
-                        grant_id,
-                        slot_index,
+                        allocation_id,
+                        segment_offset,
+                        capacity_bytes,
                         err
                     );
                 }

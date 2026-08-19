@@ -49,12 +49,14 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("fluxonkv_owner_requires_sub_cluster", test_fluxonkv_owner_requires_sub_cluster),
         ("fluxonkv_owner_requires_large_file_paths", test_fluxonkv_owner_requires_large_file_paths),
         ("fluxonkv_external_forbids_large_file_paths", test_fluxonkv_external_forbids_large_file_paths),
+        ("fluxonkv_owner_segment_memfd", test_fluxonkv_owner_segment_memfd),
         ("fluxonkv_owner_ssd_capacity", test_fluxonkv_owner_ssd_capacity),
         ("fluxonkv_p2p_relay_removed", test_fluxonkv_p2p_relay_removed),
         ("fluxon_client_config_yaml_shape", test_fluxon_client_config_yaml_shape),
         ("fluxonkv_protocol_field", test_fluxonkv_protocol_field),
         ("fluxonkv_runtime_defaults_are_internal", test_fluxonkv_runtime_defaults_are_internal),
         ("fluxonkv_removed_rdma_config_keys", test_fluxonkv_removed_rdma_config_keys),
+        ("fluxonkv_owner_placement_class", test_fluxonkv_owner_placement_class),
         ("fluxonkv_owner_hot_writeback", test_fluxonkv_owner_hot_writeback),
         ("fluxonkv_test_spec_config", test_fluxonkv_test_spec_config),
         ("fluxon_pyo3_import_authority", test_fluxon_pyo3_import_authority),
@@ -335,6 +337,36 @@ def test_fluxonkv_external_forbids_large_file_paths():
         print(f"❌ FAIL: test_fluxonkv_external_forbids_large_file_paths - {e}")
 
 
+def test_fluxonkv_owner_segment_memfd():
+    """Ensure memfd segment backing is explicit and owner-only."""
+    try:
+        owner = _owner_fluxonkv_base_config(tag="owner_segment_memfd")
+        owner["test_spec_config"] = {"owner_segment_memfd": True}
+        rendered = FluxonKvClientConfig(
+            owner
+        ).to_fluxon_kv_client_config_yaml_str()
+        loaded = yaml.safe_load(rendered)
+        assert loaded["test_spec_config"]["owner_segment_memfd"] is True
+
+        external = {
+            "instance_key": "test_external_memfd",
+            "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
+            "test_spec_config": {"owner_segment_memfd": True},
+            "fluxonkv_spec": {
+                "cluster_name": "test_cluster",
+                "share_mem_path": "/tmp/kvcache_shared_memory/test_memfd",
+            },
+        }
+        try:
+            FluxonKvClientConfig(external)
+            raise AssertionError("external memfd segment backing must be rejected")
+        except ValueError:
+            pass
+        print("✅ PASS: test_fluxonkv_owner_segment_memfd")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_owner_segment_memfd - {e}")
+
+
 def test_fluxonkv_owner_ssd_capacity():
     """Ensure the Python schema forwards owner SSD capacity to Rust unchanged."""
     try:
@@ -522,7 +554,14 @@ def test_fluxonkv_owner_hot_writeback():
         )
         assert loaded["replica_writeback_hot_capacity_ratio"] == 0.75
 
-        for invalid in (0, 1, -0.1, float("nan"), True, "0.75"):
+        exact_local = _owner_fluxonkv_base_config(tag="owner_hot_exact_local")
+        exact_local["replica_writeback_hot_capacity_ratio"] = 1.0
+        exact_loaded = yaml.safe_load(
+            FluxonKvClientConfig(exact_local).to_fluxon_kv_client_config_yaml_str()
+        )
+        assert exact_loaded["replica_writeback_hot_capacity_ratio"] == 1.0
+
+        for invalid in (0, 1.1, -0.1, float("nan"), True, "0.75"):
             invalid_owner = _owner_fluxonkv_base_config(tag="owner_hot_invalid")
             invalid_owner["replica_writeback_hot_capacity_ratio"] = invalid
             try:
@@ -567,6 +606,72 @@ def test_fluxonkv_owner_hot_writeback():
         print(f"❌ FAIL: test_fluxonkv_owner_hot_writeback - {e}")
 
 
+def test_fluxonkv_owner_placement_class():
+    """Keep the Python owner-role contract identical to the Rust config contract."""
+    try:
+        remote_cpu = _owner_fluxonkv_base_config(tag="placement_remote_cpu")
+        remote_cpu["owner_placement_class"] = "remote_cpu"
+        remote_config = FluxonKvClientConfig(remote_cpu)
+        remote_loaded = yaml.safe_load(
+            remote_config.to_fluxon_kv_client_config_yaml_str()
+        )
+        assert remote_config.owner_placement_class == "remote_cpu"
+        assert remote_loaded["owner_placement_class"] == "remote_cpu"
+        assert "replica_writeback_hot_capacity_ratio" not in remote_loaded
+
+        inference = _owner_fluxonkv_base_config(tag="placement_inference")
+        inference["owner_placement_class"] = "inference"
+        inference["replica_writeback_hot_capacity_ratio"] = 0.75
+        inference_config = FluxonKvClientConfig(inference)
+        inference_loaded = yaml.safe_load(
+            inference_config.to_fluxon_kv_client_config_yaml_str()
+        )
+        assert inference_config.owner_placement_class == "inference"
+        assert inference_loaded["replica_writeback_hot_capacity_ratio"] == 0.75
+
+        invalid_configs = []
+
+        missing_hot = _owner_fluxonkv_base_config(tag="placement_missing_hot")
+        missing_hot["owner_placement_class"] = "inference"
+        invalid_configs.append(missing_hot)
+
+        remote_with_hot = _owner_fluxonkv_base_config(tag="placement_remote_hot")
+        remote_with_hot["owner_placement_class"] = "remote_cpu"
+        remote_with_hot["replica_writeback_hot_capacity_ratio"] = 0.75
+        invalid_configs.append(remote_with_hot)
+
+        invalid_role = _owner_fluxonkv_base_config(tag="placement_invalid")
+        invalid_role["owner_placement_class"] = "storage"
+        invalid_configs.append(invalid_role)
+
+        external = {
+            "instance_key": "placement_external",
+            "owner_placement_class": "remote_cpu",
+            "fluxonkv_spec": {
+                "cluster_name": "test_cluster",
+                "share_mem_path": "/tmp/kvcache_shared_memory/placement_external",
+            },
+        }
+        invalid_configs.append(external)
+
+        mooncake = config_dict()
+        mooncake["owner_placement_class"] = "inference"
+        invalid_configs.append(mooncake)
+
+        for invalid in invalid_configs:
+            try:
+                FluxonKvClientConfig(invalid)
+                raise AssertionError(
+                    f"invalid owner placement config was accepted: {invalid}"
+                )
+            except ValueError:
+                pass
+
+        print("✅ PASS: test_fluxonkv_owner_placement_class")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_owner_placement_class - {e}")
+
+
 def test_fluxonkv_test_spec_config():
     """Ensure test_spec_config is accepted, normalized, and serialized."""
     try:
@@ -593,6 +698,9 @@ def test_fluxonkv_test_spec_config():
         rdma_devices["test_spec_config"]["disable_crossowner_ipc"] = True
         rdma_devices["test_spec_config"]["iceoryx_external_busy_poll"] = True
         rdma_devices["test_spec_config"]["iceoryx_owner_client_busy_poll"] = True
+        rdma_devices["test_spec_config"][
+            "legacy_a19_global_demotion_one_phase"
+        ] = True
         rdma_devices["test_spec_config"]["tcp_thread_reactor_shard_count"] = 2
         rdma_devices["protocol"] = {
             "protocol_type": "rdma",
@@ -619,6 +727,10 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["enable_iceoryx_logs"] is True
         assert loaded["test_spec_config"]["iceoryx_external_busy_poll"] is True
         assert loaded["test_spec_config"]["iceoryx_owner_client_busy_poll"] is True
+        assert (
+            loaded["test_spec_config"]["legacy_a19_global_demotion_one_phase"]
+            is True
+        )
         assert loaded["test_spec_config"]["rdma_device_names"] == ["mlx5_0", "mlx5_4"]
         assert loaded["test_spec_config"]["tcp_thread_reactor_shard_count"] == 2
         assert loaded["protocol"]["tcp_thread_reactor"] == "event_driven"
@@ -717,6 +829,27 @@ def test_fluxonkv_test_spec_config():
                 "❌ FAIL: test_fluxonkv_test_spec_config - expected-capacity value_len=0 should be rejected"
             )
             return
+        except ValueError:
+            pass
+
+        small_segment = _owner_fluxonkv_base_config(tag="small_segment_capacity")
+        small_segment["test_spec_config"] = {
+            "owner_local_reserve_expected_capacity": {
+                "value_len": 4096,
+                "payload_capacity_bytes": 4096,
+            },
+        }
+        FluxonKvClientConfig(small_segment)
+
+        over_segment = copy.deepcopy(small_segment)
+        over_segment["test_spec_config"][
+            "owner_local_reserve_expected_capacity"
+        ]["payload_capacity_bytes"] = 16_777_217
+        try:
+            FluxonKvClientConfig(over_segment)
+            raise AssertionError(
+                "owner-local expected payload larger than the segment must be rejected"
+            )
         except ValueError:
             pass
 

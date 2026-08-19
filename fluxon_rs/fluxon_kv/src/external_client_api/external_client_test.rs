@@ -83,6 +83,7 @@ fn new_client_config(
         },
         pprof_duration_seconds: None,
         replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: vec![etcd.to_string()],
@@ -129,6 +130,7 @@ fn new_zero_contribution_client_config(
         },
         pprof_duration_seconds: None,
         replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),

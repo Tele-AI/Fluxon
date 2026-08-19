@@ -1,3 +1,6 @@
+use crate::owner_segment::{
+    OwnerSlotDesc, OwnerSourceRouteToken, OwnerSsdSourceRouteToken, OwnerTargetRouteToken,
+};
 use crate::{
     cluster_manager::NodeIDString,
     p2p::msg_pack::{MsgPackSerializePart, RPCReq},
@@ -21,6 +24,14 @@ pub enum GetAllocationMode {
     /// Caller-owned memory used only as the terminal data sink. The master
     /// neither allocates it nor publishes it as a cache route on GetDone.
     ExternalSink = 4,
+    /// The selected global Allocation already belongs to the requester's
+    /// share-group owner. The owner borrows that exact backing for this Get;
+    /// no payload moves and the route remains in the global/ring-B domain.
+    RequesterLocalBorrow = 5,
+    /// The selected GlobalShared CommittedSlot already belongs to the
+    /// requester's owner segment.  The owner retains that exact slot and
+    /// GetDone changes only its route/index scope back to LocalExclusive.
+    RequesterLocalPromote = 6,
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
@@ -30,18 +41,10 @@ pub enum GetSourceKind {
     Ssd = 1,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
-pub struct GetPreparedLocalReserveTarget {
-    pub grant_id: u64,
-    /// Grant-relative offset in 4 KiB allocation units. The wire field stays
-    /// in place, but fixed-slot peers use a different meaning; mixed versions
-    /// must not share local-reserve messages.
-    pub slot_index: u32,
-    /// 4 KiB-aligned allocation capacity in bytes.
-    pub slot_size: u64,
-    pub addr: u64,
-    pub base_addr: u64,
-}
+/// Exact owner-issued target capability. Keeping the wire type identical to
+/// route metadata prevents generation or registration identity from being
+/// dropped between local claim, master validation and transfer completion.
+pub type GetPreparedLocalReserveTarget = crate::owner_segment::OwnerSlotDesc;
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub struct GetExternalSinkTarget {
@@ -80,8 +83,19 @@ pub struct GetStartResp {
     pub src_base_addr: u64,
     pub len: u64,
     pub source_kind: GetSourceKind,
+    /// Exact owner-managed source capability. `None` means the source still
+    /// uses the transitional master-Allocation or SSD staging path.
+    pub source_route_token: Option<OwnerSourceRouteToken>,
+    /// Exact owner/SSD generation selected by master. The SSD owner allocates
+    /// transient DRAM locally only when GetToTarget executes.
+    pub ssd_source_route_token: Option<OwnerSsdSourceRouteToken>,
     /// Echoes the owner-local slot accepted as this Get's target.
     pub prepared_target: Option<GetPreparedLocalReserveTarget>,
+    /// Exact existing GlobalShared owner slot reused as both source and
+    /// destination. Unlike `prepared_target`, this slot already owns a live
+    /// route and must be retained/promoted instead of released as an
+    /// uncommitted destination.
+    pub reused_committed_slot: Option<GetPreparedLocalReserveTarget>,
     pub atomic_group: Option<PutAtomicGroup>,
     pub error_code: ErrorCode,
     pub error_json: String,
@@ -230,7 +244,15 @@ pub struct BatchGetStartItemResp {
     pub src_base_addr: u64,
     pub len: u64,
     pub source_kind: GetSourceKind,
+    /// Exact owner-managed source capability. The requester must Acquire it
+    /// before transfer and Release it only after the target terminal.
+    pub source_route_token: Option<OwnerSourceRouteToken>,
+    pub ssd_source_route_token: Option<OwnerSsdSourceRouteToken>,
     pub prepared_target: Option<GetPreparedLocalReserveTarget>,
+    /// Exact existing GlobalShared owner slot reused as both source and
+    /// destination.  Unlike `prepared_target`, this allocation already owns a
+    /// live route and must never be released as an uncommitted target.
+    pub reused_committed_slot: Option<GetPreparedLocalReserveTarget>,
     pub atomic_group: Option<PutAtomicGroup>,
     pub error_code: ErrorCode,
     pub error_json: String,
@@ -273,11 +295,20 @@ pub struct BatchGetPlanItemResp {
     pub src_base_addr: u64,
     pub len: u64,
     pub source_kind: GetSourceKind,
+    /// Exact owner-managed source capability selected by this plan. This is
+    /// metadata only; GetToTarget installs the owner read lease internally.
+    pub source_route_token: Option<OwnerSourceRouteToken>,
+    pub ssd_source_route_token: Option<OwnerSsdSourceRouteToken>,
     pub atomic_group: Option<PutAtomicGroup>,
-    /// True only for remote memory. Requester-local memory and every SSD
-    /// source must materialize through an owner CPU holder instead of binding
-    /// the RDMA-only GPU sink.
+    /// True only for remote owner-authoritative memory. Requester-local
+    /// memory, transitional master allocations and every SSD source must
+    /// materialize through an owner CPU holder instead of using late-bound
+    /// direct GPU transfer.
     pub gpu_direct_eligible: bool,
+    /// The selected memory source is an Allocation on the requester's owner.
+    /// A CPU execution may bind that source in place instead of claiming a
+    /// local-reserve destination and copying DRAM to DRAM.
+    pub requester_local_borrow_eligible: bool,
     pub error_code: ErrorCode,
     pub error_json: String,
 }
@@ -304,6 +335,128 @@ pub enum GetBindTarget {
     Invalid,
     PreparedLocalReserve(GetPreparedLocalReserveTarget),
     ExternalSink(GetExternalSinkTarget),
+    /// Bind the exact planned requester-local backing as both source and
+    /// target. Bind revalidates the route generation and backing geometry. A
+    /// master-owned Allocation remains a borrow; an owner-managed
+    /// CommittedSlot is promoted metadata-only on GetDone.
+    RequesterLocalSource,
+}
+
+impl BatchGetPlanItemResp {
+    /// Materialize a transfer descriptor without a separate Bind RPC when the
+    /// source already has an exact owner capability and the target is owned by
+    /// the caller. Master validation still runs later from BatchGetDone's
+    /// `late_target`; this helper only preserves the exact Plan/target identity
+    /// used by GetToTarget and the data transfer.
+    pub(crate) fn materialize_owner_source_late_target(
+        &self,
+        target: &GetBindTarget,
+        requester_owner: Option<&crate::owner_segment::OwnerGeneration>,
+    ) -> Result<BatchGetStartItemResp, &'static str> {
+        if self.error_code != OK {
+            return Err("late target requires a successful Plan");
+        }
+        let plan_nonce = self
+            .get_id
+            .checked_add(1)
+            .ok_or("master Get id overflows the owner operation identity")?;
+        let memory_source = match self.source_kind {
+            GetSourceKind::Memory => {
+                let source = self
+                    .source_route_token
+                    .as_ref()
+                    .ok_or("memory Plan requires an exact owner source token")?;
+                if self.ssd_source_route_token.is_some()
+                    || source.put_id != self.put_id
+                    || source.route_epoch == 0
+                    || !source.source.is_valid()
+                    || source.source.owner.node_id != self.node_id
+                    || source.source.addr != self.src_addr
+                    || source.source.base_addr != self.src_base_addr
+                    || source.source.len != self.len
+                    || source.atomic_batch != self.atomic_group
+                    || source.plan_nonce != plan_nonce
+                {
+                    return Err("owner memory source token does not match the Plan");
+                }
+                Some(source)
+            }
+            GetSourceKind::Ssd => {
+                let source = self
+                    .ssd_source_route_token
+                    .as_ref()
+                    .ok_or("SSD Plan requires an exact owner source token")?;
+                if self.source_route_token.is_some()
+                    || source.put_id != self.put_id
+                    || source.owner.node_id != self.node_id
+                    || source.len != self.len
+                    || source.atomic_batch != self.atomic_group
+                    || source.plan_nonce != plan_nonce
+                {
+                    return Err("owner SSD source token does not match the Plan");
+                }
+                None
+            }
+        };
+
+        let (target_addr, target_base_addr, prepared_target, reused_committed_slot) = match target {
+            GetBindTarget::PreparedLocalReserve(target) => {
+                if !target.is_valid() || target.len != self.len || target.capacity_bytes < self.len
+                {
+                    return Err("prepared owner target does not match the Plan length");
+                }
+                (target.addr, target.base_addr, Some(target.clone()), None)
+            }
+            GetBindTarget::ExternalSink(target) => {
+                if target.addr == 0
+                    || target.capacity < self.len
+                    || target.registration_id == 0
+                    || target.addr.checked_add(target.capacity).is_none()
+                {
+                    return Err("external sink target is invalid or too small");
+                }
+                (target.addr, target.addr, None, None)
+            }
+            GetBindTarget::RequesterLocalSource => {
+                let source =
+                    memory_source.ok_or("SSD source cannot be reused as requester-local memory")?;
+                if !self.requester_local_borrow_eligible {
+                    return Err("Plan did not authorize requester-local source reuse");
+                }
+                let requester_owner = requester_owner
+                    .ok_or("requester-local reuse requires the current owner generation")?;
+                if &source.source.owner != requester_owner {
+                    return Err("requester-local source belongs to another owner generation");
+                }
+                (
+                    self.src_addr,
+                    self.src_base_addr,
+                    None,
+                    Some(source.source.clone()),
+                )
+            }
+            GetBindTarget::Invalid => return Err("late target must be concrete"),
+        };
+
+        Ok(BatchGetStartItemResp {
+            get_id: self.get_id,
+            node_id: self.node_id.clone(),
+            put_id: self.put_id,
+            target_addr,
+            src_addr: self.src_addr,
+            target_base_addr,
+            src_base_addr: self.src_base_addr,
+            len: self.len,
+            source_kind: self.source_kind,
+            source_route_token: self.source_route_token.clone(),
+            ssd_source_route_token: self.ssd_source_route_token.clone(),
+            prepared_target,
+            reused_committed_slot,
+            atomic_group: self.atomic_group.clone(),
+            error_code: self.error_code,
+            error_json: self.error_json.clone(),
+        })
+    }
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -341,13 +494,27 @@ impl RPCReq for BatchGetBindReq {
 #[cfg(test)]
 mod planned_get_wire_tests {
     use super::{
-        BatchGetBindItemReq, BatchGetBindReq, BatchGetPlanItemResp, BatchGetPlanResp,
-        GetBindTarget, GetExternalSinkTarget,
+        BatchGetBindItemReq, BatchGetBindReq, BatchGetDoneItemReq, BatchGetDoneReq,
+        BatchGetPlanItemResp, BatchGetPlanResp, BatchGetStartItemResp, GetBindTarget,
+        GetExternalSinkTarget, GetPreparedLocalReserveTarget, GetSourceKind,
+    };
+    use crate::owner_segment::{
+        OwnerGeneration, OwnerSlotDesc, OwnerSourceRouteToken, OwnerSsdSourceRouteToken,
     };
     use crate::rpcresp_kvresult_convert::msg_and_error::OK;
 
     #[test]
     fn first_get_id_and_late_gpu_binding_round_trip() {
+        let source_slot = OwnerSlotDesc {
+            owner: OwnerGeneration::new("source-a", 9),
+            allocation_id: 17,
+            segment_offset: 0x800,
+            capacity_bytes: 4096,
+            addr: 0x1000,
+            base_addr: 0x800,
+            len: 4096,
+            segment_registration_epoch: 3,
+        };
         let plan = BatchGetPlanResp {
             items: vec![BatchGetPlanItemResp {
                 get_id: 0,
@@ -355,7 +522,16 @@ mod planned_get_wire_tests {
                 src_addr: 0x1000,
                 src_base_addr: 0x800,
                 len: 4096,
+                source_route_token: Some(OwnerSourceRouteToken {
+                    key: "key".to_string(),
+                    put_id: (4, 2),
+                    route_epoch: source_slot.allocation_id,
+                    source: source_slot.clone(),
+                    atomic_batch: None,
+                    plan_nonce: 1,
+                }),
                 gpu_direct_eligible: true,
+                requester_local_borrow_eligible: false,
                 error_code: OK,
                 ..Default::default()
             }],
@@ -366,7 +542,16 @@ mod planned_get_wire_tests {
             bitcode::decode(&bitcode::encode(&plan)).expect("decode GetPlan response");
         assert_eq!(decoded.items[0].get_id, 0);
         assert!(decoded.items[0].gpu_direct_eligible);
+        assert!(!decoded.items[0].requester_local_borrow_eligible);
         assert_eq!(decoded.items[0].src_addr, 0x1000);
+        assert_eq!(
+            decoded.items[0]
+                .source_route_token
+                .as_ref()
+                .expect("source token must survive GetPlan encoding")
+                .source,
+            source_slot
+        );
 
         let bind = BatchGetBindReq {
             items: vec![BatchGetBindItemReq {
@@ -388,6 +573,244 @@ mod planned_get_wire_tests {
                     && target.registration_id == 7
                     && target.requester_node_start_time == 11
         ));
+
+        let late_target = GetBindTarget::ExternalSink(GetExternalSinkTarget {
+            addr: 0x2000,
+            capacity: 4096,
+            registration_id: 7,
+            requester_node_start_time: 11,
+        });
+        let done = BatchGetDoneReq {
+            items: vec![BatchGetDoneItemReq {
+                get_id: 0,
+                late_target: Some(late_target.clone()),
+            }],
+        };
+        let encoded = bitcode::encode(&done);
+        let decoded: BatchGetDoneReq =
+            bitcode::decode(&encoded).expect("decode late-target GetDone request");
+        assert_eq!(decoded.items[0].get_id, 0);
+        assert_eq!(decoded.items[0].late_target.as_ref(), Some(&late_target));
+        let replayed: BatchGetDoneReq =
+            bitcode::decode(&encoded).expect("replay the exact late-target GetDone request");
+        assert_eq!(replayed.items[0].get_id, decoded.items[0].get_id);
+        assert_eq!(replayed.items[0].late_target, decoded.items[0].late_target);
+
+        let local_borrow = BatchGetBindReq {
+            items: vec![BatchGetBindItemReq {
+                get_id: 1,
+                target: GetBindTarget::RequesterLocalSource,
+            }],
+        };
+        let decoded: BatchGetBindReq = bitcode::decode(&bitcode::encode(&local_borrow))
+            .expect("decode requester-local GetBind request");
+        assert!(matches!(
+            decoded.items[0].target,
+            GetBindTarget::RequesterLocalSource
+        ));
+
+        let reused = BatchGetStartItemResp {
+            get_id: 2,
+            src_addr: 0x5000,
+            target_addr: 0x5000,
+            reused_committed_slot: Some(GetPreparedLocalReserveTarget {
+                owner: crate::owner_segment::OwnerGeneration::for_test("requester"),
+                allocation_id: 9,
+                segment_offset: 0x4000,
+                capacity_bytes: 8192,
+                addr: 0x5000,
+                base_addr: 0x1000,
+                len: 4096,
+                segment_registration_epoch: 1,
+            }),
+            ..Default::default()
+        };
+        let decoded: BatchGetStartItemResp = bitcode::decode(&bitcode::encode(&reused))
+            .expect("decode requester-local CommittedSlot response");
+        let slot = decoded
+            .reused_committed_slot
+            .expect("reused slot identity must survive the wire");
+        assert_eq!(slot.allocation_id, 9);
+        assert_eq!(slot.segment_offset, 0x4000);
+        assert_eq!(decoded.src_addr, decoded.target_addr);
+    }
+
+    #[test]
+    fn owner_plan_materializes_every_caller_owned_target_and_rejects_legacy_sources() {
+        let source = OwnerSlotDesc {
+            owner: OwnerGeneration::new("source-owner", 13),
+            allocation_id: 17,
+            segment_offset: 0x2000,
+            capacity_bytes: 8192,
+            addr: 0x5000,
+            base_addr: 0x3000,
+            len: 4096,
+            segment_registration_epoch: 3,
+        };
+        let mut plan = BatchGetPlanItemResp {
+            get_id: 7,
+            node_id: source.owner.node_id.clone(),
+            put_id: (4, 2),
+            src_addr: source.addr,
+            src_base_addr: source.base_addr,
+            len: source.len,
+            source_kind: GetSourceKind::Memory,
+            source_route_token: Some(OwnerSourceRouteToken {
+                key: "key".to_string(),
+                put_id: (4, 2),
+                route_epoch: source.allocation_id,
+                source: source.clone(),
+                atomic_batch: None,
+                plan_nonce: 8,
+            }),
+            error_code: OK,
+            ..Default::default()
+        };
+
+        let prepared = GetPreparedLocalReserveTarget {
+            owner: OwnerGeneration::new("requester-owner", 19),
+            allocation_id: 23,
+            segment_offset: 0x6000,
+            capacity_bytes: 8192,
+            addr: 0xa000,
+            base_addr: 0x4000,
+            len: plan.len,
+            segment_registration_epoch: 5,
+        };
+        let prepared_start = plan
+            .materialize_owner_source_late_target(
+                &GetBindTarget::PreparedLocalReserve(prepared.clone()),
+                None,
+            )
+            .expect("owner source must materialize into a prepared owner slot");
+        assert_eq!(prepared_start.prepared_target.as_ref(), Some(&prepared));
+        assert!(prepared_start.reused_committed_slot.is_none());
+        assert_eq!(prepared_start.target_addr, prepared.addr);
+
+        let sink = GetExternalSinkTarget {
+            addr: 0xc000,
+            capacity: 8192,
+            registration_id: 29,
+            requester_node_start_time: 31,
+        };
+        let sink_start = plan
+            .materialize_owner_source_late_target(&GetBindTarget::ExternalSink(sink.clone()), None)
+            .expect("owner source must materialize into an external sink");
+        assert_eq!(sink_start.target_addr, sink.addr);
+        assert_eq!(sink_start.target_base_addr, sink.addr);
+        assert!(sink_start.prepared_target.is_none());
+        assert!(sink_start.reused_committed_slot.is_none());
+
+        plan.requester_local_borrow_eligible = true;
+        let reused_start = plan
+            .materialize_owner_source_late_target(
+                &GetBindTarget::RequesterLocalSource,
+                Some(&source.owner),
+            )
+            .expect("authorized requester-local owner source must materialize in place");
+        assert_eq!(reused_start.src_addr, reused_start.target_addr);
+        assert_eq!(reused_start.reused_committed_slot.as_ref(), Some(&source));
+        assert!(
+            plan.materialize_owner_source_late_target(
+                &GetBindTarget::RequesterLocalSource,
+                Some(&OwnerGeneration::new("source-owner", 14)),
+            )
+            .is_err(),
+            "requester-local reuse must match the current owner generation"
+        );
+
+        let mut mismatched = plan.clone();
+        mismatched
+            .source_route_token
+            .as_mut()
+            .expect("owner token")
+            .plan_nonce += 1;
+        assert!(
+            mismatched
+                .materialize_owner_source_late_target(
+                    &GetBindTarget::RequesterLocalSource,
+                    Some(&source.owner),
+                )
+                .is_err(),
+            "a mismatched owner capability must fail closed"
+        );
+
+        let mut master_allocation = plan.clone();
+        master_allocation.source_route_token = None;
+        assert!(
+            master_allocation
+                .materialize_owner_source_late_target(
+                    &GetBindTarget::PreparedLocalReserve(prepared.clone()),
+                    None
+                )
+                .is_err(),
+            "master Allocation sources must stay on the pre-bound compatibility path"
+        );
+
+        let mut ssd = plan;
+        ssd.source_kind = GetSourceKind::Ssd;
+        ssd.src_addr = 0;
+        ssd.src_base_addr = 0;
+        ssd.source_route_token = None;
+        ssd.ssd_source_route_token = Some(OwnerSsdSourceRouteToken {
+            key: "key".to_string(),
+            put_id: ssd.put_id,
+            owner: source.owner,
+            len: ssd.len,
+            atomic_batch: None,
+            plan_nonce: ssd.get_id + 1,
+        });
+        let ssd_start = ssd
+            .materialize_owner_source_late_target(
+                &GetBindTarget::PreparedLocalReserve(prepared.clone()),
+                None,
+            )
+            .expect("SSD owner token must materialize without a master staging Allocation");
+        assert_eq!(ssd_start.src_addr, 0);
+        assert_eq!(ssd_start.src_base_addr, 0);
+        assert_eq!(ssd_start.prepared_target.as_ref(), Some(&prepared));
+        assert!(ssd_start.reused_committed_slot.is_none());
+        assert!(ssd_start.source_route_token.is_none());
+        assert_eq!(ssd_start.ssd_source_route_token, ssd.ssd_source_route_token);
+        assert!(
+            ssd.materialize_owner_source_late_target(
+                &GetBindTarget::RequesterLocalSource,
+                Some(&OwnerGeneration::new("source-owner", 13)),
+            )
+            .is_err(),
+            "SSD metadata cannot masquerade as requester-local DRAM"
+        );
+
+        let mut changed_ssd = ssd.clone();
+        changed_ssd
+            .ssd_source_route_token
+            .as_mut()
+            .expect("SSD token")
+            .plan_nonce += 1;
+        assert!(
+            changed_ssd
+                .materialize_owner_source_late_target(
+                    &GetBindTarget::PreparedLocalReserve(prepared.clone()),
+                    None,
+                )
+                .is_err(),
+            "SSD Plan nonce drift must fail closed"
+        );
+        let mut changed_ssd = ssd;
+        changed_ssd
+            .ssd_source_route_token
+            .as_mut()
+            .expect("SSD token")
+            .owner = OwnerGeneration::new("another-owner", 13);
+        assert!(
+            changed_ssd
+                .materialize_owner_source_late_target(
+                    &GetBindTarget::PreparedLocalReserve(prepared),
+                    None,
+                )
+                .is_err(),
+            "SSD owner drift must fail closed"
+        );
     }
 }
 
@@ -424,8 +847,17 @@ impl RPCReq for BatchGetRevokeReq {
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchGetDoneItemReq {
+    pub get_id: u64,
+    /// A caller-owned target submitted together with Done. `None` replays the
+    /// transitional pre-bound path. External GPU sinks use this field to
+    /// remove the separate physical BatchGetBind RTT.
+    pub late_target: Option<GetBindTarget>,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct BatchGetDoneReq {
-    pub get_ids: Vec<u64>,
+    pub items: Vec<BatchGetDoneItemReq>,
 }
 impl MsgPackSerializePart for BatchGetDoneReq {
     fn msg_id(&self) -> u32 {
@@ -511,44 +943,6 @@ impl RPCReq for GetMasterOnlyMetricPartReq {
     type Resp = GetMasterOnlyMetricPartResp;
 }
 
-#[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct ReserveLocalGrantReq {}
-impl MsgPackSerializePart for ReserveLocalGrantReq {
-    fn msg_id(&self) -> u32 {
-        MsgId::ReserveLocalGrantReq as u32
-    }
-}
-
-#[allow(unused_assignments)]
-#[derive(Default, Debug, Clone, Encode, Decode)]
-pub enum ReserveLocalGrantOutcome {
-    #[default]
-    None,
-    Granted {
-        grant_id: u64,
-        node_id: NodeIDString,
-        addr: u64,
-        base_addr: u64,
-        len: u64,
-    },
-}
-
-#[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct ReserveLocalGrantResp {
-    pub outcome: ReserveLocalGrantOutcome,
-    pub error_code: ErrorCode,
-    pub error_json: String,
-    pub server_process_us: i64,
-}
-impl MsgPackSerializePart for ReserveLocalGrantResp {
-    fn msg_id(&self) -> u32 {
-        MsgId::ReserveLocalGrantResp as u32
-    }
-}
-impl RPCReq for ReserveLocalGrantReq {
-    type Resp = ReserveLocalGrantResp;
-}
-
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum OwnerReclaimPhase {
     #[default]
@@ -574,9 +968,9 @@ pub enum OwnerReclaimBacking {
     #[default]
     Allocation,
     CommittedSlot {
-        grant_id: u64,
-        slot_index: u32,
-        slot_size: u64,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
     },
     /// A master-owned allocation with no owner-side key index.
     ///
@@ -625,6 +1019,14 @@ pub struct OwnerSourceEvictionVictim {
     pub key: String,
     pub put_id: PutIDForAKey,
     pub backing: OwnerReclaimBacking,
+    /// The source owner atomically reserved this exact slot's logical
+    /// GlobalShared budget before issuing the master RPC.  The reservation is
+    /// retained across transport/retry uncertainty and is consumed only when
+    /// the owner commits the LocalExclusive -> GlobalShared scope change.
+    /// Without it the master may delete the replica or wait for an already
+    /// selected GlobalShared victim to become a real owner-side Free, but it
+    /// must not publish a new GlobalShared route.
+    pub global_demotion_reserved: bool,
     /// Durable owner-local SSD bytes prepared under the exact source fence.
     /// The master installs this backing immediately before deleting `memory`.
     pub ssd_backing_len: Option<u64>,
@@ -642,6 +1044,10 @@ pub struct BatchEvictOwnerSourceReq {
     pub operation_id: u64,
     /// Membership generation of the authenticated source owner.
     pub owner_node_start_time: i64,
+    /// Bytes of already-GlobalShared entries that the master must explicitly
+    /// select before demoting this batch.  This is bounded by the exact source
+    /// victims in the same request and is never physical reclaim credit.
+    pub global_reclaim_requested_bytes: u64,
     pub victims: Vec<OwnerSourceEvictionVictim>,
 }
 
@@ -657,11 +1063,20 @@ pub enum OwnerSourceEvictionOutcome {
     Unspecified,
     Accepted,
     AlreadyInProgress,
+    /// The exact physical slot remains live; only its scope changed from
+    /// LocalExclusive to GlobalShared.
+    DemotedGlobal,
     Completed,
     SsdCandidate,
     RetryableBusy,
     Stale,
     RejectedNotEvictable,
+    /// Master proved that this exact source is the last live memory backing,
+    /// but the owner did not reserve GlobalShared budget for it.  The owner
+    /// must first finish the rest of the batch (releasing speculative
+    /// reservations held by direct-delete victims), reserve only these
+    /// screened generations, and retry them in one follow-up batch.
+    NeedsGlobalReservation,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -675,6 +1090,8 @@ pub struct OwnerSourceEvictionVictimResp {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct BatchEvictOwnerSourceResp {
     pub operation_id: u64,
+    pub global_reclaim_requested_bytes: u64,
+    pub global_reclaim_selected_bytes: u64,
     pub victims: Vec<OwnerSourceEvictionVictimResp>,
     pub error_code: ErrorCode,
     pub error_json: String,
@@ -838,29 +1255,52 @@ impl RPCReq for BatchEnqueueReplicaTaskReq {
     type Resp = BatchEnqueueReplicaTaskResp;
 }
 
-#[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct ReleaseLocalGrantReq {
-    pub grant_id: u64,
+#[derive(
+    Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode, serde::Serialize, serde::Deserialize,
+)]
+pub enum OwnerLocalReserveControlOp {
+    #[default]
+    Get,
+    SetLocalTarget {
+        controller_epoch: u64,
+        local_target_bytes: u64,
+    },
 }
-impl MsgPackSerializePart for ReleaseLocalGrantReq {
+
+#[derive(Default, Debug, Clone, Encode, Decode, serde::Serialize, serde::Deserialize)]
+pub struct OwnerLocalReserveControlReq {
+    pub expected_owner_node_start_time: i64,
+    pub operation: OwnerLocalReserveControlOp,
+}
+impl MsgPackSerializePart for OwnerLocalReserveControlReq {
     fn msg_id(&self) -> u32 {
-        MsgId::ReleaseLocalGrantReq as u32
+        MsgId::OwnerLocalReserveControlReq as u32
     }
 }
 
-#[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct ReleaseLocalGrantResp {
+#[derive(Default, Debug, Clone, Encode, Decode, serde::Serialize, serde::Deserialize)]
+pub struct OwnerLocalReserveControlResp {
+    pub owner_node_start_time: i64,
+    pub controller_epoch: u64,
+    pub physical_capacity_bytes: u64,
+    pub local_target_bytes: u64,
+    pub global_target_bytes: u64,
+    pub allocated_bytes: u64,
+    pub free_bytes: u64,
+    pub applied_moka_bytes: u64,
+    pub moka_weighted_bytes: u64,
+    pub settled: bool,
     pub error_code: ErrorCode,
     pub error_json: String,
     pub server_process_us: i64,
 }
-impl MsgPackSerializePart for ReleaseLocalGrantResp {
+impl MsgPackSerializePart for OwnerLocalReserveControlResp {
     fn msg_id(&self) -> u32 {
-        MsgId::ReleaseLocalGrantResp as u32
+        MsgId::OwnerLocalReserveControlResp as u32
     }
 }
-impl RPCReq for ReleaseLocalGrantReq {
-    type Resp = ReleaseLocalGrantResp;
+impl RPCReq for OwnerLocalReserveControlReq {
+    type Resp = OwnerLocalReserveControlResp;
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -998,18 +1438,9 @@ impl RPCReq for PutRevokeReq {
     type Resp = PutRevokeResp;
 }
 
-#[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct PutDoneCommittedSlot {
-    pub grant_id: u64,
-    /// Grant-relative offset in 4 KiB allocation units. Fixed-slot peers use a
-    /// different meaning, so local-reserve messages require coordinated peers.
-    pub slot_index: u32,
-    /// 4 KiB-aligned allocation capacity in bytes.
-    pub slot_size: u64,
-    pub addr: u64,
-    pub base_addr: u64,
-    pub len: u64,
-}
+/// The committed target returned by an owner is the same generation-safe
+/// descriptor used by the owner allocator and master route.
+pub type PutDoneCommittedSlot = crate::owner_segment::OwnerSlotDesc;
 
 /// Exact prefix dependency for one immutable KV page.
 ///
@@ -1372,6 +1803,9 @@ pub struct PutAppendStartResp {
     pub target_addr: u64,
     pub target_base_addr: u64,
     pub len: u64,
+    /// Ordered owner generations. These are placement hints; each target
+    /// performs the authoritative PrepareTarget claim.
+    pub owner_candidates: Vec<OwnerTargetRouteToken>,
     pub error_code: ErrorCode,
     pub error_json: String,
     pub server_process_us: i64,
@@ -1414,6 +1848,7 @@ pub struct BatchPutAppendStartItemResp {
     pub target_addr: u64,
     pub target_base_addr: u64,
     pub len: u64,
+    pub owner_candidates: Vec<OwnerTargetRouteToken>,
     pub error_code: ErrorCode,
     pub error_json: String,
 }
@@ -1464,6 +1899,9 @@ pub struct PutAppendDoneReq {
     pub key: String,
     pub put_id: PutIDForAKey,
     pub operation_id: u64,
+    /// Present only for the owner-authoritative direct-transfer path.
+    pub committed_slot: Option<OwnerSlotDesc>,
+    pub route_token: Option<OwnerTargetRouteToken>,
 }
 impl MsgPackSerializePart for PutAppendDoneReq {
     fn msg_id(&self) -> u32 {
@@ -1473,6 +1911,7 @@ impl MsgPackSerializePart for PutAppendDoneReq {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct PutAppendDoneResp {
     pub appended: bool,
+    pub route_epoch: u64,
     pub error_code: ErrorCode,
     pub error_json: String,
     pub server_process_us: i64,
@@ -1491,6 +1930,8 @@ pub struct BatchPutAppendDoneItemReq {
     pub key: String,
     pub put_id: PutIDForAKey,
     pub operation_id: u64,
+    pub committed_slot: Option<OwnerSlotDesc>,
+    pub route_token: Option<OwnerTargetRouteToken>,
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -1508,6 +1949,7 @@ pub struct BatchPutAppendDoneItemResp {
     pub key: String,
     pub put_id: PutIDForAKey,
     pub appended: bool,
+    pub route_epoch: u64,
     pub error_code: ErrorCode,
     pub error_json: String,
 }
@@ -1828,6 +2270,41 @@ mod put_atomic_group_tests {
             bitcode::decode(&bitcode::encode(&req)).expect("decode owner SSD publication");
         assert_eq!(decoded.owner_node_start_time, 41);
         assert_eq!(decoded.items, req.items);
+    }
+
+    #[test]
+    fn owner_scope_budget_control_round_trips_epoch_target_and_snapshot() {
+        let request = OwnerLocalReserveControlReq {
+            expected_owner_node_start_time: 41,
+            operation: OwnerLocalReserveControlOp::SetLocalTarget {
+                controller_epoch: 7,
+                local_target_bytes: 96 * 1024 * 1024 * 1024,
+            },
+        };
+        let decoded: OwnerLocalReserveControlReq = bitcode::decode(&bitcode::encode(&request))
+            .expect("decode owner local-reserve control request");
+        assert_eq!(decoded.expected_owner_node_start_time, 41);
+        assert_eq!(decoded.operation, request.operation);
+
+        let response = OwnerLocalReserveControlResp {
+            owner_node_start_time: 41,
+            controller_epoch: 7,
+            physical_capacity_bytes: 128 * 1024 * 1024 * 1024,
+            local_target_bytes: 96 * 1024 * 1024 * 1024,
+            global_target_bytes: 32 * 1024 * 1024 * 1024,
+            allocated_bytes: 80 * 1024 * 1024 * 1024,
+            free_bytes: 48 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let decoded: OwnerLocalReserveControlResp = bitcode::decode(&bitcode::encode(&response))
+            .expect("decode owner local-reserve control response");
+        assert_eq!(decoded.owner_node_start_time, 41);
+        assert_eq!(decoded.controller_epoch, 7);
+        assert_eq!(decoded.physical_capacity_bytes, 128 * 1024 * 1024 * 1024);
+        assert_eq!(decoded.local_target_bytes, 96 * 1024 * 1024 * 1024);
+        assert_eq!(decoded.global_target_bytes, 32 * 1024 * 1024 * 1024);
+        assert_eq!(decoded.allocated_bytes, 80 * 1024 * 1024 * 1024);
+        assert_eq!(decoded.free_bytes, 48 * 1024 * 1024 * 1024);
     }
 
     #[test]

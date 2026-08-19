@@ -19,6 +19,7 @@ pub mod memholder;
 pub mod metric_reporter;
 pub mod metrics;
 pub mod observe_kvope;
+pub(crate) mod owner_segment;
 pub mod p2p;
 pub mod profile;
 pub mod rpcresp_kvresult_convert;
@@ -31,45 +32,21 @@ pub use crate::client_seg_pool::SharedJsonMeta;
 pub use crate::cluster_manager::{ClusterEvent, ClusterMember};
 pub use fluxon_observability::types::FsMountKind;
 
-pub const OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES: u64 = 512 * 1024 * 1024;
-pub(crate) const OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES: u64 = 4 * 1024;
+pub(crate) const OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES: u64 = 4 * 1024;
 
-pub(crate) fn owner_local_reserve_slot_offset_bytes(slot_index: u32) -> Option<u64> {
-    u64::from(slot_index).checked_mul(OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES)
+pub(crate) fn owner_segment_offset_bytes(offset_units: u32) -> Option<u64> {
+    u64::from(offset_units).checked_mul(OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES)
 }
 
-pub(crate) fn owner_local_reserve_slot_size_bytes(value_len: u64) -> Option<u64> {
-    let normalized = value_len.max(OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES);
-    let alignment_mask = OWNER_LOCAL_RESERVE_MIN_SLOT_SIZE_BYTES - 1;
+pub(crate) fn owner_segment_allocation_capacity_bytes(value_len: u64) -> Option<u64> {
+    let normalized = value_len.max(OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES);
+    let alignment_mask = OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES - 1;
     let slot_size = normalized
         .checked_add(alignment_mask)
         .map(|rounded| rounded & !alignment_mask)?;
-    (slot_size <= OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES).then_some(slot_size)
-}
-
-pub(crate) fn owner_local_reserve_slots_per_grant(slot_size: u64) -> Option<u32> {
-    if slot_size == 0 || slot_size > OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES {
-        return None;
-    }
-    u32::try_from(OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES / slot_size).ok()
-}
-
-pub(crate) fn owner_local_reserve_expected_grant_count(
-    value_len: u64,
-    payload_capacity_bytes: u64,
-) -> Option<u64> {
-    if value_len == 0 || payload_capacity_bytes == 0 {
-        return None;
-    }
-    let slot_size = owner_local_reserve_slot_size_bytes(value_len)?;
-    let slots_per_grant = u64::from(owner_local_reserve_slots_per_grant(slot_size)?);
-    let value_count =
-        payload_capacity_bytes / value_len + u64::from(payload_capacity_bytes % value_len != 0);
-    Some(value_count / slots_per_grant + u64::from(value_count % slots_per_grant != 0))
-}
-
-pub(crate) fn owner_local_reserve_physical_grant_count(physical_capacity_bytes: u64) -> u64 {
-    physical_capacity_bytes / OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES
+    u32::try_from(slot_size / OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES)
+        .ok()
+        .map(|_| slot_size)
 }
 
 pub type MembershipEventReceiver =
@@ -869,6 +846,7 @@ fn build_side_transfer_worker_config(
         },
         pprof_duration_seconds: owner_config.pprof_duration_seconds,
         replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),
@@ -921,6 +899,7 @@ fn build_side_transfer_worker_config_yaml(
         contribute_to_cluster_pool_size: None,
         pprof_duration_seconds: side_config.pprof_duration_seconds,
         replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         fluxonkv_spec: crate::config::FluxonKvSpecYaml {
             etcd_addresses: None,
             cluster_name: side_config.cluster_name,
@@ -1991,6 +1970,34 @@ async fn run_client_impl(
             config.test_spec_config.side_transfer_role,
             Some(SideTransferRole::Worker)
         );
+    let owner_placement_class = if is_external {
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid
+    } else {
+        config.owner_placement_class.unwrap_or_else(|| {
+            if config.replica_writeback_hot_capacity_ratio.is_some() {
+                // Transitional compatibility for already-written inference
+                // configs. New deployments set owner_placement_class
+                // explicitly; RemoteCpu is never inferred from topology.
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference
+            } else {
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid
+            }
+        })
+    };
+    let owner_allocation_authority = if owner_placement_class.is_valid() {
+        crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Owner
+    } else {
+        crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master
+    };
+    let owner_local_target_bytes = match owner_placement_class {
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference => {
+            config.replica_writeback_hot_capacity_ratio.map(|ratio| {
+                (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
+            })
+        }
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::RemoteCpu => Some(0),
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid => None,
+    };
     let bootstrapped_shared_meta = if is_side_transfer_worker {
         Some(wait_for_external_bootstrap_bundle(&config).await?.meta)
     } else {
@@ -2031,6 +2038,12 @@ async fn run_client_impl(
         // Owner nodes are the global relay set. Keeping a single metadata marker converges
         // route selection, observability proxy eligibility, and ops topology rendering.
         metadata.insert("p2p_relay".to_string(), "true".to_string());
+        if owner_placement_class.is_valid() {
+            metadata.insert(
+                "owner_placement_class".to_string(),
+                owner_placement_class.as_str().to_string(),
+            );
+        }
         if config.ssd_storage.is_some() {
             metadata.insert(
                 crate::cluster_manager::META_KEY_KV_SSD_STORAGE.to_string(),
@@ -2123,6 +2136,12 @@ async fn run_client_impl(
             },
             client_seg_pool_arg: ClientSegPoolNewArg {
                 contribute_size: config.contribute_to_cluster_pool_size.clone(),
+                allocation_authority:
+                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+                owner_placement_class:
+                    crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
+                owner_local_target_bytes: None,
+                owner_segment_memfd: false,
                 share_mem_path: config.share_mem_path.clone(),
                 large_file_paths: config.large_file_paths.clone(),
                 cluster_name: config.cluster_name.clone(),
@@ -2192,18 +2211,23 @@ async fn run_client_impl(
             },
             client_kv_api_arg: ClientKvApiNewArg {
                 test_spec_config: config.test_spec_config.clone(),
-                owner_hot_cache_capacity_bytes: config.replica_writeback_hot_capacity_ratio.map(
-                    |ratio| {
-                        (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
-                    },
-                ),
+                owner_hot_cache_capacity_bytes: owner_local_target_bytes.filter(|_| {
+                    owner_placement_class
+                        == crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference
+                }),
                 owner_local_reserve_physical_capacity_bytes: config
                     .contribute_to_cluster_pool_size
                     .dram,
+                allocation_authority: owner_allocation_authority,
+                owner_placement_class,
                 ssd_storage: ssd_storage_init,
             },
             client_seg_pool_arg: ClientSegPoolNewArg {
                 contribute_size: config.contribute_to_cluster_pool_size.clone(),
+                allocation_authority: owner_allocation_authority,
+                owner_placement_class,
+                owner_local_target_bytes,
+                owner_segment_memfd: config.test_spec_config.owner_segment_memfd,
                 // Read shared memory path from config (must not be empty).
                 share_mem_path: config.share_mem_path.clone(),
                 large_file_paths: config.large_file_paths.clone(),
@@ -2607,18 +2631,15 @@ mod tests {
     }
 
     #[test]
-    fn production_owner_grant_remains_a_generic_mixed_size_extent() {
+    fn owner_segment_alignment_supports_mixed_size_allocations() {
         const SGLANG_KV_PAGE_BYTES: u64 = 4_718_592;
-
-        let slot_size = owner_local_reserve_slot_size_bytes(SGLANG_KV_PAGE_BYTES).unwrap();
-        let slots_per_grant = owner_local_reserve_slots_per_grant(slot_size).unwrap();
-        let slot_relative_tail =
-            OWNER_LOCAL_RESERVE_GRANT_QUANTUM_BYTES - u64::from(slots_per_grant) * slot_size;
-
-        assert_eq!(slots_per_grant, 113);
-        assert_eq!(slot_relative_tail, 3_670_016);
-        assert!(
-            slot_relative_tail >= owner_local_reserve_slot_size_bytes(3 * 1024 * 1024).unwrap()
+        assert_eq!(
+            owner_segment_allocation_capacity_bytes(SGLANG_KV_PAGE_BYTES),
+            Some(SGLANG_KV_PAGE_BYTES)
+        );
+        assert_eq!(
+            owner_segment_allocation_capacity_bytes(3 * 1024 * 1024 + 1),
+            Some(3 * 1024 * 1024 + 4096)
         );
     }
 
@@ -2638,6 +2659,7 @@ mod tests {
             },
             pprof_duration_seconds: None,
             replica_writeback_hot_capacity_ratio: None,
+            owner_placement_class: None,
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: vec!["http://127.0.0.1:2379".to_string()],
@@ -3013,6 +3035,7 @@ mod tests {
             },
             pprof_duration_seconds: None,
             replica_writeback_hot_capacity_ratio: None,
+            owner_placement_class: None,
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: Vec::new(),

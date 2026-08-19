@@ -1322,13 +1322,17 @@ mod tests {
                     NodeTombTag::new(),
                     KvMemoryReplica {
                         backing: KvReplicaBacking::CommittedSlot(CommittedSlotReplica {
-                            owner_node_id: owner.clone(),
-                            grant_id: 7,
-                            slot_index: 3,
-                            slot_size: input.len() as u64,
+                            owner: crate::owner_segment::OwnerGeneration::new(
+                                owner.as_ref().to_string(),
+                                1,
+                            ),
+                            allocation_id: 7,
+                            segment_offset: 0,
+                            capacity_bytes: input.len() as u64,
                             addr: input.as_ptr() as u64,
                             len: input.len() as u64,
                             base_addr: input.as_ptr() as u64,
+                            segment_registration_epoch: 1,
                         }),
                         owner_local_indexed: true,
                         get_durable_reservation: None,

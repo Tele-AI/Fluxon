@@ -338,7 +338,9 @@ pub struct ExternalBatchGetCancelResp {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct ExternalPlannedGetItem {
     pub key: String,
-    pub get_id: u64,
+    /// Reuse the canonical master Plan wire type instead of copying a second
+    /// set of source identity fields into the owner execution protocol.
+    pub plan: crate::master_kv_router::msg_pack::BatchGetPlanItemResp,
 }
 
 /// Execute a target-free master plan into the requester's owner-local CPU
@@ -383,7 +385,11 @@ mod external_execute_planned_get_wire_tests {
             plan_handle: 19,
             items: vec![ExternalPlannedGetItem {
                 key: "page-a".to_string(),
-                get_id: 0,
+                plan: crate::master_kv_router::msg_pack::BatchGetPlanItemResp {
+                    get_id: 0,
+                    requester_local_borrow_eligible: true,
+                    ..Default::default()
+                },
             }],
             req_node_id: "external-a".to_string(),
             started_time: 23,
@@ -392,7 +398,8 @@ mod external_execute_planned_get_wire_tests {
         let decoded: ExternalExecutePlannedGetReq =
             bitcode::decode(&bitcode::encode(&request)).expect("decode planned execute request");
         assert_eq!(decoded.plan_handle, 19);
-        assert_eq!(decoded.items[0].get_id, 0);
+        assert_eq!(decoded.items[0].plan.get_id, 0);
+        assert!(decoded.items[0].plan.requester_local_borrow_eligible);
         assert_eq!(decoded.started_time, 23);
 
         let terminal = ExternalExecutePlannedGetResp {
