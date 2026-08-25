@@ -15,8 +15,9 @@ use fluxon_commu_contract::{
     ClosedRuntimeDispatchTransportPolicy, ClosedRuntimeError, ClosedRuntimeHandle,
     ClosedRuntimeHostCallbackHandle, ClosedRuntimeLocalMemoryKind, ClosedRuntimeP2pCall,
     ClosedRuntimeP2pCallRawObservedRequestView, ClosedRuntimeP2pResponse,
-    ClosedRuntimeP2pSendResponseRawRequestView, ClosedRuntimePeerGen, ClosedRuntimeRawSlice,
-    ClosedRuntimeRequest, ClosedRuntimeResponse, ClosedRuntimeTransferEngineCall,
+    ClosedRuntimeP2pSendResponseRawRequestView, ClosedRuntimePeerGen,
+    ClosedRuntimeProcessLoggingConfig, ClosedRuntimeRawSlice, ClosedRuntimeRequest,
+    ClosedRuntimeResponse, ClosedRuntimeTransferEngineCall,
     ClosedRuntimeTransferEngineOpenRuntimeRequest, ClosedRuntimeTransferEngineOpenRuntimeResponse,
     ClosedRuntimeTransferEngineResponse, ClosedRuntimeUserRpcBytesRequestView,
     ClosedRuntimeUserRpcHandlerLocalObserveView, ClosedRuntimeWireBodyView,
@@ -26,8 +27,8 @@ use fluxon_commu_contract::{
 
 pub mod rdma_probe;
 
-pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 7;
-pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 9;
+pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 8;
+pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 10;
 pub const FLUXON_COMMU_CLOSED_HOST_CALLBACKS_ABI_VERSION: u32 = 8;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK: i32 = 0;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_ERR: i32 = 1;
@@ -1632,6 +1633,18 @@ pub async fn runtime_invoke(
             Err(ClosedSdkConsumerError::RuntimeError { error })
         }
         status => Err(ClosedSdkConsumerError::RuntimeSubmitRejected { status }),
+    }
+}
+
+pub async fn initialize_process_logging(
+    config: ClosedRuntimeProcessLoggingConfig,
+) -> Result<String, ClosedSdkConsumerError> {
+    assert_abi_compatible()?;
+    match runtime_invoke(&ClosedRuntimeRequest::InitializeProcessLogging { config }).await? {
+        ClosedRuntimeResponse::ProcessLoggingInitialized { absolute_path } => Ok(absolute_path),
+        other => Err(ClosedSdkConsumerError::RuntimeUnexpectedResponse {
+            detail: format!("{other:?}"),
+        }),
     }
 }
 

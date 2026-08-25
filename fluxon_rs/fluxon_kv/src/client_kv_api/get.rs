@@ -10,10 +10,11 @@ use crate::{
     cluster_manager::NodeID,
     master_kv_router::msg_pack::{
         BatchGetBindItemReq, BatchGetBindReq, BatchGetBindResp, BatchGetDoneItemReq,
-        BatchGetDoneReq, BatchGetDoneResp, BatchGetRevokeReq, BatchGetRevokeResp,
-        BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp, BatchIsExistReq,
-        GetAllocationMode, GetBindTarget, GetDoneReq, GetDoneResp, GetMetaReq, GetMetaResp,
-        GetPreparedLocalReserveTarget, GetRevokeReq, GetSourceKind, GetStartReq, GetStartResp,
+        BatchGetDoneReq, BatchGetDoneResp, BatchGetPlanReq, BatchGetPlanResp, BatchGetRevokeReq,
+        BatchGetRevokeResp, BatchGetStartItemResp, BatchGetStartReq, BatchGetStartResp,
+        BatchIsExistReq, GetAllocationMode, GetBindTarget, GetDoneReq, GetDoneResp, GetMetaReq,
+        GetMetaResp, GetPreparedLocalReserveTarget, GetRevokeReq, GetSourceKind, GetStartReq,
+        GetStartResp,
     },
     owner_segment::{
         OwnerGeneration, OwnerGetDestinationCapability, OwnerGetSourceCapability,
@@ -1758,11 +1759,12 @@ impl ClientKvApiInner {
         }
 
         if !missing_keys.is_empty() {
-            let start_resp = super::external_api::batch_get_start_with_local_reserve_targets(
-                self,
-                &missing_keys,
-            )
-            .await?;
+            let (start_resp, late_targets) =
+                super::external_api::batch_get_start_with_local_reserve_targets(
+                    self,
+                    &missing_keys,
+                )
+                .await?;
             if start_resp.items.len() != missing_keys.len() {
                 return Err(KvError::Api(ApiError::Unknown {
                     detail: format!(
@@ -1772,7 +1774,6 @@ impl ClientKvApiInner {
                     ),
                 }));
             }
-            let late_targets = vec![None; start_resp.items.len()];
             let finished = self
                 .batch_get_finish_started(
                     missing_keys,
@@ -1981,6 +1982,37 @@ impl ClientKvApiInner {
     pub async fn batch_get_start(&self, keys: Vec<String>) -> KvResult<BatchGetStartResp> {
         self.batch_get_start_with_prepared_targets(keys, Vec::new())
             .await
+    }
+
+    pub(crate) async fn batch_get_plan(&self, keys: Vec<String>) -> KvResult<BatchGetPlanResp> {
+        if !self.view.register_shutdown_poller().is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "ClientKvApi is shutting down; rejecting batch_get_plan".to_string(),
+            }));
+        }
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_batch_get_plan,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            MsgPack {
+                serialize_part: BatchGetPlanReq { keys },
+                raw_bytes: Vec::new(),
+            },
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            resp.serialize_part.error_code,
+            resp.serialize_part.error_json.clone(),
+        )?;
+        Ok(resp.serialize_part)
     }
 
     pub(crate) async fn batch_get_start_with_prepared_targets(

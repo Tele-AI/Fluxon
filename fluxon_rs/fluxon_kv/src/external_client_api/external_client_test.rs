@@ -7,6 +7,7 @@ use crate::config::{
     TransferEngineType,
 };
 use crate::master_kv_router::MasterKvRouterView;
+use crate::master_seg_manager::msg_pack::{OwnerPlacementClass, SegmentAllocationAuthority};
 use crate::{ConfigArg, run_client, run_master};
 use limit_thirdparty::tokio::{self};
 use std::time::{Duration, Instant};
@@ -82,8 +83,8 @@ fn new_client_config(
             tcp_thread_reactor: Default::default(),
         },
         pprof_duration_seconds: None,
-        replica_writeback_hot_capacity_ratio: None,
-        owner_placement_class: None,
+        replica_writeback_hot_capacity_ratio: Some(0.5),
+        owner_placement_class: Some(OwnerPlacementClass::Inference),
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: vec![etcd.to_string()],
@@ -158,8 +159,11 @@ async fn test_external_client_basic_crud() {
     let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
         .expect("read etcd endpoint from build_config_ext.yml");
     let cluster = "test_cluster_ext";
-    let shm_path = "/tmp/kvcache_shared_memory_exttest";
-    std::fs::create_dir_all(shm_path).unwrap();
+    let shm_path = format!(
+        "{}/sharemem/kvcache_shared_memory_exttest",
+        fluxon_util::test_util::test_workdir_base()
+    );
+    std::fs::create_dir_all(&shm_path).unwrap();
 
     // Start master
     let master_cfg = new_master_config("ext_test_master", None, cluster, &etcd);
@@ -168,7 +172,7 @@ async fn test_external_client_basic_crud() {
         .expect("start master");
 
     // Start owner client (provides shared memory)
-    let owner_cfg = new_client_config("ext_test_owner", cluster, shm_path, &etcd);
+    let owner_cfg = new_client_config("ext_test_owner", cluster, &shm_path, &etcd);
     let (owner_fw, _) = run_client(ConfigArg::Config(owner_cfg))
         .await
         .expect("start owner client");
@@ -177,8 +181,9 @@ async fn test_external_client_basic_crud() {
         .cluster_manager()
         .get_self_info()
         .id;
-    // Wait until master has registered allocators for owner node
-    wait_node_allocators(
+    // Owner-authoritative registration publishes geometry and authority while
+    // deliberately leaving the master allocator map empty.
+    wait_owner_allocation_authority(
         master_fw.master_kv_router_view(),
         &owner_node_id,
         Duration::from_secs(30),
@@ -186,7 +191,7 @@ async fn test_external_client_basic_crud() {
     .await;
 
     // Start external client bound to owner's shared memory
-    let ext_cfg = new_zero_contribution_client_config(&owner_node_id, cluster, shm_path);
+    let ext_cfg = new_zero_contribution_client_config(&owner_node_id, cluster, &shm_path);
     let (ext_fw, _) = run_client(ConfigArg::Config(ext_cfg))
         .await
         .expect("start external client");
@@ -227,6 +232,12 @@ async fn test_external_client_basic_crud() {
             .put(key, value, crate::client_kv_api::PutOptionalArgs::new())
             .await
             .expect("external put");
+        wait_master_route(
+            master_fw.master_kv_router_view(),
+            key,
+            Duration::from_secs(5),
+        )
+        .await;
         // owner validate exists
         assert!(
             owner_api
@@ -301,12 +312,261 @@ async fn test_external_client_basic_crud() {
             other => panic!("expected is_exist false after delete, got {:?}", other),
         }
     }
-    // Shutdown in reverse order
+    // The diagnostic short-circuit mode deliberately skips payload memcpy and
+    // transfer. Validate only allocation, commit, route publication, logical
+    // length, and reclaim; input-byte equality is not part of this mode.
     ext_fw.shutdown().await.expect("shutdown ext");
+    let mut short_circuit_cfg =
+        new_zero_contribution_client_config(&owner_node_id, cluster, &shm_path);
+    short_circuit_cfg
+        .test_spec_config
+        .short_circuit_put_payload_path = true;
+    let (short_circuit_fw, _) = run_client(ConfigArg::Config(short_circuit_cfg))
+        .await
+        .expect("start short-circuit external client");
+    {
+        let short_circuit_view = short_circuit_fw.external_client_api_view();
+        let short_circuit_api = short_circuit_view.external_client_api();
+        let owner_view = owner_fw.client_kv_api_view();
+        let owner_api = owner_view.client_kv_api();
+        let key = "ext_client_short_circuit_key";
+        let logical_payload = b"payload_is_intentionally_not_copied";
+
+        short_circuit_api
+            .inner()
+            .put(
+                key,
+                logical_payload,
+                crate::client_kv_api::PutOptionalArgs::new(),
+            )
+            .await
+            .expect("short-circuit external put");
+        wait_master_route(
+            master_fw.master_kv_router_view(),
+            key,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            owner_api
+                .inner()
+                .is_exist(key)
+                .await
+                .expect("owner sees short-circuit route")
+        );
+        let (holder, _) = owner_api
+            .inner()
+            .get(key)
+            .await
+            .expect("owner get after short-circuit put")
+            .expect("short-circuit owner slot");
+        assert_eq!(holder.bytes().len(), logical_payload.len());
+        drop(holder);
+
+        short_circuit_api
+            .inner()
+            .delete(key)
+            .await
+            .expect("delete short-circuit key");
+        assert!(
+            !owner_api
+                .inner()
+                .is_exist(key)
+                .await
+                .expect("owner no longer sees short-circuit key")
+        );
+    }
+    short_circuit_fw
+        .shutdown()
+        .await
+        .expect("shutdown short-circuit ext");
+
+    // Shutdown remaining services in reverse order.
     owner_fw.shutdown().await.expect("shutdown owner");
     master_fw.shutdown().await.expect("shutdown master");
 
     info!("✅ external client basic crud test finished");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_external_remote_get_uses_bound_owner_slot_without_master_allocator() {
+    let _test_guard = crate::kvcore_test_lib::integration_test_lock().await;
+    fluxon_util::test_util::start_test_etcd().expect("start etcd for remote external Get test");
+    unsafe {
+        std::env::set_var("FLUXON_LOG", "info");
+    }
+    let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
+        .expect("read etcd endpoint from build_config_ext.yml");
+    let cluster = "test_cluster_ext_remote_owner_target";
+    let root = fluxon_util::test_util::test_workdir_base();
+    let source_shm = format!("{root}/sharemem/ext_remote_get_source");
+    let target_shm = format!("{root}/sharemem/ext_remote_get_target");
+    std::fs::create_dir_all(&source_shm).expect("create source owner shared-memory root");
+    std::fs::create_dir_all(&target_shm).expect("create target owner shared-memory root");
+
+    let (master_fw, _) = run_master(ConfigArg::Config(new_master_config(
+        "ext_remote_get_master",
+        None,
+        cluster,
+        &etcd,
+    )))
+    .await
+    .expect("start master");
+    let (source_owner_fw, _) = run_client(ConfigArg::Config(new_client_config(
+        "ext_remote_get_source_owner",
+        cluster,
+        &source_shm,
+        &etcd,
+    )))
+    .await
+    .expect("start source owner");
+    let (target_owner_fw, _) = run_client(ConfigArg::Config(new_client_config(
+        "ext_remote_get_target_owner",
+        cluster,
+        &target_shm,
+        &etcd,
+    )))
+    .await
+    .expect("start target owner");
+    let source_owner_id = source_owner_fw
+        .cluster_manager_view()
+        .cluster_manager()
+        .get_self_info()
+        .id;
+    let target_owner_id = target_owner_fw
+        .cluster_manager_view()
+        .cluster_manager()
+        .get_self_info()
+        .id;
+    wait_owner_allocation_authority(
+        master_fw.master_kv_router_view(),
+        &source_owner_id,
+        Duration::from_secs(30),
+    )
+    .await;
+    wait_owner_allocation_authority(
+        master_fw.master_kv_router_view(),
+        &target_owner_id,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let (source_external_fw, _) = run_client(ConfigArg::Config(
+        new_zero_contribution_client_config(&source_owner_id, cluster, &source_shm),
+    ))
+    .await
+    .expect("start source-bound external");
+    let (target_external_fw, _) = run_client(ConfigArg::Config(
+        new_zero_contribution_client_config(&target_owner_id, cluster, &target_shm),
+    ))
+    .await
+    .expect("start target-bound external");
+    let target_external_id = target_external_fw
+        .cluster_manager_view()
+        .cluster_manager()
+        .get_self_info()
+        .id;
+    let master_view = master_fw.master_kv_router_view();
+    for node_id in [&source_owner_id, &target_owner_id, &target_external_id] {
+        let node: NodeID = node_id.to_string().into();
+        assert!(
+            master_view
+                .master_seg_manager()
+                .get_node_allocators(&node)
+                .is_empty(),
+            "owner-authoritative/external requester must not expose a master allocator: {node_id}"
+        );
+    }
+
+    let key = "external-remote-owner-target-without-master-allocator";
+    let value = vec![0xa5_u8; 1024 * 1024 + 123];
+    let source_external_view = source_external_fw.external_client_api_view();
+    let source_external = source_external_view.external_client_api();
+    source_external
+        .inner()
+        .put(
+            key,
+            &value,
+            crate::client_kv_api::PutOptionalArgs(vec![
+                crate::client_kv_api::PutOptionalArg::SkipMakeReplicaTask,
+            ]),
+        )
+        .await
+        .expect("put only on source owner");
+    wait_master_route(master_view.clone(), key, Duration::from_secs(5)).await;
+    {
+        let route = master_view
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .get(key)
+            .expect("source Put must publish one route");
+        let replicas = route.node_replicas.read();
+        assert!(replicas.contains_key(source_owner_id.as_str()));
+        assert!(
+            !replicas.contains_key(target_owner_id.as_str()),
+            "SkipMakeReplicaTask must leave the target owner genuinely remote before Get"
+        );
+    }
+    let target_owner_view = target_owner_fw.client_kv_api_view();
+    assert!(
+        target_owner_view
+            .client_kv_api()
+            .inner()
+            .local_visible_mem_holder(key)
+            .is_none(),
+        "target owner must not have a local slot before the remote Get"
+    );
+
+    let target_external_view = target_external_fw.external_client_api_view();
+    let got = target_external_view
+        .external_client_api()
+        .inner()
+        .get(key)
+        .await
+        .expect("dram=0 external remote Get must use its bound owner target")
+        .expect("remote key must exist");
+    assert_eq!(got.bytes(), value.as_slice());
+    let publish_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if target_owner_view
+            .client_kv_api()
+            .inner()
+            .local_visible_mem_holder(key)
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < publish_deadline,
+            "remote Get must eventually publish the exact target-owner slot"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(got);
+
+    source_external
+        .inner()
+        .delete(key)
+        .await
+        .expect("delete remote Get regression key");
+    target_external_fw
+        .shutdown()
+        .await
+        .expect("shutdown target-bound external");
+    source_external_fw
+        .shutdown()
+        .await
+        .expect("shutdown source-bound external");
+    target_owner_fw
+        .shutdown()
+        .await
+        .expect("shutdown target owner");
+    source_owner_fw
+        .shutdown()
+        .await
+        .expect("shutdown source owner");
+    master_fw.shutdown().await.expect("shutdown master");
 }
 
 // #[tokio::test]
@@ -319,8 +579,11 @@ pub async fn test_external_client_lifetime() {
         .expect("read etcd endpoint from build_config_ext.yml");
     info!("[ELT-SETUP] etcd endpoint loaded");
     let cluster = "test_cluster_ext_lifetime";
-    let shm_path = "/tmp/kvcache_shared_memory_ext_lifetime";
-    std::fs::create_dir_all(shm_path).unwrap();
+    let shm_path = format!(
+        "{}/sharemem/kvcache_shared_memory_ext_lifetime",
+        fluxon_util::test_util::test_workdir_base()
+    );
+    std::fs::create_dir_all(&shm_path).unwrap();
     info!("[ELT-SETUP] cluster='{}', shm_path='{}'", cluster, shm_path);
 
     // Start master
@@ -331,7 +594,7 @@ pub async fn test_external_client_lifetime() {
     info!("[ELT-SETUP] master started");
 
     // Start owner
-    let owner_cfg = new_client_config("ext_lt_owner", cluster, shm_path, &etcd);
+    let owner_cfg = new_client_config("ext_lt_owner", cluster, &shm_path, &etcd);
     let (owner_fw, _) = run_client(ConfigArg::Config(owner_cfg))
         .await
         .expect("start owner client");
@@ -348,19 +611,19 @@ pub async fn test_external_client_lifetime() {
     info!("[ELT-SETUP] owner node_id={}", owner_node_id);
 
     // Start external bound to owner
-    let ext_cfg = new_zero_contribution_client_config(&owner_node_id, cluster, shm_path);
+    let ext_cfg = new_zero_contribution_client_config(&owner_node_id, cluster, &shm_path);
     let (ext_fw, _) = run_client(ConfigArg::Config(ext_cfg))
         .await
         .expect("start external client");
     info!("[ELT-SETUP] external started (bound to owner)");
-    // Ensure owner allocators registered (no fixed sleep)
-    wait_node_allocators(
+    // Ensure owner authority is registered without creating a master allocator.
+    wait_owner_allocation_authority(
         master_fw.master_kv_router_view(),
         &owner_node_id,
         Duration::from_secs(30),
     )
     .await;
-    info!("[ELT-SETUP] master has allocators for owner node");
+    info!("[ELT-SETUP] master recorded owner allocation authority");
 
     {
         let ext_view = ext_fw.external_client_api_view();
@@ -398,6 +661,12 @@ pub async fn test_external_client_lifetime() {
             .put(key, val, crate::client_kv_api::PutOptionalArgs::new())
             .await
             .expect("external put");
+        wait_master_route(
+            master_fw.master_kv_router_view(),
+            key,
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(
             owner_api
                 .inner()
@@ -517,7 +786,7 @@ pub async fn test_external_client_lifetime() {
 
             // Start external client only (owner is down)
             info!("[ELT-EXT-ONLY] start a new external client for recovery path");
-            let ext_cfg2 = new_zero_contribution_client_config(&owner_node_id, cluster, shm_path);
+            let ext_cfg2 = new_zero_contribution_client_config(&owner_node_id, cluster, &shm_path);
             let (ext_fw2, _) = run_client(ConfigArg::Config(ext_cfg2))
                 .await
                 .expect("start external 2");
@@ -542,7 +811,7 @@ pub async fn test_external_client_lifetime() {
             let (owner_fw_new, _) = run_client(ConfigArg::Config(new_client_config(
                 "ext_lt_owner",
                 cluster,
-                shm_path,
+                &shm_path,
                 &etcd,
             )))
             .await
@@ -551,14 +820,14 @@ pub async fn test_external_client_lifetime() {
             // short wait before checking, member join and segment re-registration needs some time
             tokio::time::sleep(Duration::from_secs(3)).await;
 
-            // Wait until owner re-registers allocators on master
-            wait_node_allocators(
+            // Wait until the restarted owner re-registers its authority and geometry.
+            wait_owner_allocation_authority(
                 master_fw.master_kv_router_view(),
                 &owner_node_id,
                 Duration::from_secs(30),
             )
             .await;
-            info!("[ELT-OWNER-ON] owner re-registered allocators");
+            info!("[ELT-OWNER-ON] owner re-registered allocation authority");
 
             // After owner restarts but before data is re-put, a GET should respond within timeout
             // and return None (no timeout expected) per design [ELT-RESP]
@@ -585,6 +854,12 @@ pub async fn test_external_client_lifetime() {
                 .put(key2, val, crate::client_kv_api::PutOptionalArgs::new())
                 .await
                 .expect("owner put after restart");
+            wait_master_route(
+                master_fw.master_kv_router_view(),
+                key2,
+                Duration::from_secs(5),
+            )
+            .await;
             info!("[ELT-RESP] external GET after owner re-put (expect Some)");
             let got2 = api2
                 .inner()
@@ -607,21 +882,55 @@ pub async fn test_external_client_lifetime() {
     master_fw.shutdown().await.expect("shutdown master");
 }
 
-// Helper: wait until master has non-tomb allocators for the given node
-async fn wait_node_allocators(master_view: MasterKvRouterView, node_id: &str, timeout: Duration) {
+async fn wait_master_route(master_view: MasterKvRouterView, key: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let node_cow: NodeID = node_id.to_string().into();
-        let allocs = master_view
-            .master_seg_manager()
-            .get_node_allocators(&node_cow);
-        if !allocs.is_empty() {
+        if master_view
+            .master_kv_router()
+            .inner()
+            .kv_routes
+            .contains_key(key)
+        {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "timeout waiting node allocators for {}",
-            node_id
+            "timeout waiting authoritative master route for key={}",
+            key
+        );
+        limit_thirdparty::tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// Helper: wait until the owner-authoritative segment contract is visible on master.
+async fn wait_owner_allocation_authority(
+    master_view: MasterKvRouterView,
+    node_id: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let node_cow: NodeID = node_id.to_string().into();
+        let authority = master_view
+            .master_seg_manager()
+            .get_node_allocation_authority(&node_cow);
+        if authority == Some(SegmentAllocationAuthority::Owner) {
+            let allocators = master_view
+                .master_seg_manager()
+                .get_node_allocators(&node_cow);
+            assert!(
+                allocators.is_empty(),
+                "owner-authoritative node must not expose master allocators: node={} count={}",
+                node_id,
+                allocators.len()
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timeout waiting owner allocation authority for {}: observed={:?}",
+            node_id,
+            authority
         );
         limit_thirdparty::tokio::time::sleep(Duration::from_millis(100)).await;
     }

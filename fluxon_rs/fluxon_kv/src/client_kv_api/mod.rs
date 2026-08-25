@@ -27,7 +27,7 @@ use crate::kv_ssd_storage::{
 };
 use crate::master_kv_router::msg_pack::{
     BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, BatchEnqueueReplicaTaskReq,
-    BatchEvictOwnerSourceReq, BatchGetBindReq, BatchGetDoneReq, BatchGetRevokeReq,
+    BatchEvictOwnerSourceReq, BatchGetBindReq, BatchGetDoneReq, BatchGetPlanReq, BatchGetRevokeReq,
     BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq,
     BatchPreparePutKeysReq, BatchPublishOwnerSsdReq, BatchPutAppendDoneReq, BatchPutAppendStartReq,
     BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
@@ -45,7 +45,7 @@ use crate::owner_segment::{
     OwnerTransferErrorCode, OwnerTransferItemError, OwnerTransferPeerTracker,
 };
 use crate::{
-    client_seg_pool::{ClientSegPool, ClientSegPoolAccessTrait, ResolveSideTransferLaneReq},
+    client_seg_pool::{ClientSegPool, ClientSegPoolAccessTrait},
     client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait},
     cluster_manager::{ClusterEvent, ClusterManager, ClusterManagerAccessTrait},
     master_kv_router::msg_pack::{
@@ -4374,6 +4374,7 @@ pub struct ClientKvApiInner {
     rpc_caller_get_revoke: RPCCaller<GetRevokeReq>,
     rpc_caller_get_done: RPCCaller<GetDoneReq>,
     rpc_caller_batch_get_start: RPCCaller<BatchGetStartReq>,
+    rpc_caller_batch_get_plan: RPCCaller<BatchGetPlanReq>,
     rpc_caller_batch_get_bind: RPCCaller<BatchGetBindReq>,
     rpc_caller_batch_get_revoke: RPCCaller<BatchGetRevokeReq>,
     rpc_caller_batch_get_done: RPCCaller<BatchGetDoneReq>,
@@ -4403,7 +4404,6 @@ pub struct ClientKvApiInner {
     rpc_caller_ssd_stage_done: RPCCaller<SsdStageDoneReq>,
     rpc_caller_external_put_commit: RPCCaller<ExternalPutCommitReq>,
     rpc_caller_external_put_revoke: RPCCaller<ExternalPutRevokeReq>,
-    rpc_caller_resolve_side_transfer_lane: RPCCaller<ResolveSideTransferLaneReq>,
     rpc_caller_owner_segment_transfer: RPCCaller<OwnerSegmentTransferReq>,
     rpc_caller_owner_capacity_report:
         RPCCaller<crate::master_seg_manager::msg_pack::OwnerCapacityReportReq>,
@@ -14960,6 +14960,7 @@ impl ClientKvApi {
             rpc_caller_get_revoke: RPCCaller::new(),
             rpc_caller_get_done: RPCCaller::new(),
             rpc_caller_batch_get_start: RPCCaller::new(),
+            rpc_caller_batch_get_plan: RPCCaller::new(),
             rpc_caller_batch_get_bind: RPCCaller::new(),
             rpc_caller_batch_get_revoke: RPCCaller::new(),
             rpc_caller_batch_get_done: RPCCaller::new(),
@@ -14989,7 +14990,6 @@ impl ClientKvApi {
             rpc_caller_ssd_stage_done: RPCCaller::new(),
             rpc_caller_external_put_commit: RPCCaller::new(),
             rpc_caller_external_put_revoke: RPCCaller::new(),
-            rpc_caller_resolve_side_transfer_lane: RPCCaller::new(),
             rpc_caller_owner_segment_transfer: RPCCaller::new(),
             rpc_caller_owner_capacity_report: RPCCaller::new(),
             owner_capacity_report_epoch: AtomicU64::new(0),
@@ -15013,6 +15013,9 @@ impl ClientKvApi {
         inner.rpc_caller_get_done.regist(inner.view.p2p_module());
         inner
             .rpc_caller_batch_get_start
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_get_plan
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_batch_get_bind
@@ -15084,9 +15087,6 @@ impl ClientKvApi {
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_external_put_revoke
-            .regist(inner.view.p2p_module());
-        inner
-            .rpc_caller_resolve_side_transfer_lane
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_owner_segment_transfer

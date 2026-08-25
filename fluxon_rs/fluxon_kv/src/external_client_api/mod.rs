@@ -9,12 +9,8 @@ use crate::client_kv_api::msg_pack::{
     ExternalInvalidateWeakIndexItem, ExternalInvalidateWeakIndexReq,
     ExternalInvalidateWeakIndexResp, ExternalPlannedGetItem,
 };
-use crate::client_seg_pool::{ClientSegPool, SideTransferPeerFileMeta};
 use crate::client_transfer_engine::{ClientTransferEngine, GpuMemoryGuard};
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
-use crate::cluster_manager::{
-    META_KEY_SHARED_STORAGE_NODE_ID, META_KEY_SHARED_STORAGE_NODE_START_TIME,
-};
 use crate::master_kv_router::msg_pack::{
     BatchGetDoneItemReq, BatchGetDoneReq, BatchGetDoneResp, BatchGetPlanItemResp, BatchGetPlanReq,
     BatchGetPlanResp, BatchGetRevokeReq, BatchGetRevokeResp, BatchGetStartItemResp,
@@ -73,7 +69,7 @@ use std::{
     // path::PathBuf, // 不再使用PathBuf
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1147,13 +1143,6 @@ fn summarize_external_put_trace_window(samples: &[TestPutPhaseTrace]) -> String 
     parts.join(" ")
 }
 
-fn stable_side_transfer_lane_for_put(put_id: (u64, u32), lane_count: usize) -> Option<u16> {
-    if lane_count == 0 {
-        return None;
-    }
-    Some((((put_id.0 ^ u64::from(put_id.1)) as usize) % lane_count) as u16)
-}
-
 #[derive(Debug, Clone)]
 struct OwnerRestartPayload {
     meta: SharedJsonMeta,
@@ -1293,10 +1282,7 @@ pub struct ExternalInner {
     expected_protocol_version: String,
     external_shared_memory_path: String,
     external_shared_file_path: String,
-    enable_side_transfer: bool,
     short_circuit_put_payload_path: bool,
-    side_rr_next: AtomicUsize,
-    side_transfer_put_bindings: moka::sync::SegmentedCache<(u64, u32), (String, u16)>,
     rpc_caller_external_get: RPCCaller<ExternalGetReq>,
     rpc_caller_external_batch_get: RPCCaller<ExternalBatchGetReq>,
     rpc_caller_external_batch_get_local_probe: RPCCaller<ExternalBatchGetLocalProbeReq>,
@@ -2481,13 +2467,7 @@ impl ExternalClientApi {
             expected_protocol_version: arg.expected_protocol_version,
             external_shared_memory_path: arg.shared_memory_path,
             external_shared_file_path: arg.shared_file_path,
-            enable_side_transfer: arg.enable_side_transfer,
             short_circuit_put_payload_path: arg.short_circuit_put_payload_path,
-            side_rr_next: AtomicUsize::new(0),
-            side_transfer_put_bindings: moka::sync::Cache::builder()
-                .time_to_live(Duration::from_secs(10 * 60))
-                .segments(16)
-                .build(),
             rpc_caller_external_get: RPCCaller::<ExternalGetReq>::new(),
             rpc_caller_external_batch_get: RPCCaller::<ExternalBatchGetReq>::new(),
             rpc_caller_external_batch_get_local_probe:
@@ -3402,146 +3382,6 @@ impl ExternalInner {
         self.external_shared_file_path.clone()
     }
 
-    fn should_fallback_side_p2p_error(err: &crate::p2p::P2PError) -> bool {
-        matches!(
-            err,
-            crate::p2p::P2PError::NoConnectionReady { .. }
-                | crate::p2p::P2PError::NodeNotFound { .. }
-                | crate::p2p::P2PError::NodeNotConnected { .. }
-                | crate::p2p::P2PError::NodePortNotReady { .. }
-                | crate::p2p::P2PError::ConnectionError { .. }
-                | crate::p2p::P2PError::SendFailed { .. }
-                | crate::p2p::P2PError::StartServerError { .. }
-                | crate::p2p::P2PError::Iceoryx2TransportNotStarted {}
-        )
-    }
-
-    fn read_side_transfer_peer(path: &std::path::Path) -> KvResult<SideTransferPeerFileMeta> {
-        let buf = std::fs::read_to_string(path).map_err(|e| {
-            KvError::SharedMem(SharedMemError::MetaDataLoadError {
-                path: path.to_string_lossy().to_string(),
-                detail: format!("Failed to read side-transfer peer file: {}", e),
-            })
-        })?;
-        serde_json::from_str(&buf).map_err(|e| {
-            KvError::SharedMem(SharedMemError::MetaDataLoadError {
-                path: path.to_string_lossy().to_string(),
-                detail: format!("Failed to parse side-transfer peer file: {}", e),
-            })
-        })
-    }
-
-    async fn pick_side_transfer_peer(&self, put_id: Option<(u64, u32)>) -> Option<(String, u16)> {
-        // External attach auto-detects owner side workers from the shared-memory peer files.
-        // Owner-side config still controls whether workers exist; external callers should not
-        // require an extra enable flag once the owner has published ready lanes.
-        let owner_id = self.shared_storage_node_id().await?;
-        let owner_start_time = self.current_owner_start_time().await;
-        let peers_dir = ClientSegPool::side_transfer_peers_dir(&self.external_shared_file_path);
-        let entries = std::fs::read_dir(&peers_dir).ok()?;
-        let mut ready = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(meta) = Self::read_side_transfer_peer(&path) else {
-                continue;
-            };
-            if meta.owner_id != owner_id || meta.owner_start_time != owner_start_time {
-                continue;
-            }
-            let Some(member) = self
-                .view
-                .cluster_manager()
-                .get_member_info_cached(&meta.side_id)
-            else {
-                continue;
-            };
-            if member
-                .metadata
-                .get("side_transfer_worker")
-                .is_some_and(|v| v == "true")
-                == false
-            {
-                continue;
-            }
-            if member
-                .metadata
-                .get(META_KEY_SHARED_STORAGE_NODE_ID)
-                .is_some_and(|v| v == &owner_id)
-                == false
-            {
-                continue;
-            }
-            if member
-                .metadata
-                .get(META_KEY_SHARED_STORAGE_NODE_START_TIME)
-                .and_then(|v| v.parse::<i64>().ok())
-                != Some(owner_start_time)
-            {
-                continue;
-            }
-            let Some(lane_idx) = meta.worker_idx() else {
-                continue;
-            };
-            ready.push((lane_idx, meta.side_id));
-        }
-
-        if ready.is_empty() {
-            return None;
-        }
-        ready.sort_by(|lhs, rhs| lhs.cmp(rhs));
-        if let Some(put_id) = put_id {
-            let lane_space = ready
-                .iter()
-                .map(|(lane_idx, _)| usize::from(*lane_idx))
-                .max()
-                .map(|max_lane_idx| max_lane_idx + 1)?;
-            let desired_lane = stable_side_transfer_lane_for_put(put_id, lane_space)?;
-            let selected = ready
-                .iter()
-                .find(|(lane_idx, _)| *lane_idx == desired_lane)
-                .cloned();
-            if selected.is_none() {
-                tracing::warn!(
-                    "side-transfer desired lane not ready locally; falling back to owner: desired_lane={} lane_space={} owner_id={}",
-                    desired_lane,
-                    lane_space,
-                    owner_id
-                );
-            }
-            return selected.map(|(lane_idx, side_id)| (side_id, lane_idx));
-        }
-
-        let idx = self.side_rr_next.fetch_add(1, Ordering::Relaxed);
-        let ready_len = ready.len();
-        ready
-            .into_iter()
-            .nth(idx % ready_len)
-            .map(|(lane_idx, side_id)| (side_id, lane_idx))
-    }
-
-    fn remember_side_transfer_binding(
-        &self,
-        put_id: Option<(u64, u32)>,
-        binding: Option<(String, u16)>,
-    ) {
-        if let (Some(put_id), Some(binding)) = (put_id, binding) {
-            self.side_transfer_put_bindings.insert(put_id, binding);
-        }
-    }
-
-    fn bound_side_transfer_peer(&self, put_id: Option<(u64, u32)>) -> Option<(String, u16)> {
-        put_id.and_then(|put_id| self.side_transfer_put_bindings.get(&put_id))
-    }
-
-    fn clear_side_transfer_binding(&self, put_id: Option<(u64, u32)>) {
-        if let Some(put_id) = put_id {
-            self.side_transfer_put_bindings.invalidate(&put_id);
-        }
-    }
-
     pub fn short_circuit_put_payload_path_enabled(&self) -> bool {
         self.short_circuit_put_payload_path
     }
@@ -3692,32 +3532,9 @@ impl ExternalInner {
         owner_id: String,
         req: MsgPack<ExternalPutStartReq>,
     ) -> KvResult<(MsgPack<ExternalPutStartResp>, Option<(String, u16)>)> {
-        if let Some((side_id, lane_idx)) = self.pick_side_transfer_peer(None).await {
-            match self
-                .rpc_caller_external_put_start
-                .call(
-                    self.view.p2p_module(),
-                    side_id.clone().into(),
-                    req.clone(),
-                    Some(Duration::from_secs(EXTERNAL_PUT_START_RPC_TIMEOUT_SECS)),
-                    0,
-                )
-                .await
-            {
-                Ok(resp) => return Ok((resp, Some((side_id, lane_idx)))),
-                Err(err) if Self::should_fallback_side_p2p_error(&err) => {
-                    tracing::warn!(
-                        "side-transfer peer unavailable for put_start; falling back to owner: side={} lane={} owner={} err={}",
-                        side_id,
-                        lane_idx,
-                        owner_id,
-                        err
-                    );
-                }
-                Err(err) => return Err(KvError::from(err)),
-            }
-        }
-
+        // The owner is the only allocator authority. External payload is written
+        // directly into its reserved slot; the retired side-WRITE path cannot
+        // create or commit that slot on the owner's behalf.
         self.rpc_caller_external_put_start
             .call(
                 self.view.p2p_module(),
@@ -3755,70 +3572,6 @@ impl ExternalInner {
         owner_id: String,
         req: MsgPack<ExternalPutTransferEndReq>,
     ) -> KvResult<(MsgPack<ExternalPutTransferEndResp>, Option<(String, u16)>)> {
-        let mut attempted_side = None;
-        if let Some((side_id, lane_idx)) = self.bound_side_transfer_peer(req.serialize_part.put_id)
-        {
-            attempted_side = Some((side_id.clone(), lane_idx));
-            match self
-                .rpc_caller_external_put_transfer_end
-                .call(
-                    self.view.p2p_module(),
-                    side_id.clone().into(),
-                    req.clone(),
-                    Some(Duration::from_secs(
-                        EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS,
-                    )),
-                    0,
-                )
-                .await
-            {
-                Ok(resp) => return Ok((resp, Some((side_id, lane_idx)))),
-                Err(err) if Self::should_fallback_side_p2p_error(&err) => {
-                    tracing::warn!(
-                        "bound side-transfer peer unavailable for put_transfer_end; retrying alternate path: side={} lane={} owner={} err={}",
-                        side_id,
-                        lane_idx,
-                        owner_id,
-                        err
-                    );
-                }
-                Err(err) => return Err(KvError::from(err)),
-            }
-        }
-
-        if let Some((side_id, lane_idx)) = self
-            .pick_side_transfer_peer(req.serialize_part.put_id)
-            .await
-        {
-            if attempted_side.as_ref() != Some(&(side_id.clone(), lane_idx)) {
-                match self
-                    .rpc_caller_external_put_transfer_end
-                    .call(
-                        self.view.p2p_module(),
-                        side_id.clone().into(),
-                        req.clone(),
-                        Some(Duration::from_secs(
-                            EXTERNAL_PUT_TRANSFER_END_RPC_TIMEOUT_SECS,
-                        )),
-                        0,
-                    )
-                    .await
-                {
-                    Ok(resp) => return Ok((resp, Some((side_id, lane_idx)))),
-                    Err(err) if Self::should_fallback_side_p2p_error(&err) => {
-                        tracing::warn!(
-                            "side-transfer peer unavailable; falling back to owner: side={} lane={} owner={} err={}",
-                            side_id,
-                            lane_idx,
-                            owner_id,
-                            err
-                        );
-                    }
-                    Err(err) => return Err(KvError::from(err)),
-                }
-            }
-        }
-
         self.rpc_caller_external_put_transfer_end
             .call(
                 self.view.p2p_module(),
@@ -7287,7 +7040,6 @@ key={}, attempt={}/{}, err={}",
             trace.external_side_transfer_peer_id = Some(side_id);
             trace.external_side_transfer_lane_idx = Some(lane_idx);
         }
-        self.remember_side_transfer_binding(put_start_ok.put_id, put_start_side);
 
         if self.short_circuit_put_payload_path_enabled() {
             let remote_target = put_start_ok
@@ -7315,7 +7067,6 @@ key={}, attempt={}/{}, err={}",
             })?;
             let commit_rpc_started_at = observe_enabled.then(Instant::now);
             let commit_resp = self.call_put_commit(owner, commit_req).await;
-            self.clear_side_transfer_binding(put_start_ok.put_id);
             let commit_resp = commit_resp?;
             if let Some(started_at) = commit_rpc_started_at {
                 trace.external_put_transfer_end_rpc_us = duration_to_i64_us(started_at.elapsed());
@@ -7386,7 +7137,6 @@ key={}, attempt={}/{}, err={}",
         let end_result = self
             .call_put_transfer_end_with_side_fallback(owner, end_req)
             .await;
-        self.clear_side_transfer_binding(put_start_ok.put_id);
         let (end_resp, selected_side) = end_result?;
         if let Some(started_at) = end_rpc_started_at {
             trace.external_put_transfer_end_rpc_us = duration_to_i64_us(started_at.elapsed());
@@ -7455,7 +7205,6 @@ key={}, attempt={}/{}, err={}",
             trace.external_side_transfer_peer_id = Some(side_id);
             trace.external_side_transfer_lane_idx = Some(lane_idx);
         }
-        self.remember_side_transfer_binding(put_start_ok.put_id, put_start_side);
 
         if self.short_circuit_put_payload_path_enabled() {
             let remote_target = put_start_ok
@@ -7483,7 +7232,6 @@ key={}, attempt={}/{}, err={}",
             })?;
             let commit_rpc_started_at = observe_enabled.then(Instant::now);
             let commit_resp = self.call_put_commit(owner, commit_req).await;
-            self.clear_side_transfer_binding(put_start_ok.put_id);
             let commit_resp = commit_resp?;
             if let Some(started_at) = commit_rpc_started_at {
                 trace.external_put_transfer_end_rpc_us = duration_to_i64_us(started_at.elapsed());
@@ -7568,7 +7316,6 @@ key={}, attempt={}/{}, err={}",
         let end_result = self
             .call_put_transfer_end_with_side_fallback(owner, end_req)
             .await;
-        self.clear_side_transfer_binding(put_start_ok.put_id);
         let (end_resp, selected_side) = end_result?;
         if let Some(started_at) = end_rpc_started_at {
             trace.external_put_transfer_end_rpc_us = duration_to_i64_us(started_at.elapsed());

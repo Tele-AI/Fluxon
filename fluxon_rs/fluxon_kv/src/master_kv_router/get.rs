@@ -179,6 +179,32 @@ fn external_sink_local_owner_id(
         .then_some(owner_ref.owner_id)
 }
 
+fn planned_get_controller_owner_id(
+    view: &MasterKvRouterView,
+    controller_node_id: &NodeID,
+    controller_node_start_time: i64,
+) -> Option<String> {
+    let controller = view
+        .cluster_manager()
+        .get_member_info_cached(controller_node_id.as_ref())?;
+    if controller.node_start_time != controller_node_start_time {
+        return None;
+    }
+    let owner_id = match controller.node_role() {
+        NodeRole::Client => controller_node_id.to_string(),
+        NodeRole::External => {
+            external_sink_local_owner_id(view, controller_node_id, controller_node_start_time)?
+        }
+        NodeRole::Master | NodeRole::Unknown => return None,
+    };
+    let owner: NodeID = owner_id.clone().into();
+    (view
+        .master_seg_manager()
+        .get_node_allocation_authority(&owner)
+        == Some(crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Owner))
+    .then_some(owner_id)
+}
+
 fn external_sink_requester_generation_is_current(
     view: &MasterKvRouterView,
     req_node_id: &NodeID,
@@ -279,6 +305,25 @@ fn planned_get_source_rank(
             (GetSourceKind::Ssd, false) => None,
         },
     }
+}
+
+/// Preserve ranked source order while skipping SSD replicas whose owner
+/// cannot issue the generation-safe staging token required by GetToTarget.
+fn select_first_transferable_planned_source<T>(
+    candidates: Vec<(PlannedGetSourceSnapshot, u8)>,
+    mut ssd_token_for: impl FnMut(&PlannedGetSourceSnapshot) -> Option<T>,
+) -> Option<(PlannedGetSourceSnapshot, Option<T>)> {
+    for (source, _) in candidates {
+        match source.source_kind {
+            GetSourceKind::Memory => return Some((source, None)),
+            GetSourceKind::Ssd => {
+                if let Some(token) = ssd_token_for(&source) {
+                    return Some((source, Some(token)));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn snapshot_live_get_sources(route: &OneKvNodesRoutes) -> Vec<PlannedGetSourceSnapshot> {
@@ -638,10 +683,11 @@ fn promote_global_shared_committed_slot(
 #[cfg(test)]
 mod planned_get_tests {
     use super::{
-        late_bind_target_for_done, owner_source_route_token,
+        PlannedGetSourceSnapshot, late_bind_target_for_done, owner_source_route_token,
         planned_get_requester_local_target_from_route, planned_get_source_is_current,
         planned_get_source_rank, planned_source_requester_local_borrow_eligible,
-        promote_global_shared_committed_slot, snapshot_live_get_sources,
+        promote_global_shared_committed_slot, select_first_transferable_planned_source,
+        snapshot_live_get_sources,
     };
     use crate::cluster_manager::NodeID;
     use crate::config::SsdReadSourcePolicy;
@@ -1039,6 +1085,38 @@ mod planned_get_tests {
             None,
             "remote SSD must not be a fallback for the local-only policy"
         );
+
+        let candidate = |node_id: &str, source_kind| PlannedGetSourceSnapshot {
+            node_id: node_id.to_string().into(),
+            tomb_tag: NodeTombTag::new(),
+            len: 4096,
+            addr: 0,
+            base_addr: 0,
+            source_kind,
+            memory_is_allocation: false,
+            memory_is_committed_slot: false,
+            owner_local_indexed: false,
+            owner_slot: None,
+        };
+        let (selected, token) = select_first_transferable_planned_source(
+            vec![
+                (candidate("invalid-ssd", GetSourceKind::Ssd), 0),
+                (candidate("memory-fallback", GetSourceKind::Memory), 1),
+            ],
+            |_| None::<u8>,
+        )
+        .expect("an invalid SSD token must not hide the next ranked source");
+        assert_eq!(selected.node_id.as_ref(), "memory-fallback");
+        assert!(token.is_none());
+
+        assert!(
+            select_first_transferable_planned_source(
+                vec![(candidate("invalid-ssd", GetSourceKind::Ssd), 0)],
+                |_| None::<u8>,
+            )
+            .is_none(),
+            "all-invalid SSD candidates must become a safe Plan miss"
+        );
     }
 
     #[test]
@@ -1089,11 +1167,14 @@ async fn handle_get_plan_item(
             },
         ));
     };
-    if controller.node_role() != NodeRole::External {
+    if !matches!(
+        controller.node_role(),
+        NodeRole::External | NodeRole::Client
+    ) {
         return get_plan_item_error(&msg_and_error::KvError::Api(
             msg_and_error::ApiError::InvalidArgument {
                 detail: format!(
-                    "GetPlan is supported only for external controllers: {}",
+                    "GetPlan is supported only for owner or external controllers: {}",
                     controller_node_id
                 ),
             },
@@ -1118,7 +1199,17 @@ async fn handle_get_plan_item(
     };
 
     let local_owner =
-        external_sink_local_owner_id(&view, &controller_node_id, controller.node_start_time);
+        planned_get_controller_owner_id(&view, &controller_node_id, controller.node_start_time);
+    if local_owner.is_none() {
+        return get_plan_item_error(&msg_and_error::KvError::Api(
+            msg_and_error::ApiError::InvalidArgument {
+                detail: format!(
+                    "GetPlan controller has no current owner-authoritative target: {}",
+                    controller_node_id
+                ),
+            },
+        ));
+    }
     let source_policy = view
         .master_kv_router()
         .inner()
@@ -1163,7 +1254,24 @@ async fn handle_get_plan_item(
                 .as_deref()
                 .is_none_or(|owner| candidate.node_id.as_ref() != owner)
     });
-    let Some((source, _)) = candidates.into_iter().next() else {
+    let get_id = view
+        .master_kv_router()
+        .inner()
+        .next_get_id
+        .fetch_add(1, Ordering::Relaxed);
+    let atomic_group = route.atomic_group.as_deref().cloned();
+    let selected = select_first_transferable_planned_source(candidates, |source| {
+        owner_ssd_source_route_token(
+            &view,
+            &source.node_id,
+            &key,
+            route.put_id,
+            source.len,
+            atomic_group.clone(),
+            get_id,
+        )
+    });
+    let Some((source, ssd_source_route_token)) = selected else {
         view.master_kv_router()
             .inner()
             .planned_get_counters
@@ -1194,11 +1302,6 @@ async fn handle_get_plan_item(
         bytes.fetch_add(source.len, Ordering::Relaxed);
     }
 
-    let get_id = view
-        .master_kv_router()
-        .inner()
-        .next_get_id
-        .fetch_add(1, Ordering::Relaxed);
     let gpu_direct_eligible = source.source_kind == GetSourceKind::Memory
         && source.owner_slot.is_some()
         && local_owner
@@ -1206,7 +1309,6 @@ async fn handle_get_plan_item(
             .is_none_or(|owner| source.node_id.as_ref() != owner);
     let requester_local_borrow_eligible =
         planned_source_requester_local_borrow_eligible(&source, local_owner.as_deref());
-    let atomic_group = route.atomic_group.as_deref().cloned();
     let source_route_token = owner_source_route_token(
         &key,
         route.put_id,
@@ -1214,26 +1316,6 @@ async fn handle_get_plan_item(
         get_id,
         source.owner_slot.as_ref(),
     );
-    let ssd_source_route_token = (source.source_kind == GetSourceKind::Ssd)
-        .then(|| {
-            owner_ssd_source_route_token(
-                &view,
-                &source.node_id,
-                &key,
-                route.put_id,
-                source.len,
-                atomic_group.clone(),
-                get_id,
-            )
-        })
-        .flatten();
-    if source.source_kind == GetSourceKind::Ssd && ssd_source_route_token.is_none() {
-        return get_plan_item_error(&msg_and_error::KvError::Api(
-            msg_and_error::ApiError::NodeNotFound {
-                desc: source.node_id.to_string(),
-            },
-        ));
-    }
     let planned = super::PlannedGetInfo {
         put_id: route.put_id,
         src_node_id: source.node_id.clone(),
@@ -1424,7 +1506,7 @@ async fn handle_get_bind_item(
             )
         }
         GetBindTarget::PreparedLocalReserve(target) => {
-            let expected_owner = external_sink_local_owner_id(
+            let expected_owner = planned_get_controller_owner_id(
                 &view,
                 &planned.controller_node_id,
                 planned.controller_node_start_time,
@@ -1465,7 +1547,7 @@ async fn handle_get_bind_item(
             )
         }
         GetBindTarget::RequesterLocalSource => {
-            let expected_owner = external_sink_local_owner_id(
+            let expected_owner = planned_get_controller_owner_id(
                 &view,
                 &planned.controller_node_id,
                 planned.controller_node_start_time,
@@ -2477,7 +2559,7 @@ pub async fn handle_get_revoke(
         .get(&get_id)
         .await
     {
-        let controller_owner = external_sink_local_owner_id(
+        let controller_owner = planned_get_controller_owner_id(
             &view,
             &planned.controller_node_id,
             planned.controller_node_start_time,

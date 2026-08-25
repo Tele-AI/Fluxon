@@ -104,6 +104,7 @@ use config::{
 };
 use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
 use fluxon_commu::TransferBackendActivationMode;
+use fluxon_commu::closed_sdk::ClosedRuntimeProcessLoggingConfig;
 use fluxon_framework::LogicalModule;
 use fluxon_framework::{AnyResult, define_framework};
 use master_kv_router::{MasterKvRouter, MasterKvRouterNewArg};
@@ -120,12 +121,201 @@ use p2p::p2p_module::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+const CLOSED_SDK_LOG_FILE_NAME: &str = "events.jsonl";
+
+#[derive(Clone)]
+struct ClosedSdkProcessLoggingAuthority {
+    absolute_path: PathBuf,
+    config: ClosedRuntimeProcessLoggingConfig,
+    pid: u32,
+    process_start_time_ticks: u64,
+}
+
+impl ClosedSdkProcessLoggingAuthority {
+    fn matches_process_generation(&self, pid: u32, process_start_time_ticks: u64) -> bool {
+        self.pid == pid && self.process_start_time_ticks == process_start_time_ticks
+    }
+}
+
+static CLOSED_SDK_PROCESS_LOGGING_AUTHORITY: OnceLock<
+    limit_thirdparty::tokio::sync::AMutex<Option<ClosedSdkProcessLoggingAuthority>>,
+> = OnceLock::new();
+
+fn closed_sdk_process_logging_authority()
+-> &'static limit_thirdparty::tokio::sync::AMutex<Option<ClosedSdkProcessLoggingAuthority>> {
+    CLOSED_SDK_PROCESS_LOGGING_AUTHORITY
+        .get_or_init(|| limit_thirdparty::tokio::sync::AMutex::new(None))
+}
+
+fn parse_process_start_time_ticks(proc_stat: &str) -> Result<u64> {
+    let right_parenthesis = proc_stat
+        .rfind(')')
+        .ok_or_else(|| anyhow::anyhow!("unexpected /proc/self/stat format: missing ')'"))?;
+    let tail = proc_stat
+        .get(right_parenthesis + 2..)
+        .ok_or_else(|| anyhow::anyhow!("unexpected /proc/self/stat format: truncated"))?;
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    if fields.len() < 20 {
+        anyhow::bail!("unexpected /proc/self/stat format: too few fields");
+    }
+    fields[19]
+        .parse::<u64>()
+        .map_err(|error| anyhow::anyhow!("parse /proc/self/stat start_time_ticks: {error}"))
+}
+
+fn self_process_start_time_ticks() -> Result<u64> {
+    let proc_stat = fs::read_to_string("/proc/self/stat")
+        .map_err(|error| anyhow::anyhow!("read /proc/self/stat failed: {error}"))?;
+    parse_process_start_time_ticks(proc_stat.as_str())
+}
+
+fn derive_closed_sdk_process_log_path(
+    kv_logs_dir: &Path,
+    instance_key: &str,
+    pid: u32,
+    process_start_time_ticks: u64,
+) -> PathBuf {
+    kv_logs_dir
+        .join("closed")
+        .join(hex::encode(Sha256::digest(instance_key.as_bytes())))
+        .join(format!("pid-{pid}-start-{process_start_time_ticks}"))
+        .join(CLOSED_SDK_LOG_FILE_NAME)
+}
+
+async fn initialize_closed_sdk_process_logging(
+    kv_logs_dir: &Path,
+    instance_key: &str,
+) -> Result<PathBuf> {
+    let pid = std::process::id();
+    let process_start_time_ticks = self_process_start_time_ticks()?;
+    let mut process_authority = closed_sdk_process_logging_authority().lock().await;
+    if let Some(existing) = process_authority.as_ref() {
+        if !existing.matches_process_generation(pid, process_start_time_ticks) {
+            anyhow::bail!(
+                "closed SDK process logging authority belongs to a different process generation: existing_pid={} existing_start_ticks={} current_pid={} current_start_ticks={}",
+                existing.pid,
+                existing.process_start_time_ticks,
+                pid,
+                process_start_time_ticks
+            );
+        }
+        let initialized_path =
+            fluxon_commu::closed_sdk::initialize_process_logging(existing.config.clone())
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("reconfirm closed SDK process logging failed: {error}")
+                })?;
+        if initialized_path != existing.config.absolute_path {
+            anyhow::bail!(
+                "closed SDK process logging path mismatch while reusing process authority: expected={} initialized={}",
+                existing.absolute_path.display(),
+                initialized_path
+            );
+        }
+        return Ok(existing.absolute_path.clone());
+    }
+
+    let canonical_logs_dir = kv_logs_dir.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize owner log directory failed: path={} error={error}",
+            kv_logs_dir.display()
+        )
+    })?;
+    let requested_path = derive_closed_sdk_process_log_path(
+        canonical_logs_dir.as_path(),
+        instance_key,
+        pid,
+        process_start_time_ticks,
+    );
+    let generation_dir = requested_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("derived closed SDK log path has no parent"))?;
+    fs::create_dir_all(generation_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "create closed SDK log directory failed: path={} error={error}",
+            generation_dir.display()
+        )
+    })?;
+    for directory in [
+        canonical_logs_dir.join("closed"),
+        generation_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("closed SDK instance log directory is missing"))?
+            .to_path_buf(),
+        generation_dir.to_path_buf(),
+    ] {
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            anyhow::anyhow!(
+                "set closed SDK log directory permissions failed: path={} error={error}",
+                directory.display()
+            )
+        })?;
+    }
+    let canonical_generation_dir = generation_dir.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize closed SDK log directory failed: path={} error={error}",
+            generation_dir.display()
+        )
+    })?;
+    let absolute_path = canonical_generation_dir.join(CLOSED_SDK_LOG_FILE_NAME);
+    if absolute_path != requested_path {
+        anyhow::bail!(
+            "derived closed SDK log path changed after canonicalization: requested={} canonical={}",
+            requested_path.display(),
+            absolute_path.display()
+        );
+    }
+    let absolute_path_text = absolute_path
+        .to_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "closed SDK process log path is not valid UTF-8: {}",
+                absolute_path.display()
+            )
+        })?
+        .to_string();
+    let config = ClosedRuntimeProcessLoggingConfig {
+        absolute_path: absolute_path_text.clone(),
+        filter: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+    };
+    let initialized_path = fluxon_commu::closed_sdk::initialize_process_logging(config.clone())
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("initialize closed SDK process logging failed: {error}")
+        })?;
+    if initialized_path != absolute_path_text {
+        anyhow::bail!(
+            "closed SDK process logging path mismatch: requested={} initialized={}",
+            absolute_path.display(),
+            initialized_path
+        );
+    }
+    *process_authority = Some(ClosedSdkProcessLoggingAuthority {
+        absolute_path: absolute_path.clone(),
+        config,
+        pid,
+        process_start_time_ticks,
+    });
+    println!(
+        "[fluxon] Closed SDK logging initialized. path={}",
+        absolute_path.display()
+    );
+    info!(
+        closed_sdk_log_path = %absolute_path.display(),
+        pid,
+        process_start_time_ticks,
+        "closed SDK log authority installed"
+    );
+    Ok(absolute_path)
+}
 
 struct ExternalBootstrapBundle {
     meta: SharedJsonMeta,
@@ -1491,6 +1681,7 @@ async fn run_master_impl(
             fluxon_util::init_log_with_extra_layer(&kv_logs_dir, &config.instance_key, layer)
         }
     }
+    initialize_closed_sdk_process_logging(&kv_logs_dir, &config.instance_key).await?;
     println!("Master config: {:?}", config);
     info!("Master config: {:?}", config);
     info!("Build version (git commit): {}", build_version);
@@ -1939,6 +2130,7 @@ async fn run_client_impl(
         );
         Some(greptime_tracing_rx)
     };
+    initialize_closed_sdk_process_logging(&kv_logs_dir, &config.instance_key).await?;
 
     println!("Build version (git commit): {}", build_version);
     println!("Build version (source-sha256): {}", source_sha256);
@@ -2623,6 +2815,49 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
     use uuid::Uuid;
+
+    #[test]
+    fn closed_sdk_log_path_is_process_scoped_and_instance_safe() {
+        let path = derive_closed_sdk_process_log_path(
+            Path::new("/authority/cluster_logs"),
+            "../owner/a",
+            17,
+            29,
+        );
+        assert_eq!(
+            path,
+            Path::new("/authority/cluster_logs")
+                .join("closed")
+                .join("bc3efb91a5f8cb2150176412901ece886e46bd1f0e9b7b8eb3121dbfc66ed974")
+                .join("pid-17-start-29")
+                .join("events.jsonl")
+        );
+        assert!(!path.to_string_lossy().contains("../owner/a"));
+    }
+
+    #[test]
+    fn process_start_time_parser_handles_spaces_and_parentheses_in_comm() {
+        let proc_stat =
+            "123 (owner worker (numa1)) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242";
+        assert_eq!(parse_process_start_time_ticks(proc_stat).unwrap(), 4242);
+        assert!(parse_process_start_time_ticks("truncated").is_err());
+    }
+
+    #[test]
+    fn closed_sdk_log_authority_is_process_generation_scoped() {
+        let authority = ClosedSdkProcessLoggingAuthority {
+            absolute_path: PathBuf::from("/authority/events.jsonl"),
+            config: ClosedRuntimeProcessLoggingConfig {
+                absolute_path: "/authority/events.jsonl".to_string(),
+                filter: "info".to_string(),
+            },
+            pid: 17,
+            process_start_time_ticks: 29,
+        };
+        assert!(authority.matches_process_generation(17, 29));
+        assert!(!authority.matches_process_generation(18, 29));
+        assert!(!authority.matches_process_generation(17, 30));
+    }
 
     fn new_test_dir(prefix: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("{}_{}", prefix, Uuid::new_v4()));

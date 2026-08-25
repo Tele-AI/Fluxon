@@ -1931,7 +1931,10 @@ def _initialize_writable_native_runtime_dir(
         export_dir = staged_dir / FLUXON_NATIVE_EXPORT_RELATIVE_DIR
         export_dir.mkdir(parents=True, exist_ok=True)
         for file_name in FLUXON_NATIVE_EXPORT_FILE_NAMES:
-            shutil.copy2(authoritative_export_dir / file_name, export_dir / file_name)
+            staged_export_path = export_dir / file_name
+            shutil.copy2(authoritative_export_dir / file_name, staged_export_path)
+            # The authority can be sealed read-only; the target cache is mutable by contract.
+            staged_export_path.chmod(staged_export_path.stat().st_mode | 0o200)
         system_library_rewrites = {
             "libdl.so": "-ldl",
             "libm.so": "-lm",

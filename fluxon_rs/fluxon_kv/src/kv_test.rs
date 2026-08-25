@@ -182,166 +182,68 @@ fn build_transfer_data_probe_attempt(
     )
 }
 
-async fn verify_external_side_transfer_lane_mapping(
+async fn verify_external_put_uses_bound_owner(
     round: &KvTestRoundOptions,
     external_framework: &Arc<crate::Framework>,
-    remote_owner_instance_key: &str,
+    bound_owner_framework: &Arc<crate::Framework>,
+    bound_owner_instance_key: &str,
 ) {
-    let Some(worker_count) = kv_test_side_transfer_worker_count() else {
-        info!("Skipping external side-transfer lane probe because side-transfer is disabled");
-        return;
-    };
-
     let external_view = external_framework.external_client_api_view().clone();
     let external_api = external_view.external_client_api();
-    let remote_owner_id = round.scoped_instance_key(remote_owner_instance_key);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut attempt = 0_u64;
+    let expected_owner_id = round.scoped_instance_key(bound_owner_instance_key);
+    let actual_owner_id = bound_owner_framework
+        .cluster_manager_view()
+        .cluster_manager()
+        .get_self_info()
+        .id;
+    assert_eq!(actual_owner_id, expected_owner_id);
 
-    loop {
-        attempt += 1;
-        let trace_sink: crate::client_kv_api::TestObservePutPhaseSink = Arc::new(Mutex::new(None));
-        let (key, value) = build_transfer_data_probe_attempt(
-            "external_side_lane_probe",
-            &round.round_name,
-            attempt,
-        );
-        let opts = crate::client_kv_api::PutOptionalArgs(vec![
-            crate::client_kv_api::PutOptionalArg::TestObservePutPhases(trace_sink.clone()),
-        ]);
-        external_api
-            .inner()
-            .put(&key, &value, opts)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "external side-transfer lane probe put failed: key={} attempt={} err={}",
-                    key, attempt, e
-                )
-            });
+    let trace_sink: crate::client_kv_api::TestObservePutPhaseSink = Arc::new(Mutex::new(None));
+    let (key, value) =
+        build_transfer_data_probe_attempt("external_owner_put_probe", &round.round_name, 1);
+    let opts = crate::client_kv_api::PutOptionalArgs(vec![
+        crate::client_kv_api::PutOptionalArg::TestObservePutPhases(trace_sink.clone()),
+    ]);
+    timeout(
+        Duration::from_secs(KV_TEST_TRANSFER_PROBE_IO_TIMEOUT_SECS),
+        external_api.inner().put(&key, &value, opts),
+    )
+    .await
+    .expect("external owner-path Put timed out")
+    .unwrap_or_else(|e| panic!("external owner-path Put failed: key={} err={}", key, e));
 
-        let trace = trace_sink.lock().clone().unwrap_or_else(|| {
+    let trace = trace_sink
+        .lock()
+        .clone()
+        .unwrap_or_else(|| panic!("external owner-path Put missing trace output: key={}", key));
+    assert_eq!(
+        trace.external_side_transfer_peer_id, None,
+        "external Put must not select a side-WRITE peer"
+    );
+    assert_eq!(
+        trace.external_side_transfer_lane_idx, None,
+        "external Put must not bind a side-WRITE lane"
+    );
+    assert_eq!(
+        trace.owner_put_transfer_peer_id, None,
+        "bound-owner shared-memory Put must not perform a source-WRITE transfer"
+    );
+
+    let owner_value = get_owner_probe_value(bound_owner_framework, &key)
+        .await
+        .unwrap_or_else(|e| {
             panic!(
-                "external side-transfer lane probe missing trace output: key={} attempt={}",
-                key, attempt
+                "bound owner could not read external Put: key={} err={}",
+                key, e
             )
         });
-
-        let Some(remote_peer_id) = trace.owner_put_transfer_peer_id.clone() else {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for remote transfer peer: key={} attempt={} owner={} trace={:?}",
-                    key, attempt, remote_owner_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe waiting for remote transfer peer: key={} attempt={} owner={} trace={:?}",
-                key, attempt, remote_owner_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-
-        if !remote_peer_id.starts_with(remote_owner_id.as_str()) {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for owner namespace match: key={} attempt={} owner={} peer={} trace={:?}",
-                    key, attempt, remote_owner_id, remote_peer_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe observed unexpected remote peer before convergence: key={} attempt={} owner={} peer={} trace={:?}",
-                key, attempt, remote_owner_id, remote_peer_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
-        let Some(local_side_id) = trace.external_side_transfer_peer_id.clone() else {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for local side selection: key={} attempt={} remote_peer={} trace={:?}",
-                    key, attempt, remote_peer_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe waiting for local side selection: key={} attempt={} remote_peer={} trace={:?}",
-                key, attempt, remote_peer_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-
-        let Some(local_lane) = trace.external_side_transfer_lane_idx.or_else(|| {
-            crate::client_seg_pool::parse_side_transfer_worker_lane_idx(&local_side_id)
-        }) else {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for local lane parse: key={} attempt={} local_side={} trace={:?}",
-                    key, attempt, local_side_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe waiting for local lane parse: key={} attempt={} local_side={} trace={:?}",
-                key, attempt, local_side_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-
-        if !remote_peer_id.starts_with(&(remote_owner_id.clone() + "__side_")) {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for remote side worker: key={} attempt={} local_side={} remote_peer={} trace={:?}",
-                    key, attempt, local_side_id, remote_peer_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe remote side not ready yet: key={} attempt={} local_side={} remote_peer={} trace={:?}",
-                key, attempt, local_side_id, remote_peer_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
-        let Some(remote_lane) =
-            crate::client_seg_pool::parse_side_transfer_worker_lane_idx(&remote_peer_id)
-        else {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for remote lane parse: key={} attempt={} remote_peer={} trace={:?}",
-                    key, attempt, remote_peer_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe waiting for remote lane parse: key={} attempt={} remote_peer={} trace={:?}",
-                key, attempt, remote_peer_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-
-        if local_lane != remote_lane {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for lane alignment: key={} attempt={} local_side={} remote_peer={} local_lane={} remote_lane={} trace={:?}",
-                    key, attempt, local_side_id, remote_peer_id, local_lane, remote_lane, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe lane mismatch before convergence: key={} attempt={} local_side={} remote_peer={} local_lane={} remote_lane={} trace={:?}",
-                key, attempt, local_side_id, remote_peer_id, local_lane, remote_lane, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
-        info!(
-            "✅ External side-transfer lane mapping verified: key={} worker_count={} local_side={} remote_peer={} lane={}",
-            key, worker_count, local_side_id, remote_peer_id, local_lane
-        );
-        return;
-    }
+    assert_eq!(owner_value, value);
+    info!(
+        "✅ External Put used bound owner without side-WRITE: key={} owner={} configured_side_workers={}",
+        key,
+        expected_owner_id,
+        kv_test_side_transfer_worker_count().unwrap_or(0)
+    );
 }
 
 async fn put_external_probe_value(
@@ -2623,8 +2525,13 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
         }
         info!("✅ New client successfully wrote 10 key-value pairs");
 
-        verify_external_side_transfer_lane_mapping(round, &client3_framework, "test_client_new")
-            .await;
+        verify_external_put_uses_bound_owner(
+            round,
+            &client3_framework,
+            &new_client_framework,
+            "test_client_new",
+        )
+        .await;
 
         new_client_framework
     };

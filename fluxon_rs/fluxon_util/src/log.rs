@@ -24,6 +24,9 @@ const RDMA_DEBUG_TARGETS: &[&str] = &["fabric_lib", "libfabric_sys", "libibverbs
 const LOG_RETENTION_DAYS: usize = 31;
 const TEST_LOG_SHARD_WINDOW_SECONDS_ENV: &str = "FLUXON_TEST_LOG_SHARD_WINDOW_SECONDS";
 const TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS_ENV: &str = "FLUXON_TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS";
+/// Test runners can suppress the asynchronous console sink while retaining
+/// the file sink. This keeps machine-readable libtest terminal lines atomic.
+pub const TEST_DISABLE_CONSOLE_LOG_ENV: &str = "FLUXON_TEST_DISABLE_CONSOLE_LOG";
 
 // Simple UTC timer in RFC3339 seconds (no subsecond precision)
 struct UtcSecondTimer;
@@ -544,8 +547,22 @@ where
             filter::LevelFilter::WARN,
         )));
 
-    // Console logging follows the same user config as file output.
-    let (console_writer, console_guard) = non_blocking(io::stdout());
+    // Console logging follows the same user config as file output. Formal test
+    // runners may route only this asynchronous sink to /dev/null so its worker
+    // cannot interleave bytes with libtest's machine-readable terminal line;
+    // the complete file layer above remains enabled.
+    let disable_console_log = matches!(
+        std::env::var(TEST_DISABLE_CONSOLE_LOG_ENV)
+            .ok()
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase()),
+        Some(v) if !matches!(v.as_str(), "" | "0" | "false" | "no")
+    );
+    let (console_writer, console_guard) = if disable_console_log {
+        non_blocking(io::sink())
+    } else {
+        non_blocking(io::stdout())
+    };
     let console_env_filter = EnvFilter::from_default_env();
     let console_layer = tracing_subscriber::fmt::layer()
         .with_writer(console_writer)
