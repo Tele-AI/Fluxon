@@ -193,7 +193,7 @@ fn node_cache_capacity_boundaries(
     }
 }
 
-fn owner_local_reserve_growth_exhausts_ring_b(
+fn owner_local_reserve_growth_exceeds_ring_b(
     current_local_reserved: u64,
     requested_local_reserved: u64,
     total_reserved: u64,
@@ -205,7 +205,64 @@ fn owner_local_reserve_growth_exhausts_ring_b(
     total_reserved
         .saturating_sub(current_local_reserved)
         .saturating_add(requested_local_reserved)
-        >= ring_b_base
+        > ring_b_base
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerLocalBudgetUpdate {
+    Initialize,
+    Control { controller_epoch: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OwnerLocalBudgetTransition {
+    controller_epoch: u64,
+    delta_bytes: i64,
+}
+
+fn owner_local_budget_transition(
+    current_controller_epoch: u64,
+    current_target_bytes: u64,
+    requested_target_bytes: u64,
+    update: OwnerLocalBudgetUpdate,
+) -> Result<Option<OwnerLocalBudgetTransition>, &'static str> {
+    let next_controller_epoch = match update {
+        OwnerLocalBudgetUpdate::Initialize => {
+            if current_controller_epoch != 0 {
+                return Ok(None);
+            }
+            1
+        }
+        OwnerLocalBudgetUpdate::Control { controller_epoch } => {
+            if controller_epoch == 0 {
+                return Err("owner local budget controller epoch must be positive");
+            }
+            if current_controller_epoch == 0 {
+                return Err("owner local budget must be initialized before runtime control");
+            }
+            if controller_epoch == current_controller_epoch {
+                if requested_target_bytes != current_target_bytes {
+                    return Err("owner local budget epoch replay changed target");
+                }
+                return Ok(None);
+            }
+            if current_controller_epoch.checked_add(1) != Some(controller_epoch) {
+                return Err("owner local budget controller epoch must advance exactly once");
+            }
+            controller_epoch
+        }
+    };
+    let delta_bytes = if requested_target_bytes >= current_target_bytes {
+        i64::try_from(requested_target_bytes - current_target_bytes)
+            .map_err(|_| "owner local budget increase exceeds i64")?
+    } else {
+        -i64::try_from(current_target_bytes - requested_target_bytes)
+            .map_err(|_| "owner local budget decrease exceeds i64")?
+    };
+    Ok(Some(OwnerLocalBudgetTransition {
+        controller_epoch: next_controller_epoch,
+        delta_bytes,
+    }))
 }
 
 #[derive(Debug)]
@@ -214,6 +271,7 @@ pub struct NodeCacheReservedCapacity {
     generation: NodeTombTag,
     pub total_bytes: AtomicU64,
     pub local_exclusive_budget_bytes: AtomicU64,
+    pub local_exclusive_budget_controller_epoch: AtomicU64,
     pub owner_indexed_allocation_bytes: AtomicU64,
     pub lease_bound_kv_bytes: AtomicU64,
 }
@@ -224,6 +282,7 @@ impl NodeCacheReservedCapacity {
             generation,
             total_bytes: AtomicU64::new(0),
             local_exclusive_budget_bytes: AtomicU64::new(0),
+            local_exclusive_budget_controller_epoch: AtomicU64::new(0),
             owner_indexed_allocation_bytes: AtomicU64::new(0),
             lease_bound_kv_bytes: AtomicU64::new(0),
         }
@@ -500,6 +559,7 @@ pub struct OwnerLocalReserveUserResponse {
     pub ring_b_weighted_bytes: u64,
     pub ring_b_pending_reclaim_bytes: u64,
     pub local_reserve_reserved_bytes: u64,
+    pub local_reserve_controller_epoch: u64,
     pub global_settled: bool,
     pub settled: bool,
 }
@@ -2844,34 +2904,230 @@ mod tests {
     }
 
     #[test]
-    fn owner_local_reserve_ring_b_guard_only_rejects_real_growth() {
+    fn owner_local_reserve_ring_b_guard_allows_exact_full_local_but_rejects_oversubscription() {
         const GIB: u64 = 1024 * 1024 * 1024;
         // A full-local initial state must still be allowed to shrink even
         // while its current reservation is above ring-B's nominal base.
-        assert!(!owner_local_reserve_growth_exhausts_ring_b(
+        assert!(!owner_local_reserve_growth_exceeds_ring_b(
             128 * GIB,
             120 * GIB,
             128 * GIB,
             121 * GIB,
         ));
-        assert!(!owner_local_reserve_growth_exhausts_ring_b(
+        assert!(!owner_local_reserve_growth_exceeds_ring_b(
             128 * GIB,
             128 * GIB,
             128 * GIB,
             121 * GIB,
         ));
-        assert!(owner_local_reserve_growth_exhausts_ring_b(
+        // The fixed-1.00 configuration already supports zero GlobalShared
+        // capacity at registration.  Runtime control must make that same
+        // exact terminal state reachable from a smaller Local boundary.
+        assert!(!owner_local_reserve_growth_exceeds_ring_b(
+            112 * GIB,
+            121 * GIB,
+            112 * GIB,
+            121 * GIB,
+        ));
+        assert!(owner_local_reserve_growth_exceeds_ring_b(
             112 * GIB,
             122 * GIB,
             112 * GIB,
             121 * GIB,
         ));
-        assert!(!owner_local_reserve_growth_exhausts_ring_b(
+        assert!(!owner_local_reserve_growth_exceeds_ring_b(
             104 * GIB,
             112 * GIB,
             104 * GIB,
             121 * GIB,
         ));
+    }
+
+    #[test]
+    fn owner_local_budget_runtime_epoch_survives_registration_reconcile() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let initial =
+            owner_local_budget_transition(0, 0, 140 * GIB, OwnerLocalBudgetUpdate::Initialize)
+                .unwrap()
+                .unwrap();
+        assert_eq!(initial.controller_epoch, 1);
+        assert_eq!(initial.delta_bytes, i64::try_from(140 * GIB).unwrap());
+
+        let dynamic = owner_local_budget_transition(
+            initial.controller_epoch,
+            140 * GIB,
+            190 * GIB,
+            OwnerLocalBudgetUpdate::Control {
+                controller_epoch: 2,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dynamic.controller_epoch, 2);
+        assert_eq!(dynamic.delta_bytes, i64::try_from(50 * GIB).unwrap());
+
+        assert_eq!(
+            owner_local_budget_transition(
+                dynamic.controller_epoch,
+                190 * GIB,
+                140 * GIB,
+                OwnerLocalBudgetUpdate::Initialize,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            owner_local_budget_transition(
+                dynamic.controller_epoch,
+                190 * GIB,
+                190 * GIB,
+                OwnerLocalBudgetUpdate::Control {
+                    controller_epoch: 2,
+                },
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            owner_local_budget_transition(
+                dynamic.controller_epoch,
+                190 * GIB,
+                140 * GIB,
+                OwnerLocalBudgetUpdate::Control {
+                    controller_epoch: 2,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            owner_local_budget_transition(
+                dynamic.controller_epoch,
+                190 * GIB,
+                140 * GIB,
+                OwnerLocalBudgetUpdate::Control {
+                    controller_epoch: 4,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn owner_local_budget_counter_survives_member_update_and_new_generation_reinitializes() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const PHYSICAL_BYTES: u64 = 256 * GIB;
+        const RING_B_RATIO: f64 = 0.95;
+
+        fn apply_transition(
+            counter: &NodeCacheReservedCapacity,
+            requested_target_bytes: u64,
+            update: OwnerLocalBudgetUpdate,
+        ) -> Result<bool, &'static str> {
+            let transition = owner_local_budget_transition(
+                counter
+                    .local_exclusive_budget_controller_epoch
+                    .load(Ordering::Acquire),
+                counter.local_exclusive_budget_bytes.load(Ordering::Relaxed),
+                requested_target_bytes,
+                update,
+            )?;
+            let Some(transition) = transition else {
+                return Ok(false);
+            };
+            counter.apply_delta(
+                ReservedCapacityReason::LocalExclusiveBudget,
+                transition.delta_bytes,
+            );
+            counter
+                .local_exclusive_budget_controller_epoch
+                .store(transition.controller_epoch, Ordering::Release);
+            Ok(true)
+        }
+
+        fn snapshot(counter: &NodeCacheReservedCapacity) -> (u64, u64, u64) {
+            (
+                counter
+                    .local_exclusive_budget_controller_epoch
+                    .load(Ordering::Acquire),
+                counter.local_exclusive_budget_bytes.load(Ordering::Relaxed),
+                node_cache_capacity_boundaries(
+                    PHYSICAL_BYTES,
+                    RING_B_RATIO,
+                    None,
+                    counter.total_reserved_bytes(),
+                )
+                .ring_b_bytes,
+            )
+        }
+
+        let ring_b_base =
+            node_cache_capacity_boundaries(PHYSICAL_BYTES, RING_B_RATIO, None, 0).ring_b_bytes;
+        let initial_global_target = PHYSICAL_BYTES * 2 / 5;
+        let dynamic_global_target = PHYSICAL_BYTES / 5;
+        let initial_reservation = ring_b_base - initial_global_target;
+        let dynamic_reservation = ring_b_base - dynamic_global_target;
+
+        let generation = NodeTombTag::new();
+        let counter = NodeCacheReservedCapacity::new(generation.clone());
+        assert!(
+            apply_transition(
+                &counter,
+                initial_reservation,
+                OwnerLocalBudgetUpdate::Initialize,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            snapshot(&counter),
+            (1, initial_reservation, initial_global_target)
+        );
+
+        assert!(
+            apply_transition(
+                &counter,
+                dynamic_reservation,
+                OwnerLocalBudgetUpdate::Control {
+                    controller_epoch: 2,
+                },
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            snapshot(&counter),
+            (2, dynamic_reservation, dynamic_global_target)
+        );
+
+        // MemberUpdated invokes the registration reconcile again with its frozen initial
+        // target.  A live runtime epoch makes that reconcile a no-op.
+        assert!(
+            !apply_transition(
+                &counter,
+                initial_reservation,
+                OwnerLocalBudgetUpdate::Initialize,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            snapshot(&counter),
+            (2, dynamic_reservation, dynamic_global_target)
+        );
+
+        generation.set_tomb();
+        let next_generation = NodeTombTag::new();
+        let replacement = NodeCacheReservedCapacity::new(next_generation.clone());
+        assert!(!next_generation.is_tomb());
+        assert!(
+            apply_transition(
+                &replacement,
+                initial_reservation,
+                OwnerLocalBudgetUpdate::Initialize,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            snapshot(&replacement),
+            (1, initial_reservation, initial_global_target)
+        );
     }
 
     #[test]
@@ -3730,9 +3986,10 @@ impl MasterKvRouter {
             let ring_b_base = self.replica_cache_base_capacity(physical_bytes);
             let global_target_bytes = physical_bytes.saturating_sub(local_target_bytes);
             let local_budget_reservation = ring_b_base.saturating_sub(global_target_bytes);
-            if let Err(err) = self.set_owner_local_budget_reservation(
+            if let Err(err) = self.update_owner_local_budget_reservation(
                 &node_id.to_string().into(),
                 local_budget_reservation,
+                OwnerLocalBudgetUpdate::Initialize,
             ) {
                 error!(
                     "failed to install initial owner scope budget: node={} local_target={} global_target={} err={}",
@@ -4038,7 +4295,7 @@ impl MasterKvRouter {
                 .saturating_sub(local_target_bytes);
             let requested_local_reserved = ring_b_base.saturating_sub(requested_global_target);
             if self.replica_cache_enabled()
-                && owner_local_reserve_growth_exhausts_ring_b(
+                && owner_local_reserve_growth_exceeds_ring_b(
                     current_local_reserved,
                     requested_local_reserved,
                     total_reserved,
@@ -4050,7 +4307,7 @@ impl MasterKvRouter {
                     .saturating_add(requested_local_reserved);
                 return Err(KvError::Api(ApiError::InvalidArgument {
                     detail: format!(
-                        "owner local target leaves no global ring-B capacity: owner={} local_target_bytes={} ring_b_base={} prospective_reserved={}",
+                        "owner local target exceeds global ring-B capacity: owner={} local_target_bytes={} ring_b_base={} prospective_reserved={}",
                         owner_node_id, local_target_bytes, ring_b_base, prospective_reserved
                     ),
                 }));
@@ -4102,9 +4359,12 @@ impl MasterKvRouter {
                 })?;
             let ring_b_base = self.replica_cache_base_capacity(pool.active_capacity_bytes);
             let requested_reserved = ring_b_base.saturating_sub(owner.global_target_bytes);
-            self.set_owner_local_budget_reservation(
+            self.update_owner_local_budget_reservation(
                 &owner_node_id.clone().into(),
                 requested_reserved,
+                OwnerLocalBudgetUpdate::Control {
+                    controller_epoch: owner.controller_epoch,
+                },
             )?;
         }
 
@@ -4131,6 +4391,17 @@ impl MasterKvRouter {
                     .load(Ordering::Relaxed)
             })
             .unwrap_or(0);
+        let local_reserve_controller_epoch = self
+            .inner()
+            .node_cache_reserved_capacity
+            .get(&owner_node_id)
+            .filter(|reserved| !reserved.generation.is_tomb())
+            .map(|reserved| {
+                reserved
+                    .local_exclusive_budget_controller_epoch
+                    .load(Ordering::Acquire)
+            })
+            .unwrap_or(0);
         let global_settled = global.ring_b_weighted_bytes <= global.ring_b_effective_capacity_bytes
             && global.ring_b_pending_reclaim_bytes == 0;
         let settled = owner.settled && global_settled;
@@ -4142,6 +4413,7 @@ impl MasterKvRouter {
             ring_b_weighted_bytes: global.ring_b_weighted_bytes,
             ring_b_pending_reclaim_bytes: global.ring_b_pending_reclaim_bytes,
             local_reserve_reserved_bytes,
+            local_reserve_controller_epoch,
             global_settled,
             settled,
         })
@@ -6682,10 +6954,11 @@ impl MasterKvRouter {
         })))
     }
 
-    fn set_owner_local_budget_reservation(
+    fn update_owner_local_budget_reservation(
         &self,
         node_id: &NodeID,
         target_bytes: u64,
+        update: OwnerLocalBudgetUpdate,
     ) -> crate::rpcresp_kvresult_convert::msg_and_error::KvResult<()> {
         if !self.replica_cache_enabled() {
             return Ok(());
@@ -6731,32 +7004,68 @@ impl MasterKvRouter {
                 counter
             }
         };
-        let current = reserved_capacity
+        let capacity_lock = self.node_capacity_boundary_lock(node_id.as_ref());
+        let _capacity_guard = capacity_lock.lock();
+        let current_identity = self
+            .inner()
+            .node_cache_reserved_capacity
+            .get(node_id.as_ref())
+            .is_some_and(|current| {
+                Arc::ptr_eq(current.value(), &reserved_capacity)
+                    && current.generation.same_generation(&generation)
+            })
+            && node_generation_is_current_live(self.inner().view(), node_id, &generation);
+        if !current_identity {
+            return Err(KvError::Api(ApiError::InvalidPutMasterState {
+                detail: format!(
+                    "owner scope budget target generation changed: node={}",
+                    node_id
+                ),
+            }));
+        }
+        let current_controller_epoch = reserved_capacity
+            .local_exclusive_budget_controller_epoch
+            .load(Ordering::Acquire);
+        let current_target_bytes = reserved_capacity
             .local_exclusive_budget_bytes
             .load(Ordering::Relaxed);
-        if current == target_bytes {
-            return Ok(());
-        }
-        let delta = if target_bytes > current {
-            i64::try_from(target_bytes - current).map_err(|_| {
-                KvError::Api(ApiError::InvalidArgument {
-                    detail: "owner scope budget increase exceeds i64".to_string(),
-                })
-            })?
-        } else {
-            -i64::try_from(current - target_bytes).map_err(|_| {
-                KvError::Api(ApiError::InvalidArgument {
-                    detail: "owner scope budget decrease exceeds i64".to_string(),
-                })
-            })?
-        };
-        self.adjust_node_cache_reserved_capacity_identity(
-            node_id.as_ref(),
-            &generation,
-            &reserved_capacity,
-            ReservedCapacityReason::LocalExclusiveBudget,
-            delta,
+        let Some(transition) = owner_local_budget_transition(
+            current_controller_epoch,
+            current_target_bytes,
+            target_bytes,
+            update,
         )
+        .map_err(|detail| {
+            KvError::Api(ApiError::InvalidArgument {
+                detail: format!("{}: node={}", detail, node_id),
+            })
+        })?
+        else {
+            return Ok(());
+        };
+
+        reserved_capacity.apply_delta(
+            ReservedCapacityReason::LocalExclusiveBudget,
+            transition.delta_bytes,
+        );
+        if let Err(err) = self.apply_node_cache_capacity_locked(node_id.as_ref()) {
+            reserved_capacity.apply_delta(
+                ReservedCapacityReason::LocalExclusiveBudget,
+                -transition.delta_bytes,
+            );
+            if let Err(rollback_err) = self.apply_node_cache_capacity_locked(node_id.as_ref()) {
+                error!(
+                    node = %node_id,
+                    error = %rollback_err,
+                    "failed to restore node cache boundary after owner scope budget rollback"
+                );
+            }
+            return Err(err);
+        }
+        reserved_capacity
+            .local_exclusive_budget_controller_epoch
+            .store(transition.controller_epoch, Ordering::Release);
+        Ok(())
     }
 
     pub fn next_prepared_put_key_reservation_id(&self) -> u64 {

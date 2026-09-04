@@ -1117,6 +1117,7 @@ pub async fn handle_batch_owner_reclaim(
             raw_bytes: Vec::new(),
         };
     }
+    let phase_started_at = std::time::Instant::now();
     let inner = view.client_kv_api().inner();
     let phase = req.serialize_part.phase;
     let items = match phase {
@@ -1219,8 +1220,9 @@ pub async fn handle_batch_owner_reclaim(
     }
     let mut rejection_reason_counts = rejection_reason_counts.into_iter().collect::<Vec<_>>();
     rejection_reason_counts.sort_by(|a, b| a.0.cmp(&b.0));
+    let duration_us = phase_started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
     tracing::info!(
-        "owner reclaim phase completed: phase={:?} items={} prepared={} committed={} finalized={} ssd_prepared={} ssd_prepared_bytes={} busy_or_stale={} rejection_reasons={:?}",
+        "owner reclaim phase completed: phase={:?} items={} prepared={} committed={} finalized={} ssd_prepared={} ssd_prepared_bytes={} busy_or_stale={} rejection_reasons={:?} duration_us={}",
         phase,
         items.len(),
         prepared,
@@ -1229,7 +1231,8 @@ pub async fn handle_batch_owner_reclaim(
         ssd_prepared,
         ssd_prepared_bytes,
         busy_or_stale,
-        rejection_reason_counts
+        rejection_reason_counts,
+        duration_us
     );
     MsgPack {
         serialize_part: BatchOwnerReclaimResp {

@@ -7379,6 +7379,73 @@ impl OwnerSegmentState {
             .saturating_add(self.global_reserved_demotion_bytes())
     }
 
+    fn try_reserve_global_demotion(
+        &mut self,
+        local_target_bytes: u64,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
+        global_accounted_bytes: &mut u64,
+    ) -> Result<bool, crate::owner_segment::OwnerTransferItemError> {
+        use crate::owner_segment::{
+            OwnerManifestKey, OwnerSlotPhysicalState, OwnerSlotScope, OwnerTransferErrorCode,
+            OwnerTransferItemError,
+        };
+
+        let manifest_key = OwnerManifestKey::new(key, put_id);
+        let manifest = self.manifest_by_key.get(&manifest_key).ok_or_else(|| {
+            OwnerTransferItemError::new(
+                OwnerTransferErrorCode::NotFound,
+                "owner manifest entry is absent during GlobalShared reservation",
+            )
+        })?;
+        if manifest.slot.allocation_id != allocation_id
+            || manifest.slot.segment_offset != segment_offset
+            || manifest.slot.capacity_bytes != capacity_bytes
+            || manifest.physical_state != OwnerSlotPhysicalState::Committed
+        {
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "owner manifest slot changed during GlobalShared reservation",
+            ));
+        }
+        if manifest.scope == Some(OwnerSlotScope::GlobalShared) {
+            return Ok(true);
+        }
+        if manifest.scope != Some(OwnerSlotScope::LocalExclusive) {
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "only a committed LocalExclusive slot can reserve GlobalShared budget",
+            ));
+        }
+        let slot = manifest.slot.clone();
+        if let Some(existing) = self.global_demotion_reservations.get(&manifest_key) {
+            if existing.geometry_matches(&slot)
+                && existing.len == slot.len
+                && existing.segment_registration_epoch == slot.segment_registration_epoch
+            {
+                return Ok(true);
+            }
+            return Err(OwnerTransferItemError::new(
+                OwnerTransferErrorCode::Conflict,
+                "GlobalShared reservation replay changed the exact owner slot",
+            ));
+        }
+        let global_target_bytes = self.len.saturating_sub(local_target_bytes);
+        let Some(next_global_accounted_bytes) = global_accounted_bytes.checked_add(capacity_bytes)
+        else {
+            return Ok(false);
+        };
+        if next_global_accounted_bytes > global_target_bytes {
+            return Ok(false);
+        }
+        self.global_demotion_reservations.insert(manifest_key, slot);
+        *global_accounted_bytes = next_global_accounted_bytes;
+        Ok(true)
+    }
+
     fn allocation_size_classes(&self) -> impl Iterator<Item = u64> + '_ {
         self.allocations
             .values()
@@ -8838,68 +8905,68 @@ impl OwnerSegmentAllocator {
         segment_offset: u64,
         capacity_bytes: u64,
     ) -> Result<bool, crate::owner_segment::OwnerTransferItemError> {
-        use crate::owner_segment::{
-            OwnerManifestKey, OwnerSlotPhysicalState, OwnerSlotScope, OwnerTransferErrorCode,
-            OwnerTransferItemError,
-        };
+        self.try_reserve_global_demotions(std::iter::once((
+            key,
+            put_id,
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        )))
+        .pop()
+        .expect("one GlobalShared reservation request must return one result")
+    }
 
-        let segment = self.segment.as_mut().ok_or_else(|| {
-            OwnerTransferItemError::new(
-                OwnerTransferErrorCode::Busy,
-                "owner segment allocator is not initialized",
+    /// Reserve a batch under one allocator lock and one accounting snapshot.
+    /// Each item is still validated and recorded independently; the shared
+    /// running total only avoids rescanning every resident allocation for
+    /// every victim in the same RPC batch.
+    pub fn try_reserve_global_demotions<'a, I>(
+        &mut self,
+        requests: I,
+    ) -> Vec<Result<bool, crate::owner_segment::OwnerTransferItemError>>
+    where
+        I: IntoIterator<
+            Item = (
+                &'a str,
+                crate::master_kv_router::put::PutIDForAKey,
+                u64,
+                u64,
+                u64,
+            ),
+        >,
+    {
+        use crate::owner_segment::{OwnerTransferErrorCode, OwnerTransferItemError};
+
+        let requests = requests.into_iter().collect::<Vec<_>>();
+        let local_target_bytes = self.local_target_bytes;
+        let Some(segment) = self.segment.as_mut() else {
+            return requests
+                .into_iter()
+                .map(|_| {
+                    Err(OwnerTransferItemError::new(
+                        OwnerTransferErrorCode::Busy,
+                        "owner segment allocator is not initialized",
+                    ))
+                })
+                .collect();
+        };
+        let mut global_accounted_bytes = segment.global_accounted_bytes();
+        requests
+            .into_iter()
+            .map(
+                |(key, put_id, allocation_id, segment_offset, capacity_bytes)| {
+                    segment.try_reserve_global_demotion(
+                        local_target_bytes,
+                        key,
+                        put_id,
+                        allocation_id,
+                        segment_offset,
+                        capacity_bytes,
+                        &mut global_accounted_bytes,
+                    )
+                },
             )
-        })?;
-        let manifest_key = OwnerManifestKey::new(key, put_id);
-        let manifest = segment.manifest_by_key.get(&manifest_key).ok_or_else(|| {
-            OwnerTransferItemError::new(
-                OwnerTransferErrorCode::NotFound,
-                "owner manifest entry is absent during GlobalShared reservation",
-            )
-        })?;
-        if manifest.slot.allocation_id != allocation_id
-            || manifest.slot.segment_offset != segment_offset
-            || manifest.slot.capacity_bytes != capacity_bytes
-            || manifest.physical_state != OwnerSlotPhysicalState::Committed
-        {
-            return Err(OwnerTransferItemError::new(
-                OwnerTransferErrorCode::Conflict,
-                "owner manifest slot changed during GlobalShared reservation",
-            ));
-        }
-        if manifest.scope == Some(OwnerSlotScope::GlobalShared) {
-            return Ok(true);
-        }
-        if manifest.scope != Some(OwnerSlotScope::LocalExclusive) {
-            return Err(OwnerTransferItemError::new(
-                OwnerTransferErrorCode::Conflict,
-                "only a committed LocalExclusive slot can reserve GlobalShared budget",
-            ));
-        }
-        let slot = manifest.slot.clone();
-        if let Some(existing) = segment.global_demotion_reservations.get(&manifest_key) {
-            if existing.geometry_matches(&slot)
-                && existing.len == slot.len
-                && existing.segment_registration_epoch == slot.segment_registration_epoch
-            {
-                return Ok(true);
-            }
-            return Err(OwnerTransferItemError::new(
-                OwnerTransferErrorCode::Conflict,
-                "GlobalShared reservation replay changed the exact owner slot",
-            ));
-        }
-        let global_target_bytes = segment.len.saturating_sub(self.local_target_bytes);
-        if segment
-            .global_accounted_bytes()
-            .checked_add(capacity_bytes)
-            .is_none_or(|next| next > global_target_bytes)
-        {
-            return Ok(false);
-        }
-        segment
-            .global_demotion_reservations
-            .insert(manifest_key, slot);
-        Ok(true)
+            .collect()
     }
 
     pub fn release_global_demotion_reservation(
@@ -10603,6 +10670,21 @@ async fn handle_owner_segment_transfer(
     let started_at = Instant::now();
     let inner = view.client_kv_api().inner();
     let caller_generation = request.serialize_part.caller_generation.clone();
+    let get_to_target_requested = request
+        .serialize_part
+        .items
+        .iter()
+        .filter(|item| matches!(&item.item, OwnerSegmentTransferItem::GetToTarget { .. }))
+        .count();
+    let get_to_target_request_bytes = request
+        .serialize_part
+        .items
+        .iter()
+        .filter_map(|item| match &item.item {
+            OwnerSegmentTransferItem::GetToTarget { source, .. } => Some(source.len()),
+            _ => None,
+        })
+        .fold(0_u64, u64::saturating_add);
     let ack_stream_id = request.serialize_part.ack_stream_id;
     let caller_is_current = caller_generation.node_id.as_str() == caller.as_ref()
         && inner
@@ -10634,12 +10716,55 @@ async fn handle_owner_segment_transfer(
     inner
         .owner_local_reserve_rebalance_notify()
         .notify_waiters();
+    let server_process_us = started_at.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    if get_to_target_requested > 0 {
+        let mut completed = 0_usize;
+        let mut completed_bytes = 0_u64;
+        let mut rdma_write_items = 0_usize;
+        let mut ipc_copy_items = 0_usize;
+        let mut local_copy_items = 0_usize;
+        let mut zero_copy_items = 0_usize;
+        for item in &items {
+            if let OwnerSegmentTransferOutcome::GetToTargetCompleted { receipt } = &item.outcome {
+                completed = completed.saturating_add(1);
+                completed_bytes = completed_bytes.saturating_add(receipt.bytes);
+                match receipt.direction {
+                    crate::owner_segment::OwnerTransferDirection::RdmaWrite => {
+                        rdma_write_items = rdma_write_items.saturating_add(1)
+                    }
+                    crate::owner_segment::OwnerTransferDirection::IpcCopy => {
+                        ipc_copy_items = ipc_copy_items.saturating_add(1)
+                    }
+                    crate::owner_segment::OwnerTransferDirection::LocalCopy => {
+                        local_copy_items = local_copy_items.saturating_add(1)
+                    }
+                    crate::owner_segment::OwnerTransferDirection::ZeroCopy => {
+                        zero_copy_items = zero_copy_items.saturating_add(1)
+                    }
+                    crate::owner_segment::OwnerTransferDirection::RdmaRead => {}
+                }
+            }
+        }
+        tracing::info!(
+            caller = %caller_generation.node_id,
+            get_to_target_requested,
+            get_to_target_completed = completed,
+            get_to_target_request_bytes,
+            get_to_target_completed_bytes = completed_bytes,
+            rdma_write_items,
+            ipc_copy_items,
+            local_copy_items,
+            zero_copy_items,
+            server_process_us,
+            "owner GetToTarget batch lifecycle"
+        );
+    }
     MsgPack {
         serialize_part: OwnerSegmentTransferResp {
             items,
             error_code: crate::rpcresp_kvresult_convert::msg_and_error::OK,
             error_json: String::new(),
-            server_process_us: i64::try_from(started_at.elapsed().as_micros()).unwrap_or(i64::MAX),
+            server_process_us: i64::try_from(server_process_us).unwrap_or(i64::MAX),
         },
         raw_bytes: Vec::new(),
     }
@@ -11011,6 +11136,53 @@ mod owner_segment_protocol_tests {
             slot.segment_offset,
             slot.capacity_bytes,
         ));
+    }
+
+    #[test]
+    fn batched_global_demotion_reservation_preserves_the_exact_hard_bound() {
+        let slot_size = crate::owner_segment_allocation_capacity_bytes(VALUE_LEN).unwrap();
+        let global_target_bytes = slot_size * 2;
+        let mut pool = pool_with_local_target(SEGMENT_BYTES - global_target_bytes);
+        let slots = (0..4u64)
+            .map(|index| {
+                let key = format!("batched-local-{index}");
+                let put_id = (300 + index, 1);
+                let slot = commit_test_target(
+                    &mut pool,
+                    30 + index,
+                    &key,
+                    put_id,
+                    OwnerTargetDisposition::LocalExclusive,
+                );
+                (key, put_id, slot)
+            })
+            .collect::<Vec<_>>();
+
+        fn reserve(
+            pool: &mut OwnerSegmentAllocator,
+            slots: &[(String, (u64, u32), crate::owner_segment::OwnerSlotDesc)],
+        ) -> Vec<bool> {
+            pool.try_reserve_global_demotions(slots.iter().map(|(key, put_id, slot)| {
+                (
+                    key.as_str(),
+                    *put_id,
+                    slot.allocation_id,
+                    slot.segment_offset,
+                    slot.capacity_bytes,
+                )
+            }))
+            .into_iter()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+        }
+        assert_eq!(reserve(&mut pool, &slots), vec![true, true, false, false]);
+        assert_eq!(pool.global_accounted_bytes(), global_target_bytes);
+        assert_eq!(
+            reserve(&mut pool, &slots),
+            vec![true, true, false, false],
+            "batch replay must reuse exact reservations without double counting"
+        );
+        assert_eq!(pool.global_accounted_bytes(), global_target_bytes);
     }
 
     #[test]

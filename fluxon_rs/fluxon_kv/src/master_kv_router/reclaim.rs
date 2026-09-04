@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const OWNER_RECLAIM_RPC_TIMEOUT: Duration = Duration::from_secs(MIN_EXPLICIT_RPC_TIMEOUT_SECS);
 const OWNER_RECLAIM_MAX_BATCH: usize = 256;
@@ -769,6 +769,105 @@ mod single_victim_transaction_tests {
         );
         assert_eq!(replay.busy_cause, None);
         assert!(!replay_delete_called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a6_sized_reserved_demotion_batch_reaches_one_terminal_vector() {
+        const VICTIM_COUNT: usize = 8_441;
+        const CAPACITY_BYTES: u64 = 4_096;
+
+        let owner: NodeID = "gpu0".to_string().into();
+        let activity = Arc::new(MasterKeyActivityTable::default());
+        let routes = dashmap::DashMap::new();
+        let mut victims = Vec::with_capacity(VICTIM_COUNT);
+        for index in 0..VICTIM_COUNT {
+            let key = format!(
+                "g4_k2r1_c40_fluxon_homogeneous_a32_online_dynamic_v147_web_a6_20260903:{index:064x}_-public-mjq-models-Qwen3-VL-8B-Instruct_0_1"
+            );
+            let victim = source_victim(
+                &key,
+                (15, u32::try_from(index).unwrap()),
+                u64::try_from(index + 1).unwrap(),
+                u64::try_from(index).unwrap() * CAPACITY_BYTES,
+            );
+            routes.insert(key, source_route(&owner, &victim, None, false));
+            victims.push(victim);
+        }
+        let cache = crate::master_kv_router::MasterNodeCache::builder(
+            u64::try_from(VICTIM_COUNT + 1).unwrap() * CAPACITY_BYTES,
+        )
+        .weigher(
+            |_key: &String, value: &crate::master_kv_router::NodeValueReplicaDesc| {
+                value.weight_bytes
+            },
+        )
+        .build();
+
+        let started_at = Instant::now();
+        let (responses, busy) = direct_delete_exact_owner_source_batch_with(
+            activity.as_ref(),
+            &owner,
+            2,
+            &victims,
+            &|key| routes.get(key).map(|route| route.clone()),
+            |item| {
+                let reserved = victims.iter().any(|victim| {
+                    victim.global_demotion_reserved
+                        && victim.key == item.key
+                        && victim.put_id == item.put_id
+                        && victim.backing == item.backing
+                });
+                assert!(reserved);
+                let desc = crate::master_kv_router::NodeValueReplicaDesc {
+                    weight_bytes: u32::try_from(CAPACITY_BYTES).unwrap(),
+                    put_id: item.put_id,
+                };
+                let alias = crate::master_kv_router::MasterPinAlias::new(&item.key, item.put_id);
+                cache
+                    .try_insert_with_resident_capacity(item.key.clone(), [alias], desc)
+                    .expect("a6-sized reserved demotion batch must fit its bounded cache");
+                let route = routes
+                    .get(&item.key)
+                    .map(|route| route.clone())
+                    .expect("current route must remain present during metadata demotion");
+                assert!(demote_exact_owner_slot_route(&route, &owner, item).is_some());
+                OwnerSourceDemoteDecision::Demoted
+            },
+            |_| false,
+        );
+        let elapsed = started_at.elapsed();
+
+        assert_eq!(responses.len(), VICTIM_COUNT);
+        assert!(
+            responses
+                .iter()
+                .all(|response| { response.outcome == OwnerSourceEvictionOutcome::DemotedGlobal })
+        );
+        assert_eq!(busy, DirectDeleteBatchBusySummary::default());
+        assert_eq!(
+            cache.resident_weighted_size(),
+            u64::try_from(VICTIM_COUNT).unwrap() * CAPACITY_BYTES,
+        );
+        assert_eq!(
+            routes
+                .iter()
+                .filter(|route| {
+                    route
+                        .node_replicas
+                        .read()
+                        .get(&owner)
+                        .and_then(|replicas| replicas.memory.as_ref())
+                        .is_some_and(|memory| !memory.owner_local_indexed)
+                })
+                .count(),
+            VICTIM_COUNT,
+        );
+        assert_eq!(activity.observe_snapshot(), Default::default());
+        eprintln!(
+            "a6_sized_reserved_demotion_batch victims={} elapsed_us={}",
+            VICTIM_COUNT,
+            elapsed.as_micros(),
+        );
     }
 }
 
@@ -1995,8 +2094,22 @@ pub(crate) async fn handle_batch_evict_owner_source(
     req: MsgPack<BatchEvictOwnerSourceReq>,
     owner: NodeID,
 ) -> MsgPack<BatchEvictOwnerSourceResp> {
+    let batch_started_at = Instant::now();
     let operation_id = req.serialize_part.operation_id;
     let global_reclaim_requested_bytes = req.serialize_part.global_reclaim_requested_bytes;
+    tracing::info!(
+        owner = %owner,
+        operation_id,
+        victims = req.serialize_part.victims.len(),
+        global_reclaim_requested_bytes,
+        global_demotion_reserved_items = req
+            .serialize_part
+            .victims
+            .iter()
+            .filter(|victim| victim.global_demotion_reserved)
+            .count(),
+        "owner source direct-delete batch started"
+    );
     let counters = view
         .master_kv_router()
         .eviction_reclaim_counters(owner.as_ref());
@@ -2210,6 +2323,7 @@ pub(crate) async fn handle_batch_evict_owner_source(
         inflight_gets = busy.inflight_gets,
         inflight_replicas = busy.inflight_replicas,
         delete_under_fence_busy_items = busy.delete_under_fence_busy_items,
+        duration_us = batch_started_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
         "owner source direct-delete batch completed"
     );
 

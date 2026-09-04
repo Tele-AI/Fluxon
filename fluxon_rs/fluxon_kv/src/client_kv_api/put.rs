@@ -51,6 +51,11 @@ use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 use tracing::info;
 
+// Bound control-plane head-of-line exposure while retaining one independent
+// result per KV. Batches run sequentially so a capacity contraction cannot
+// flood the peer with many large reservation requests at once.
+const OWNER_SOURCE_EVICTION_RPC_BATCH: usize = 256;
+
 fn duration_to_i64_us(duration: std::time::Duration) -> i64 {
     duration.as_micros().min(i64::MAX as u128) as i64
 }
@@ -775,6 +780,31 @@ fn owner_local_reserve_timeout_error(
     })
 }
 
+fn log_owner_local_reserve_claim_lifecycle(
+    outcome: &'static str,
+    stage: &'static str,
+    value_len: u64,
+    slot_size: u64,
+    key_count: usize,
+    claim_attempts: u64,
+    claim_turn_wait_us: i64,
+    refill_wait_us: i64,
+    total_us: i64,
+) {
+    tracing::info!(
+        outcome,
+        stage,
+        value_len,
+        slot_size,
+        key_count,
+        claim_attempts,
+        claim_turn_wait_us,
+        refill_wait_us,
+        total_us,
+        "owner local reserve claim lifecycle"
+    );
+}
+
 /// Ephemeral result of entering the existing owner-side remote Put singleflight.
 /// This does not add a second state machine: the shared operation remains the
 /// only generation terminal and only its leader owns the transfer task.
@@ -888,6 +918,18 @@ impl ClientKvApiInner {
         self.owner_local_reserve_rebalance_notify().notify_waiters();
 
         let Some(remaining_for_turn) = hard_deadline.checked_duration_since(Instant::now()) else {
+            let total_us = duration_to_i64_us(request_started_at.elapsed());
+            log_owner_local_reserve_claim_lifecycle(
+                "timeout",
+                "claim_turn",
+                value_len,
+                slot_size,
+                key_count,
+                0,
+                total_us,
+                0,
+                total_us,
+            );
             return Err(owner_local_reserve_timeout_error(
                 self,
                 "claim_turn",
@@ -902,6 +944,18 @@ impl ClientKvApiInner {
         let _claim_turn = match tokio::time::timeout(remaining_for_turn, claim_lock.lock()).await {
             Ok(claim_turn) => claim_turn,
             Err(_) => {
+                let total_us = duration_to_i64_us(request_started_at.elapsed());
+                log_owner_local_reserve_claim_lifecycle(
+                    "timeout",
+                    "claim_turn",
+                    value_len,
+                    slot_size,
+                    key_count,
+                    0,
+                    total_us,
+                    0,
+                    total_us,
+                );
                 return Err(owner_local_reserve_timeout_error(
                     self,
                     "claim_turn",
@@ -913,8 +967,11 @@ impl ClientKvApiInner {
                 ));
             }
         };
+        let claim_turn_wait_us = duration_to_i64_us(request_started_at.elapsed());
+        let mut claim_attempts = 0_u64;
 
         loop {
+            claim_attempts = claim_attempts.saturating_add(1);
             let claim = {
                 let mut pool = self.owner_segment_allocator.lock();
                 let claim =
@@ -936,6 +993,18 @@ impl ClientKvApiInner {
             };
             if let Some(lease) = claim {
                 pending_demand.disarm_after_locked_consume();
+                let total_us = duration_to_i64_us(request_started_at.elapsed());
+                log_owner_local_reserve_claim_lifecycle(
+                    "success",
+                    "complete",
+                    value_len,
+                    slot_size,
+                    key_count,
+                    claim_attempts,
+                    claim_turn_wait_us,
+                    total_us.saturating_sub(claim_turn_wait_us),
+                    total_us,
+                );
                 return Ok(lease);
             }
             self.owner_local_reserve_rebalance_notify().notify_waiters();
@@ -951,6 +1020,18 @@ impl ClientKvApiInner {
                 break;
             }
         }
+        let total_us = duration_to_i64_us(request_started_at.elapsed());
+        log_owner_local_reserve_claim_lifecycle(
+            "timeout",
+            "refill",
+            value_len,
+            slot_size,
+            key_count,
+            claim_attempts,
+            claim_turn_wait_us,
+            total_us.saturating_sub(claim_turn_wait_us),
+            total_us,
+        );
         Err(owner_local_reserve_timeout_error(
             self,
             "refill",
@@ -2442,24 +2523,44 @@ impl ClientKvApiInner {
     ) -> KvResult<BatchEvictOwnerSourceResp> {
         let mut global_demotion_reserved_bytes = 0u64;
         if reserve_global_demotion && !self.test_spec_config.legacy_a19_global_demotion_one_phase {
+            let reservation_started_at = Instant::now();
             let mut allocator = self.owner_segment_allocator.lock();
+            let reservation_results =
+                allocator.try_reserve_global_demotions(victims.iter().filter_map(|victim| {
+                    let OwnerReclaimBacking::CommittedSlot {
+                        allocation_id,
+                        segment_offset,
+                        capacity_bytes,
+                    } = &victim.backing
+                    else {
+                        return None;
+                    };
+                    Some((
+                        victim.key.as_str(),
+                        victim.put_id,
+                        *allocation_id,
+                        *segment_offset,
+                        *capacity_bytes,
+                    ))
+                }));
+            let mut reservation_results = reservation_results.into_iter();
+            let mut reservation_slots = 0usize;
+            let mut global_demotion_reserved_items = 0usize;
             for victim in &mut victims {
                 let OwnerReclaimBacking::CommittedSlot {
                     allocation_id,
-                    segment_offset,
+                    segment_offset: _,
                     capacity_bytes,
                 } = &victim.backing
                 else {
                     victim.global_demotion_reserved = false;
                     continue;
                 };
-                victim.global_demotion_reserved = match allocator.try_reserve_global_demotion(
-                    &victim.key,
-                    victim.put_id,
-                    *allocation_id,
-                    *segment_offset,
-                    *capacity_bytes,
-                ) {
+                reservation_slots += 1;
+                victim.global_demotion_reserved = match reservation_results
+                    .next()
+                    .expect("each committed owner victim must have one reservation result")
+                {
                     Ok(reserved) => reserved,
                     Err(error) => {
                         tracing::debug!(
@@ -2474,10 +2575,24 @@ impl ClientKvApiInner {
                     }
                 };
                 if victim.global_demotion_reserved {
+                    global_demotion_reserved_items += 1;
                     global_demotion_reserved_bytes =
                         global_demotion_reserved_bytes.saturating_add(*capacity_bytes);
                 }
             }
+            debug_assert!(reservation_results.next().is_none());
+            drop(allocator);
+            tracing::info!(
+                victims = victims.len(),
+                reservation_slots,
+                global_demotion_reserved_items,
+                global_demotion_reserved_bytes,
+                duration_us = reservation_started_at
+                    .elapsed()
+                    .as_micros()
+                    .min(u64::MAX as u128) as u64,
+                "owner GlobalShared reservation batch completed"
+            );
         } else {
             for victim in &mut victims {
                 victim.global_demotion_reserved = false;
@@ -3842,6 +3957,46 @@ async fn submit_owner_source_eviction_decisions(
 
 async fn submit_owner_source_eviction_decisions_with_followup(
     inner: &ClientKvApiInner,
+    mut pending: Vec<(OwnerHotEvictionEvent, Arc<OwnerSourceEvictionVictim>)>,
+    allow_global_reservation_followup: bool,
+    rpc_failure_reason: &'static str,
+    response_length_reason: &'static str,
+    response_identity_reason: &'static str,
+) {
+    let total_victims = pending.len();
+    let batch_count = total_victims.div_ceil(OWNER_SOURCE_EVICTION_RPC_BATCH);
+    if batch_count > 1 {
+        tracing::info!(
+            total_victims,
+            batch_count,
+            batch_limit = OWNER_SOURCE_EVICTION_RPC_BATCH,
+            "splitting owner source-eviction decisions into bounded RPC batches"
+        );
+    }
+    while !pending.is_empty() {
+        let prepared = take_owner_source_eviction_rpc_batch(&mut pending);
+        submit_one_owner_source_eviction_batch_with_followup(
+            inner,
+            prepared,
+            allow_global_reservation_followup,
+            rpc_failure_reason,
+            response_length_reason,
+            response_identity_reason,
+        )
+        .await;
+    }
+}
+
+fn take_owner_source_eviction_rpc_batch<T>(pending: &mut Vec<T>) -> Vec<T> {
+    if pending.len() <= OWNER_SOURCE_EVICTION_RPC_BATCH {
+        return std::mem::take(pending);
+    }
+    let remainder = pending.split_off(OWNER_SOURCE_EVICTION_RPC_BATCH);
+    std::mem::replace(pending, remainder)
+}
+
+async fn submit_one_owner_source_eviction_batch_with_followup(
+    inner: &ClientKvApiInner,
     mut prepared: Vec<(OwnerHotEvictionEvent, Arc<OwnerSourceEvictionVictim>)>,
     mut allow_global_reservation_followup: bool,
     rpc_failure_reason: &'static str,
@@ -3915,6 +4070,39 @@ async fn submit_owner_source_eviction_decisions_with_followup(
         );
         prepared = reservation_candidates;
         allow_global_reservation_followup = false;
+    }
+}
+
+#[cfg(test)]
+mod owner_source_eviction_rpc_batch_tests {
+    use super::{OWNER_SOURCE_EVICTION_RPC_BATCH, take_owner_source_eviction_rpc_batch};
+
+    #[test]
+    fn a6_sized_followup_is_bounded_ordered_and_complete() {
+        const VICTIMS: usize = 8_441;
+        let mut pending = (0..VICTIMS).collect::<Vec<_>>();
+        let mut observed = Vec::with_capacity(VICTIMS);
+        let mut batch_sizes = Vec::new();
+        while !pending.is_empty() {
+            let batch = take_owner_source_eviction_rpc_batch(&mut pending);
+            batch_sizes.push(batch.len());
+            observed.extend(batch);
+        }
+
+        assert_eq!(observed, (0..VICTIMS).collect::<Vec<_>>());
+        assert_eq!(
+            batch_sizes.len(),
+            VICTIMS.div_ceil(OWNER_SOURCE_EVICTION_RPC_BATCH)
+        );
+        assert!(
+            batch_sizes
+                .iter()
+                .all(|size| *size > 0 && *size <= OWNER_SOURCE_EVICTION_RPC_BATCH)
+        );
+        assert_eq!(
+            batch_sizes.last(),
+            Some(&(VICTIMS % OWNER_SOURCE_EVICTION_RPC_BATCH))
+        );
     }
 }
 

@@ -307,6 +307,34 @@ fn require_external_pending_put_ctx_value(
     pending_ctx.ok_or_else(|| external_pending_put_ctx_missing(op, key, put_id))
 }
 
+type ExternalPendingPutCache =
+    moka::sync::SegmentedCache<(String, u64, u32), ExternalPendingPutCtx>;
+
+/// Flush cache-owned references after one terminal Put RPC.
+///
+/// `SegmentedCache::invalidate` removes lookup visibility immediately, but the
+/// removed value remains in Moka's maintenance queue. That value owns one
+/// `ExternalPendingPutFenceGuard` reference, so a low-volume tail can otherwise
+/// leave an already-terminal key fenced until another cache write happens. The
+/// guard is declared before request-local context clones and therefore drops
+/// after them. Contexts handed to an asynchronous publish task still retain
+/// their own reference and keep the key fenced until that task terminates.
+struct ExternalPendingPutCacheMaintenance<'a> {
+    cache: &'a ExternalPendingPutCache,
+}
+
+impl<'a> ExternalPendingPutCacheMaintenance<'a> {
+    fn new(cache: &'a ExternalPendingPutCache) -> Self {
+        Self { cache }
+    }
+}
+
+impl Drop for ExternalPendingPutCacheMaintenance<'_> {
+    fn drop(&mut self) {
+        self.cache.run_pending_tasks();
+    }
+}
+
 async fn best_effort_revoke_missing_external_pending_ctx(
     inner: &client_kv_api::ClientKvApiInner,
     op: &'static str,
@@ -1182,14 +1210,35 @@ async fn prepare_planned_get_with_local_reserve_targets(
 
 #[cfg(test)]
 mod external_put_pending_tests {
-    use super::{ExternalPutStartFenceClaim, require_external_pending_put_ctx_value};
+    use super::{
+        ExternalPendingPutCache, ExternalPendingPutCacheMaintenance, ExternalPutStartFenceClaim,
+        require_external_pending_put_ctx_value,
+    };
     use crate::client_kv_api::{
-        ExternalPendingPutFenceGuard, OwnerKeyControlTable,
+        ExternalPendingPutCtx, ExternalPendingPutFenceGuard, OwnerKeyControlTable,
         acquire_external_pending_put_fence_for_key,
     };
     use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError};
     use parking_lot::Mutex;
     use std::sync::Arc;
+
+    fn pending_ctx(fence: Arc<ExternalPendingPutFenceGuard>) -> ExternalPendingPutCtx {
+        ExternalPendingPutCtx {
+            peer_id: None,
+            src_offset: 0,
+            target_base_addr: 0,
+            target_offset: 0,
+            len: 4096,
+            make_replica_task: false,
+            remote_replica_admitted: false,
+            preferred_sub_cluster: None,
+            local_reserve_slot: None,
+            local_reserve_slot_size: None,
+            atomic_group: None,
+            radix: None,
+            _pending_fence: fence,
+        }
+    }
 
     #[test]
     fn missing_or_expired_pending_context_is_not_a_commit_capability() {
@@ -1228,6 +1277,59 @@ mod external_put_pending_tests {
                 .lock_key("cancelled-start")
                 .get("cancelled-start")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_maintenance_releases_invalidated_cache_owned_fence() {
+        let key = ("terminal-tail".to_string(), 17, 3);
+        let controls = Arc::new(OwnerKeyControlTable::default());
+        let fence = acquire_external_pending_put_fence_for_key(&controls, &key.0)
+            .expect("pending fence acquisition must succeed");
+        let cache: ExternalPendingPutCache = moka::sync::SegmentedCache::builder(16).build();
+        cache.insert(key.clone(), pending_ctx(fence));
+        cache.run_pending_tasks();
+
+        cache.invalidate(&key);
+        assert!(cache.get(&key).is_none());
+        assert_eq!(
+            controls.lock_key(&key.0)[&key.0].external_pending_puts,
+            1,
+            "Moka's queued removed value still owns the key fence before maintenance"
+        );
+
+        drop(ExternalPendingPutCacheMaintenance::new(&cache));
+        assert!(
+            controls.lock_key(&key.0).get(&key.0).is_none(),
+            "terminal maintenance must retire the cache-owned tail reference"
+        );
+    }
+
+    #[test]
+    fn terminal_maintenance_preserves_live_pending_context_clone() {
+        let key = ("terminal-live-clone".to_string(), 19, 5);
+        let controls = Arc::new(OwnerKeyControlTable::default());
+        let fence = acquire_external_pending_put_fence_for_key(&controls, &key.0)
+            .expect("pending fence acquisition must succeed");
+        let cache: ExternalPendingPutCache = moka::sync::SegmentedCache::builder(16).build();
+        cache.insert(key.clone(), pending_ctx(fence));
+        cache.run_pending_tasks();
+        let live_context = cache
+            .get(&key)
+            .expect("one request-local context clone must remain live");
+
+        cache.invalidate(&key);
+        drop(ExternalPendingPutCacheMaintenance::new(&cache));
+        assert_eq!(
+            controls.lock_key(&key.0)[&key.0].external_pending_puts,
+            1,
+            "maintenance must not release a fence retained by live business work"
+        );
+
+        drop(live_context);
+        assert!(
+            controls.lock_key(&key.0).get(&key.0).is_none(),
+            "the final business clone must release the exact key fence"
         );
     }
 }
@@ -4645,6 +4747,9 @@ impl HandlerForExternalClient for ClientKvApi {
             });
         }
 
+        let _pending_put_cache_maintenance =
+            ExternalPendingPutCacheMaintenance::new(&inner.external_pending_puts);
+
         #[derive(Clone)]
         struct DonePending {
             idx: usize,
@@ -5051,6 +5156,9 @@ impl HandlerForExternalClient for ClientKvApi {
             });
         }
 
+        let _pending_put_cache_maintenance =
+            ExternalPendingPutCacheMaintenance::new(&inner.external_pending_puts);
+
         #[derive(Clone)]
         struct DonePending {
             idx: usize,
@@ -5398,6 +5506,8 @@ impl HandlerForExternalClient for ClientKvApi {
             return Err(Self::side_transfer_unsupported("external_put_revoke"));
         }
         let inner = self.inner();
+        let _pending_put_cache_maintenance =
+            ExternalPendingPutCacheMaintenance::new(&inner.external_pending_puts);
         self.validate_requester_owner_status_updated(req.started_time)?;
         let Some(put_id) = req.put_id else {
             let err = KvError::Unreachable(
