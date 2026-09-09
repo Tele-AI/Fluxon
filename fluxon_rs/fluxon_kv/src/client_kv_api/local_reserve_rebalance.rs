@@ -534,11 +534,14 @@ impl OwnerPressureProgressBaseline {
     }
 }
 
-fn owner_pressure_global_headroom(snapshot: RebalanceSnapshot) -> u64 {
-    snapshot
-        .physical_capacity_bytes
-        .saturating_sub(snapshot.local_target_bytes)
-        .saturating_sub(snapshot.global_accounted_bytes)
+pub(super) fn owner_pressure_global_headroom(
+    physical_capacity_bytes: u64,
+    local_target_bytes: u64,
+    global_accounted_bytes: u64,
+) -> u64 {
+    physical_capacity_bytes
+        .saturating_sub(local_target_bytes)
+        .saturating_sub(global_accounted_bytes)
 }
 
 impl OwnerPressureBackoff {
@@ -575,12 +578,10 @@ enum OwnerPressureBatchDispatchError {
 async fn finish_owner_pressure_batch(
     tx: &limit_thirdparty::tokio::sync::ampsc::UnboundedSender<OwnerHotEvictionDispatch>,
     selected_bytes: u64,
-    global_headroom_before: u64,
 ) -> Result<OwnerPressureBatchReclaim, OwnerPressureBatchDispatchError> {
     let (completion, completed) = ::tokio::sync::oneshot::channel();
     tx.send(OwnerHotEvictionDispatch::EndPressure {
         selected_bytes,
-        global_headroom_before,
         completion,
     })
     .map_err(|_| OwnerPressureBatchDispatchError::DispatcherClosed)?;
@@ -628,7 +629,11 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
             }
             let pressure_round = backoff.round;
             let exponential_request_bytes = backoff.request_bytes(initial_bytes);
-            let global_headroom_bytes = owner_pressure_global_headroom(snapshot);
+            let global_headroom_bytes = owner_pressure_global_headroom(
+                snapshot.physical_capacity_bytes,
+                snapshot.local_target_bytes,
+                snapshot.global_accounted_bytes,
+            );
             // One closed batch that did not make an allocation possible is
             // followed by B, 2B, 4B... selection.  Logical scope changes,
             // Moka selection, retry debt and an installed source fence are
@@ -658,7 +663,6 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
                 result = finish_owner_pressure_batch(
                     &inner.owner_hot_eviction_tx,
                     selected_bytes,
-                    global_headroom_bytes,
                 ) => result,
             };
             let global_reclaim = match result {

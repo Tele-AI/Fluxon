@@ -952,6 +952,57 @@ mod tests {
     }
 
     #[test]
+    fn zero_born_boundary_can_grow_without_losing_pin_or_reclaim_accounting() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let evicted = Arc::new(Mutex::new(Vec::new()));
+            let cache = cache(0, evicted.clone());
+            let pin = cache.try_pin_alias("alias".to_string()).unwrap();
+            insert(&cache, "pinned", "alias", 40);
+            assert_eq!(cache.resident_weighted_size(), 40);
+            assert_eq!(cache.weighted_size(), 0);
+            cache.set_max_capacity(100).unwrap();
+            drop(pin);
+            cache.run_pending_tasks();
+            assert_eq!(cache.weighted_size(), 40);
+            cache
+                .try_insert_with_resident_capacity("second".into(), ["other".into()], 60)
+                .unwrap();
+            cache.run_pending_tasks();
+            assert_eq!(cache.resident_weighted_size(), 100);
+            assert!(
+                cache
+                    .try_insert_with_resident_capacity("extra".into(), ["extra".into()], 1)
+                    .is_err()
+            );
+            cache.set_max_capacity(0).unwrap();
+            cache.run_pending_tasks();
+            assert_eq!(cache.weighted_size(), 0);
+            assert_eq!(cache.resident_weighted_size(), 100);
+            assert_eq!(evicted.lock().len(), 2);
+            cache.set_max_capacity(100).unwrap();
+            assert!(
+                cache
+                    .try_insert_with_resident_capacity("extra".into(), ["extra".into()], 1)
+                    .is_err(),
+                "selection must not create reclaim credit"
+            );
+            assert!(cache.invalidate(&"pinned".into()));
+            assert!(cache.invalidate(&"second".into()));
+            cache
+                .try_insert_with_resident_capacity("new".into(), ["new".into()], 100)
+                .unwrap();
+            cache.run_pending_tasks();
+            assert_eq!(cache.resident_weighted_size(), 100);
+            assert_eq!(cache.weighted_size(), 100);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("zero-born cache must reopen without stalling a final unpin");
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn concurrent_resident_admission_cannot_overbook_capacity() {
         let cache = cache(100, Arc::new(Mutex::new(Vec::new())));
         let barrier = Arc::new(Barrier::new(3));

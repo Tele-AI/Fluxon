@@ -1042,25 +1042,20 @@ pub(crate) fn complete_owner_source_demotion(
         return Err("metadata-only demotion requires an exact committed owner slot".to_string());
     };
     if !inner.test_spec_config.legacy_a19_global_demotion_one_phase {
-        match inner
+        // Master can demote only after the batch reserved this exact slot.
+        // Revalidate that reservation in O(1); do not rescan the full segment
+        // or silently create a new reservation after the route decision.
+        inner
             .owner_segment_allocator
             .lock()
-            .try_reserve_global_demotion(
+            .validate_global_demotion_reservation(
                 &victim.key,
                 victim.put_id,
                 *allocation_id,
                 *segment_offset,
                 *capacity_bytes,
-            ) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(
-                    "metadata-only demotion is waiting for exact GlobalShared owner headroom"
-                        .to_string(),
-                );
-            }
-            Err(error) => return Err(error.detail),
-        }
+            )
+            .map_err(|error| error.detail)?;
     }
     let item = OwnerReclaimItem {
         key: victim.key.clone(),

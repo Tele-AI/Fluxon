@@ -773,14 +773,29 @@ mod single_victim_transaction_tests {
 
     #[test]
     fn a6_sized_reserved_demotion_batch_reaches_one_terminal_vector() {
-        const VICTIM_COUNT: usize = 8_441;
+        assert_reserved_demotion_batch_progress(8_441, false);
+    }
+
+    #[test]
+    fn zero_born_global_cache_reserved_demotion_batch_reaches_one_terminal_vector() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            assert_reserved_demotion_batch_progress(256, true);
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("zero-born Global cache must complete the first reserved demotion batch");
+        worker.join().unwrap();
+    }
+
+    fn assert_reserved_demotion_batch_progress(victim_count: usize, initially_zero: bool) {
         const CAPACITY_BYTES: u64 = 4_096;
 
         let owner: NodeID = "gpu0".to_string().into();
         let activity = Arc::new(MasterKeyActivityTable::default());
         let routes = dashmap::DashMap::new();
-        let mut victims = Vec::with_capacity(VICTIM_COUNT);
-        for index in 0..VICTIM_COUNT {
+        let mut victims = Vec::with_capacity(victim_count);
+        for index in 0..victim_count {
             let key = format!(
                 "g4_k2r1_c40_fluxon_homogeneous_a32_online_dynamic_v147_web_a6_20260903:{index:064x}_-public-mjq-models-Qwen3-VL-8B-Instruct_0_1"
             );
@@ -793,15 +808,21 @@ mod single_victim_transaction_tests {
             routes.insert(key, source_route(&owner, &victim, None, false));
             victims.push(victim);
         }
-        let cache = crate::master_kv_router::MasterNodeCache::builder(
-            u64::try_from(VICTIM_COUNT + 1).unwrap() * CAPACITY_BYTES,
-        )
+        let target_capacity = u64::try_from(victim_count + 1).unwrap() * CAPACITY_BYTES;
+        let cache = crate::master_kv_router::MasterNodeCache::builder(if initially_zero {
+            0
+        } else {
+            target_capacity
+        })
         .weigher(
             |_key: &String, value: &crate::master_kv_router::NodeValueReplicaDesc| {
                 value.weight_bytes
             },
         )
         .build();
+        if initially_zero {
+            cache.set_max_capacity(target_capacity).unwrap();
+        }
 
         let started_at = Instant::now();
         let (responses, busy) = direct_delete_exact_owner_source_batch_with(
@@ -837,7 +858,10 @@ mod single_victim_transaction_tests {
         );
         let elapsed = started_at.elapsed();
 
-        assert_eq!(responses.len(), VICTIM_COUNT);
+        assert_eq!(responses.len(), victim_count);
+        for (index, response) in responses.iter().enumerate() {
+            assert_eq!(response.victim_index, u32::try_from(index).unwrap());
+        }
         assert!(
             responses
                 .iter()
@@ -846,7 +870,7 @@ mod single_victim_transaction_tests {
         assert_eq!(busy, DirectDeleteBatchBusySummary::default());
         assert_eq!(
             cache.resident_weighted_size(),
-            u64::try_from(VICTIM_COUNT).unwrap() * CAPACITY_BYTES,
+            u64::try_from(victim_count).unwrap() * CAPACITY_BYTES,
         );
         assert_eq!(
             routes
@@ -860,12 +884,13 @@ mod single_victim_transaction_tests {
                         .is_some_and(|memory| !memory.owner_local_indexed)
                 })
                 .count(),
-            VICTIM_COUNT,
+            victim_count,
         );
         assert_eq!(activity.observe_snapshot(), Default::default());
         eprintln!(
-            "a6_sized_reserved_demotion_batch victims={} elapsed_us={}",
-            VICTIM_COUNT,
+            "reserved_demotion_batch victims={} initially_zero={} elapsed_us={}",
+            victim_count,
+            initially_zero,
             elapsed.as_micros(),
         );
     }

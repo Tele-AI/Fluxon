@@ -3108,14 +3108,11 @@ pub(crate) enum OwnerHotEvictionDispatch {
     },
     EndPressure {
         selected_bytes: u64,
-        /// GlobalShared logical headroom observed before this pressure batch
-        /// popped LocalExclusive entries.  The dispatcher combines this with
-        /// only the victims that actually acquired an exact source fence;
-        /// metadata-only candidates never become projected physical credit.
-        global_headroom_before: u64,
         /// The pressure producer must not select another Moka batch until
-        /// this batch has finished source fencing, master direct-delete, and
-        /// owner slot-release handling.  Candidate debt before that point is
+        /// all bounded source batches have finished fencing, master
+        /// direct-delete, and owner slot-release handling. Each source batch
+        /// re-reads GlobalShared headroom before requesting reclaim.
+        /// Candidate debt before that point is
         /// deliberately not projected reclaim credit.  The dispatcher
         /// returns both the requested bytes and the bytes actually selected
         /// from the master's GlobalShared Moka for observability only.  A
@@ -6619,6 +6616,8 @@ struct OwnerSegmentState {
     /// admission state, not projected physical reclaim credit.  A retry of
     /// the same fenced generation reuses the same entry.
     global_demotion_reservations: HashMap<crate::owner_segment::OwnerManifestKey, OwnerSlotRef>,
+    #[cfg(test)]
+    global_accounting_scans: AtomicU64,
     /// Advances only after the unique allocator has actually returned one
     /// allocation to its free extents.  Aggregate free bytes can stay flat
     /// when another claimant consumes the extent immediately, so pressure
@@ -6706,6 +6705,8 @@ impl OwnerSegmentState {
             source_leases: HashMap::new(),
             target_leases: HashMap::new(),
             global_demotion_reservations: HashMap::new(),
+            #[cfg(test)]
+            global_accounting_scans: AtomicU64::new(0),
             physical_free_epoch: 0,
         })
     }
@@ -7375,6 +7376,8 @@ impl OwnerSegmentState {
     }
 
     fn global_accounted_bytes(&self) -> u64 {
+        #[cfg(test)]
+        self.global_accounting_scans.fetch_add(1, Ordering::Relaxed);
         self.global_committed_bytes()
             .saturating_add(self.global_reserved_demotion_bytes())
     }
@@ -8995,8 +8998,10 @@ impl OwnerSegmentAllocator {
         matches
     }
 
-    pub fn commit_reserved_global_demotion(
-        &mut self,
+    /// Validate an already reserved exact slot without scanning capacity or
+    /// admitting a new reservation. A committed scope is a valid replay.
+    pub fn validate_global_demotion_reservation(
+        &self,
         key: &str,
         put_id: crate::master_kv_router::put::PutIDForAKey,
         allocation_id: u64,
@@ -9004,11 +9009,11 @@ impl OwnerSegmentAllocator {
         capacity_bytes: u64,
     ) -> Result<(), crate::owner_segment::OwnerTransferItemError> {
         use crate::owner_segment::{
-            OwnerManifestKey, OwnerSlotPhysicalState, OwnerSlotScope, OwnerTargetDisposition,
-            OwnerTransferErrorCode, OwnerTransferItemError,
+            OwnerManifestKey, OwnerSlotPhysicalState, OwnerSlotScope, OwnerTransferErrorCode,
+            OwnerTransferItemError,
         };
 
-        let segment = self.segment.as_mut().ok_or_else(|| {
+        let segment = self.segment.as_ref().ok_or_else(|| {
             OwnerTransferItemError::new(
                 OwnerTransferErrorCode::Busy,
                 "owner segment allocator is not initialized",
@@ -9032,7 +9037,6 @@ impl OwnerSegmentAllocator {
             ));
         }
         if manifest.scope == Some(OwnerSlotScope::GlobalShared) {
-            segment.global_demotion_reservations.remove(&manifest_key);
             return Ok(());
         }
         let reserved = segment
@@ -9049,6 +9053,31 @@ impl OwnerSegmentAllocator {
                 "GlobalShared scope commit has no exact owner budget reservation",
             ));
         }
+        Ok(())
+    }
+
+    pub fn commit_reserved_global_demotion(
+        &mut self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
+    ) -> Result<(), crate::owner_segment::OwnerTransferItemError> {
+        use crate::owner_segment::{OwnerManifestKey, OwnerSlotScope, OwnerTargetDisposition};
+
+        self.validate_global_demotion_reservation(
+            key,
+            put_id,
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        )?;
+        let segment = self
+            .segment
+            .as_mut()
+            .expect("validated owner segment disappeared");
+        let manifest_key = OwnerManifestKey::new(key, put_id);
         let manifest = segment
             .manifest_by_key
             .get_mut(&manifest_key)
@@ -10781,7 +10810,7 @@ mod owner_segment_protocol_tests {
     };
 
     const SEGMENT_BYTES: u64 = 64 * 1024;
-    const VALUE_LEN: u64 = 5000;
+    pub(super) const VALUE_LEN: u64 = 5000;
 
     fn generation(node_id: &str, node_start_time: i64) -> OwnerGeneration {
         OwnerGeneration::new(node_id, node_start_time)
@@ -10833,7 +10862,7 @@ mod owner_segment_protocol_tests {
         }
     }
 
-    fn commit_test_target(
+    pub(super) fn commit_test_target(
         pool: &mut OwnerSegmentAllocator,
         sequence: u64,
         key: &str,

@@ -4166,16 +4166,65 @@ mod owner_ssd_fast_drop_tests {
 async fn process_owner_source_eviction_events(
     view: &ClientKvApiView,
     events: Vec<OwnerHotEvictionEvent>,
-    pressure_global_headroom_before: Option<u64>,
+    pressure: bool,
 ) -> OwnerPressureBatchReclaim {
     let inner = view.client_kv_api().inner();
-    let prepared = events
-        .into_iter()
-        .filter_map(|event| prepare_owner_source_eviction_event(inner, event))
-        .collect::<Vec<_>>();
-    if prepared.is_empty() {
-        return OwnerPressureBatchReclaim::default();
+    let mut events = events.into_iter();
+    let mut reclaimed = OwnerPressureBatchReclaim::default();
+    let mut ssd_batch_available = true;
+    while events.len() != 0 {
+        // Tail candidates retain their local index and reader holders until
+        // their own batch is ready to contact master. Uncertain retries keep
+        // their existing exact fence and are never reopened here.
+        let prepared = prepare_owner_source_eviction_batch(inner, &mut events);
+        if prepared.is_empty() {
+            continue;
+        }
+        let prepared_items = prepared.len();
+        let started_at = Instant::now();
+        let result = process_owner_source_eviction_batch(
+            inner,
+            prepared,
+            pressure,
+            &mut ssd_batch_available,
+        )
+        .await;
+        reclaimed.requested_bytes = reclaimed
+            .requested_bytes
+            .saturating_add(result.requested_bytes);
+        reclaimed.selected_bytes = reclaimed
+            .selected_bytes
+            .saturating_add(result.selected_bytes);
+        tracing::debug!(
+            prepared_items,
+            remaining_candidates = events.len(),
+            duration_us = started_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
+            "owner source eviction bounded batch completed"
+        );
     }
+    reclaimed
+}
+
+fn prepare_owner_source_eviction_batch(
+    inner: &ClientKvApiInner,
+    events: &mut impl Iterator<Item = OwnerHotEvictionEvent>,
+) -> Vec<(OwnerHotEvictionEvent, Arc<OwnerSourceEvictionVictim>)> {
+    events
+        .by_ref()
+        .take(OWNER_SOURCE_EVICTION_RPC_BATCH)
+        .filter_map(|event| prepare_owner_source_eviction_event(inner, event))
+        .collect()
+}
+
+async fn process_owner_source_eviction_batch(
+    inner: &ClientKvApiInner,
+    prepared: Vec<(OwnerHotEvictionEvent, Arc<OwnerSourceEvictionVictim>)>,
+    pressure: bool,
+    ssd_batch_available: &mut bool,
+) -> OwnerPressureBatchReclaim {
+    // Previous batches may have consumed or released GlobalShared budget.
+    // Read one current snapshot after fencing; candidates are not Free credit.
+    let pressure_global_headroom_before = owner_source_eviction_pressure_headroom(inner, pressure);
     let prepared_bytes = prepared
         .iter()
         .map(|(_, victim)| owner_reclaim_backing_len(&victim.backing))
@@ -4325,11 +4374,17 @@ async fn process_owner_source_eviction_events(
         .iter()
         .map(|(_, victim)| owner_reclaim_backing_len(&victim.backing))
         .collect::<Vec<_>>();
-    let admission = inner
-        .ssd_storage
-        .as_ref()
-        .map(|store| store.admit_owner_write_candidates(&candidate_lengths))
-        .unwrap_or_else(|| vec![false; candidates.len()]);
+    let admission = admit_owner_source_ssd_candidates_once(
+        &candidate_lengths,
+        ssd_batch_available,
+        |lengths| {
+            inner
+                .ssd_storage
+                .as_ref()
+                .map(|store| store.admit_owner_write_candidates(lengths))
+                .unwrap_or_else(|| vec![false; lengths.len()])
+        },
+    );
     let candidate_items = candidates.len();
     let mut dropped = Vec::new();
     let mut admitted_candidates = Vec::new();
@@ -4418,6 +4473,42 @@ async fn process_owner_source_eviction_events(
     pressure_reclaim
 }
 
+fn admit_owner_source_ssd_candidates_once(
+    lengths: &[u64],
+    batch_available: &mut bool,
+    admit: impl FnOnce(&[u64]) -> Vec<bool>,
+) -> Vec<bool> {
+    // Splitting source fencing must not multiply the original round's one
+    // bounded durability batch, even if tokens refill between source batches.
+    if !*batch_available {
+        return vec![false; lengths.len()];
+    }
+    let admitted = admit(lengths);
+    assert_eq!(admitted.len(), lengths.len());
+    if admitted.iter().any(|allowed| *allowed) {
+        *batch_available = false;
+    }
+    admitted
+}
+
+fn owner_source_eviction_pressure_headroom(
+    inner: &ClientKvApiInner,
+    pressure: bool,
+) -> Option<u64> {
+    pressure.then(|| {
+        let allocator = inner.owner_segment_allocator.lock();
+        super::local_reserve_rebalance::owner_pressure_global_headroom(
+            allocator.physical_capacity_bytes(),
+            allocator.local_target_bytes,
+            allocator.global_accounted_bytes(),
+        )
+    })
+}
+
+#[cfg(test)]
+#[path = "put_reclaim_tests.rs"]
+mod put_reclaim_tests;
+
 fn owner_pressure_global_reclaim_request(
     prepared_bytes: u64,
     pressure_global_headroom_before: Option<u64>,
@@ -4471,7 +4562,7 @@ pub fn spawn_owner_source_eviction_dispatcher(
                         process_owner_source_eviction_events(
                             &view_task,
                             std::mem::take(&mut events),
-                            None,
+                            false,
                         )
                         .await;
                         continue;
@@ -4483,7 +4574,7 @@ pub fn spawn_owner_source_eviction_dispatcher(
                     process_owner_source_eviction_events(
                         &view_task,
                         std::mem::take(&mut events),
-                        None,
+                        false,
                     )
                     .await;
                 }
@@ -4502,7 +4593,7 @@ pub fn spawn_owner_source_eviction_dispatcher(
                         process_owner_source_eviction_events(
                             &view_task,
                             std::mem::take(&mut events),
-                            None,
+                            false,
                         )
                         .await;
                     }
@@ -4510,25 +4601,19 @@ pub fn spawn_owner_source_eviction_dispatcher(
                 }
                 super::OwnerHotEvictionDispatch::EndPressure {
                     selected_bytes,
-                    global_headroom_before,
                     completion,
                 } => {
-                    let pressure_global_headroom_before = if pressure_open {
-                        Some(global_headroom_before)
-                    } else {
-                        None
-                    };
                     if !pressure_open {
                         tracing::warn!(
                             selected_bytes,
                             "owner pressure selection ended without a matching begin marker"
                         );
                     }
-                    pressure_open = false;
+                    let pressure = std::mem::replace(&mut pressure_open, false);
                     let global_reclaim = process_owner_source_eviction_events(
                         &view_task,
                         std::mem::take(&mut events),
-                        pressure_global_headroom_before,
+                        pressure,
                     )
                     .await;
                     if completion.send(global_reclaim).is_err() {
@@ -4545,7 +4630,7 @@ pub fn spawn_owner_source_eviction_dispatcher(
                         process_owner_source_eviction_events(
                             &view_task,
                             std::mem::take(&mut events),
-                            None,
+                            false,
                         )
                         .await;
                     }
