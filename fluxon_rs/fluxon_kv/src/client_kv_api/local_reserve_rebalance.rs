@@ -69,7 +69,6 @@ struct RebalanceSnapshot {
     physical_free_epoch: u64,
     physical_capacity_bytes: u64,
     local_target_bytes: u64,
-    global_accounted_bytes: u64,
 }
 
 fn expected_capacity_layout(
@@ -244,9 +243,10 @@ fn slot_pressure_capacity(pool: &OwnerSegmentAllocator) -> SlotPressureCapacity 
     }
 }
 
-fn snapshot_rebalance(inner: &ClientKvApiInner) -> RebalanceSnapshot {
-    let pool = inner.owner_segment_allocator.lock();
-    let pressure = slot_pressure_capacity(&pool);
+// Pressure decisions need allocator progress and exact free slots, not the
+// full-segment GlobalShared accounting used by reports and admission checks.
+fn snapshot_rebalance(pool: &OwnerSegmentAllocator) -> RebalanceSnapshot {
+    let pressure = slot_pressure_capacity(pool);
     RebalanceSnapshot {
         used_bytes: pool.total_used_bytes(),
         free_bytes: pool.total_free_bytes(),
@@ -263,7 +263,6 @@ fn snapshot_rebalance(inner: &ClientKvApiInner) -> RebalanceSnapshot {
         physical_free_epoch: pool.physical_free_epoch(),
         physical_capacity_bytes: pool.physical_capacity_bytes(),
         local_target_bytes: pool.local_target_bytes,
-        global_accounted_bytes: pool.global_accounted_bytes(),
     }
 }
 
@@ -282,7 +281,10 @@ pub(crate) fn owner_local_reserve_timeout_config(inner: &ClientKvApiInner) -> (D
 }
 
 fn report_owner_segment_state(inner: &ClientKvApiInner) {
-    let snapshot = snapshot_rebalance(inner);
+    let (snapshot, global_accounted_bytes) = {
+        let pool = inner.owner_segment_allocator.lock();
+        (snapshot_rebalance(&pool), pool.global_accounted_bytes())
+    };
     let expected = configured_expected_capacity(inner);
     let moka_weighted_bytes = inner
         .owner_hot_cache
@@ -292,14 +294,12 @@ fn report_owner_segment_state(inner: &ClientKvApiInner) {
     let global_target_bytes = snapshot
         .physical_capacity_bytes
         .saturating_sub(snapshot.local_target_bytes);
-    let global_budget_overshoot_bytes = snapshot
-        .global_accounted_bytes
-        .saturating_sub(global_target_bytes);
+    let global_budget_overshoot_bytes = global_accounted_bytes.saturating_sub(global_target_bytes);
     tracing::info!(
         physical_capacity_bytes = snapshot.physical_capacity_bytes,
         local_target_bytes = snapshot.local_target_bytes,
         global_target_bytes,
-        global_accounted_bytes = snapshot.global_accounted_bytes,
+        global_accounted_bytes,
         global_budget_overshoot_bytes,
         expected_value_len = expected.map(|layout| layout.value_len).unwrap_or(0),
         expected_slot_size = expected.map(|layout| layout.slot_size).unwrap_or(0),
@@ -615,7 +615,7 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
             }
 
             let inner = view_task.client_kv_api().inner();
-            let snapshot = snapshot_rebalance(inner);
+            let snapshot = snapshot_rebalance(&inner.owner_segment_allocator.lock());
             backoff.sync_claim_progress(snapshot.claim_progress_epoch);
             let initial_bytes = snapshot.pressure_initial_pop_bytes;
             if initial_bytes == 0 {
@@ -629,11 +629,6 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
             }
             let pressure_round = backoff.round;
             let exponential_request_bytes = backoff.request_bytes(initial_bytes);
-            let global_headroom_bytes = owner_pressure_global_headroom(
-                snapshot.physical_capacity_bytes,
-                snapshot.local_target_bytes,
-                snapshot.global_accounted_bytes,
-            );
             // One closed batch that did not make an allocation possible is
             // followed by B, 2B, 4B... selection.  Logical scope changes,
             // Moka selection, retry debt and an installed source fence are
@@ -677,11 +672,9 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
                     return;
                 }
             };
-            let completed_snapshot = snapshot_rebalance(inner);
+            let completed_snapshot = snapshot_rebalance(&inner.owner_segment_allocator.lock());
             let physical_progress = OwnerPressureProgressBaseline::from_snapshot(snapshot)
                 .observed_physical_progress(completed_snapshot);
-            let logical_progress =
-                completed_snapshot.global_accounted_bytes != snapshot.global_accounted_bytes;
             // Advance after every closed non-empty pop. If this batch really
             // enabled a claim, claim_progress_epoch resets the backoff on the
             // next observation. If it only selected busy candidates, the next
@@ -702,12 +695,9 @@ pub fn spawn_owner_slot_pressure_actor(view: ClientKvApiView) {
                 pending_size_classes = snapshot.pending_size_classes,
                 claim_progress_epoch = snapshot.claim_progress_epoch,
                 physical_free_epoch = snapshot.physical_free_epoch,
-                global_accounted_bytes = snapshot.global_accounted_bytes,
-                global_headroom_bytes,
                 global_reclaim_requested_bytes = global_reclaim.requested_bytes,
                 global_reclaim_selected_bytes = global_reclaim.selected_bytes,
                 physical_progress,
-                logical_progress,
                 candidate_only_selection = global_reclaim.selected_bytes != 0 && !physical_progress,
                 "owner segment pressure completed exponential single-KV eviction round"
             );
@@ -794,7 +784,6 @@ mod tests {
         allocatable_slots: u64,
         claim_progress_epoch: u64,
         physical_free_epoch: u64,
-        global_accounted_bytes: u64,
     ) -> RebalanceSnapshot {
         RebalanceSnapshot {
             free_bytes,
@@ -803,28 +792,94 @@ mod tests {
             physical_free_epoch,
             physical_capacity_bytes: 128 * 1024 * 1024,
             local_target_bytes: 96 * 1024 * 1024,
-            global_accounted_bytes,
             ..RebalanceSnapshot::default()
         }
     }
 
     #[test]
-    fn metadata_only_demotion_is_not_allocator_progress() {
-        let before = pressure_snapshot(4096, 0, 7, 11, 24 * 1024 * 1024);
-        let after = pressure_snapshot(4096, 0, 7, 11, 25 * 1024 * 1024);
+    fn only_allocator_changes_count_as_pressure_progress() {
+        let before = pressure_snapshot(4096, 0, 7, 11);
+        let after = pressure_snapshot(4096, 0, 7, 11);
         let baseline = OwnerPressureProgressBaseline::from_snapshot(before);
         assert!(!baseline.observed_physical_progress(after));
 
-        let freed = pressure_snapshot(8192, 1, 7, 12, 25 * 1024 * 1024);
+        let freed = pressure_snapshot(8192, 1, 7, 12);
         assert!(baseline.observed_physical_progress(freed));
-        let claimed = pressure_snapshot(4096, 0, 8, 11, 25 * 1024 * 1024);
+        let claimed = pressure_snapshot(4096, 0, 8, 11);
         assert!(baseline.observed_physical_progress(claimed));
 
         // Another allocator user may consume the newly freed extent before
         // the pressure actor samples aggregate bytes.  Exact Free still has
         // to count as progress so the remaining shortage is replanned.
-        let free_masked_by_claim = pressure_snapshot(2048, 0, 7, 12, 25 * 1024 * 1024);
+        let free_masked_by_claim = pressure_snapshot(2048, 0, 7, 12);
         assert!(baseline.observed_physical_progress(free_masked_by_claim));
+    }
+
+    #[test]
+    fn pressure_snapshots_skip_global_accounting_with_nonzero_global_capacity() {
+        use crate::owner_segment::{OwnerGeneration, OwnerSlotScope};
+
+        let slot_size = crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES;
+        let mut pool = OwnerSegmentAllocator::default();
+        pool.install_segment(
+            OwnerGeneration::new("pressure-owner".to_string(), 1),
+            1,
+            0x1000,
+            0x1000,
+            10 * slot_size,
+            9 * slot_size,
+            Some(slot_size),
+        )
+        .unwrap();
+        let slot = pool.claim_value(slot_size, 1).pop().unwrap();
+        assert!(pool.mark_prepared_slot_pending_visible(
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+        assert!(pool.promote_pending_visible_slot_to_committed(
+            slot.allocation_id,
+            slot.segment_offset,
+            slot.capacity_bytes,
+        ));
+        pool.install_committed_manifest(
+            "global-kv",
+            (1, 1),
+            slot.allocation_id,
+            OwnerSlotScope::GlobalShared,
+            1,
+        )
+        .unwrap();
+        assert_eq!(pool.global_accounted_bytes(), slot_size);
+        let scans_before = pool
+            .segment
+            .as_ref()
+            .unwrap()
+            .global_accounting_scans
+            .load(Ordering::Relaxed);
+
+        for under_pressure in [false, true] {
+            if under_pressure {
+                pool.pending_demand_by_slot_size.insert(slot_size, 10);
+                pool.record_failed_claim(slot_size);
+            }
+            let snapshot = snapshot_rebalance(&pool);
+            assert_eq!(snapshot.used_bytes, slot_size);
+            assert_eq!(snapshot.free_bytes, 9 * slot_size);
+            assert_eq!(
+                snapshot.pressure_initial_pop_bytes,
+                if under_pressure { 11 * slot_size } else { 0 },
+            );
+            assert_eq!(
+                pool.segment
+                    .as_ref()
+                    .unwrap()
+                    .global_accounting_scans
+                    .load(Ordering::Relaxed),
+                scans_before,
+                "pressure snapshots must not rescan GlobalShared accounting",
+            );
+        }
     }
 
     #[test]
