@@ -6587,6 +6587,15 @@ pub(crate) struct OwnerSegmentAllocatableReport {
     pub slot_unallocatable_bytes: u64,
 }
 
+const OWNER_ALLOCATABLE_REPORT_CACHE_ENTRIES: usize = 16;
+
+#[derive(Clone, Copy)]
+struct OwnerCachedAllocatableReport {
+    layout_revision: u64,
+    slot_size: u64,
+    report: OwnerSegmentAllocatableReport,
+}
+
 /// The single physical allocator for one owner's complete registered DRAM segment.
 ///
 /// Local-exclusive and global-shared slots use this same allocator.  A logical
@@ -6598,11 +6607,24 @@ struct OwnerSegmentState {
     pub addr: u64,
     pub len: u64,
     allocator: offset_allocator::Allocator,
+    /// Read-only derived geometry, scoped to this segment generation. Runtime
+    /// access remains under the existing owner allocator mutex. OnceLock keeps
+    /// the shared report API Send + Sync without another report-cache mutex.
+    /// Physical allocate/free clears these bounded entries; the allocator's
+    /// own revision additionally prevents a stale layout from ever matching.
+    allocatable_report_cache:
+        [OnceLock<OwnerCachedAllocatableReport>; OWNER_ALLOCATABLE_REPORT_CACHE_ENTRIES],
+    #[cfg(test)]
+    allocatable_report_cache_hits: AtomicU64,
+    #[cfg(test)]
+    allocatable_report_scans: AtomicU64,
+    #[cfg(test)]
+    allocatable_report_free_nodes_visited: AtomicU64,
     /// ABA-safe primary identity. Allocation ids are never reused within an
     /// owner process generation.
     allocations: HashMap<u64, OwnerAllocationState>,
-    /// Ordered physical offsets are maintained separately so allocatable-slot
-    /// accounting walks every real free extent instead of combining holes.
+    /// Ordered physical offsets retain exact identity checks and the test
+    /// oracle. Production capacity reports read OffsetAllocator's free nodes.
     allocations_by_offset: BTreeMap<u32, u64>,
     manifest_by_key: HashMap<
         crate::owner_segment::OwnerManifestKey,
@@ -6698,6 +6720,13 @@ impl OwnerSegmentState {
                 allocation_units,
                 max_allocation_nodes,
             ),
+            allocatable_report_cache: std::array::from_fn(|_| OnceLock::new()),
+            #[cfg(test)]
+            allocatable_report_cache_hits: AtomicU64::new(0),
+            #[cfg(test)]
+            allocatable_report_scans: AtomicU64::new(0),
+            #[cfg(test)]
+            allocatable_report_free_nodes_visited: AtomicU64::new(0),
             allocations: HashMap::new(),
             allocations_by_offset: BTreeMap::new(),
             manifest_by_key: HashMap::new(),
@@ -6732,6 +6761,7 @@ impl OwnerSegmentState {
             u32::try_from(capacity_bytes / crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES)
                 .ok()?;
         let allocation = self.allocator.allocate(allocation_units)?;
+        self.clear_allocatable_report_cache();
         let offset_units = allocation.offset;
         let segment_offset = crate::owner_segment_offset_bytes(offset_units)?;
         let previous = self.allocations.insert(
@@ -7123,6 +7153,7 @@ impl OwnerSegmentState {
             "owner segment offset index diverged from allocation identity"
         );
         self.allocator.free(allocation.allocation);
+        self.clear_allocatable_report_cache();
         self.physical_free_epoch = self.physical_free_epoch.saturating_add(1);
     }
 
@@ -7305,6 +7336,84 @@ impl OwnerSegmentState {
     }
 
     fn allocatable_report(&self, slot_size: u64) -> OwnerSegmentAllocatableReport {
+        let raw_free_bytes = self.total_free_bytes();
+        if slot_size == 0
+            || slot_size > self.len
+            || slot_size % crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES != 0
+        {
+            return OwnerSegmentAllocatableReport {
+                raw_free_bytes,
+                slot_unallocatable_bytes: raw_free_bytes,
+                ..Default::default()
+            };
+        }
+
+        let layout_revision = self.allocator.layout_revision();
+        for cached in self
+            .allocatable_report_cache
+            .iter()
+            .filter_map(OnceLock::get)
+        {
+            if cached.layout_revision == layout_revision && cached.slot_size == slot_size {
+                #[cfg(test)]
+                self.allocatable_report_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return cached.report;
+            }
+        }
+
+        let slot_units =
+            u32::try_from(slot_size / crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES)
+                .expect("validated owner slot size exceeds the allocator address space");
+        let exact = self.allocator.storage_report_for_size(slot_units);
+        #[cfg(test)]
+        {
+            self.allocatable_report_scans
+                .fetch_add(1, Ordering::Relaxed);
+            self.allocatable_report_free_nodes_visited
+                .fetch_add(u64::from(exact.free_regions), Ordering::Relaxed);
+        }
+        let exact_raw_free_bytes =
+            u64::from(exact.total_free_space) * crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES;
+        // Preserve the previous report's fail-closed boundary when allocator
+        // metadata is exhausted: physical geometry alone must not turn a real
+        // failed allocation into an immediately-ready retry loop.
+        assert_eq!(
+            exact_raw_free_bytes, raw_free_bytes,
+            "owner allocation index diverged from OffsetAllocator free accounting"
+        );
+        let allocatable_bytes = exact.allocatable_slots * slot_size;
+        let report = OwnerSegmentAllocatableReport {
+            raw_free_bytes,
+            allocatable_slots: exact.allocatable_slots,
+            allocatable_bytes,
+            slot_unallocatable_bytes: raw_free_bytes - allocatable_bytes,
+        };
+        let cached = OwnerCachedAllocatableReport {
+            layout_revision,
+            slot_size,
+            report,
+        };
+        // Preserve the first (usually configured) sizes for this layout. More
+        // than sixteen queried sizes still get an exact uncached report.
+        for entry in &self.allocatable_report_cache {
+            if entry.set(cached).is_ok() {
+                break;
+            }
+        }
+        report
+    }
+
+    fn clear_allocatable_report_cache(&mut self) {
+        for entry in &mut self.allocatable_report_cache {
+            entry.take();
+        }
+    }
+
+    /// Independent baseline for tests: reconstruct free extents from all live
+    /// allocation identities rather than trusting the allocator report/cache.
+    #[cfg(test)]
+    fn allocatable_report_from_allocations(&self, slot_size: u64) -> OwnerSegmentAllocatableReport {
         let raw_free_bytes = self.total_free_bytes();
         if slot_size == 0
             || slot_size > self.len
@@ -10798,6 +10907,9 @@ async fn handle_owner_segment_transfer(
         raw_bytes: Vec::new(),
     }
 }
+
+#[cfg(test)]
+mod owner_allocatable_report_tests;
 
 #[cfg(test)]
 mod owner_segment_protocol_tests {

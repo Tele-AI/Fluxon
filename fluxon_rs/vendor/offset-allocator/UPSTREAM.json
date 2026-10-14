@@ -1,0 +1,17 @@
+{
+  "crate": "offset-allocator",
+  "version": "0.2.0",
+  "repository": "https://github.com/pcwalton/offset-allocator/",
+  "revision": "9449d4d81be91396938b05894fad443f63093077",
+  "license": "MIT",
+  "upstream_sha256": {
+    "Cargo.toml": "2eb824a3ce811c56f5cbae8907190759851c8ad4a0644a2198f6bd118d9845f2",
+    "Cargo.toml.orig": "c50331da1b6d54008531c3add45c28cb8e19a79b89ef815aced3448cfbc923c5",
+    "README.md": "4deecc83b525ea277b10b985fac0ee11a39d3c17e0b8e7edf58801b9ebf25718",
+    "LICENSE-MIT": "cbb95c14fc8f3cd76a53dc7eb6be80b4ac06dc2833881027c998f748b7fea503",
+    "src/lib.rs": "43a73129d00fad0759696e9ea13cde08f0350e022dbc201c0569091ed5412419",
+    "src/ext.rs": "a4197004956e751d430ba4a83d620699e21aa57bc165ff130d8282365bac5f25",
+    "src/small_float.rs": "65e6d46991a872caa15dce00be1b8c3da0c86199899929f8e42934678704f001",
+    "src/tests.rs": "599afbe9ec140d5cdf1286d26d93de5f443cdf641c012d578001ff6efac6aacb"
+  }
+}
