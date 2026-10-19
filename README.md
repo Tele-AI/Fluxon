@@ -333,6 +333,10 @@ Contributions are welcome. Before you start, please read the developer docs on G
 
 ## 👤 Project Leader
 
+<a href="https://github.com/kaimary">
+  <img src="https://github.com/kaimary.png?size=128" width="96" height="96" alt="kaimary" />
+</a>
+
 - [kaimary](https://github.com/kaimary)
 
 <a id="contributors"></a>
