@@ -44,7 +44,6 @@ Built on the unified Rust-based transport and caching foundation, Fluxon exposes
 - [Quick Start](#quick-start)
 - [Repository Structure](#repository-structure)
 - [Contributing](#contributing)
-- [Project Leader](#project-leader)
 - [Contributors](#contributors)
 - [Acknowledgements](#acknowledgements)
 - [License](#license)
@@ -329,16 +328,6 @@ Contributions are welcome. Before you start, please read the developer docs on G
 - [Developer - 8 - Data Structure and Index Design Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---8---Data-Structure-and-Index-Design-Guidelines/)
 - [Developer - 9 - Test Extension Configuration](https://tele-ai.github.io/Fluxon/dev_doc/Developer---9---Test-Extension-Configuration/)
 
-<a id="project-leader"></a>
-
-## 👤 Project Leader
-
-<a href="https://github.com/kaimary">
-  <img src="https://github.com/kaimary.png?size=128" width="96" height="96" alt="kaimary" />
-</a>
-
-- [kaimary](https://github.com/kaimary)
-
 <a id="contributors"></a>
 
 ## 👥 Contributors
@@ -368,6 +357,12 @@ Some earlier contribution records are no longer fully reflected in the current c
 - `maplestarplayl`: IPC integration, SPDK integration
 - `RuileLu`: `KV Lease` support
 - `Summage`: Initial KV architecture optimization
+
+**Project Leader**
+
+<a href="https://github.com/kaimary">
+  <img src="https://github.com/kaimary.png?size=128" width="96" height="96" alt="kaimary" />
+</a>
 
 ## Acknowledgements
 
