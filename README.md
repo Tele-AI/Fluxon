@@ -44,6 +44,7 @@ Built on the unified Rust-based transport and caching foundation, Fluxon exposes
 - [Quick Start](#quick-start)
 - [Repository Structure](#repository-structure)
 - [Contributing](#contributing)
+- [Project Leader](#project-leader)
 - [Contributors](#contributors)
 - [Acknowledgements](#acknowledgements)
 - [License](#license)
@@ -327,6 +328,12 @@ Contributions are welcome. Before you start, please read the developer docs on G
 - [Developer - 7 - Event Subscription and Full Snapshot Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---7---Event-Subscription-and-Full-Snapshot-Guidelines/)
 - [Developer - 8 - Data Structure and Index Design Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---8---Data-Structure-and-Index-Design-Guidelines/)
 - [Developer - 9 - Test Extension Configuration](https://tele-ai.github.io/Fluxon/dev_doc/Developer---9---Test-Extension-Configuration/)
+
+<a id="project-leader"></a>
+
+## 👤 Project Leader
+
+- [kaimary](https://github.com/kaimary)
 
 <a id="contributors"></a>
 
