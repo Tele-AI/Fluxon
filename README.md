@@ -332,9 +332,13 @@ Contributions are welcome. Before you start, please read the developer docs on G
 
 ## 👥 Contributors
 
-<a href="https://github.com/Tele-AI/Fluxon/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Tele-AI/Fluxon" />
-</a>
+<div style="display: flex; align-items: flex-end; gap: 8px;">
+  <a href="https://github.com/Tele-AI/Fluxon/graphs/contributors"><img src="https://contrib.rocks/image?repo=Tele-AI/Fluxon" /></a>
+  <span style="display: inline-flex; align-items: flex-end; gap: 0;">
+    <a href="https://github.com/kaimary"><img src="https://github.com/kaimary.png?size=128" width="64" height="64" alt="kaimary" style="border-radius: 50%;" /></a>
+    <span style="transform: translate(-4px, -4px);">（*<strong>Project Lead</strong>）</span>
+  </span>
+</div>
 
 Some earlier contribution records are no longer fully reflected in the current commit history. Historical highlights:
 
@@ -357,12 +361,6 @@ Some earlier contribution records are no longer fully reflected in the current c
 - `maplestarplayl`: IPC integration, SPDK integration
 - `RuileLu`: `KV Lease` support
 - `Summage`: Initial KV architecture optimization
-
-**Project Leader**
-
-<a href="https://github.com/kaimary">
-  <img src="https://github.com/kaimary.png?size=128" width="96" height="96" alt="kaimary" />
-</a>
 
 ## Acknowledgements
 
