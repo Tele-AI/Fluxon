@@ -21,13 +21,10 @@ use crate::{P2pModuleAccessTrait, cluster_manager::ClusterManagerAccessTrait};
 use async_trait::async_trait;
 use fluxon_commu::ClosedRuntimeHandle;
 use fluxon_commu::p2p::PeerGen;
-use fluxon_commu::transfer_engine::{
-    AttachedTransferEngine, CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER,
-    ClosedRuntimeLocalMemoryKind,
-};
+use fluxon_commu::transfer_engine::{AttachedTransferEngine, ClosedRuntimeLocalMemoryKind};
 use fluxon_commu::{
     ClientTransferEngineClusterRuntime, ClientTransferEngineCore, ClientTransferEngineRuntime,
-    CpuAllocatedMem, TransferBreakdown,
+    CpuAllocatedMem, TransferBreakdown, TransferEngineError,
 };
 use fluxon_framework::{LogicalModule, define_module};
 use std::future::Future;
@@ -862,9 +859,7 @@ impl ClientTransferEngine {
             match result {
                 Ok(breakdown) => return Ok(breakdown),
                 Err(err)
-                    if err
-                        .to_string()
-                        .contains(CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER)
+                    if matches!(err, TransferEngineError::RequiredDirectFastPathNotReady)
                         && started.elapsed() < DIRECT_READY_TIMEOUT =>
                 {
                     tracing::debug!(
@@ -937,9 +932,7 @@ impl ClientTransferEngine {
             match result {
                 Ok(breakdown) => return Ok(breakdown),
                 Err(err)
-                    if err
-                        .to_string()
-                        .contains(CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER)
+                    if matches!(err, TransferEngineError::RequiredDirectFastPathNotReady)
                         && started.elapsed() < DIRECT_READY_TIMEOUT =>
                 {
                     tracing::debug!(

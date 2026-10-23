@@ -53,10 +53,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             git \
+            libnvidia-compute-580 \
             pigz \
             protobuf-compiler \
             python3-venv \
             rsync
+          python3 -c 'import ctypes; ctypes.CDLL("libcuda.so.1")'
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
@@ -168,10 +170,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             git \
+            libnvidia-compute-580 \
             pigz \
             protobuf-compiler \
             python3-venv \
             rsync
+          python3 -c 'import ctypes; ctypes.CDLL("libcuda.so.1")'
 
       - name: Verify Docker availability
         run: |
@@ -308,6 +312,12 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
+
+      - name: Install CUDA driver userspace library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libnvidia-compute-580
+          python3 -c 'import ctypes; ctypes.CDLL("libcuda.so.1")'
 
       - name: Download Fluxon CI release
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7

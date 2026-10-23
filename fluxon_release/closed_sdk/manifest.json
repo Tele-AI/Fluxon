@@ -1,7 +1,7 @@
 {
   "object_kind": "FluxonCommuClosedSdk",
-  "schema_version": 7,
-  "abi_version": 9,
+  "schema_version": 8,
+  "abi_version": 10,
   "sdk_version": "0.2.1",
   "required_open_surface_version": "0.2.1",
   "feature_contract": {
@@ -9,7 +9,7 @@
     "runtime_authority_crate": "fluxon_commu_private_impl",
     "transfer_link_snapshot_mode": "watch-v1"
   },
-  "public_workspace_input_sha256": "59c66ec1fe0dc849a3e2a9f8ce4c721cfee6a387286bd25d3d28bf6ca1705197",
+  "public_workspace_input_sha256": "3abad9b322d2c9df2257fff4a9c98381342183f482557d158c8e5645c10f5e63",
   "layout": {
     "native": "native",
     "lib": "lib"
@@ -18,6 +18,18 @@
     "native_runtime"
   ],
   "libraries": [
+    {
+      "name": "fluxon_commu_core",
+      "path": "lib/libcudart.so"
+    },
+    {
+      "name": "fluxon_commu_core",
+      "path": "lib/libcudart.so.13"
+    },
+    {
+      "name": "fluxon_commu_core",
+      "path": "lib/libcudart.so.13.0.48"
+    },
     {
       "name": "fluxon_commu_core",
       "path": "lib/libfluxon_commu_core.so"
