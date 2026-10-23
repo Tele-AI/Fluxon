@@ -58,7 +58,7 @@ import importlib
 from typing import Any
 
 
-__version__ = "0.2.2+trace.g4.a40.followupbounded1"
+__version__ = "0.2.4"
 __all__ = [
     # Core API
     "KvClient",
