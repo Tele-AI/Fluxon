@@ -44,9 +44,6 @@ def _build_config(*, instance_key: str) -> FluxonKvClientConfig:
                 "cluster_name": CLUSTER_NAME,
                 "share_mem_path": SHARE_MEM_PATH,
             },
-            "test_spec_config": {
-                "disable_observability": True,
-            },
         }
     )
 

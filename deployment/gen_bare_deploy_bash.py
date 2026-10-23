@@ -34,10 +34,9 @@ from selection_supervisor_codegen import (  # type: ignore
     render_python_selection_supervisor_module,
 )
 from selection_runtime import (  # type: ignore
-    atomic_group_member_authority_name as _selection_atomic_group_member_authority_name,
     atomic_group_member_selection_workload_name as _selection_atomic_group_member_selection_workload_name,
+    atomic_group_member_workload_name as _selection_atomic_group_member_workload_name,
     daemonset_selection_supervisor_label as _selection_daemonset_supervisor_label,
-    plain_selection_authority_name as _selection_plain_selection_authority_name,
     plain_selection_workload_name as _selection_plain_workload_name,
 )
 
@@ -47,10 +46,14 @@ STANDALONE_BACKOFF_MAX_SECONDS = 30
 ATOMIC_GROUP_BACKOFF_MAX_SECONDS = 25
 ATOMIC_GROUP_CRASHLOOP_CONSECUTIVE_RESTARTS = 10
 ATOMIC_GROUP_CRASHLOOP_INTERVAL_LT_SECONDS = 30
+
+# Allow delayed child creation on cold or contended hosts, then require the same
+# child PID to remain alive for the probable-ready window. An observed restart fails fast.
 ATOMIC_GROUP_PROBABLE_READY_SECONDS = 10
 STANDALONE_PROBABLE_READY_SECONDS = 10
-STANDALONE_STARTUP_DEADLINE_SECONDS = 20
-ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS = 20
+STANDALONE_STARTUP_DEADLINE_SECONDS = 60
+ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS = 60
+
 HOSTWORKDIR_RUNTIME_TOKEN = "${HOSTWORKDIR}"
 REPO_ROOT = SCRIPT_DIR.parent
 BARE_TEMPLATE_DIR = SCRIPT_DIR / "templates" / "gen_bare_deploy_bash"
@@ -141,12 +144,20 @@ def main() -> None:
 
     for service_name, raw_service_cfg in services.items():
         service_cfg = _require_dict(raw_service_cfg, f"service.{service_name}")
+        stop_supervisor_labels = _bare_service_stop_supervisor_labels(
+            name_prefix=name_prefix,
+            service_name=service_name,
+            atomic_groups=atomic_groups,
+        )
         standalone_entrypoint = _resolve_service_entrypoint(
             service_name=service_name,
             service_cfg=service_cfg,
             placeholder_mapping=mapping,
         )
-        standalone_workload_name = _bare_plain_workload_name(name_prefix=name_prefix, service_name=service_name)
+        standalone_workload_name = _selection_plain_workload_name(
+            name_prefix=name_prefix,
+            selection_name=service_name,
+        )
         _write_script(
             outdir / _bare_entrypoint_script_name(workload_name=standalone_workload_name),
             _render_bare_entrypoint_script(
@@ -171,6 +182,7 @@ def main() -> None:
                 cluster_nodes=cluster_nodes,
                 service_name=service_name,
                 service_cfg=service_cfg,
+                supervisor_labels=stop_supervisor_labels,
             ),
         )
 
@@ -182,9 +194,9 @@ def main() -> None:
                 service_cfg=service_cfg,
                 placeholder_mapping=mapping,
             )
-            group_workload_name = _bare_atomic_group_member_workload_name(
+            group_workload_name = _selection_atomic_group_member_selection_workload_name(
                 name_prefix=name_prefix,
-                group_name=group_name,
+                selection_name=group_name,
                 service_name=service_name,
             )
             _write_script(
@@ -288,31 +300,11 @@ def _validate_atomic_groups(
     return out
 
 
-def _bare_plain_workload_name(*, name_prefix: str, service_name: str) -> str:
-    return _selection_plain_workload_name(
-        name_prefix=name_prefix,
-        selection_name=service_name,
-    )
-
-
-def _bare_atomic_group_member_workload_name(
-    *,
-    name_prefix: str,
-    group_name: str,
-    service_name: str,
-) -> str:
-    return _selection_atomic_group_member_selection_workload_name(
-        name_prefix=name_prefix,
-        selection_name=group_name,
-        service_name=service_name,
-    )
-
-
 def _bare_plain_selection_supervisor_label(*, name_prefix: str, service_name: str) -> str:
     return _selection_daemonset_supervisor_label(
-        workload_name=_bare_plain_workload_name(
+        workload_name=_selection_plain_workload_name(
             name_prefix=name_prefix,
-            service_name=service_name,
+            selection_name=service_name,
         )
     )
 
@@ -324,12 +316,38 @@ def _bare_atomic_group_member_selection_supervisor_label(
     service_name: str,
 ) -> str:
     return _selection_daemonset_supervisor_label(
-        workload_name=_bare_atomic_group_member_workload_name(
+        workload_name=_selection_atomic_group_member_selection_workload_name(
             name_prefix=name_prefix,
-            group_name=group_name,
+            selection_name=group_name,
             service_name=service_name,
         )
     )
+
+
+def _bare_service_stop_supervisor_labels(
+    *,
+    name_prefix: str,
+    service_name: str,
+    atomic_groups: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    labels = [
+        _bare_plain_selection_supervisor_label(
+            name_prefix=name_prefix,
+            service_name=service_name,
+        )
+    ]
+    for group_name, group_cfg in atomic_groups.items():
+        group_services = _require_list_of_str(group_cfg.get("services"), f"atomic_groups.{group_name}.services")
+        if service_name not in group_services:
+            continue
+        labels.append(
+            _bare_atomic_group_member_selection_supervisor_label(
+                name_prefix=name_prefix,
+                group_name=group_name,
+                service_name=service_name,
+            )
+        )
+    return labels
 
 
 def _bare_entrypoint_script_name(*, workload_name: str) -> str:
@@ -340,7 +358,7 @@ def _render_bare_entrypoint_script(*, service_name: str, entrypoint: str) -> str
     return _render_bare_template(
         template_name="bare_entrypoint.sh.tmpl",
         values={
-            "SERVICE_EXPORT": _sh_quote(service_name),
+            "SERVICE_EXPORT": shlex.quote(service_name),
             "ENTRYPOINT": entrypoint.strip(),
         },
     )
@@ -387,8 +405,8 @@ def _render_standalone_start_script(
     return _render_bare_template(
         template_name="standalone_start.sh.tmpl",
         values={
-            "SERVICE_ASSIGN": _sh_quote(service_name),
-            "NAME_PREFIX_ASSIGN": _sh_quote(name_prefix),
+            "SERVICE_ASSIGN": shlex.quote(service_name),
+            "NAME_PREFIX_ASSIGN": shlex.quote(name_prefix),
             "ALLOWED_NODES_BLOCK": _render_nodes_bash(name="ALLOWED_NODES", nodes=allowed_nodes),
             "HOST_PRELUDE": _render_host_prelude(cluster_nodes=cluster_nodes),
             "COMMON_NODE_RESOLUTION_TAIL": _render_common_node_resolution_tail(service_name=service_name),
@@ -412,20 +430,19 @@ def _render_standalone_stop_script(
     cluster_nodes: List[Dict[str, Any]],
     service_name: str,
     service_cfg: Dict[str, Any],
+    supervisor_labels: List[str],
 ) -> str:
     allowed_nodes = _extract_nodes(service_cfg)
     return _render_bare_template(
         template_name="standalone_stop.sh.tmpl",
         values={
-            "SERVICE_ASSIGN": _sh_quote(service_name),
-            "NAME_PREFIX_ASSIGN": _sh_quote(name_prefix),
+            "SERVICE_ASSIGN": shlex.quote(service_name),
+            "NAME_PREFIX_ASSIGN": shlex.quote(name_prefix),
             "ALLOWED_NODES_BLOCK": _render_nodes_bash(name="ALLOWED_NODES", nodes=allowed_nodes),
             "HOST_PRELUDE": _render_host_prelude(cluster_nodes=cluster_nodes),
             "COMMON_NODE_RESOLUTION_TAIL": _render_common_node_resolution_tail(service_name=service_name),
             "SELECTION_SUPERVISOR_PATH_BLOCK": _render_selection_supervisor_path_from_script_dir(),
-            "SUPERVISOR_LABEL_ASSIGN": _sh_quote(
-                _bare_plain_selection_supervisor_label(name_prefix=name_prefix, service_name=service_name)
-            ),
+            "STOP_LABELS_BLOCK": _render_standalone_stop_labels_block(supervisor_labels=supervisor_labels),
         },
     )
 
@@ -453,8 +470,8 @@ def _render_atomic_group_start_script(
     return _render_bare_template(
         template_name="atomic_group_start.sh.tmpl",
         values={
-            "GROUP_ASSIGN": _sh_quote(group_name),
-            "NAME_PREFIX_ASSIGN": _sh_quote(name_prefix),
+            "GROUP_ASSIGN": shlex.quote(group_name),
+            "NAME_PREFIX_ASSIGN": shlex.quote(name_prefix),
             "HOST_PRELUDE": _render_host_prelude(cluster_nodes=cluster_nodes),
             "ATOMIC_GROUP_NODE_RESOLUTION_TAIL": _render_atomic_group_node_resolution_tail(group_cfg["nodes"]),
             "SELECTION_SUPERVISOR_PATH_BLOCK": _render_selection_supervisor_path_from_script_dir(),
@@ -477,8 +494,8 @@ def _render_atomic_group_stop_script(
     return _render_bare_template(
         template_name="atomic_group_stop.sh.tmpl",
         values={
-            "GROUP_ASSIGN": _sh_quote(group_name),
-            "NAME_PREFIX_ASSIGN": _sh_quote(name_prefix),
+            "GROUP_ASSIGN": shlex.quote(group_name),
+            "NAME_PREFIX_ASSIGN": shlex.quote(name_prefix),
             "HOST_PRELUDE": _render_host_prelude(cluster_nodes=cluster_nodes),
             "ATOMIC_GROUP_NODE_RESOLUTION_TAIL": _render_atomic_group_node_resolution_tail(group_cfg["nodes"]),
             "SELECTION_SUPERVISOR_PATH_BLOCK": _render_selection_supervisor_path_from_script_dir(),
@@ -507,9 +524,9 @@ def _render_host_prelude(*, cluster_nodes: List[Dict[str, Any]]) -> str:
         node_name = _require_str(node.get("hostname"), "cluster_nodes[].hostname")
         node_ip = _require_str(node.get("ip"), f"cluster_nodes[{node_name}].ip")
         hostworkdir = _require_str(node.get("hostworkdir"), f"cluster_nodes[{node_name}].hostworkdir")
-        ip_case_lines.append(f"        {_sh_quote(node_name)}) _ip_n={_sh_quote(node_ip)};;")
+        ip_case_lines.append(f"        {shlex.quote(node_name)}) _ip_n={shlex.quote(node_ip)};;")
         host_case_lines.append(
-            f"  {_sh_quote(node_name)}) HOST_IP={_sh_quote(node_ip)}; HOSTWORKDIR={_sh_quote(hostworkdir)};;"
+            f"  {shlex.quote(node_name)}) HOST_IP={shlex.quote(node_ip)}; HOSTWORKDIR={shlex.quote(hostworkdir)};;"
         )
     return _render_bare_template(
         template_name="host_prelude.sh.tmpl",
@@ -571,9 +588,19 @@ def _render_service_port_export(*, service_name: str, service_cfg: Dict[str, Any
     if service_port is None:
         return indent + "unset SERVICE_PORT\n"
     return (
-        indent + f"export {service_name.upper()}__PORT={_sh_quote(str(service_port))}\n"
-        + indent + f"export SERVICE_PORT={_sh_quote(str(service_port))}\n"
+        indent + f"export {service_name.upper()}__PORT={shlex.quote(str(service_port))}\n"
+        + indent + f"export SERVICE_PORT={shlex.quote(str(service_port))}\n"
     )
+
+
+def _render_standalone_stop_labels_block(*, supervisor_labels: List[str]) -> str:
+    if not supervisor_labels:
+        raise ValueError("supervisor_labels must be non-empty")
+    lines = ["STOP_SUPERVISOR_LABELS=(\n"]
+    for label in supervisor_labels:
+        lines.append(f"  {shlex.quote(label)}\n")
+    lines.append(")\n")
+    return "".join(lines)
 
 
 def _indent_script_block(*, script: str, prefix: str) -> str:
@@ -587,11 +614,14 @@ def _indent_script_block(*, script: str, prefix: str) -> str:
 
 
 def _render_standalone_start_body(*, name_prefix: str, service_name: str) -> str:
-    workload_name = _bare_plain_workload_name(name_prefix=name_prefix, service_name=service_name)
+    workload_name = _selection_plain_workload_name(
+        name_prefix=name_prefix,
+        selection_name=service_name,
+    )
     child_command = _bare_entrypoint_command(workload_name=workload_name)
     runtime_state_json = _bare_runtime_state_json(
         workload_name=workload_name,
-        authority_name=_selection_plain_selection_authority_name(selection_name=service_name),
+        authority_name=service_name,
         service_name=service_name,
         log_path=f"${{HOSTWORKDIR}}/log/{service_name}.log",
     )
@@ -611,10 +641,10 @@ def _render_standalone_start_body(*, name_prefix: str, service_name: str) -> str
     return _render_bare_template(
         template_name="standalone_start_body.sh.tmpl",
         values={
-            "SUPERVISOR_LABEL_ASSIGN": _sh_quote(
+            "SUPERVISOR_LABEL_ASSIGN": shlex.quote(
                 _bare_plain_selection_supervisor_label(name_prefix=name_prefix, service_name=service_name)
             ),
-            "RUNTIME_STATE_JSON_ASSIGN": _sh_quote(runtime_state_json),
+            "RUNTIME_STATE_JSON_ASSIGN": shlex.quote(runtime_state_json),
             "STARTUP_DEADLINE_SECONDS": str(STANDALONE_STARTUP_DEADLINE_SECONDS),
             "SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK": _render_selection_supervisor_launch_wait_block(
                 run_cmd=run_cmd,
@@ -640,15 +670,15 @@ def _render_atomic_group_service_block(
     service_name: str,
     service_cfg: Dict[str, Any],
 ) -> str:
-    workload_name = _bare_atomic_group_member_workload_name(
+    workload_name = _selection_atomic_group_member_selection_workload_name(
         name_prefix=name_prefix,
-        group_name=group_name,
+        selection_name=group_name,
         service_name=service_name,
     )
     child_command = _bare_entrypoint_command(workload_name=workload_name)
     runtime_state_json = _bare_runtime_state_json(
         workload_name=workload_name,
-        authority_name=_selection_atomic_group_member_authority_name(
+        authority_name=_selection_atomic_group_member_workload_name(
             selection_name=group_name,
             service_name=service_name,
         ),
@@ -674,20 +704,20 @@ def _render_atomic_group_service_block(
         values={
             "SERVICE_NAME": service_name,
             "ALLOWED_NODES_BLOCK": _render_nodes_bash(name="ALLOWED_NODES", nodes=allowed_nodes),
-            "SERVICE_EXPORT": _sh_quote(service_name),
+            "SERVICE_EXPORT": shlex.quote(service_name),
             "PORT_EXPORT": _render_service_port_export(
                 service_name=service_name,
                 service_cfg=service_cfg,
                 indent="  ",
             ),
-            "SUPERVISOR_LABEL_ASSIGN": _sh_quote(
+            "SUPERVISOR_LABEL_ASSIGN": shlex.quote(
                 _bare_atomic_group_member_selection_supervisor_label(
                     name_prefix=name_prefix,
                     group_name=group_name,
                     service_name=service_name,
                 )
             ),
-            "RUNTIME_STATE_JSON_ASSIGN": _sh_quote(runtime_state_json),
+            "RUNTIME_STATE_JSON_ASSIGN": shlex.quote(runtime_state_json),
             "LOGFILE_PATH": f"$HOSTWORKDIR/log/{service_name}.log",
             "INDENTED_SELECTION_SUPERVISOR_LAUNCH_WAIT_BLOCK": _indent_script_block(
                 script=_render_selection_supervisor_launch_wait_block(
@@ -708,7 +738,7 @@ def _render_atomic_group_stop_fn(*, runtime_specs: List[Dict[str, str]]) -> str:
     out += "  local STOP_FAILED=0\n"
     for spec in runtime_specs:
         supervisor_label = _require_str(spec.get("supervisor_label"), "runtime_specs[].supervisor_label")
-        out += f'  SUPERVISOR_LABEL={_sh_quote(supervisor_label)}\n'
+        out += f'  SUPERVISOR_LABEL={shlex.quote(supervisor_label)}\n'
         out += '  if ! python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR" --missing-ok >/dev/null; then\n'
         out += '    echo "[atomic-group] stop failed group=$GROUP node=$NODE_ID label=$SUPERVISOR_LABEL"\n'
         out += "    STOP_FAILED=1\n"
@@ -783,7 +813,7 @@ def _render_global_env_exports(global_envs: Dict[str, Any]) -> str:
                 )
             out += f'export {key}="{_sh_escape_double_quotes(value)}"\n'
         else:
-            out += f"export {key}={_sh_quote(value)}\n"
+            out += f"export {key}={shlex.quote(value)}\n"
     if out:
         out += "\n"
     return out
@@ -840,7 +870,7 @@ def _extract_port(service_cfg: Dict[str, Any]) -> int | None:
 
 
 def _render_nodes_bash(*, name: str, nodes: List[str]) -> str:
-    return f"{name}=(" + " ".join(_sh_quote(node_name) for node_name in nodes) + ")\n"
+    return f"{name}=(" + " ".join(shlex.quote(node_name) for node_name in nodes) + ")\n"
 
 
 def _require_dict(raw: Any, field_name: str) -> Dict[str, Any]:
@@ -866,10 +896,6 @@ def _require_str(raw: Any, field_name: str) -> str:
     return raw.strip()
 
 
-def _sh_quote(value: str) -> str:
-    return shlex.quote(value)
-
-
 def _sh_quote_runtime_expand_arg(value: str) -> str:
     # English note:
     # - Bare child argv can legitimately contain `${HOSTWORKDIR}` because the generated
@@ -880,7 +906,7 @@ def _sh_quote_runtime_expand_arg(value: str) -> str:
     #   expansion-preserving quoting for the specific hostworkdir runtime token path.
     if HOSTWORKDIR_RUNTIME_TOKEN in value or "$HOSTWORKDIR" in value:
         return _sh_expand_quote(value)
-    return _sh_quote(value)
+    return shlex.quote(value)
 
 
 def _sh_expand_quote(value: str) -> str:

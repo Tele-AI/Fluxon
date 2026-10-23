@@ -124,6 +124,36 @@ class TestPyO3EtcdKvClient(unittest.TestCase):
             context_lease_id = int(held_lock.lease_id)
         self._assert_lease_not_live(context_lease_id)
 
+    def test_lock_keeps_lease_alive_past_ttl(self) -> None:
+        lock_name = self.prefix + "long_critical_section_lock"
+        ttl_seconds = 2
+        lock_a = self.fluxon_pyo3.EtcdLock(
+            [self.endpoint], lock_name, ttl_seconds, 1.0
+        )
+        lock_b = self.fluxon_pyo3.EtcdLock(
+            [self.endpoint], lock_name, ttl_seconds, 0.5
+        )
+
+        try:
+            self.assertTrue(lock_a.acquire())
+            lease_id = int(lock_a.lease_id)
+
+            time.sleep(ttl_seconds + 1.5)
+
+            self.assertGreater(self.client.lease_ttl(lease_id), 0)
+            self.assertFalse(lock_b.acquire())
+
+            self.assertTrue(lock_a.release())
+            self.assertTrue(lock_b.acquire(1.0))
+        finally:
+            for lock in (lock_b, lock_a):
+                if not lock.held:
+                    continue
+                try:
+                    lock.release()
+                except RuntimeError:
+                    pass
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

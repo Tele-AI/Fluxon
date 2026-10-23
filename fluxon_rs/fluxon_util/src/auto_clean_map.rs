@@ -106,6 +106,20 @@ where
         }
     }
 
+    /// Return a guard for an existing live entry without creating a new value.
+    pub fn get_existing(&self, key: &K) -> Option<AutoCleanMapEntry<K, V>> {
+        let stored = self
+            .inner
+            .get(key)
+            .and_then(|entry| entry.value().upgrade())?;
+        Some(AutoCleanMapEntry {
+            key: key.clone(),
+            version_id: stored.version_id,
+            stored,
+            map_ref: Arc::downgrade(&self.inner),
+        })
+    }
+
     /// 若 key 存在且 Weak 可升级，执行闭包并返回结果；否则返回 None。
     pub fn with_existing<R, F>(&self, key: &K, f: F) -> Option<R>
     where

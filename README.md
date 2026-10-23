@@ -4,15 +4,92 @@
 
 <div align="center">
 
+An AI-native distributed data plane that supports high performance RPC, KV Cache, Message Queue, and File & Object Acceleration.
+
 [![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#runtime-requirements)
 [![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#runtime-requirements)
 [![Rust](https://img.shields.io/badge/Rust-1.93.0-000000)](./fluxon_rs/rust-toolchain.toml)
-[![Latest](https://img.shields.io/badge/Latest-v0.2.2-f28500)](./fluxon_release)
+[![Latest](https://img.shields.io/badge/Latest-v0.2.4-f28500)](./fluxon_release)
 [![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#interface-capabilities)
+
+<details>
+<summary><img src="https://img.shields.io/badge/WeChat-Join%20Group-07C160?logo=wechat&amp;logoColor=white" alt="WeChat Group" /></summary>
+
+Add the project administrator on WeChat to join the open-source community group.
+
+<img src="./pics/wx.jpg" width="360" alt="Project administrator WeChat QR code" />
+
+</details>
 
 [English](./README.md) | [中文](./README_CN.md) | [Docs](https://tele-ai.github.io/Fluxon/) | [中文文档](https://tele-ai.github.io/Fluxon/cn/) | <a href="https://github.com/Tele-AI/Fluxon" title="GitHub Repository"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
 
+
 </div>
+
+Built on the unified Rust-based transport and caching foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
+
+- **KV/RPC (Unified key-value and RPC)**: Breaks data silos and enables efficient cross-process, cross-node reuse of inference-side `KV Cache` and `latent cache`
+- **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
+- **FS (`S3`-compatible file, object, and cache acceleration system)**: Unifies multi-form storage so one system can cache key-value, file, and object data, while supporting remote access, `S3` forwarding, and large-scale cross-cluster migration for AI data and model files
+
+<a id="contents"></a>
+
+## 🧭 Contents
+
+- [Benchmark](#benchmark)
+- [Background](#background)
+- [Foundation Capabilities](#foundation-capabilities)
+- [Interface Capabilities](#interface-capabilities)
+- [Runtime Requirements](#runtime-requirements)
+- [Quick Start](#quick-start)
+- [Repository Structure](#repository-structure)
+- [Contributing](#contributing)
+- [Contributors](#contributors)
+- [Acknowledgements](#acknowledgements)
+- [License](#license)
+- [Stargazers over time](#stargazers-over-time)
+
+<a id="benchmark"></a>
+
+## 📊 Benchmark
+
+The benchmark section mainly covers the `RPC`, `KV`, and `FS` data planes, and the related scripts and configurations are primarily under `fluxon_test_stack/`.
+
+### Fluxon RPC Benchmark
+
+The RPC benchmark mainly shows call latency and throughput across different message sizes and concurrency levels, to observe the stability and tail-latency behavior of the service-to-service call path.
+
+![](./pics/fluxon_rpc_bench.png)
+
+### Fluxon KV Benchmark
+
+The `TCP Benchmark` shows that Fluxon outperforms `MooncakeStore` and `Redis` on the two read-heavy workloads `Read-affinity` and `Read-Zipf`. For `put_only`, the current primary constraint remains the inflight metadata deduplication path rather than `Payload` transport.
+
+![](./pics/kv_benchmark_chart.png)
+
+Fluxon KV can also use an owner's local SSD as a runtime backing layer for DRAM replicas. The chart below shows a single-node H100 SSD-pressure experiment measured through CUDA event completion. At c16, Fluxon's hit payload throughput for 4/8/16 MiB payloads was 3.83×/5.61×/6.73× that of the faster of the two Mooncake topologies.
+
+![GPU-ready KV throughput and hit rate across Fluxon and Mooncake SSD configurations](./pics/kv_ssd_gpu_sweep.png)
+
+See the Chinese deep dive, [Fluxon KV SSD Storage: Using Local SSD as a Backing Layer for In-Memory Replicas](https://tele-ai.github.io/Fluxon/cn/blog/blog_2_Fluxon_KV_SSD%E5%AD%98%E5%82%A8%EF%BC%9A%E6%8A%8A%E6%9C%AC%E5%9C%B0SSD%E6%8E%A5%E6%88%90%E5%86%85%E5%AD%98%E5%89%AF%E6%9C%AC%E7%9A%84%E5%9B%9E%E5%A1%AB%E5%B1%82), for the full setup, hit rates, and scope.
+
+### Fluxon FS Benchmark
+
+#### Multi-node FS Python API
+
+The benchmark results show that small-file reads and large-file writes already outperform `Alluxio`, large-file read performance is broadly on par, and small-file write performance still has further room to improve.
+
+![](./pics/fs_benchmark_chart.png)
+
+#### Single-node S3 API
+
+In the reported single-node `rclone v1.60.1` comparison with Alluxio S3 Proxy, FluxonFS led all 18 persisted-PUT and cold-read object-size/concurrency combinations. Hot-read gains were strongest for 4 KiB objects, while medium- and large-object sequential hot-read throughput was generally close.
+
+![FluxonFS S3 persisted PUT, cold-read, and hot-read throughput compared with Alluxio S3 Proxy](./pics/fluxon-s3-throughput-overview.svg)
+
+<a id="background"></a>
+
+## Background
 
 As GPU compute power continues to scale, bottlenecks in AI systems are expanding from individual operators into the data plane. Inference services need cross-node `KV Cache` reuse. Training pipelines need to pass intermediate state across heterogeneous resource pools. Model files and `Checkpoint` data need to move reliably between remote access paths and local caches.
 
@@ -26,29 +103,9 @@ Most existing systems, however, are still specialized components built for narro
 - **Fragmented object lifecycle management:** caches, messages, and files each maintain their own reference and eviction state, and those states easily fragment across business frameworks, cache layers, and transport layers
 - **Fragmented observability pipelines:** cache hits, transport paths, and object materialization are scattered across separate systems, so performance debugging becomes an exercise in stitching clues together from multiple metric sets
 
-Fluxon is designed around these problems. It separates data-plane resources, object lifecycles, cross-node transport, and business integration into explicit abstractions, then governs them on one unified storage and transport foundation so more system budget goes to model computation instead of data-plane assembly and movement. Built on that unified Rust-based storage and transport foundation, Fluxon exposes three standardized interfaces that target the core bottlenecks in AI systems:
 
-- **KV/RPC (Unified key-value and RPC)**: Breaks data silos and enables efficient cross-process, cross-node reuse of inference-side `KV Cache` and `latent cache`
-- **MQ (Elastic message queue)**: Decouples system dependencies and supports elastic message transport across heterogeneous resource pools
-- **FS (`S3`-compatible file, object, and cache acceleration system)**: Unifies multi-form storage so one system can cache key-value, file, and object data, while supporting remote access, `S3` forwarding, and large-scale cross-cluster migration for AI data and model files
 
 ![](./pics/fluxon架构图20260423.png)
-
-<a id="contents"></a>
-
-## 🧭 Contents
-
-- [Foundation Capabilities](#foundation-capabilities)
-- [Interface Capabilities](#interface-capabilities)
-- [Benchmark](#benchmark)
-- [Runtime Requirements](#runtime-requirements)
-- [Quick Start](#quick-start)
-- [Repository Structure](#repository-structure)
-- [Contributing](#contributing)
-- [Contributors](#contributors)
-- [Acknowledgements](#acknowledgements)
-- [License](#license)
-- [Stargazers over time](#stargazers-over-time)
 
 <a id="foundation-capabilities"></a>
 
@@ -107,34 +164,6 @@ Fluxon FS is a high-performance, S3-compatible file and object cache for AI data
 - Specialized optimization for small-file / large-file reads and writes: optimizes concurrency and transport paths by file granularity and read / write path to improve bandwidth utilization and overall throughput
 - Large-scale cross-cluster migration: supports `PB`-scale data migration and keeps caching, transport, and failure recovery in one unified path
 
-<a id="benchmark"></a>
-
-## 📊 Benchmark
-
-The benchmark section mainly covers the `RPC`, `KV`, and `FS` data planes, and the related scripts and configurations are primarily under `fluxon_test_stack/`.
-
-### Fluxon RPC Benchmark
-
-The RPC benchmark mainly shows call latency and throughput across different message sizes and concurrency levels, to observe the stability and tail-latency behavior of the service-to-service call path.
-
-![](./pics/fluxon_rpc_bench.png)
-
-### Fluxon KV Benchmark
-
-The `TCP Benchmark` shows that Fluxon outperforms `MooncakeStore` and `Redis` on the two read-heavy workloads `Read-affinity` and `Read-Zipf`. For `put_only`, the current primary constraint remains the inflight metadata deduplication path rather than `Payload` transport.
-
-![](./pics/kv_benchmark_chart.png)
-
-### Fluxon FS Benchmark
-
-The benchmark results show that small-file reads and large-file writes already outperform `Alluxio`, large-file read performance is broadly on par, and small-file write performance still has further room to improve.
-
-![](./pics/fs_benchmark_chart.png)
-
-### Fluxon MQ Benchmark
-
-`MQ` currently focuses mainly on scenario problems and data-plane design. The automated runtime entrypoints are `test_runner.py` and `fluxon_test_stack/`.
-
 <a id="runtime-requirements"></a>
 
 ## 🧰 Runtime Requirements
@@ -160,11 +189,19 @@ The benchmark results show that small-file reads and large-file writes already o
 
 Quick Start is the shortest path to try Fluxon. For formal installation, deployment, and operations, see [User Docs](https://tele-ai.github.io/Fluxon/user_doc/).
 
+For a Linux x86_64 Python process that connects to an existing service plane, install the public distribution directly:
+
+```bash
+python3 -m pip install fluxon-py
+```
+
+The distribution installs the `fluxon_py` import package. Service-plane runtimes and the complete release bundle remain available from GitHub Releases.
+
 ### KV Quick Start
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.2 \
+  hanbaoaaa/fluxon_quick_start:0.2.4 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -197,7 +234,7 @@ Related interface docs:
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.2 \
+  hanbaoaaa/fluxon_quick_start:0.2.4 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -213,7 +250,7 @@ put world
 exit
 ```
 
-The background `Consumer` keeps printing received messages.  
+The background `Consumer` keeps printing received messages.
 Startup also prints the `MQ Web UI` address.
 
 Expected runtime view:
@@ -228,7 +265,7 @@ Related interface docs:
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.2 \
+  hanbaoaaa/fluxon_quick_start:0.2.4 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \
@@ -248,68 +285,7 @@ ui
 `FS Quick Start` additionally prints:
 
 - `fs_s3` endpoint
-- `Basic Auth` entry; `0.2.2` uses `admin / admin` only as first-time setup credentials
-
-A new workdir requires both the username and password to be changed on the first sign-in, and S3
-access remains disabled until that succeeds. The old `admin / admin` credentials become invalid
-immediately after the update. Allow about two seconds for the updated permissions to reach the FS
-agent before the first S3 request.
-
-The PyPI package can start the directory-backed S3 service without a source checkout:
-
-```bash
-python3 -m pip install --upgrade fluxon-py
-```
-
-Create `serve_s3_single_node.py`:
-
-```python
-from fluxon_py.quick_start import serve_s3_single_node
-
-kv_master_config = {
-    "etcd_endpoints": ["127.0.0.1:22379"],
-    "cluster_name": "fluxon_s3",
-    "instance_key": "fluxon_s3_master",
-    "port": 25100,
-    "log_dir": "/absolute/path/to/state/kv-master/log",
-    "monitoring": {
-        "prometheus_base_url": "http://127.0.0.1:24000/v1/prometheus",
-        "prom_remote_write_url": ["http://127.0.0.1:24000/v1/prometheus/write"],
-        "otlp_log_api": {
-            "otlp_endpoint": "http://127.0.0.1:24000/v1/otlp/v1/logs",
-            "db_name": "public",
-            "table_name": "fluxon_logs",
-        },
-    },
-}
-kv_owner_config = {
-    "instance_key": "fluxon_s3_owner",
-    "contribute_to_cluster_pool_size": {"dram": 1073741824, "vram": {}},
-    "fluxonkv_spec": {
-        "etcd_addresses": ["127.0.0.1:22379"],
-        "cluster_name": "fluxon_s3",
-        "share_mem_path": "/dev/shm/fluxon-s3",
-        "sub_cluster": "default",
-        "large_file_paths": ["/absolute/path/to/state/kv-owner/large"],
-    },
-}
-serve_s3_single_node(
-    "/absolute/path/to/data",
-    "/absolute/path/to/state",
-    kv_master_config=kv_master_config,
-    kv_owner_config=kv_owner_config,
-    export_name="local-data",
-)
-```
-
-`serve_s3_single_node` passes both dictionaries to the canonical KV runtime starters without introducing
-another KV process wrapper. The name makes its single-node scope explicit. The shared-memory root is
-separate and rebuildable; ensure it has enough capacity. `export_name` is also the S3 bucket name;
-omit it to use `quick-start-export`.
-
-```bash
-python3 serve_s3_single_node.py
-```
+- `Basic Auth` entry; the default username / password is `admin / admin`
 
 Expected runtime view:
 
@@ -346,14 +322,23 @@ Contributions are welcome. Before you start, please read the developer docs on G
 - [Developer - 2 - Package middleware and images](https://tele-ai.github.io/Fluxon/dev_doc/Developer---2---Package-Middleware-and-Images/)
 - [Developer - 3 - Documentation Writing Rules](https://tele-ai.github.io/Fluxon/dev_doc/Developer---3---Documentation-Writing-Rules/)
 - [Developer - 4 - Publish a release](https://tele-ai.github.io/Fluxon/dev_doc/Developer---4---Publish-a-Release/)
+- [Developer - 5 - Technical Documentation Copy Editing](https://tele-ai.github.io/Fluxon/dev_doc/Developer---5---Technical-Documentation-Copy-Editing/)
+- [Developer - 6 - Code Review Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---6---Code-Review-Guidelines/)
+- [Developer - 7 - Event Subscription and Full Snapshot Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---7---Event-Subscription-and-Full-Snapshot-Guidelines/)
+- [Developer - 8 - Data Structure and Index Design Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---8---Data-Structure-and-Index-Design-Guidelines/)
+- [Developer - 9 - Test Extension Configuration](https://tele-ai.github.io/Fluxon/dev_doc/Developer---9---Test-Extension-Configuration/)
 
 <a id="contributors"></a>
 
 ## 👥 Contributors
 
-<a href="https://github.com/Tele-AI/Fluxon/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Tele-AI/Fluxon" />
-</a>
+<div style="display: flex; align-items: flex-end; gap: 8px;">
+  <a href="https://github.com/Tele-AI/Fluxon/graphs/contributors"><img src="https://contrib.rocks/image?repo=Tele-AI/Fluxon" /></a>
+  <span style="display: inline-flex; align-items: flex-end; gap: 0;">
+    <a href="https://github.com/kaimary"><img src="https://github.com/kaimary.png?size=128" width="64" height="64" alt="kaimary" style="border-radius: 50%;" /></a>
+    <span style="transform: translate(-4px, -4px);">（*<strong>Project Lead</strong>）</span>
+  </span>
+</div>
 
 Some earlier contribution records are no longer fully reflected in the current commit history. Historical highlights:
 

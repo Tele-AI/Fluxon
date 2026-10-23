@@ -147,11 +147,8 @@ pub fn parse_etcd_produce_offset_key(key: &str) -> Option<String> {
 ///   The count comes from the master-side derived prefix index, so it is
 ///   intended for aggregate backpressure rather than immediate visibility
 ///   confirmation for a just-written message.
-/// - In standalone MPSC mode we keep the historical layout for
-///   backward compatibility.
+/// - Standalone MPSC uses its established layout.
 ///
-/// Use this function in preference to the legacy `backend_message_key`
-/// to avoid ambiguity and keep the rate-limit semantics explicit.
 pub fn backend_message_key_with_category(
     chan_id: i64,
     producer_idx: &str,
@@ -180,11 +177,6 @@ pub fn backend_message_key_with_category(
             )
         }
     }
-}
-
-/// Backward-compatible wrapper when category is not available.
-pub fn backend_message_key(chan_id: i64, producer_idx: &str, msg_id: i64) -> String {
-    backend_message_key_with_category(chan_id, producer_idx, msg_id, &MqCategory::Mpsc)
 }
 
 /// Key for producer weight used by smooth weighted round-robin.

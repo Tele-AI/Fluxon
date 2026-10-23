@@ -250,7 +250,8 @@ struct ClosedClusterManagerRuntime {
 
 impl ClosedClusterManagerRuntime {
     async fn construct(arg: ClusterManagerNewArg) -> crate::ClusterResult<Self> {
-        let handle = construct_cluster_manager_handle(arg.clone())
+        let etcd_endpoints = arg.etcd_endpoints.clone();
+        let handle = construct_cluster_manager_handle(arg)
             .await
             .map_err(cluster_manager_closed_sdk_error)?;
         let self_member_id = closed_cluster_manager_string_call(
@@ -282,7 +283,7 @@ impl ClosedClusterManagerRuntime {
         let (event_tx, _) = abroadcast::channel(100);
         let (self_rdma_resolved_tx, _) = watch::channel(current_rdma);
         let transfer_link_p2p_snapshot_source = CommuTransferLinkP2pSnapshotSource::new(
-            connect_transfer_link_client(&arg.etcd_endpoints).await?,
+            connect_transfer_link_client(&etcd_endpoints).await?,
             format!("/{}/transfer_link/p2p", cluster_name),
         );
         // ClosedRuntimeClusterManagerCall::GetMembers reflects the closed facade's
@@ -290,14 +291,14 @@ impl ClosedClusterManagerRuntime {
         // has missed a join.  Keep an independent etcd client for an authoritative
         // membership snapshot instead.
         let authoritative_member_client = Arc::new(Mutex::new(
-            connect_transfer_link_client(&arg.etcd_endpoints).await?,
+            connect_transfer_link_client(&etcd_endpoints).await?,
         ));
         let transfer_link_writer = make_runtime_transfer_link_writer(handle);
         let runtime = Self {
             handle,
             self_member_id,
             cluster_name,
-            etcd_endpoints: arg.etcd_endpoints,
+            etcd_endpoints,
             observe_handle: std::sync::OnceLock::new(),
             ipc_bandwidth_attributor_handle: std::sync::OnceLock::new(),
             self_info: Arc::new(RwLock::new(self_info)),

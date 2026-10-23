@@ -79,7 +79,7 @@ class TestTestRunnerUiContract(unittest.TestCase):
                             deadline=160.0,
                         )
         self.assertEqual(offset, 0)
-        self.assertEqual(next_heartbeat, 115.0)
+        self.assertEqual(next_heartbeat, 160.0)
         self.assertIn(
             "[1970-01-01 00:01:40 UTC] [CI wait exit_code] waiting for ci_runner progress...",
             buf.getvalue(),
@@ -100,11 +100,57 @@ class TestTestRunnerUiContract(unittest.TestCase):
                             deadline=160.0,
                         )
         self.assertEqual(offset, 12)
-        self.assertEqual(next_heartbeat, 115.0)
+        self.assertEqual(next_heartbeat, 160.0)
         self.assertEqual(
             buf.getvalue(),
             "[1970-01-01 00:01:40 UTC] a\n[1970-01-01 00:01:40 UTC] b\n",
         )
+
+    def test_print_ci_wait_status_snapshot_includes_status_and_file_states(self) -> None:
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td)
+            current_state = _RUNNER._ObservedFileState(size=12, mtime_ns=34)
+            with mock.patch.object(_RUNNER.time, "time", return_value=100.0):
+                with mock.patch.object(_RUNNER.sys, "stdout", buf):
+                    _RUNNER._print_ci_wait_status_snapshot(
+                        run_dir=run_dir,
+                        status={"ok": True, "running": True, "detail": "ignored"},
+                        baseline_state=None,
+                        current_state=current_state,
+                        last_status_err="transient",
+                    )
+
+        text = buf.getvalue()
+        self.assertIn("[CI wait exit_code] status_snapshot", text)
+        self.assertIn('"ok": true', text)
+        self.assertIn('"running": true', text)
+        self.assertIn("baseline_exit_code_state=missing", text)
+        self.assertIn("current_exit_code_state=size=12 mtime_ns=34", text)
+        self.assertIn("last_status_err=transient", text)
+
+    def test_controller_transient_retry_log_is_throttled_per_url(self) -> None:
+        buf = io.StringIO()
+        with mock.patch.object(_RUNNER.time, "time", side_effect=[100.0, 120.0, 161.0]):
+            with mock.patch.object(_RUNNER.sys, "stdout", buf):
+                with mock.patch.object(_RUNNER, "_CONTROLLER_TRANSIENT_LOG_NEXT_AT", {}):
+                    _RUNNER._print_controller_transient_retry(
+                        source="unit",
+                        url="http://controller/api/wait_delete_apply",
+                        detail="status=502",
+                    )
+                    _RUNNER._print_controller_transient_retry(
+                        source="unit",
+                        url="http://controller/api/wait_delete_apply",
+                        detail="status=502",
+                    )
+                    _RUNNER._print_controller_transient_retry(
+                        source="unit",
+                        url="http://controller/api/wait_delete_apply",
+                        detail="status=502",
+                    )
+
+        self.assertEqual(buf.getvalue().count("transient controller error; retrying"), 2)
 
     def test_runner_stdio_mirror_enabled_only_for_github_actions(self) -> None:
         with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}, clear=True):
@@ -536,7 +582,15 @@ class TestTestRunnerUiContract(unittest.TestCase):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.bind(("127.0.0.1", 0))
                 port = int(sock.getsockname()[1])
-            with mock.patch.object(_RUNNER, "_ui_discovery_roots", return_value=[service_root.resolve()]):
+            with mock.patch.object(
+                _RUNNER,
+                "_ui_history_list_recent_workdirs",
+                return_value=[],
+            ), mock.patch.object(
+                _RUNNER,
+                "_ui_discovery_roots",
+                return_value=[service_root.resolve()],
+            ):
                 server_thread = threading.Thread(
                     target=_RUNNER._serve_test_runner_ui,
                     kwargs={

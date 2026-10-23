@@ -3,9 +3,11 @@ use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
+use fluxon_framework_compiled::shutdown::{ShutdownPoller, ShutdownWaiter, ViewShutdownExt};
 use tokio::sync::mpsc;
 
 use fluxon_fs_core::config::{FluxonFsCacheControllerConfig, FluxonFsRequestIdentity};
+use fluxon_util::run_async_from_sync::spawn_blocking_allow_sync_async_bridge;
 
 /// Key of a single cacheable piece of an S3-gateway object. See design §4.1.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -71,6 +73,8 @@ pub struct CacheControllerStatsSnapshot {
 
 /// The controller. One instance per coordinator member (at most one per host).
 pub struct CacheController {
+    _lifecycle: crate::Framework,
+    shutdown_poller: ShutdownPoller,
     inflight: Arc<DashMap<PieceKey, ()>>,
     stats: Arc<DashMap<PieceKey, Arc<Stats>>>,
     stage_queue_tx: mpsc::Sender<StageTask>,
@@ -93,7 +97,7 @@ impl CacheController {
         config: FluxonFsCacheControllerConfig,
         stage_piece_fn: StagePieceFn,
         stage_piece_range_fn: StagePieceRangeFn,
-        rt_handle: tokio::runtime::Handle,
+        lifecycle: crate::Framework,
     ) -> Arc<Self> {
         let (stage_queue_tx, stage_queue_rx) =
             mpsc::channel::<StageTask>(config.stage_queue_capacity);
@@ -103,8 +107,11 @@ impl CacheController {
         let stage_success_count = Arc::new(AtomicU64::new(0));
         let stage_fail_count = Arc::new(AtomicU64::new(0));
         let stage_panic_count = Arc::new(AtomicU64::new(0));
+        let shutdown_poller = lifecycle.register_shutdown_poller();
 
         let ctrl = Arc::new(Self {
+            _lifecycle: lifecycle.clone(),
+            shutdown_poller: shutdown_poller.clone(),
             inflight: inflight.clone(),
             stats: stats.clone(),
             stage_queue_tx,
@@ -128,39 +135,47 @@ impl CacheController {
             let rx = shared_rx.clone();
             let inflight_clone = inflight.clone();
             let fn_clone = stage_piece_fn.clone();
-            let rt = rt_handle.clone();
             let queue_depth_clone = queue_depth.clone();
             let stage_success_count_clone = stage_success_count.clone();
             let stage_fail_count_clone = stage_fail_count.clone();
             let stage_panic_count_clone = stage_panic_count.clone();
             let stage_piece_range_fn_clone = stage_piece_range_fn.clone();
             let max_coalesced_piece_count = config.max_coalesced_piece_count.max(1);
-            rt_handle.spawn(async move {
-                stage_worker_loop(
-                    worker_id,
-                    rx,
-                    inflight_clone,
-                    fn_clone,
-                    stage_piece_range_fn_clone,
-                    rt,
-                    queue_depth_clone,
-                    stage_success_count_clone,
-                    stage_fail_count_clone,
-                    stage_panic_count_clone,
-                    max_coalesced_piece_count,
-                )
-                .await;
-            });
+            let shutdown_waiter = lifecycle.register_shutdown_waiter();
+            crate::framework::spawn_fs_task(
+                &lifecycle,
+                format!("cache_stage_worker_{worker_id}"),
+                async move {
+                    stage_worker_loop(
+                        worker_id,
+                        rx,
+                        inflight_clone,
+                        fn_clone,
+                        stage_piece_range_fn_clone,
+                        queue_depth_clone,
+                        stage_success_count_clone,
+                        stage_fail_count_clone,
+                        stage_panic_count_clone,
+                        max_coalesced_piece_count,
+                        shutdown_waiter,
+                    )
+                    .await;
+                },
+            );
         }
 
         let stats_gc = stats.clone();
         let stats_gc_interval = Duration::from_secs(config.stats_gc_scan_interval_secs.max(1));
         let stats_gc_max_age_ms = (config.stats_gc_max_entry_age_secs as i64) * 1000;
-        rt_handle.spawn(async move {
+        let mut shutdown_waiter = lifecycle.register_shutdown_waiter();
+        crate::framework::spawn_fs_task(&lifecycle, "cache_stats_gc", async move {
             let mut ticker = tokio::time::interval(stats_gc_interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = shutdown_waiter.wait() => return,
+                    _ = ticker.tick() => {}
+                }
                 let now = now_ms();
                 stats_gc.retain(|_, s| {
                     now - s.last_access_ms.load(Ordering::Relaxed) < stats_gc_max_age_ms
@@ -184,6 +199,11 @@ impl CacheController {
         key: PieceKey,
         identity: Option<FluxonFsRequestIdentity>,
     ) -> SuggestOutcome {
+        if !self.shutdown_poller.is_running() {
+            self.suggest_admission_rejected_count
+                .fetch_add(1, Ordering::Relaxed);
+            return SuggestOutcome::AdmissionRejected;
+        }
         // 1. touch stats entry for GC/accounting.
         let entry = self
             .stats
@@ -280,12 +300,12 @@ async fn stage_worker_loop(
     inflight: Arc<DashMap<PieceKey, ()>>,
     stage_piece_fn: StagePieceFn,
     stage_piece_range_fn: StagePieceRangeFn,
-    rt_handle: tokio::runtime::Handle,
     queue_depth: Arc<AtomicUsize>,
     stage_success_count: Arc<AtomicU64>,
     stage_fail_count: Arc<AtomicU64>,
     stage_panic_count: Arc<AtomicU64>,
     max_coalesced_piece_count: usize,
+    mut shutdown_waiter: ShutdownWaiter,
 ) {
     let mut pending_task: Option<StageTask> = None;
     loop {
@@ -293,8 +313,14 @@ async fn stage_worker_loop(
         let (task, task_from_queue) = if let Some(t) = pending_task.take() {
             (t, false)
         } else {
-            let mut guard = rx.lock().await;
-            let t = match guard.recv().await {
+            let mut guard = tokio::select! {
+                _ = shutdown_waiter.wait() => return,
+                guard = rx.lock() => guard,
+            };
+            let t = match tokio::select! {
+                _ = shutdown_waiter.wait() => return,
+                task = guard.recv() => task,
+            } {
                 Some(t) => t,
                 None => return, // sender dropped, nothing to do
             };
@@ -355,20 +381,18 @@ async fn stage_worker_loop(
         let identity_clone = task.identity.clone();
         let fn_clone = stage_piece_fn.clone();
         let fn_range_clone = stage_piece_range_fn.clone();
-        let result = rt_handle
-            .spawn_blocking(move || {
-                if staged_piece_count_clone > 1 {
-                    stage_piece_range_fn_invoke(
-                        &fn_range_clone,
-                        &key_clone,
-                        staged_piece_count_clone,
-                        identity_clone.as_ref(),
-                    )
-                } else {
-                    stage_piece_fn_invoke(&fn_clone, &key_clone, identity_clone.as_ref())
-                }
-            })
-            .await;
+        let result = spawn_blocking_allow_sync_async_bridge(move || {
+            if staged_piece_count_clone > 1 {
+                fn_range_clone(
+                    &key_clone,
+                    staged_piece_count_clone,
+                    identity_clone.as_ref(),
+                )
+            } else {
+                fn_clone(&key_clone, identity_clone.as_ref())
+            }
+        })
+        .await;
 
         // Always release inflight.
         for piece_key in &staged_piece_keys {
@@ -401,23 +425,6 @@ async fn stage_worker_loop(
     }
 }
 
-fn stage_piece_fn_invoke(
-    f: &StagePieceFn,
-    key: &PieceKey,
-    identity: Option<&FluxonFsRequestIdentity>,
-) -> Result<(), String> {
-    f(key, identity)
-}
-
-fn stage_piece_range_fn_invoke(
-    f: &StagePieceRangeFn,
-    key: &PieceKey,
-    piece_count: usize,
-    identity: Option<&FluxonFsRequestIdentity>,
-) -> Result<(), String> {
-    f(key, piece_count, identity)
-}
-
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -429,6 +436,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxon_util::run_async_from_sync::SyncAsyncBridge;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc;
     use std::sync::{Condvar, Mutex};
@@ -459,7 +467,7 @@ mod tests {
             FluxonFsCacheControllerConfig::default(),
             stage_piece_fn,
             stage_piece_range_fn,
-            tokio::runtime::Handle::current(),
+            crate::new_fs_framework("cache-controller-test"),
         );
 
         let outcome = ctrl.handle_suggest(sample_key(), None);
@@ -481,6 +489,54 @@ mod tests {
         assert_eq!(snapshot.suggest_enqueued_count, 1);
         assert_eq!(snapshot.stage_success_count, 1);
         assert_eq!(snapshot.queue_depth, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stage_worker_allows_sync_async_bridge_in_blocking_callback() {
+        let handle = tokio::runtime::Handle::current();
+        let (stage_result_tx, stage_result_rx) = mpsc::sync_channel(1);
+        let stage_piece_fn: StagePieceFn = Arc::new(move |_key, _identity| {
+            let value = handle
+                .run_async_from_sync(async { 7_usize })
+                .map_err(|err| err.to_string())?;
+            let _ = stage_result_tx.send(value);
+            Ok(())
+        });
+        let stage_piece_range_fn: StagePieceRangeFn =
+            Arc::new(move |_key, _count, _identity| Ok(()));
+        let ctrl = CacheController::start(
+            FluxonFsCacheControllerConfig {
+                stage_worker_count: 1,
+                ..FluxonFsCacheControllerConfig::default()
+            },
+            stage_piece_fn,
+            stage_piece_range_fn,
+            crate::new_fs_framework("cache-controller-test"),
+        );
+
+        assert_eq!(
+            ctrl.handle_suggest(sample_key(), None),
+            SuggestOutcome::Enqueued
+        );
+        assert_eq!(
+            stage_result_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("stage worker did not run within 5s"),
+            7
+        );
+
+        for _ in 0..50 {
+            let snapshot = ctrl.stats_snapshot();
+            if snapshot.stage_success_count == 1 && snapshot.stage_fail_count == 0 {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        let snapshot = ctrl.stats_snapshot();
+        assert_eq!(snapshot.stage_success_count, 1);
+        assert_eq!(snapshot.stage_fail_count, 0);
+        assert_eq!(snapshot.stage_panic_count, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -508,7 +564,7 @@ mod tests {
             FluxonFsCacheControllerConfig::default(),
             stage_piece_fn,
             stage_piece_range_fn,
-            tokio::runtime::Handle::current(),
+            crate::new_fs_framework("cache-controller-test"),
         );
 
         let key = sample_key();
@@ -573,7 +629,7 @@ mod tests {
             },
             stage_piece_fn,
             stage_piece_range_fn,
-            tokio::runtime::Handle::current(),
+            crate::new_fs_framework("cache-controller-test"),
         );
 
         let key0 = sample_key();
@@ -612,5 +668,72 @@ mod tests {
         let snapshot = ctrl.stats_snapshot();
         assert_eq!(snapshot.suggest_enqueued_count, 2);
         assert_eq!(snapshot.suggest_queue_dropped_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn framework_shutdown_closes_admission_and_joins_stage_worker() {
+        let (stage_started_tx, stage_started_rx) = mpsc::sync_channel(1);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let callback_gate = gate.clone();
+        let stage_piece_fn: StagePieceFn = Arc::new(move |_key, _identity| {
+            let _ = stage_started_tx.send(());
+            let (lock, cv) = &*callback_gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cv.wait(released).unwrap();
+            }
+            Ok(())
+        });
+        let stage_piece_range_fn: StagePieceRangeFn =
+            Arc::new(move |_key, _count, _identity| Ok(()));
+        let framework = crate::new_fs_framework("cache-controller-shutdown-test");
+        let ctrl = CacheController::start(
+            FluxonFsCacheControllerConfig {
+                stage_worker_count: 1,
+                ..FluxonFsCacheControllerConfig::default()
+            },
+            stage_piece_fn,
+            stage_piece_range_fn,
+            framework.clone(),
+        );
+
+        assert_eq!(
+            ctrl.handle_suggest(sample_key(), None),
+            SuggestOutcome::Enqueued
+        );
+        stage_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("stage worker did not start within 5s");
+
+        framework.request_shutdown();
+        assert_eq!(
+            ctrl.handle_suggest(
+                PieceKey {
+                    piece_idx: 1,
+                    ..sample_key()
+                },
+                None,
+            ),
+            SuggestOutcome::AdmissionRejected
+        );
+
+        let shutdown_framework = framework.clone();
+        let shutdown = tokio::spawn(async move { shutdown_framework.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "framework shutdown must remain behind the running worker barrier"
+        );
+
+        {
+            let (lock, cv) = &*gate;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("framework shutdown timed out")
+            .expect("framework shutdown task failed")
+            .expect("framework shutdown returned an error");
     }
 }

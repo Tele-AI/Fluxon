@@ -193,7 +193,7 @@ test_runner_ui:
 
 bootstrap_phases:
   - mode: fixed_bare
-    node: infra44-ThinkStation-PX
+    node: example-node-a
     services: [etcd, greptime, tikv_pd, tikv]
 ```
 
@@ -208,7 +208,7 @@ retention:
 repos:
   - addr: git@github.com:Tele-AI/fluxon.git
     follow:
-      - branch: big_step2
+      - branch: example-feature-branch
         run:
           name_prefix: fluxon_ci
           commands:
@@ -260,8 +260,8 @@ instance_key: my-owner-1
 
 # 只要 dram > 0，就进入 owner 分支
 contribute_to_cluster_pool_size:
-  # 容量按 16 MiB 对齐
-  dram: 1677721600
+  # 容量解析后向下对齐到 16 MiB
+  dram: "1.5GB"
   vram: {}
 
 fluxonkv_spec:
@@ -281,6 +281,11 @@ fluxonkv_spec:
   # 日志和 cache 等子目录都从固定相对位置派生
   large_file_paths:
     - /var/lib/fluxon/large
+
+  # 可选；和 large_file_paths 长度一致，限制每个 KV SSD backing tier root 的 payload 用量
+  # 缺省或 null 时不启用 KV SSD
+  large_limit_size:
+    - "4GB"
 
   # 可选
   p2p_listen_port: 31001
@@ -315,10 +320,13 @@ fluxonkv_spec:
 
 - `monitoring` 在 master 上必填。
 - `master_ui` 依赖 `monitoring`，并作为嵌入式 monitor HTTP 服务启动。
-- `contribute_to_cluster_pool_size` 里的容量都按 16 MiB 对齐；`dram = 0` 但 `vram` 非 0 会被拒绝，避免半 owner 半 external 的模糊状态。
+- size 字段可以写整数 bytes，也可以写 `"512.9B"`、`"1.5GB"` 这类字符串；`MB/GB` 按二进制单位解析，等价于 `MiB/GiB`，小数结果按 bytes 向下截断。
+- `contribute_to_cluster_pool_size` 里的容量解析后都向下对齐到 16 MiB；`dram = 0` 但 `vram` 非 0 会被拒绝，避免半 owner 半 external 的模糊状态。
 - owner 模式要求 `contribute_to_cluster_pool_size.dram > 0`，并且必须显式提供 `etcd_addresses`、`sub_cluster`、`large_file_paths`。
+- `fluxonkv_spec.large_limit_size` 只允许 owner 配置；出现时必须和 `large_file_paths` 长度一致，每项解析后必须大于或等于 512 bytes。
 - zero-contribution `external` 模式禁止再写 owner 专属字段；运行时会从 owner `shared.json` 补齐这部分信息。
 - `share_mem_path` 会拼成 `cluster_name` 作用域路径；`mmap.file`、`shared.json` 和 peer metadata 都位于这个 cluster-scoped 目录下。
+- `network.tcp_reactor_mode` 控制当前进程的 TCP reactor 等待方式，可选 `busy_poll` / `event_driven`；zero-contribution external 默认 `event_driven`，owner 和 master 默认 `busy_poll`。同一进程内全部 `tcp_thread` P2P 连接共用该值，通信对端的设置不受影响。
 - `test_spec_config.side_transfer_role = worker` 不是第三套 YAML，而是 zero-contribution client 的子分支；它强制 `TransferEngineType::P2p`，并关闭 transfer RPC fast path。
 - `test_spec_config.side_transfer_worker_count` 只允许出现在 owner 配置里，用来控制 owner 拉起的 worker 数量。
 
@@ -438,40 +446,43 @@ http_listen_addr: 0.0.0.0:18080
 
 ### 5.4 共享传输契约
 
-`fluxon_commu_contract` 提供多个被 KV / FS 共同复用的基础类型：
-
-最常见的是 `NetworkConfig` 这块 YAML：
+`fluxon_commu_contract` 提供多个被 KV / FS 共同复用的基础类型。KV 公开 YAML 使用一个
+`network` 配置块，同时承载成员网络策略和传输调优：
 
 ```yaml
 network:
   subnet_whitelist:
     - 127.0.0.0/8
-    - 10.0.0.0/24
+    - 192.0.2.0/24
   primary_ip_to_extended_ips:
-    10.0.0.10:
-      - 10.0.0.11
-      - 10.0.0.12
+    192.0.2.10:
+      - 192.0.2.11
+      - 192.0.2.12
+  rdma_device_names: mlx5_0
+  tcp_reactor_mode: event_driven
 ```
 
-以及协议/传输分支这两个输入：
+`subnet_whitelist` 和 `primary_ip_to_extended_ips` 只允许 master 使用；`rdma_device_names` 和
+`tcp_reactor_mode` 可用于 master、owner 和 external。省略 `tcp_reactor_mode` 时，external
+默认 `event_driven`，owner 和 master 默认 `busy_poll`。公开 YAML 不再提供 `protocol` 配置块。
 
-```yaml
-protocol:
-  protocol_type: rdma
-```
+协议选择按作用域收敛到下面三条路径：
 
-```yaml
-protocol:
-  protocol_type: tcp
-```
+| 作用域 | 配置入口 | 协议规则 |
+| --- | --- | --- |
+| 生产 owner / external / master | 无 | 使用当前默认（RDMA） |
+| 测试与 benchmark | `test_spec_config.protocol_type` | 显式选择 `tcp` / `rdma`；省略时保持当前默认 |
+| 内部 side-transfer worker | 无 | 根据 worker 角色推导 TCP |
 
-这里对应的稳定枚举取值是：
+完整测试字段和组合约束见 [开发者 - 9 - 测试扩展配置](<../dev_doc/开发者 - 9 - 测试扩展配置.md>)。
+
+内部通信契约仍保留有限枚举：
 
 - `ProtocolType`: `tcp` / `rdma`
 - `TransferEngineType`: `Closed` / `P2p`
 - `TransferBackendActivationMode`: `RdmaControl` / `TcpTestBypassRdmaControl` / `TestForceEnableBypassRdmaControl`
 
-这些类型是共享契约，不属于某一个子系统的私有配置。
+这些类型由 KV / FS 共用，但不等同于用户可配置的分支集合。
 
 ## 6. 配置之间的关系
 

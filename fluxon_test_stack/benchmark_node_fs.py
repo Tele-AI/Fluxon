@@ -239,30 +239,6 @@ def _fs_backend_kind_from_test_config(test_config: Mapping[str, Any]) -> str:
     return backend_kind
 
 
-def _build_operation_result(
-    operation_result_cls: Any,
-    *,
-    success: bool,
-    latency_us: float,
-    operation_type: str,
-    key: str,
-    data_size: int,
-    inflight_at_start: int,
-    outcome_kind: Any,
-    error_msg: Optional[str],
-) -> Any:
-    return operation_result_cls(
-        success=success,
-        latency_us=latency_us,
-        operation_type=operation_type,
-        key=key,
-        data_size=data_size,
-        inflight_at_start=inflight_at_start,
-        outcome_kind=outcome_kind,
-        error_msg=error_msg,
-    )
-
-
 def _ensure_fs_runtime(self: Any, runtime_cfg: FSRuntimeConfig) -> FSNodeRuntimeState:
     if not isinstance(self.instance_key, str) or not self.instance_key.strip():
         raise RuntimeError("FS benchmark requires BenchmarkNode.instance_key")
@@ -481,8 +457,7 @@ def _run_fs_client_worker(
                     op_idx=op_idx,
                 )
             latency_us = (time.time() - start_ts) * 1_000_000.0
-            result = _build_operation_result(
-                operation_result_cls,
+            result = operation_result_cls(
                 success=True,
                 latency_us=latency_us,
                 operation_type=operation_type,
@@ -493,8 +468,7 @@ def _run_fs_client_worker(
                 error_msg=None,
             )
         except Exception as exc:  # noqa: BLE001
-            result = _build_operation_result(
-                operation_result_cls,
+            result = operation_result_cls(
                 success=False,
                 latency_us=0.0,
                 operation_type=operation_type,

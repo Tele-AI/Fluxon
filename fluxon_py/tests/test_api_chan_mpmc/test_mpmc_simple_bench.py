@@ -68,12 +68,14 @@ from fluxon_py.tests.test_lib import (  # noqa: E402
     KV_SVC_TYPE,
     MOONCAKE_MASTER_SERVER_ADDRESS,
     MOONCAKE_METADATA_SERVER,
-    load_test_fluxon_cluster_name,
-    load_test_fluxon_share_mem_path,
     new_test_consumer,
     new_test_producer,
     pre_kill_existing_test_processes_by_script_name,
     setup_test_environment,
+)
+from setup_and_pack.utils.repo_config_utils import (  # noqa: E402
+    load_test_fluxon_cluster_name_from_test_config,
+    load_test_fluxon_share_mem_path_from_test_config,
 )
 
 
@@ -438,12 +440,15 @@ def _run_producer(args: argparse.Namespace) -> None:
                     return
                 shutdown_notified = True
                 logging.info(
-                    "[bench producer %s] caught %s, requesting shutdown...",
+                    "[bench producer %s] caught %s, closing...",
                     args.producer_id,
                     reason,
                 )
                 if producer is not None:
-                    producer.request_shutdown()
+                    _best_effort_close(
+                        producer,
+                        role=f"producer_{args.producer_id}",
+                    )
 
             restore_signal_listener = register_ctrlc_callback(
                 _on_ctrlc,
@@ -520,12 +525,15 @@ def _run_consumer(args: argparse.Namespace) -> None:
                     return
                 shutdown_notified = True
                 logging.info(
-                    "[bench consumer %s] caught %s, requesting shutdown...",
+                    "[bench consumer %s] caught %s, closing...",
                     args.consumer_id,
                     reason,
                 )
                 if consumer is not None:
-                    consumer.request_shutdown()
+                    _best_effort_close(
+                        consumer,
+                        role=f"consumer_{args.consumer_id}",
+                    )
 
             restore_signal_listener = register_ctrlc_callback(
                 _on_ctrlc,
@@ -761,7 +769,7 @@ def _new_store_config(
             share_mem_path=share_mem_path,
         )
         fluxon_spec: dict[str, Any] = {
-            "cluster_name": load_test_fluxon_cluster_name(),
+            "cluster_name": load_test_fluxon_cluster_name_from_test_config(),
             "share_mem_path": resolved_share_mem_path,
         }
         return FluxonKvClientConfig(
@@ -833,7 +841,7 @@ def _parse_shared_bundles(
     share_mem_paths_raw: str | None,
 ) -> tuple[SharedBundle, ...]:
     if share_mem_paths_raw is None:
-        return (load_test_fluxon_share_mem_path(),)
+        return (load_test_fluxon_share_mem_path_from_test_config(),)
     return _parse_csv_paths(raw=share_mem_paths_raw, arg_name="share-mem-paths")
 
 

@@ -156,6 +156,7 @@ def _wait_until_stopped(client: object) -> None:
         close_res = client.close()
         if not close_res.is_ok():
             raise RuntimeError(f"store close failed: {close_res.unwrap_error()}")
+        close_res.unwrap()
 
 
 def start_owner_kvclient_process(

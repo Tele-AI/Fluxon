@@ -39,8 +39,13 @@ import yaml
 
 RUNNER_REPO_ROOT = Path(__file__).resolve().parent.parent
 RUNNER_DEPLOYMENT_DIR = RUNNER_REPO_ROOT / "deployment"
+RUNNER_DEPLOYMENT_UTILS_DIR = RUNNER_DEPLOYMENT_DIR / "utils"
 RUNNER_TEMPLATE_DIR = (RUNNER_REPO_ROOT / "fluxon_test_stack" / "test_runner_templates").resolve()
+sys.path.insert(0, str(RUNNER_REPO_ROOT))
 sys.path.insert(0, str(RUNNER_DEPLOYMENT_DIR))
+sys.path.insert(0, str(RUNNER_DEPLOYMENT_UTILS_DIR))
+
+from setup_and_pack.package_contract import RELEASE_WHEEL_GLOB
 
 from benchmark_role_names import (
     KV_NODE_ROLE_SEED,
@@ -56,11 +61,11 @@ from top_attention_index_helper import (
     run_top_attention_entries,
     select_top_attention_entries,
 )
-from utils import log_shard
+import log_shard
 from test_runner_ci_runtime import (
     _assert_ci_runtime_python_abi as _assert_ci_runtime_python_abi_impl,
     _ci_runtime_python_abi as _ci_runtime_python_abi_impl,
-    _ci_runtime_python_executable as _ci_runtime_python_executable_impl,
+    _ci_runtime_python_executable,
     _create_ci_runtime_venv as _create_ci_runtime_venv_impl,
 )
 from test_runner_models import (
@@ -86,20 +91,16 @@ from test_runner_runtime_backend import (
     _finalize_test_stack_case_runtime as _finalize_test_stack_case_runtime_impl,
     _prepare_ci_case as _prepare_ci_case_impl,
     _prepare_test_stack_case as _prepare_test_stack_case_impl,
-    _require_ci_runner_exit_code_baseline as _require_ci_runner_exit_code_baseline_impl,
-    _require_test_stack_result_path as _require_test_stack_result_path_impl,
-    _require_test_stack_result_timeout as _require_test_stack_result_timeout_impl,
-    _test_stack_result_timeout_seconds as _test_stack_result_timeout_seconds_impl,
+    _test_stack_result_timeout_seconds,
     _wait_and_load_test_stack_benchmark_result_json as _wait_and_load_test_stack_benchmark_result_json_impl,
 )
 from test_runner_ui_runtime import (
-    _ci_log_prefix_lines as _ci_log_prefix_lines_impl,
-    _ci_log_timestamp_prefix as _ci_log_timestamp_prefix_impl,
-    _load_gitops_ctx_for_ui as _load_gitops_ctx_for_ui_impl,
+    _ci_log_prefix_lines,
+    _ci_log_timestamp_prefix,
     _redirect_process_stdio_to_log as _redirect_process_stdio_to_log_impl,
     _resolve_history_roots_cli_paths as _resolve_history_roots_cli_paths_impl,
     _resolve_repo_root_cli_path as _resolve_repo_root_cli_path_impl,
-    _runner_stdio_mirror_enabled as _runner_stdio_mirror_enabled_impl,
+    _runner_stdio_mirror_enabled,
     _start_runner_stdio_log_mirror as _start_runner_stdio_log_mirror_impl,
     run_ui_service as run_ui_service_impl,
 )
@@ -173,6 +174,9 @@ CI_OWNER_SHARED_BUNDLE_RELPATHS = ("services/share_mem/shared.json", "services/s
 CI_RUNNER_SHARED_BUNDLE_TIMEOUT_S = 600
 CI_RUNNER_READINESS_PROBE_DEADLINE_S = 120
 CI_RUNNER_EXIT_CODE_GRACE_TIMEOUT_S = 300
+CI_SUCCESS_RUNTIME_DATA_RELPATHS = ("services", "src", "venv")
+TEST_STACK_SUCCESS_RUNTIME_DATA_RELPATHS = ("__pycache__", "services", "test_stack_runtime")
+TEST_STACK_RUNTIME_NOFILE_LIMIT = 65536
 TEST_STACK_REMOTE_STAGE_SHARED_INCLUDE_RELPATHS = (
     "benchmark_config.py",
     "deployer_deploy.yaml",
@@ -201,6 +205,7 @@ CI_RUNTIME_LAYER_INSTANCE_IDS: Dict[str, Tuple[str, ...]] = {
 }
 CI_RUNTIME_INSTANCE_IDS = CI_CASE_RUNTIME_INSTANCE_IDS
 CONTROLLER_STATUS_TRANSIENT_HTTP_CODES = (502, 503, 504)
+CONTROLLER_REQUEST_MODE_DIRECT = "direct"
 CONTROLLER_REQUEST_MODE_SSH_EXEC_PER_REQUEST = "ssh_exec_per_request"
 # Controller requests during TEST_STACK teardown can fan out to many remote nodes and are prone to
 # short SSH/control-plane stalls. Keep each attempt bounded, but allow a wider retry window so
@@ -260,7 +265,7 @@ TEST_STACK_KV_OWNER_INSTANCE_ID_PREFIX = "kv_owner_"
 TEST_STACK_REDIS_INSTANCE_ID_PREFIX = "redis_node_"
 TEST_STACK_ALLUXIO_INSTANCE_ID_PREFIX = "alluxio_node_"
 TEST_STACK_MOONCAKE_MASTER_INSTANCE_ID = "mooncake_master"
-TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS = 4
+TEST_STACK_BENCHMARK_THREADS_PER_PROCESS_VALUES = (2, 4)
 # Owner-mode Fluxon KV configs in CI / TEST_STACK share the same canonical label.
 FLUXON_KV_OWNER_SUB_CLUSTER = "owner"
 
@@ -274,6 +279,14 @@ TEST_STACK_BACKENDS_ALLOWED = {
     TEST_STACK_BACKEND_ALLUXIO,
     TEST_STACK_BACKEND_MOONCAKE,
 }
+TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER = "DEDICATED_OWNER"
+TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS = "PER_BENCHMARK_PROCESS"
+TEST_STACK_MOONCAKE_STORAGE_MODES_ALLOWED = {
+    TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER,
+    TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS,
+}
+TEST_STACK_MOONCAKE_SEGMENT_ALIGNMENT_BYTES = 16 * 1024 * 1024
+TEST_STACK_MOONCAKE_SSD_LIMIT_ENV = "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES"
 
 TEST_STACK_COMPLETION_STATUS_SUCCESS = "SUCCESS"
 RUN_MODE_DEBUG_ONE_BY_ONE = "debug_one_by_one"
@@ -297,6 +310,12 @@ TEST_STACK_MODES_REQUIRE_KV_MASTER = (
     TEST_STACK_MODE_PY_FS,
     TEST_STACK_MODE_RPC,
 )
+
+# Local same-host MPMC runs can create hundreds of benchmark workers on one machine.
+# Keep the throttle implicit and bounded so normal multi-host suites do not gain a new config surface.
+TEST_STACK_LOCAL_NODE_START_THROTTLE_MIN_NODES = 64
+TEST_STACK_LOCAL_NODE_START_THROTTLE_SECONDS_PER_EXTRA_NODE = 0.6
+TEST_STACK_LOCAL_NODE_START_THROTTLE_MAX_SECONDS = 180.0
 
 
 def _test_stack_mode_requires_kv_master(mode: str) -> bool:
@@ -381,17 +400,30 @@ TEST_STACK_REQUEST_DISTRIBUTIONS_ALLOWED = {
     TEST_STACK_REQUEST_DISTRIBUTION_ZIPFIAN,
 }
 TEST_STACK_SCENE_KEY_AFFINITY_LOCALITY_RATIO = "affinity_locality_ratio"
+TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD = "keyspace_capacity_guard"
+TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY = "kv_bootstrap_concurrency"
+TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS = "kv_bootstrap_put_gap_ms"
+TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY = "kv_bootstrap_storage_full_policy"
+TEST_STACK_SCENE_KEY_KV_GET_OUTPUT = "kv_get_output"
+TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX = "kv_cuda_device_index"
+TEST_STACK_KV_BOOTSTRAP_STORAGE_FULL_POLICIES_ALLOWED = {"fail", "stop"}
+TEST_STACK_KV_GET_OUTPUTS_ALLOWED = {"holder", "bytes", "cuda"}
 TEST_STACK_BENCHMARK_KEY_AFFINITY_SLOT_COUNT = "affinity_slot_count"
+SCENE_ID_KV_DRAM_RESIDENT_ZIPF = "kv_dram_resident_zipf"
 SCENE_ID_KV_READ_HEAVY_AFFINITY = "kv_read_heavy_affinity"
+SCENE_ID_TCP_EVENT_DRIVEN_REACTOR_LIFECYCLE = "tcp_event_driven_reactor_lifecycle"
 SCENE_ENUMS_ALLOWED = {
     "bench_mq",
     "fs_open_read_close_smallfiles",
     "fs_write_close_commit",
+    SCENE_ID_KV_DRAM_RESIDENT_ZIPF,
     "kv_read_heavy_zipf",
     SCENE_ID_KV_READ_HEAVY_AFFINITY,
+    "kv_ssd_pressure_zipf",
     "kv_write_heavy_large_value",
     "rpc_echo_small_payload",
     "rpc_echo_small_payload_zerorpc",
+    SCENE_ID_TCP_EVENT_DRIVEN_REACTOR_LIFECYCLE,
 }
 
 
@@ -447,8 +479,11 @@ _RUNNER_STDIO_LOG_FP: Optional[Any] = None
 _RUNNER_STDIO_KEEPALIVE_FDS: Optional[Tuple[int, int]] = None
 _RUNNER_STDIO_MIRROR_THREAD: Optional[threading.Thread] = None
 _RUNNER_STDIO_ROUTER_THREAD: Optional[threading.Thread] = None
-_CI_WAIT_HEARTBEAT_INTERVAL_SECONDS = 15.0
+_CI_WAIT_HEARTBEAT_INTERVAL_SECONDS = 60.0
+_CI_WAIT_STATUS_SNAPSHOT_INTERVAL_SECONDS = 180.0
 _CI_WAIT_TAIL_MAX_CHARS = 8000
+_CONTROLLER_TRANSIENT_LOG_INTERVAL_SECONDS = 60.0
+_CONTROLLER_TRANSIENT_LOG_NEXT_AT: Dict[Tuple[str, str], float] = {}
 _TEST_RUNNER_UI_MAX_LOG_CHUNK_BYTES = 1024 * 1024
 _TEST_RUNNER_UI_HISTORY_SCHEMA_VERSION = 1
 _TEST_RUNNER_UI_DEFAULT_LOOKBACK_DAYS = 30
@@ -459,41 +494,13 @@ _TEST_RUNNER_UI_HISTORY_CACHE: Dict[str, Any] = {}
 _TEST_RUNNER_UI_LOCK_FILENAME = ".test_runner_ui.lock"
 
 
-def _runner_stdio_mirror_enabled() -> bool:
-    return _runner_stdio_mirror_enabled_impl()
-
-
-def _ci_log_timestamp_prefix(now: Optional[float] = None) -> str:
-    return _ci_log_timestamp_prefix_impl(now)
-
-
-def _ci_log_prefix_lines(text: str, *, now: Optional[float] = None) -> str:
-    return _ci_log_prefix_lines_impl(text, now=now)
-
-
 def _service_log_base_path(workdir_root: Path, *, filename: str) -> Path:
     return (workdir_root / filename).resolve()
 
 
-def _service_log_daily_path(base_path: Path, *, now: Optional[datetime.datetime] = None) -> Path:
-    return log_shard.daily_sharded_log_path(base_path, now=now)
-
-
-def _service_log_latest_path(base_path: Path) -> Optional[Path]:
-    return log_shard.latest_existing_daily_sharded_log_path(base_path)
-
-
 def _service_log_resolve_read_path(workdir_root: Path, *, filename: str) -> Optional[Path]:
     base_path = _service_log_base_path(workdir_root, filename=filename)
-    return _service_log_resolve_read_path_from_base(base_path)
-
-
-def _service_log_resolve_read_path_from_base(base_path: Path) -> Optional[Path]:
     return log_shard.resolve_readable_log_path(base_path)
-
-
-def _cleanup_old_service_logs(base_path: Path, *, retention_days: int = _SERVICE_LOG_RETENTION_DAYS) -> None:
-    log_shard.cleanup_old_daily_sharded_logs(base_path, retention_days=retention_days)
 
 
 def _start_runner_stdio_log_router(*, base_log_path: Path, read_fd: int) -> None:
@@ -551,17 +558,6 @@ def _resolve_history_roots_cli_paths(raw_paths: List[str]) -> List[Path]:
     return _resolve_history_roots_cli_paths_impl(
         repo_root=REPO_ROOT,
         raw_paths=raw_paths,
-    )
-
-
-def _load_gitops_ctx_for_ui(
-    *,
-    workdir_root: Path,
-    gitops_config_path: Optional[Path],
-) -> Optional[gitops_lib.GitOpsContext]:
-    return _load_gitops_ctx_for_ui_impl(
-        workdir_root=workdir_root,
-        gitops_config_path=gitops_config_path,
     )
 
 
@@ -645,6 +641,14 @@ def main() -> None:
         "--gitops-config",
         required=False,
         help="Optional GitOps config YAML. When set with --action ui, test_runner owns the GitOps poller/UI/API as part of the same service.",
+    )
+    parser.add_argument(
+        "--cleanup-successful-case-artifacts",
+        action="store_true",
+        help=(
+            "After a case and its teardown both succeed, keep only summary.yaml in its run directory. "
+            "Failed cases retain their complete diagnostic artifacts."
+        ),
     )
     parser.add_argument(
         "--top-attention-prefix",
@@ -871,6 +875,15 @@ def main() -> None:
                         controller_url=_require_str(stack_identity.get("controller_url"), "stack_identity.controller_url"),
                         case_id=case.case_id,
                     )
+                    if args.cleanup_successful_case_artifacts:
+                        previous_run_index = _require_int(
+                            last_run.get("run_index"),
+                            f"case_runs[{case.case_id}].last_run.run_index",
+                            min_v=1,
+                        )
+                        _cleanup_successful_run_artifacts(
+                            results_root / case.case_id / f"run_{previous_run_index}"
+                        )
                     continue
         _bench_case_preflight_cleanup(
             stack_identity=stack_identity,
@@ -889,25 +902,29 @@ def main() -> None:
         started_at = int(time.time())
         summary_path = run_dir / "summary.yaml"
         if not summary_path.exists():
+            placeholder_case_family = _case_family_from_scene_item(
+                _require_dict(suite.scenes.get(case.scene_id), f"suite.scenes[{case.scene_id!r}]"),
+                f"suite.scenes[{case.scene_id!r}]",
+            )
+            initial_summary: Dict[str, Any] = {
+                "schema_version": SCHEMA_VERSION,
+                "case_id": case.case_id,
+                "case_key": case.case_key,
+                "run_index": int(run_slot.run_index),
+                # This will be overwritten in finalize. If it remains, treat as an interrupted run.
+                "outcome": RUN_OUTCOME_FAILED,
+                "counted": False,
+                "timing": {
+                    "started_at_unix_s": int(started_at),
+                    "finished_at_unix_s": int(started_at),
+                },
+                "error": _RUN_SUMMARY_INCOMPLETE_ERROR,
+            }
+            if placeholder_case_family == CASE_FAMILY_BENCH:
+                initial_summary["test_stack"] = {}
             # Create an initial summary.yaml immediately, so every run_dir is observable even if
             # the runner is killed before reaching the finalize() path.
-            _write_yaml_file(
-                summary_path,
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "case_id": case.case_id,
-                    "case_key": case.case_key,
-                    "run_index": int(run_slot.run_index),
-                    # This will be overwritten in finalize. If it remains, treat as an interrupted run.
-                    "outcome": RUN_OUTCOME_FAILED,
-                    "counted": False,
-                    "timing": {
-                        "started_at_unix_s": int(started_at),
-                        "finished_at_unix_s": int(started_at),
-                    },
-                    "error": _RUN_SUMMARY_INCOMPLETE_ERROR,
-                },
-            )
+            _write_yaml_file(summary_path, initial_summary)
         infer_deploy_attempted = False
         runtime_tracking = _CaseRuntimeTracking()
         counted = False
@@ -1093,6 +1110,21 @@ def main() -> None:
                 print(f"ERROR: failed to write/update summary.yaml: {exc}")
                 raise SystemExit(1)
 
+            if (
+                args.cleanup_successful_case_artifacts
+                and outcome == RUN_OUTCOME_SUCCESS
+                and finalize_error is None
+            ):
+                try:
+                    _cleanup_successful_run_artifacts(run_dir)
+                except Exception as exc:
+                    print(
+                        "ERROR: successful case artifact cleanup failed; stopping to avoid exhausting disk: "
+                        f"case_id={case.case_id} run_dir={run_dir} err={type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    raise SystemExit(1)
+
             if fatal_stop_after_finalize:
                 raise SystemExit(1)
 
@@ -1262,11 +1294,7 @@ def _source_deployconf_contract_hostworkdir(
 
 
 def _load_source_stack_contract() -> Dict[str, Any]:
-    source_deployconf_path = _load_test_bed_deployconf_path()
-    source_deployconf = _require_dict(
-        _load_yaml_file(source_deployconf_path),
-        f"bootstrap source deployconf {source_deployconf_path}",
-    )
+    source_deployconf_path, source_deployconf = _load_test_bed_deployconf()
     cluster_nodes = _require_list(source_deployconf.get("cluster_nodes"), "bootstrap source deployconf.cluster_nodes")
     contract_hostworkdir = _source_deployconf_contract_hostworkdir(source_deployconf, cluster_nodes)
 
@@ -1512,6 +1540,29 @@ def _load_test_bed_deployconf_path() -> Path:
     return p
 
 
+def _load_test_bed_deployconf() -> Tuple[Path, Dict[str, Any]]:
+    manifest_info = _load_test_bed_manifest_opt()
+    if manifest_info is not None:
+        manifest_path, manifest = manifest_info
+        raw_workdir = manifest.get("workdir")
+        if isinstance(raw_workdir, str) and raw_workdir.strip():
+            workdir_path = Path(raw_workdir).expanduser()
+            if not workdir_path.is_absolute():
+                workdir_path = (manifest_path.parent / workdir_path).resolve()
+            normalized_path = (workdir_path / "deployconf.with_release_manifest_sha256.yaml").resolve()
+            if normalized_path.is_file():
+                deployconf = _require_dict(
+                    _load_yaml_file(normalized_path),
+                    f"normalized test bed deployconf {normalized_path}",
+                )
+                global_envs = deployconf.get("global_envs")
+                if isinstance(global_envs, dict):
+                    global_envs.pop("FLUXON_RELEASE_MANIFEST_SHA256", None)
+                return normalized_path, deployconf
+    deployconf_path = _load_test_bed_deployconf_path()
+    return deployconf_path, _require_dict(_load_yaml_file(deployconf_path), f"test bed deployconf {deployconf_path}")
+
+
 def _load_test_bed_manifest_opt() -> Optional[Tuple[Path, Dict[str, Any]]]:
     manifest_path = _load_test_bed_bootstrap_config_path().with_name("manifest.json")
     if not manifest_path.exists():
@@ -1539,8 +1590,7 @@ def _test_bed_cluster_proxy_env() -> Dict[str, str]:
                     continue
                 proxy_cfg[key] = str(raw_value)
     if not proxy_cfg:
-        deployconf_path = _load_test_bed_deployconf_path()
-        deployconf = _require_dict(_load_yaml_file(deployconf_path), f"test bed deployconf {deployconf_path}")
+        deployconf_path, deployconf = _load_test_bed_deployconf()
         global_envs = _require_dict(deployconf.get("global_envs"), "test bed deployconf.global_envs")
         for key in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
             raw_value = global_envs.get(f"FLUXON_CLUSTER_PROXY__{key.upper()}")
@@ -1567,10 +1617,7 @@ def _render_env_exports(env_map: Dict[str, str]) -> str:
 
 
 def _load_test_bed_cluster_hostnames_by_ip_opt() -> Optional[Dict[str, List[str]]]:
-    deployconf_path = _load_test_bed_deployconf_path()
-    if not deployconf_path.exists():
-        return None
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"test bed deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     raw_nodes = deployconf.get("cluster_nodes")
     if not isinstance(raw_nodes, list):
         return None
@@ -1648,6 +1695,11 @@ def _test_bed_manifest_transport_ctx_opt() -> Optional[Dict[str, Any]]:
     if manifest_info is None:
         return None
     manifest_path, manifest = manifest_info
+    mode_raw = manifest.get("controller_request_mode")
+    if mode_raw is not None:
+        mode = _require_str(mode_raw, f"test bed manifest {manifest_path}.controller_request_mode")
+        if mode == CONTROLLER_REQUEST_MODE_DIRECT:
+            return None
     bastion = _require_dict(manifest.get("bastion"), f"test bed manifest {manifest_path}.bastion")
     bastion_user_raw = manifest.get("bastion_user")
     bastion_private_key_raw = manifest.get("bastion_private_key")
@@ -1958,17 +2010,20 @@ def _remote_ssh_common_argv() -> List[str]:
 
 
 def _suite_cluster_name_for_workdir(workdir_root: Path) -> str:
-    """Return the fixed benchmark workload cluster namespace.
+    """Return a stable, workdir-scoped benchmark workload cluster namespace.
 
     English note:
-    - Benchmark runs intentionally reuse one stable cluster namespace so shared-memory and
-      etcd state stay under a predictable top-level path.
+    - Benchmark runs inside one workdir intentionally reuse one namespace so resume sees the
+      same shared-memory and etcd roots.
+    - Different workdirs must not reuse the same namespace. TEST_STACK keeps long-running
+      ops services alive and etcd RDMA-control keys are not lease-scoped, so a fixed
+      cluster name lets stale benchmark state from an older run affect a later one.
     - Isolation from the ops bed still comes from the explicit `cluster_name !=
       ops_cluster_name` guard in `_load_stack_identity`.
     """
 
-    _ = workdir_root
-    return "fluxon_benchmark"
+    workdir_scope = hashlib.sha256(str(workdir_root.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"fluxon_benchmark_{workdir_scope}"
 
 
 def _cluster_scoped_shared_dir(*, root_path: str, cluster_name: str) -> Path:
@@ -2089,6 +2144,122 @@ def _test_stack_owner_targets_by_machine(
     return out
 
 
+def _test_stack_benchmark_targets(
+    *,
+    role_plan: Dict[str, Any],
+    roles_order: List[str],
+    ctx: str,
+) -> List[str]:
+    targets: List[str] = []
+    for role in roles_order:
+        plan = _require_dict(role_plan.get(role), f"{ctx}.role_plan[{role}]")
+        count = _require_int(plan.get("count"), f"{ctx}.role_plan[{role}].count", min_v=1)
+        raw_targets = _require_list(plan.get("targets"), f"{ctx}.role_plan[{role}].targets")
+        if len(raw_targets) != int(count):
+            raise ValueError(
+                f"{ctx}.role_plan[{role}].targets length must equal count: "
+                f"count={count} targets={len(raw_targets)}"
+            )
+        for index, raw_target in enumerate(raw_targets):
+            targets.append(_require_str(raw_target, f"{ctx}.role_plan[{role}].targets[{index}]"))
+    return targets
+
+
+def _test_stack_targets_are_same_host_local(
+    *,
+    targets: List[str],
+    target_ip_map: Dict[str, Any],
+    cluster_nodes: Dict[str, Any],
+    ctx: str,
+) -> bool:
+    if not targets:
+        return False
+    ips: set[str] = set()
+    for index, target in enumerate(targets):
+        target_name = _require_str(target, f"{ctx}.targets[{index}]")
+        ips.add(
+            _require_str(
+                target_ip_map.get(target_name),
+                f"{ctx}.target_ip_map[{target_name!r}]",
+            )
+        )
+        node_cfg = _require_dict(cluster_nodes.get(target_name), f"{ctx}.cluster_nodes[{target_name!r}]")
+        execution_mode_raw = node_cfg.get("execution_mode", "ssh")
+        execution_mode = execution_mode_raw.strip() if isinstance(execution_mode_raw, str) else ""
+        if execution_mode != "local":
+            return False
+    return len(ips) == 1
+
+
+def _test_stack_local_benchmark_node_start_throttle_max_seconds(
+    *,
+    scene_mode: str,
+    node_total: int,
+    role_plan: Dict[str, Any],
+    roles_order: List[str],
+    target_ip_map: Dict[str, Any],
+    cluster_nodes: Dict[str, Any],
+    ctx: str,
+) -> float:
+    if scene_mode != TEST_STACK_MODE_MPMC:
+        return 0.0
+    if int(node_total) <= TEST_STACK_LOCAL_NODE_START_THROTTLE_MIN_NODES:
+        return 0.0
+    benchmark_targets = _test_stack_benchmark_targets(
+        role_plan=role_plan,
+        roles_order=roles_order,
+        ctx=ctx,
+    )
+    if not _test_stack_targets_are_same_host_local(
+        targets=benchmark_targets,
+        target_ip_map=target_ip_map,
+        cluster_nodes=cluster_nodes,
+        ctx=ctx,
+    ):
+        return 0.0
+    extra_nodes = int(node_total) - TEST_STACK_LOCAL_NODE_START_THROTTLE_MIN_NODES
+    return min(
+        TEST_STACK_LOCAL_NODE_START_THROTTLE_MAX_SECONDS,
+        float(extra_nodes) * TEST_STACK_LOCAL_NODE_START_THROTTLE_SECONDS_PER_EXTRA_NODE,
+    )
+
+
+def _test_stack_local_benchmark_node_start_throttle_delay_seconds(
+    *,
+    node_ordinal: int,
+    node_total: int,
+    max_seconds: float,
+) -> float:
+    if max_seconds <= 0.0:
+        return 0.0
+    if node_total <= 1:
+        return 0.0
+    ordinal = max(0, min(int(node_ordinal), int(node_total) - 1))
+    return float(max_seconds) * (float(ordinal) / float(int(node_total) - 1))
+
+
+def _test_stack_node_start_throttle_prelude(
+    *,
+    delay_seconds: float,
+    instance_key: str,
+) -> str:
+    if delay_seconds <= 0.0:
+        return ""
+    delay_text = f"{float(delay_seconds):.2f}"
+    message = (
+        "[TEST_STACK] benchmark node start throttle: "
+        f"sleep_seconds={delay_text} instance_key={instance_key}"
+    )
+    return (
+        "printf '%s\\n' "
+        + _shell_quote(message)
+        + "\n"
+        + "sleep "
+        + _shell_quote(delay_text)
+        + "\n"
+    )
+
+
 def _test_stack_owner_target_for_node_process(
     *,
     target: str,
@@ -2187,6 +2358,7 @@ def _build_runtime_token_mapping(
     stack_identity: Dict[str, Any],
     extra_tokens: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
+    test_bed_bundle_root = _test_bed_bundle_root_opt()
     mapping = {
         "__WORKDIR_ROOT__": workdir_root,
         "__RUN_DIR__": run_dir,
@@ -2207,6 +2379,8 @@ def _build_runtime_token_mapping(
             "stack_identity.share_mem_path",
         ),
     }
+    if test_bed_bundle_root is not None:
+        mapping["__TEST_BED_BUNDLE_ROOT__"] = str(test_bed_bundle_root)
     if extra_tokens is not None:
         for token_name, token_value in extra_tokens.items():
             mapping[f"__{token_name}__"] = token_value
@@ -2218,7 +2392,7 @@ def _is_runtime_token_placeholder(raw: str) -> bool:
 
 
 def _find_unresolved_runtime_tokens(raw: str) -> List[str]:
-    return sorted(set(re.findall(r"__[A-Z0-9_]+__", raw)))
+    return sorted(set(re.findall(r"__[A-Z][A-Z0-9_]*__", raw)))
 
 
 def _resolved_case_runtime_token_mapping(resolved_case: Dict[str, Any]) -> Dict[str, str]:
@@ -2920,10 +3094,6 @@ def _write_phase_inputs(
     _write_deployer_manifests(phase_case, run_dir, allow_overwrite=True)
 
 
-def _ci_write_phase_inputs(resolved_case: Dict[str, Any], *, run_dir: Path, instance_ids: List[str]) -> None:
-    _write_phase_inputs(resolved_case, run_dir=run_dir, instance_ids=instance_ids, ctx="CI")
-
-
 def _runtime_phase_label(phase: _RuntimePhase) -> str:
     return f"{phase.write_ctx} {phase.phase_id} [{phase.layer}]"
 
@@ -3399,31 +3569,6 @@ def _finalize_test_stack_case_runtime(
     )
 
 
-def _require_ci_runner_exit_code_baseline(
-    baseline_state: Optional[_ObservedFileState],
-) -> Optional[_ObservedFileState]:
-    return _require_ci_runner_exit_code_baseline_impl(baseline_state)
-
-
-def _require_test_stack_result_path(result_path: Optional[Path]) -> Path:
-    return _require_test_stack_result_path_impl(result_path)
-
-
-def _require_test_stack_result_timeout(timeout_s: Optional[int]) -> int:
-    return _require_test_stack_result_timeout_impl(timeout_s)
-
-
-def _test_stack_result_timeout_seconds(
-    *,
-    max_benchmark_seconds: int,
-    metric_warmup_seconds: float,
-) -> int:
-    return _test_stack_result_timeout_seconds_impl(
-        max_benchmark_seconds=max_benchmark_seconds,
-        metric_warmup_seconds=metric_warmup_seconds,
-    )
-
-
 def _deploy_instance_target_name(resolved_case: Dict[str, Any], *, instance_id: str) -> str:
     inst = _find_deploy_instance(resolved_case, instance_id=instance_id)
     return _require_str(
@@ -3538,19 +3683,29 @@ def _resolved_run_dir_path(resolved_case: Dict[str, Any]) -> Path:
     return Path(_require_str(runtime.get("run_dir"), "runtime.run_dir")).resolve()
 
 
-def _ci_share_mem_path(resolved_case: Dict[str, Any], *, run_dir: Path) -> str:
+def _ci_share_mem_path(resolved_case: Dict[str, Any]) -> str:
     runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
     stack_identity = _require_dict(runtime.get("stack_identity"), "resolved_case.runtime.stack_identity")
     share_mem_root = _require_str(
         stack_identity.get("share_mem_path"),
         "resolved_case.runtime.stack_identity.share_mem_path",
     )
-    # English note:
-    # - iceoryx2 uses share_mem_path as a base for per-node paths (e.g. .../nodes/<id>/iox2_<hash>/.service_tag).
-    # - The per-node suffix can be long, and some filesystems enforce a max path length of 255 bytes.
-    # - Therefore share_mem_path must be short and must not embed run_dir (which can be deep under repo/workdir).
-    token = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:16]
-    return str((Path(share_mem_root) / "ci" / token).resolve())
+    # CI cases are serialized and cluster_name already scopes every shared bundle.
+    return str((Path(share_mem_root) / "ci").resolve())
+
+
+def _ci_case_shared_bundle_dir(resolved_case: Dict[str, Any]) -> Path:
+    share_mem_root = Path(_ci_share_mem_path(resolved_case)).resolve()
+    cluster_name = _ci_cluster_name(resolved_case)
+    if Path(cluster_name).name != cluster_name:
+        raise ValueError(f"CI cluster_name must be one path component: {cluster_name!r}")
+    bundle_dir = (share_mem_root / cluster_name).resolve()
+    if bundle_dir.parent != share_mem_root:
+        raise ValueError(
+            "CI shared bundle escaped its canonical root: "
+            f"root={share_mem_root} cluster_name={cluster_name!r} bundle_dir={bundle_dir}"
+        )
+    return bundle_dir
 
 
 def _ci_owner_shared_bundle_paths(run_dir: Path, *, owner_config_path: Path) -> List[Path]:
@@ -3869,12 +4024,40 @@ def _acquire_ui_service_lock(*, workdir_root: Path) -> Any:
     )
 
 
-def _acquire_ci_lock() -> Any:
+def _ci_lock_name_for_ops_cluster_name(ops_cluster_name: str) -> str:
+    return "bench_ci__" + hashlib.sha256(ops_cluster_name.encode("utf-8")).hexdigest()[:16] + ".lock"
+
+
+def _acquire_ci_lock(*, resolved_case: Optional[Dict[str, Any]] = None) -> Any:
+    owner_lines = [f"pid={os.getpid()}", f"repo_root={_runner_repo_root()}"]
+    busy_message = "another CI run is active (lock busy)"
     lock_path = _bench_lock_dir() / "bench_ci.lock"
+    if resolved_case is not None:
+        runtime = _require_dict(resolved_case.get("runtime"), "resolved_case.runtime")
+        stack_identity = _require_dict(
+            runtime.get("stack_identity"),
+            "resolved_case.runtime.stack_identity",
+        )
+        ops_cluster_name = _require_str(
+            stack_identity.get("ops_cluster_name"),
+            "resolved_case.runtime.stack_identity.ops_cluster_name",
+        )
+        controller_url = _require_str(
+            stack_identity.get("controller_url"),
+            "resolved_case.runtime.stack_identity.controller_url",
+        )
+        lock_path = _bench_lock_dir() / _ci_lock_name_for_ops_cluster_name(ops_cluster_name)
+        owner_lines.extend(
+            [
+                f"ops_cluster_name={ops_cluster_name}",
+                f"controller_url={controller_url}",
+            ]
+        )
+        busy_message = f"another CI run is active for ops_cluster_name={ops_cluster_name} (lock busy)"
     return _acquire_named_lock(
         lock_path=lock_path,
-        owner_lines=[f"pid={os.getpid()}", f"repo_root={_runner_repo_root()}"],
-        busy_message="another CI run is active (lock busy)",
+        owner_lines=owner_lines,
+        busy_message=busy_message,
     )
 
 
@@ -3984,6 +4167,16 @@ def _require_int(v: Any, ctx: str, *, min_v: int, max_v: int | None = None) -> i
     return v
 
 
+def _require_test_stack_benchmark_threads_per_process(v: Any, ctx: str) -> int:
+    threads_per_process = _require_int(v, ctx, min_v=1)
+    if threads_per_process not in TEST_STACK_BENCHMARK_THREADS_PER_PROCESS_VALUES:
+        supported = ", ".join(
+            str(value) for value in TEST_STACK_BENCHMARK_THREADS_PER_PROCESS_VALUES
+        )
+        raise ValueError(f"{ctx} must be one of: {supported}")
+    return threads_per_process
+
+
 def _require_bool(v: Any, ctx: str) -> bool:
     if not isinstance(v, bool):
         raise ValueError(f"{ctx} must be bool")
@@ -3997,6 +4190,8 @@ def _forbid_unknown_keys(d: Dict[str, Any], allowed: set[str], ctx: str) -> None
 
 
 def _forbid_removed_fluxon_kv_config_keys(kv_base: Dict[str, Any], ctx: str) -> Dict[str, Any]:
+    if "protocol" in kv_base:
+        raise ValueError(f"{ctx}.protocol has been removed; use {ctx}.network")
     if "rdma_device_names" in kv_base:
         raise ValueError(f"{ctx}.rdma_device_names has been removed from Fluxon KV config")
 
@@ -4004,6 +4199,31 @@ def _forbid_removed_fluxon_kv_config_keys(kv_base: Dict[str, Any], ctx: str) -> 
     if "transfer_engine" in fluxonkv_spec:
         raise ValueError(f"{ctx}.fluxonkv_spec.transfer_engine has been removed from Fluxon KV config")
     return fluxonkv_spec
+
+
+def _normalize_test_stack_fluxon_network_config(
+    raw: Any,
+    ctx: str,
+) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    cfg = copy.deepcopy(_require_dict(raw, ctx))
+    _forbid_unknown_keys(cfg, {"rdma_device_names", "tcp_reactor_mode"}, ctx)
+    if "rdma_device_names" in cfg:
+        cfg["rdma_device_names"] = _require_str(
+            cfg.get("rdma_device_names"), f"{ctx}.rdma_device_names"
+        ).strip()
+        if not cfg["rdma_device_names"]:
+            raise ValueError(f"{ctx}.rdma_device_names must be non-empty")
+    if "tcp_reactor_mode" in cfg:
+        tcp_reactor_mode = _require_str(
+            cfg.get("tcp_reactor_mode"), f"{ctx}.tcp_reactor_mode"
+        )
+        if tcp_reactor_mode not in {"busy_poll", "event_driven"}:
+            raise ValueError(
+                f"{ctx}.tcp_reactor_mode must be one of ['busy_poll', 'event_driven'], got {tcp_reactor_mode!r}"
+            )
+    return cfg
 
 
 def _normalize_test_stack_zero_contribution_pool(raw: Any, ctx: str) -> Dict[str, Any]:
@@ -4057,6 +4277,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             "skip_put_end_commit",
             "post_read_remote_policy",
             "p2p_transport_impl",
+            "protocol_type",
             "transport_mode",
             "tcp_thread_reactor_shard_count",
             "tcp_thread_bulk_lane_count",
@@ -4068,6 +4289,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             "side_transfer_worker_count",
             "side_transfer_worker_p2p_port_base",
             "side_transfer_role",
+            "kv_ssd_storage_backend",
+            "kv_ssd_uring_mode",
         },
         ctx,
     )
@@ -4107,6 +4330,38 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
                 f"{ctx}.p2p_transport_impl must be one of {sorted(allowed_p2p_transport_impls)}, got {p2p_transport_impl!r}"
             )
         out["p2p_transport_impl"] = p2p_transport_impl
+    if "kv_ssd_storage_backend" in cfg:
+        kv_ssd_storage_backend = _require_str(
+            cfg.get("kv_ssd_storage_backend"), f"{ctx}.kv_ssd_storage_backend"
+        )
+        allowed_kv_ssd_storage_backends = {"native", "foyer"}
+        if kv_ssd_storage_backend not in allowed_kv_ssd_storage_backends:
+            raise ValueError(
+                f"{ctx}.kv_ssd_storage_backend must be one of {sorted(allowed_kv_ssd_storage_backends)}, got {kv_ssd_storage_backend!r}"
+            )
+        out["kv_ssd_storage_backend"] = kv_ssd_storage_backend
+    if "kv_ssd_uring_mode" in cfg:
+        kv_ssd_uring_mode = _require_str(cfg.get("kv_ssd_uring_mode"), f"{ctx}.kv_ssd_uring_mode")
+        allowed_kv_ssd_uring_modes = {"single_buffer", "iovec"}
+        if kv_ssd_uring_mode not in allowed_kv_ssd_uring_modes:
+            raise ValueError(
+                f"{ctx}.kv_ssd_uring_mode must be one of {sorted(allowed_kv_ssd_uring_modes)}, got {kv_ssd_uring_mode!r}"
+            )
+        out["kv_ssd_uring_mode"] = kv_ssd_uring_mode
+    if out.get("kv_ssd_storage_backend") == "foyer" and out.get(
+        "kv_ssd_uring_mode", "single_buffer"
+    ) != "single_buffer":
+        raise ValueError(
+            f"{ctx}.kv_ssd_uring_mode is only valid with {ctx}.kv_ssd_storage_backend=native"
+        )
+    if "protocol_type" in cfg:
+        protocol_type = _require_str(cfg.get("protocol_type"), f"{ctx}.protocol_type")
+        allowed_protocol_types = {"tcp", "rdma"}
+        if protocol_type not in allowed_protocol_types:
+            raise ValueError(
+                f"{ctx}.protocol_type must be one of {sorted(allowed_protocol_types)}, got {protocol_type!r}"
+            )
+        out["protocol_type"] = protocol_type
     transport_mode_was_explicit = "transport_mode" in cfg
     side_transfer_role_raw = cfg.get("side_transfer_role")
     default_transport_mode = None if side_transfer_role_raw == "worker" else "transfer_with_rpc"
@@ -4133,6 +4388,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         if not normalized:
             raise ValueError(f"{ctx}.rdma_device_names must be non-empty")
         out["rdma_device_names"] = sorted(normalized)
+    if out.get("protocol_type") == "tcp" and "rdma_device_names" in out:
+        raise ValueError(f"{ctx}.rdma_device_names requires {ctx}.protocol_type=rdma")
     if "require_transfer_rpc_fast_path_ready_timeout_seconds" in cfg:
         timeout_seconds = _require_int(
             cfg.get("require_transfer_rpc_fast_path_ready_timeout_seconds"),
@@ -4144,7 +4401,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             raise ValueError(
                 f"{ctx}.require_transfer_rpc_fast_path_ready_timeout_seconds requires {ctx}.transport_mode=transfer_with_rpc"
             )
-        if "rdma_device_names" not in out:
+        if out.get("protocol_type") != "tcp" and "rdma_device_names" not in out:
             raise ValueError(
                 f"{ctx}.require_transfer_rpc_fast_path_ready_timeout_seconds requires explicit {ctx}.rdma_device_names"
             )
@@ -4183,13 +4440,21 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             )
         out["side_transfer_role"] = side_transfer_role
     if out.get("side_transfer_role") == "worker":
-        if "rdma_device_names" in out and not transport_mode_was_explicit:
-            raise ValueError(f"{ctx}.rdma_device_names requires {ctx}.transport_mode")
+        for field_name in ("protocol_type", "rdma_device_names"):
+            if field_name not in out:
+                continue
+            raise ValueError(
+                f"{ctx}.{field_name} is not valid for side-transfer workers; their protocol is derived from the worker role"
+            )
     elif "transport_mode" not in out:
         out["transport_mode"] = "transfer_with_rpc"
-    if transport_mode_was_explicit and "rdma_device_names" not in out:
+    if (
+        transport_mode_was_explicit
+        and out.get("protocol_type") != "tcp"
+        and "rdma_device_names" not in out
+    ):
         raise ValueError(
-            f"explicit {ctx}.transport_mode now requires {ctx}.rdma_device_names because it maps to TestForceEnableBypassRdmaControl and must avoid UCX default device selection"
+            f"explicit {ctx}.transport_mode now requires {ctx}.rdma_device_names to avoid implicit RDMA device selection"
         )
     return out
 
@@ -4226,18 +4491,6 @@ def _test_spec_config_p2p_transport_impl(test_spec_config: Dict[str, Any]) -> Op
     if raw is None:
         return None
     return _require_str(raw, "test_spec_config.p2p_transport_impl")
-
-
-def _resolve_test_stack_fluxon_protocol_cfg(
-    *,
-    kv_base: Dict[str, Any],
-    merged_test_spec_config: Dict[str, Any],
-    ctx: str,
-) -> Optional[Dict[str, Any]]:
-    raw_protocol = kv_base.get("protocol")
-    if raw_protocol is None:
-        return None
-    return copy.deepcopy(_require_dict(raw_protocol, f"{ctx}.protocol"))
 
 
 def _rewrite_artifact_set_transport_impl(
@@ -4441,10 +4694,6 @@ def _normalize_owner_cpu_core_by_target(
     return out
 
 
-def _render_runtime_env_exports(runtime_env: Dict[str, str]) -> str:
-    return _render_env_exports(runtime_env)
-
-
 def _parse_selector_ids(raw: Any, ctx: str) -> Optional[Tuple[str, ...]]:
     if isinstance(raw, str):
         value = _require_str(raw, ctx)
@@ -4628,6 +4877,65 @@ def _clean_workdir(workdir_root: Path) -> None:
         print(f"[clean_workdir] removed: {p}", flush=True)
     if not removed_any:
         print(f"[clean_workdir] nothing to remove under: {workdir_root}", flush=True)
+
+
+def _cleanup_successful_run_artifacts(run_dir: Path) -> None:
+    """Keep the terminal summary and remove bulky artifacts from a successful run."""
+    run_dir = Path(run_dir).resolve()
+    if not run_dir.exists():
+        print(f"[cleanup_successful_run_artifacts] run directory already absent: {run_dir}", flush=True)
+        return
+    if not run_dir.is_dir():
+        raise ValueError(f"successful run path is not a directory: {run_dir}")
+
+    summary_path = run_dir / "summary.yaml"
+    if not summary_path.is_file() or summary_path.is_symlink():
+        raise ValueError(f"successful run must retain a regular summary.yaml before cleanup: {summary_path}")
+    summary = _require_dict(_load_yaml_file(summary_path), "successful run summary")
+    if summary.get("outcome") != RUN_OUTCOME_SUCCESS:
+        raise ValueError(
+            "refusing to clean a run whose summary is not SUCCESS: "
+            f"run_dir={run_dir} outcome={summary.get('outcome')!r}"
+        )
+    test_stack_summary = summary.get("test_stack")
+    has_diagnostic_error = (
+        summary.get("error") is not None
+        or summary.get("teardown_error") is not None
+        or (
+            isinstance(test_stack_summary, dict)
+            and any(
+                test_stack_summary.get(field_name) is not None
+                for field_name in ("error", "collect_error", "teardown_error")
+            )
+        )
+    )
+    if has_diagnostic_error:
+        print(
+            "[cleanup_successful_run_artifacts] preserving run with error diagnostics: "
+            f"{run_dir}",
+            flush=True,
+        )
+        return
+
+    free_before = shutil.disk_usage(run_dir).free
+    removed_entries = 0
+    for path in list(run_dir.iterdir()):
+        if path.name == "summary.yaml":
+            continue
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+        removed_entries += 1
+
+    free_after = shutil.disk_usage(run_dir).free
+    reclaimed_bytes = max(0, int(free_after) - int(free_before))
+    print(
+        "[cleanup_successful_run_artifacts] "
+        f"run_dir={run_dir} removed_entries={removed_entries} reclaimed_bytes={reclaimed_bytes} "
+        f"free_bytes={free_after}",
+        flush=True,
+    )
 
 
 def _repair_reserved_last_runs(case_runs: Dict[str, Any], *, results_root: Path) -> List[str]:
@@ -4849,11 +5157,20 @@ def _test_stack_backend_uses_external_fluxon_kv(*, backend_kind: str, mode: str)
     )
 
 
-def _test_stack_backend_uses_dedicated_kv_owners(*, backend_kind: str, mode: str) -> bool:
+def _test_stack_backend_uses_dedicated_kv_owners(
+    *,
+    backend_kind: str,
+    mode: str,
+    mooncake_storage_mode: Optional[str] = None,
+) -> bool:
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
         return _test_stack_backend_uses_external_fluxon_kv(backend_kind=backend_kind, mode=mode)
     if backend_kind == TEST_STACK_BACKEND_MOONCAKE:
-        return mode in (
+        if mooncake_storage_mode is None:
+            raise ValueError("Mooncake TEST_STACK requires an explicit storage mode")
+        if mooncake_storage_mode not in TEST_STACK_MOONCAKE_STORAGE_MODES_ALLOWED:
+            raise ValueError(f"invalid Mooncake TEST_STACK storage mode: {mooncake_storage_mode!r}")
+        return mooncake_storage_mode == TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER and mode in (
             TEST_STACK_MODE_KVSTORE,
             TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE,
             TEST_STACK_MODE_RPC,
@@ -5404,6 +5721,12 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             "write_ratio",
             "request_distribution",
             "keyspace_size",
+            TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY,
+            TEST_STACK_SCENE_KEY_KV_GET_OUTPUT,
+            TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX,
             TEST_STACK_SCENE_KEY_AFFINITY_LOCALITY_RATIO,
             "value_size_mode",
             "value_size_weighted_set",
@@ -5472,6 +5795,78 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
                 keyspace_size,
                 f"{ctx}.test_stack.keyspace_size",
                 min_v=1,
+            )
+
+        keyspace_capacity_guard = ts.get(TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD)
+        if keyspace_capacity_guard is not None:
+            if not isinstance(keyspace_capacity_guard, bool):
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD} must be bool"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD] = bool(keyspace_capacity_guard)
+
+        bootstrap_concurrency = ts.get(TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY)
+        if bootstrap_concurrency is not None:
+            out_ts[TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY] = _require_int(
+                bootstrap_concurrency,
+                f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY}",
+                min_v=1,
+            )
+
+        bootstrap_put_gap_ms = ts.get(TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS)
+        if bootstrap_put_gap_ms is not None:
+            if not isinstance(bootstrap_put_gap_ms, (int, float)):
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS} must be number"
+                )
+            if float(bootstrap_put_gap_ms) < 0.0:
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS} must be >= 0"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS] = float(bootstrap_put_gap_ms)
+
+        bootstrap_storage_full_policy = ts.get(TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY)
+        if bootstrap_storage_full_policy is not None:
+            policy = _require_str(
+                bootstrap_storage_full_policy,
+                f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY}",
+            ).strip().lower()
+            if policy not in TEST_STACK_KV_BOOTSTRAP_STORAGE_FULL_POLICIES_ALLOWED:
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY} invalid: {policy!r}"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY] = policy
+
+        kv_get_output_raw = ts.get(TEST_STACK_SCENE_KEY_KV_GET_OUTPUT)
+        kv_get_output = None
+        if kv_get_output_raw is not None:
+            if mode not in (TEST_STACK_MODE_KVSTORE, TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE):
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_GET_OUTPUT} "
+                    "is only allowed for KV modes"
+                )
+            kv_get_output = _require_str(
+                kv_get_output_raw,
+                f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_GET_OUTPUT}",
+            ).strip().lower()
+            if kv_get_output not in TEST_STACK_KV_GET_OUTPUTS_ALLOWED:
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_GET_OUTPUT} "
+                    f"invalid: {kv_get_output!r}"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KV_GET_OUTPUT] = kv_get_output
+
+        kv_cuda_device_index = ts.get(TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX)
+        if kv_cuda_device_index is not None:
+            if kv_get_output != "cuda":
+                raise ValueError(
+                    f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX} "
+                    f"requires {TEST_STACK_SCENE_KEY_KV_GET_OUTPUT}=cuda"
+                )
+            out_ts[TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX] = _require_int(
+                kv_cuda_device_index,
+                f"{ctx}.test_stack.{TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX}",
+                min_v=0,
             )
 
         affinity_locality_ratio = ts.get(TEST_STACK_SCENE_KEY_AFFINITY_LOCALITY_RATIO)
@@ -5619,6 +6014,11 @@ def _parse_scene(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             "write_ratio",
             "request_distribution",
             "keyspace_size",
+            TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS,
+            TEST_STACK_SCENE_KEY_KV_GET_OUTPUT,
+            TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX,
             "value_size_mode",
             "value_size_weighted_set",
             *TEST_STACK_RPC_SCENE_KEYS,
@@ -5717,6 +6117,7 @@ def _parse_scale(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
                 "cluster_ready_timeout_seconds",
                 "value_size_list",
                 "consumer_sim_handle_ms_range",
+                "mpmc_active_producer_runtime_limit",
             },
             f"{ctx}.benchmark",
         )
@@ -5725,16 +6126,10 @@ def _parse_scale(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             f"{ctx}.benchmark.processes_per_target",
             min_v=1,
         )
-        threads_per_process = _require_int(
+        _ = _require_test_stack_benchmark_threads_per_process(
             bench.get("threads_per_process"),
             f"{ctx}.benchmark.threads_per_process",
-            min_v=1,
         )
-        if int(threads_per_process) != TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS:
-            raise ValueError(
-                f"{ctx}.benchmark.threads_per_process must be fixed to "
-                f"{TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS}"
-            )
         owner_group_processes = bench.get("owner_group_processes")
         if owner_group_processes is not None:
             _ = _require_int(owner_group_processes, f"{ctx}.benchmark.owner_group_processes", min_v=1)
@@ -5763,6 +6158,13 @@ def _parse_scale(item: Dict[str, Any], ctx: str) -> Dict[str, Any]:
             if len(r) != 2:
                 raise ValueError(f"{ctx}.benchmark.consumer_sim_handle_ms_range must have 2 items")
             _ = _require_int(r[0], f"{ctx}.benchmark.consumer_sim_handle_ms_range[0]", min_v=0)
+        active_producer_limit = bench.get("mpmc_active_producer_runtime_limit")
+        if active_producer_limit is not None:
+            _ = _require_int(
+                active_producer_limit,
+                f"{ctx}.benchmark.mpmc_active_producer_runtime_limit",
+                min_v=1,
+            )
             _ = _require_int(r[1], f"{ctx}.benchmark.consumer_sim_handle_ms_range[1]", min_v=0)
             if int(r[0]) > int(r[1]):
                 raise ValueError(f"{ctx}.benchmark.consumer_sim_handle_ms_range invalid: {r}")
@@ -6024,10 +6426,106 @@ def _validate_profile_test_stack_monitoring_config(raw: Any, ctx: str) -> None:
         _ = _require_str(table_name, f"{ctx}.otlp_log_api.table_name")
 
 
+def _normalize_test_stack_owner_kv_ssd_config(raw: Any, ctx: str) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    cfg = _require_dict(raw, ctx)
+    _forbid_unknown_keys(cfg, {"large_limit_size"}, ctx)
+    large_limit_size_raw = _require_list(cfg.get("large_limit_size"), f"{ctx}.large_limit_size")
+    if not large_limit_size_raw:
+        raise ValueError(f"{ctx}.large_limit_size must be non-empty")
+    large_limit_size: List[int] = []
+    for index, raw_limit in enumerate(large_limit_size_raw):
+        large_limit_size.append(
+            _require_int(
+                raw_limit,
+                f"{ctx}.large_limit_size[{index}]",
+                min_v=512,
+            )
+        )
+    return {"large_limit_size": large_limit_size}
+
+
+def _normalize_testbed_mooncake_storage_config(raw: Any, ctx: str) -> Dict[str, Any]:
+    cfg = _require_dict(raw, ctx)
+    _forbid_unknown_keys(
+        cfg,
+        {"mode", "ssd_offload_root", "ssd_capacity_bytes"},
+        ctx,
+    )
+    mode = _require_str(cfg.get("mode"), f"{ctx}.mode").strip().upper()
+    if mode not in TEST_STACK_MOONCAKE_STORAGE_MODES_ALLOWED:
+        raise ValueError(
+            f"{ctx}.mode must be one of {sorted(TEST_STACK_MOONCAKE_STORAGE_MODES_ALLOWED)}, "
+            f"got {mode!r}"
+        )
+
+    raw_ssd_root = cfg.get("ssd_offload_root")
+    raw_ssd_capacity = cfg.get("ssd_capacity_bytes")
+    if raw_ssd_root is None and raw_ssd_capacity is None:
+        return {"mode": mode}
+    if raw_ssd_root is None or raw_ssd_capacity is None:
+        raise ValueError(
+            f"{ctx}.ssd_offload_root and {ctx}.ssd_capacity_bytes must be set together"
+        )
+    ssd_offload_root = _require_str(
+        raw_ssd_root,
+        f"{ctx}.ssd_offload_root",
+    ).strip()
+    if not ssd_offload_root:
+        raise ValueError(f"{ctx}.ssd_offload_root must be non-empty")
+    if not Path(ssd_offload_root).is_absolute():
+        raise ValueError(f"{ctx}.ssd_offload_root must be absolute")
+    ssd_capacity_bytes = _require_int(
+        raw_ssd_capacity,
+        f"{ctx}.ssd_capacity_bytes",
+        min_v=1,
+    )
+    return {
+        "mode": mode,
+        "ssd_offload_root": ssd_offload_root,
+        "ssd_capacity_bytes": int(ssd_capacity_bytes),
+    }
+
+
+def _split_testbed_mooncake_capacity(
+    *,
+    total_bytes: int,
+    instance_count: int,
+    alignment_bytes: int,
+    ctx: str,
+) -> int:
+    if instance_count <= 0:
+        raise ValueError(f"{ctx} instance_count must be > 0")
+    if total_bytes <= 0:
+        raise ValueError(f"{ctx} total_bytes must be > 0")
+    if total_bytes % instance_count != 0:
+        raise ValueError(
+            f"{ctx} total capacity must divide evenly across instances: "
+            f"total_bytes={total_bytes} instance_count={instance_count}"
+        )
+    per_instance_bytes = total_bytes // instance_count
+    if alignment_bytes > 1 and per_instance_bytes % alignment_bytes != 0:
+        raise ValueError(
+            f"{ctx} per-instance capacity must be {alignment_bytes}-byte aligned: "
+            f"total_bytes={total_bytes} instance_count={instance_count} "
+            f"per_instance_bytes={per_instance_bytes}"
+        )
+    return int(per_instance_bytes)
+
+
 def _validate_profile_test_stack_fluxon_runtime_config(rc: Dict[str, Any], ctx: str) -> None:
     _forbid_unknown_keys(
         rc,
-        {"kv_base", "mq_base", "kv_node_patch_template", "runtime_env", "monitoring", "owner_cpu_core_by_target"},
+        {
+            "kv_base",
+            "mq_base",
+            "kv_node_patch_template",
+            "runtime_env",
+            "monitoring",
+            "owner_cpu_core_by_target",
+            "owner_kv_ssd",
+        },
         ctx,
     )
     kv_base = _require_dict(rc.get("kv_base"), f"{ctx}.kv_base")
@@ -6043,6 +6541,7 @@ def _validate_profile_test_stack_fluxon_runtime_config(rc: Dict[str, Any], ctx: 
         rc.get("owner_cpu_core_by_target"),
         f"{ctx}.owner_cpu_core_by_target",
     )
+    _ = _normalize_test_stack_owner_kv_ssd_config(rc.get("owner_kv_ssd"), f"{ctx}.owner_kv_ssd")
 
 
 def _validate_profile_test_stack_redis_runtime_config(rc: Dict[str, Any], ctx: str) -> None:
@@ -6093,7 +6592,7 @@ def _validate_profile_test_stack_redis_runtime_config(rc: Dict[str, Any], ctx: s
 
 
 def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx: str) -> None:
-    _forbid_unknown_keys(rc, {"kv_base", "master"}, ctx)
+    _forbid_unknown_keys(rc, {"kv_base", "master", "testbed_mooncake_storage"}, ctx)
     kv_base = _require_dict(rc.get("kv_base"), f"{ctx}.kv_base")
     if "rdma_device_names" in kv_base:
         raise ValueError(f"{ctx}.kv_base.rdma_device_names has been removed from Fluxon KV config")
@@ -6105,10 +6604,12 @@ def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx
     _forbid_unknown_keys(
         mooncake_spec,
         {
+            "local_hostname",
             "local_buffer_size",
             "metadata_server",
             "master_server_address",
             "etcd_addresses",
+            "skip_get_size_on_get",
         },
         f"{ctx}.kv_base.mooncake_spec",
     )
@@ -6117,6 +6618,10 @@ def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx
         f"{ctx}.kv_base.mooncake_spec.local_buffer_size",
         min_v=1,
     )
+    if "local_hostname" in mooncake_spec:
+        raise ValueError(
+            f"{ctx}.kv_base.mooncake_spec.local_hostname is generated per TEST_STACK node; do not set it"
+        )
     if "metadata_server" in mooncake_spec:
         raise ValueError(
             f"{ctx}.kv_base.mooncake_spec.metadata_server is generated by TEST_STACK Mooncake master; do not set it"
@@ -6124,6 +6629,11 @@ def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx
     if "master_server_address" in mooncake_spec:
         raise ValueError(
             f"{ctx}.kv_base.mooncake_spec.master_server_address is generated by TEST_STACK Mooncake master; do not set it"
+        )
+    if "skip_get_size_on_get" in mooncake_spec:
+        _ = _require_bool(
+            mooncake_spec.get("skip_get_size_on_get"),
+            f"{ctx}.kv_base.mooncake_spec.skip_get_size_on_get",
         )
     raw_etcd_addresses = mooncake_spec.get("etcd_addresses")
     if raw_etcd_addresses is not None:
@@ -6147,6 +6657,10 @@ def _validate_profile_test_stack_mooncake_runtime_config(rc: Dict[str, Any], ctx
     _ = _normalize_test_spec_config(
         kv_base.get("benchmark_fast_path"),
         f"{ctx}.kv_base.benchmark_fast_path",
+    )
+    _ = _normalize_testbed_mooncake_storage_config(
+        rc.get("testbed_mooncake_storage"),
+        f"{ctx}.testbed_mooncake_storage",
     )
     pprof_duration_seconds = kv_base.get("pprof_duration_seconds")
     if pprof_duration_seconds is not None:
@@ -7911,6 +8425,7 @@ def _test_stack_runtime_role_for_scene_role(*, scene_mode: str, role: str) -> st
 
 def _test_stack_scene_uses_per_target_process_fanout(*, scene_mode: str) -> bool:
     return scene_mode in (
+        TEST_STACK_MODE_MPMC,
         TEST_STACK_MODE_KVSTORE,
         TEST_STACK_MODE_KVSTORE_WITH_LOCAL_CACHE,
         TEST_STACK_MODE_RPC,
@@ -8140,6 +8655,11 @@ def _test_stack_effective_kv_keyspace_size(
     if raw_keyspace_size is None:
         raise ValueError("scene.test_stack.keyspace_size is required for KV capacity sizing")
     requested_keyspace_size = _require_int(raw_keyspace_size, "scene.test_stack.keyspace_size", min_v=1)
+    raw_guard = ts_scene.get(TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD, True)
+    if not isinstance(raw_guard, bool):
+        raise ValueError(f"scene.test_stack.{TEST_STACK_SCENE_KEY_KEYSPACE_CAPACITY_GUARD} must be bool")
+    if not bool(raw_guard):
+        return int(requested_keyspace_size)
     owner_scale = _require_dict(scale.get("owner"), "resolved_case.scale.owner")
     owner_count = _require_int(owner_scale.get("owner_count"), "resolved_case.scale.owner.owner_count", min_v=1)
     owner_dram_bytes = _require_int(
@@ -8429,7 +8949,7 @@ def _build_test_stack_external_kv_owner_instances(
     kv_p2p_port_stride: int,
     kv_p2p_slot_offset: int,
     p2p_ports_per_slot: int,
-    node_total: int,
+    owner_p2p_port_offset: int,
     run_index: int,
     runtime_instance_prefix: str,
     kv_base: Dict[str, Any],
@@ -8438,6 +8958,7 @@ def _build_test_stack_external_kv_owner_instances(
     runtime_env: Dict[str, str],
     owner_group_processes: Optional[int],
     owner_cpu_core_by_target: Dict[str, int],
+    owner_kv_ssd: Optional[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     required_python_abi = _test_stack_runtime_required_python_abi(
         resolved_case=resolved_case,
@@ -8471,7 +8992,7 @@ def _build_test_stack_external_kv_owner_instances(
             int(kv_p2p_port_base)
             + int(kv_p2p_port_stride) * int(run_index - 1)
             + int(kv_p2p_slot_offset) * int(p2p_ports_per_slot)
-            + int(node_total)
+            + int(owner_p2p_port_offset)
             + int(master_port_offset)
             + int(owner_ordinal)
         )
@@ -8488,6 +9009,25 @@ def _build_test_stack_external_kv_owner_instances(
             )
         owner_services_dir = run_dir / "services" / "kv_owner" / target_slug
         owner_large_file_paths = _fluxon_kv_owner_large_file_paths(owner_work_root=owner_services_dir)
+        owner_fluxonkv_spec = {
+            "etcd_addresses": list(etcd_endpoints),
+            "cluster_name": cluster_name,
+            "share_mem_path": owner_share_mem_path,
+            "large_file_paths": owner_large_file_paths,
+            "sub_cluster": FLUXON_KV_OWNER_SUB_CLUSTER,
+            "p2p_listen_port": int(owner_p2p_listen_port),
+        }
+        if owner_kv_ssd is not None:
+            owner_large_limit_size = _require_list(
+                owner_kv_ssd.get("large_limit_size"),
+                "profile.test_stack.runtime_config.owner_kv_ssd.large_limit_size",
+            )
+            if len(owner_large_limit_size) != len(owner_large_file_paths):
+                raise ValueError(
+                    "profile.test_stack.runtime_config.owner_kv_ssd.large_limit_size length must match "
+                    "generated owner large_file_paths length"
+                )
+            owner_fluxonkv_spec["large_limit_size"] = copy.deepcopy(owner_large_limit_size)
         owner_cfg = {
             "instance_key": _test_stack_kv_owner_runtime_instance_key(
                 runtime_instance_prefix=runtime_instance_prefix,
@@ -8495,23 +9035,14 @@ def _build_test_stack_external_kv_owner_instances(
                 ctx="external kv owner",
             ),
             "contribute_to_cluster_pool_size": {"dram": int(owner_dram_bytes), "vram": {}},
-            "fluxonkv_spec": {
-                "etcd_addresses": list(etcd_endpoints),
-                "cluster_name": cluster_name,
-                "share_mem_path": owner_share_mem_path,
-                "large_file_paths": owner_large_file_paths,
-                "sub_cluster": FLUXON_KV_OWNER_SUB_CLUSTER,
-                "p2p_listen_port": int(owner_p2p_listen_port),
-            },
+            "fluxonkv_spec": owner_fluxonkv_spec,
         }
-        owner_protocol = kv_base.get("protocol")
-        if owner_protocol is not None:
-            owner_cfg["protocol"] = copy.deepcopy(
-                _require_dict(
-                    owner_protocol,
-                    "profile.test_stack.runtime_config.kv_base.protocol",
-                )
-            )
+        owner_network = _normalize_test_stack_fluxon_network_config(
+            kv_base.get("network"),
+            "profile.test_stack.runtime_config.kv_base.network",
+        )
+        if owner_network is not None:
+            owner_cfg["network"] = owner_network
         pprof_duration_seconds = kv_base.get("pprof_duration_seconds")
         if pprof_duration_seconds is not None:
             owner_cfg["pprof_duration_seconds"] = int(pprof_duration_seconds)
@@ -8575,6 +9106,7 @@ def _build_test_stack_mooncake_owner_instances(
     test_spec_config: Dict[str, Any],
     perf_config: Optional[Dict[str, Any]],
     runtime_env: Dict[str, str],
+    testbed_mooncake_storage: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     required_python_abi = _test_stack_runtime_required_python_abi(
         resolved_case=resolved_case,
@@ -8586,6 +9118,15 @@ def _build_test_stack_mooncake_owner_instances(
         raise ValueError(
             "TEST_STACK Mooncake requires owner_count to match owner target list length: "
             f"owner_count={owner_count} targets={len(owner_targets)}"
+        )
+    storage_mode = _require_str(
+        testbed_mooncake_storage.get("mode"),
+        "profile.test_stack.runtime_config.testbed_mooncake_storage.mode",
+    )
+    if storage_mode != TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER:
+        raise ValueError(
+            "Mooncake owner instances require testbed_mooncake_storage.mode="
+            f"{TEST_STACK_MOONCAKE_STORAGE_MODE_DEDICATED_OWNER}, got {storage_mode!r}"
         )
     owner_dram_bytes = _require_int(
         owner_scale.get("owner_dram_bytes"),
@@ -8621,9 +9162,31 @@ def _build_test_stack_mooncake_owner_instances(
         "profile.test_stack.runtime_config.kv_base.mooncake_spec.local_buffer_size",
         min_v=16777216,
     )
+    require_unlimited_memlock = True
 
     owner_instances: List[Dict[str, Any]] = []
+    local_ipv4_addrs = _local_ipv4_addresses()
+    ssd_offload_root_raw = testbed_mooncake_storage.get("ssd_offload_root")
+    ssd_capacity_raw = testbed_mooncake_storage.get("ssd_capacity_bytes")
+    per_owner_ssd_capacity: Optional[int] = None
+    if ssd_offload_root_raw is not None:
+        per_owner_ssd_capacity = _split_testbed_mooncake_capacity(
+            total_bytes=_require_int(
+                ssd_capacity_raw,
+                "profile.test_stack.runtime_config.testbed_mooncake_storage.ssd_capacity_bytes",
+                min_v=1,
+            ),
+            instance_count=owner_count,
+            alignment_bytes=1,
+            ctx="Mooncake dedicated-owner SSD",
+        )
     for target in owner_targets:
+        target_node_cfg = _require_dict(cluster_nodes.get(target), f"cluster_nodes[{target}]")
+        target_endpoint_host = _test_stack_target_advertise_host(
+            cluster_nodes=cluster_nodes,
+            target_name=target,
+            local_ipv4_addrs=local_ipv4_addrs,
+        )
         target_slug, instance_id = _test_stack_kv_owner_instance_id(
             owner_target=target,
             ctx="mooncake owner",
@@ -8639,18 +9202,34 @@ def _build_test_stack_mooncake_owner_instances(
             "mooncake_spec": {
                 # Mooncake owner/server should contribute storage capacity only.
                 # The benchmark node keeps the local transfer buffer; owner stays pure server mode.
+                "local_hostname": target_endpoint_host,
                 "local_buffer_size": 0,
                 "metadata_server": metadata_server,
                 "master_server_address": master_server_address,
                 "etcd_addresses": list(etcd_addresses),
             },
-            "protocol": copy.deepcopy(
-                _require_dict(
-                    kv_base.get("protocol"),
-                    "profile.test_stack.runtime_config.kv_base.protocol",
-                )
-            ),
         }
+        owner_pre_exec_shell = ""
+        owner_runtime_env = copy.deepcopy(runtime_env)
+        if ssd_offload_root_raw is not None:
+            owner_ssd_path = str(
+                (Path(_require_str(ssd_offload_root_raw, "ssd_offload_root")) / target_slug).resolve()
+            )
+            owner_cfg["mooncake_spec"].update(
+                {
+                    "enable_ssd_offload": True,
+                    "ssd_offload_path": owner_ssd_path,
+                }
+            )
+            owner_pre_exec_shell = (
+                "mkdir -p "
+                + _shell_quote(owner_ssd_path)
+                + "\n"
+            )
+            assert per_owner_ssd_capacity is not None
+            owner_runtime_env[TEST_STACK_MOONCAKE_SSD_LIMIT_ENV] = str(
+                per_owner_ssd_capacity
+            )
         pprof_duration_seconds = kv_base.get("pprof_duration_seconds")
         if pprof_duration_seconds is not None:
             owner_cfg["pprof_duration_seconds"] = int(pprof_duration_seconds)
@@ -8683,7 +9262,9 @@ def _build_test_stack_mooncake_owner_instances(
                 "-w",
                 str(owner_services_dir.resolve()),
             ],
-            runtime_env=runtime_env,
+            runtime_env=owner_runtime_env,
+            pre_exec_shell=owner_pre_exec_shell,
+            require_unlimited_memlock=require_unlimited_memlock,
         )
         if perf_config is not None and "owner" in _require_list(perf_config.get("targets"), "perf_config.targets"):
             owner_cmd = _test_stack_perf_wrapper_command(
@@ -8884,7 +9465,11 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     else:
         coord_target_str = _require_str(raw_coord_target, "coordinator_template.deployer.target")
         coord_target = coordinator_target if coord_target_str == "__TARGET__" else coord_target_str
-    coord_ip = _require_str(target_ip_map.get(coord_target), "deploy.target_ip_map[coordinator_target]")
+    coord_ip = _test_stack_target_advertise_host(
+        cluster_nodes=cluster_nodes,
+        target_name=coord_target,
+        local_ipv4_addrs=_local_ipv4_addresses(),
+    )
     coordinator_addr = f"{coord_ip}:{coordinator_port}"
 
     bench = _require_dict(scale.get("benchmark"), "scale.benchmark")
@@ -8893,16 +9478,10 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         "scale.benchmark.processes_per_target",
         min_v=1,
     )
-    threads_per_process = _require_int(
+    threads_per_process = _require_test_stack_benchmark_threads_per_process(
         bench.get("threads_per_process"),
         "scale.benchmark.threads_per_process",
-        min_v=1,
     )
-    if int(threads_per_process) != TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS:
-        raise ValueError(
-            "scale.benchmark.threads_per_process must be fixed to "
-            f"{TEST_STACK_BENCHMARK_FIXED_THREADS_PER_PROCESS}"
-        )
     value_size = _require_int(bench.get("value_size"), "scale.benchmark.value_size", min_v=0)
     warmup = bench.get("metric_warmup_seconds")
     if not isinstance(warmup, (int, float)):
@@ -8939,6 +9518,14 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
 
     value_size_list = _require_list(bench.get("value_size_list"), "scale.benchmark.value_size_list")
     consumer_sim_handle_ms_range = bench.get("consumer_sim_handle_ms_range")
+    mpmc_active_producer_runtime_limit_raw = bench.get("mpmc_active_producer_runtime_limit")
+    mpmc_active_producer_runtime_limit: Optional[int] = None
+    if mpmc_active_producer_runtime_limit_raw is not None:
+        mpmc_active_producer_runtime_limit = _require_int(
+            mpmc_active_producer_runtime_limit_raw,
+            "scale.benchmark.mpmc_active_producer_runtime_limit",
+            min_v=1,
+        )
 
     # Compute a deterministic per-node P2P listen port allocation for this case.
     #
@@ -8947,15 +9534,23 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     # - Port allocation must be stable across resume within the same run_dir, but also avoid collisions across
     #   different workdirs on different machines (runner_root slot offset).
     node_total = 0
+    benchmark_p2p_ports_per_slot = 0
     for role in roles_order:
         plan = _require_dict(role_plan.get(role), f"scale.role_plan[{role}]")
         role_target_count = _require_int(plan.get("count"), f"scale.role_plan[{role}].count", min_v=1)
         if _test_stack_scene_uses_per_target_process_fanout(scene_mode=scene_mode):
-            node_total += int(role_target_count) * int(processes_per_target)
+            role_node_total = int(role_target_count) * int(processes_per_target)
         else:
-            node_total += int(role_target_count)
+            role_node_total = int(role_target_count)
+        node_total += role_node_total
+        if scene_mode == TEST_STACK_MODE_MPMC and role == "producer":
+            benchmark_p2p_ports_per_slot += role_node_total * int(threads_per_process)
+        else:
+            benchmark_p2p_ports_per_slot += role_node_total
     if node_total <= 0:
         raise ValueError("computed node_total must be positive")
+    if benchmark_p2p_ports_per_slot <= 0:
+        raise ValueError("computed benchmark_p2p_ports_per_slot must be positive")
     owner_targets = _test_stack_owner_targets(
         scale=scale,
         role_plan=role_plan,
@@ -8975,11 +9570,24 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         target_ip_map=target_ip_map,
         ctx="resolved_case.scale.owner.targets",
     )
+    rc = _require_dict(ts_profile.get("runtime_config"), "profile.test_stack.runtime_config")
+    testbed_mooncake_storage: Optional[Dict[str, Any]] = None
+    mooncake_storage_mode: Optional[str] = None
+    if backend_kind == TEST_STACK_BACKEND_MOONCAKE:
+        testbed_mooncake_storage = _normalize_testbed_mooncake_storage_config(
+            rc.get("testbed_mooncake_storage"),
+            "profile.test_stack.runtime_config.testbed_mooncake_storage",
+        )
+        mooncake_storage_mode = _require_str(
+            testbed_mooncake_storage.get("mode"),
+            "profile.test_stack.runtime_config.testbed_mooncake_storage.mode",
+        )
     needs_kv_master = _test_stack_backend_requires_fluxon_kv_master(backend_kind=backend_kind, mode=scene_mode)
     uses_external_fluxon_kv = _test_stack_backend_uses_external_fluxon_kv(backend_kind=backend_kind, mode=scene_mode)
     uses_dedicated_kv_owners = _test_stack_backend_uses_dedicated_kv_owners(
         backend_kind=backend_kind,
         mode=scene_mode,
+        mooncake_storage_mode=mooncake_storage_mode,
     )
     _require_explicit_owner_group_processes_for_multi_owner_same_machine(
         owner_targets_by_machine=owner_targets_by_machine,
@@ -8993,15 +9601,17 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         assert kv_p2p_port_stride is not None
         # English note:
         # - Port allocation must be stable across resume within the same run_dir.
-        # - Allocate a disjoint KV P2P listen port for every KV process in the case:
-        #   benchmark nodes + (optional) dedicated KV owners.
+        # - MPMC producer workers create worker-owned KV runtimes before READY, so each
+        #   producer thread needs a disjoint P2P listen port.
+        # - Other benchmark nodes use one KV runtime per process.
+        # - Dedicated KV owners use one P2P listen port per owner process.
         owner_total = len(owner_targets) if uses_dedicated_kv_owners else 0
-        p2p_ports_per_slot = node_total + owner_total
+        p2p_ports_per_slot = benchmark_p2p_ports_per_slot + owner_total
         if kv_p2p_port_stride < p2p_ports_per_slot:
             raise ValueError(
                 "profile.test_stack.port_alloc.kv_p2p_port_stride too small for this case: "
                 f"stride={kv_p2p_port_stride} required_ports_per_slot={p2p_ports_per_slot} "
-                f"node_total={node_total} mode={scene_mode}"
+                f"benchmark_ports={benchmark_p2p_ports_per_slot} owner_total={owner_total} mode={scene_mode}"
             )
         kv_p2p_slot_count = kv_p2p_port_stride // p2p_ports_per_slot
         if kv_p2p_slot_count <= 0:
@@ -9015,6 +9625,20 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     node_instances: List[Dict[str, Any]] = []
     node_roles: List[str] = []
     node_overrides: List[Dict[str, Any]] = []
+    benchmark_node_start_throttle_max_seconds = _test_stack_local_benchmark_node_start_throttle_max_seconds(
+        scene_mode=scene_mode,
+        node_total=node_total,
+        role_plan=role_plan,
+        roles_order=roles_order,
+        target_ip_map=target_ip_map,
+        cluster_nodes=cluster_nodes,
+        ctx="resolved_case.scale",
+    )
+    mooncake_local_ipv4_addrs = (
+        _local_ipv4_addresses()
+        if backend_kind == TEST_STACK_BACKEND_MOONCAKE
+        else set()
+    )
     stack_cluster_name: Optional[str] = None
     stack_share_mem_path: Optional[str] = None
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
@@ -9028,13 +9652,15 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             "runtime.stack_identity.share_mem_path",
         )
 
-    rc = _require_dict(ts_profile.get("runtime_config"), "profile.test_stack.runtime_config")
     kv_base: Dict[str, Any]
     kv_node_patch_template: Dict[str, Any] = {}
     mq_base: Optional[Any] = None
     rc_redis: Optional[Dict[str, Any]] = None
     rc_alluxio: Optional[Dict[str, Any]] = None
     rc_mooncake_master: Optional[Dict[str, Any]] = None
+    owner_kv_ssd: Optional[Dict[str, Any]] = None
+    mooncake_per_benchmark_process_dram_bytes: Optional[int] = None
+    mooncake_per_benchmark_process_ssd_capacity_bytes: Optional[int] = None
     owner_cpu_core_by_target: Dict[str, int] = {}
     alluxio_mount_root_by_target: Dict[str, str] = {}
     redis_instances: List[Dict[str, Any]] = []
@@ -9043,6 +9669,10 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     mooncake_metadata_port: Optional[int] = None
     mooncake_metrics_port: Optional[int] = None
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
+        owner_kv_ssd = _normalize_test_stack_owner_kv_ssd_config(
+            rc.get("owner_kv_ssd"),
+            "profile.test_stack.runtime_config.owner_kv_ssd",
+        )
         owner_cpu_core_by_target = _normalize_owner_cpu_core_by_target(
             rc.get("owner_cpu_core_by_target"),
             "profile.test_stack.runtime_config.owner_cpu_core_by_target",
@@ -9108,26 +9738,6 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         # - instance_key is still run_dir scoped to avoid stale member-key collisions across reruns inside the same
         #   benchmark cluster namespace.
         kv_base["instance_key"] = f"{runtime_instance_prefix}__bench_base"
-        pre_test_spec_config = _normalize_test_spec_config(
-            kv_base.get("test_spec_config"),
-            "profile.test_stack.runtime_config.kv_base.test_spec_config",
-        )
-        pre_legacy_benchmark_fast_path = _normalize_test_spec_config(
-            kv_base.get("benchmark_fast_path"),
-            "profile.test_stack.runtime_config.kv_base.benchmark_fast_path",
-        )
-        pre_merged_test_spec_config = _merge_test_spec_config_with_legacy_alias(
-            test_spec_config=pre_test_spec_config,
-            legacy_benchmark_fast_path=pre_legacy_benchmark_fast_path,
-            ctx="profile.test_stack.runtime_config.kv_base",
-        )
-        resolved_protocol_cfg = _resolve_test_stack_fluxon_protocol_cfg(
-            kv_base=kv_base,
-            merged_test_spec_config=pre_merged_test_spec_config,
-            ctx="profile.test_stack.runtime_config.kv_base",
-        )
-        if resolved_protocol_cfg is not None:
-            kv_base["protocol"] = resolved_protocol_cfg
         fluxonkv_spec = _forbid_removed_fluxon_kv_config_keys(kv_base, "profile.test_stack.runtime_config.kv_base")
         if uses_external_fluxon_kv:
             # External (zero-contribution) mode forbids etcd_addresses and several advanced knobs.
@@ -9201,6 +9811,8 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         )
         kv_base["instance_key"] = f"{runtime_instance_prefix}__bench_base"
     elif backend_kind == TEST_STACK_BACKEND_MOONCAKE:
+        assert testbed_mooncake_storage is not None
+        assert mooncake_storage_mode is not None
         kv_base = copy.deepcopy(_require_dict(rc.get("kv_base"), "profile.test_stack.runtime_config.kv_base"))
         if "fluxonkv_spec" in kv_base:
             raise ValueError(
@@ -9224,6 +9836,35 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         )
         kv_base["backend_kind"] = TEST_STACK_BACKEND_MOONCAKE
         kv_base["instance_key"] = f"{runtime_instance_prefix}__bench_base"
+        if mooncake_storage_mode == TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS:
+            owner_scale = _require_dict(scale.get("owner"), "resolved_case.scale.owner")
+            owner_count = _require_int(
+                owner_scale.get("owner_count"),
+                "resolved_case.scale.owner.owner_count",
+                min_v=1,
+            )
+            owner_dram_bytes = _require_int(
+                owner_scale.get("owner_dram_bytes"),
+                "resolved_case.scale.owner.owner_dram_bytes",
+                min_v=TEST_STACK_MOONCAKE_SEGMENT_ALIGNMENT_BYTES,
+            )
+            mooncake_per_benchmark_process_dram_bytes = _split_testbed_mooncake_capacity(
+                total_bytes=int(owner_count) * int(owner_dram_bytes),
+                instance_count=node_total,
+                alignment_bytes=TEST_STACK_MOONCAKE_SEGMENT_ALIGNMENT_BYTES,
+                ctx="Mooncake per-benchmark-process DRAM",
+            )
+            if testbed_mooncake_storage.get("ssd_offload_root") is not None:
+                mooncake_per_benchmark_process_ssd_capacity_bytes = _split_testbed_mooncake_capacity(
+                    total_bytes=_require_int(
+                        testbed_mooncake_storage.get("ssd_capacity_bytes"),
+                        "profile.test_stack.runtime_config.testbed_mooncake_storage.ssd_capacity_bytes",
+                        min_v=1,
+                    ),
+                    instance_count=node_total,
+                    alignment_bytes=1,
+                    ctx="Mooncake per-benchmark-process SSD",
+                )
         mooncake_rpc_port_base = _require_int(
             port_alloc.get("mooncake_rpc_port_base"),
             "profile.test_stack.port_alloc.mooncake_rpc_port_base",
@@ -9292,16 +9933,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         mooncake_spec["metadata_server"] = f"http://{mooncake_host}:{int(mooncake_metadata_port)}/metadata"
         mooncake_spec["master_server_address"] = f"{mooncake_host}:{int(mooncake_rpc_port)}"
         mooncake_spec["etcd_addresses"] = list(etcd_endpoints)
-        raw_protocol = kv_base.get("protocol")
-        if raw_protocol is None:
-            kv_base["protocol"] = {"protocol_type": "tcp"}
-        else:
-            kv_base["protocol"] = copy.deepcopy(
-                _require_dict(
-                    raw_protocol,
-                    "profile.test_stack.runtime_config.kv_base.protocol",
-                )
-            )
+        mooncake_spec.setdefault("skip_get_size_on_get", True)
     else:
         raise ValueError(f"unsupported TEST_STACK backend kind: {backend_kind!r}")
     test_spec_config = _normalize_test_spec_config(
@@ -9340,22 +9972,19 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         ctx="profile.test_stack.runtime_config.kv_base",
     )
     runtime_test_spec_config = _test_spec_config_runtime_view(test_spec_config)
-    runtime_protocol_cfg = None
+    runtime_network_cfg = None
     if backend_kind == TEST_STACK_BACKEND_FLUXON:
-        runtime_protocol_cfg = kv_base.get("protocol")
-        if runtime_protocol_cfg is not None:
-            runtime_protocol_cfg = copy.deepcopy(
-                _require_dict(
-                    runtime_protocol_cfg,
-                    "profile.test_stack.runtime_config.kv_base.protocol",
-                )
-            )
+        runtime_network_cfg = _normalize_test_stack_fluxon_network_config(
+            kv_base.get("network"),
+            "profile.test_stack.runtime_config.kv_base.network",
+        )
     kv_base.pop("benchmark_fast_path", None)
     kv_base.pop("test_spec_config", None)
     if runtime_test_spec_config:
         kv_base["test_spec_config"] = copy.deepcopy(runtime_test_spec_config)
-    if runtime_protocol_cfg is not None:
-        kv_base["protocol"] = runtime_protocol_cfg
+    if runtime_network_cfg is not None:
+        kv_base["network"] = runtime_network_cfg
+    mooncake_requires_unlimited_memlock = backend_kind == TEST_STACK_BACKEND_MOONCAKE
     # mq_new_or_bind_unique_key is used to derive etcd keys for MPMC channel creation,
     # including a distributed lock key "<unique_id>_lock".
     #
@@ -9413,8 +10042,8 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             master_cfg["pprof_duration_seconds"] = int(pprof_duration_seconds)
         if runtime_test_spec_config:
             master_cfg["test_spec_config"] = copy.deepcopy(runtime_test_spec_config)
-        if runtime_protocol_cfg is not None:
-            master_cfg["protocol"] = copy.deepcopy(runtime_protocol_cfg)
+        if runtime_network_cfg is not None:
+            master_cfg["network"].update(copy.deepcopy(runtime_network_cfg))
         master_cfg_path = cfg_dir / "test_stack_master.yaml"
         if master_cfg_path.exists():
             raise ValueError(f"test_stack master config already exists (no overwrite): {master_cfg_path}")
@@ -9515,6 +10144,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             module_name="mooncake.cli",
             module_args=mooncake_args,
             runtime_env=runtime_env,
+            require_unlimited_memlock=mooncake_requires_unlimited_memlock,
         )
         if perf_config is not None and TEST_STACK_MOONCAKE_MASTER_INSTANCE_ID in _require_list(
             perf_config.get("targets"),
@@ -9593,7 +10223,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             kv_p2p_port_stride=kv_p2p_port_stride,
             kv_p2p_slot_offset=kv_p2p_slot_offset,
             p2p_ports_per_slot=p2p_ports_per_slot,
-            node_total=node_total,
+            owner_p2p_port_offset=benchmark_p2p_ports_per_slot,
             run_index=run_index,
             runtime_instance_prefix=runtime_instance_prefix,
             kv_base=kv_base,
@@ -9602,8 +10232,10 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             runtime_env=runtime_env,
             owner_group_processes=owner_group_processes,
             owner_cpu_core_by_target=owner_cpu_core_by_target,
+            owner_kv_ssd=owner_kv_ssd,
         )
     elif backend_kind == TEST_STACK_BACKEND_MOONCAKE and uses_dedicated_kv_owners:
+        assert testbed_mooncake_storage is not None
         owner_instances = _build_test_stack_mooncake_owner_instances(
             resolved_case=resolved_case,
             scale=scale,
@@ -9617,6 +10249,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             test_spec_config=runtime_test_spec_config,
             perf_config=perf_config,
             runtime_env=runtime_env,
+            testbed_mooncake_storage=testbed_mooncake_storage,
         )
 
     rpc_server_instance_keys: List[str] = []
@@ -9624,6 +10257,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
     rpc_server_zero_rpc_ports: Dict[str, int] = {}
     network_sample_targets_seen: set[str] = set()
 
+    benchmark_p2p_port_offset = 0
     for role in roles_order:
         plan = _require_dict(role_plan.get(role), f"scale.role_plan[{role}]")
         cnt = _require_int(plan.get("count"), f"scale.role_plan[{role}].count", min_v=1)
@@ -9661,12 +10295,50 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                 )
                 if scene_mode == TEST_STACK_MODE_KVSTORE:
                     runtime_role = KV_NODE_ROLE_WORKER
+                node_ordinal = len(node_overrides)
+                node_start_throttle_delay_seconds = (
+                    _test_stack_local_benchmark_node_start_throttle_delay_seconds(
+                        node_ordinal=node_ordinal,
+                        node_total=node_total,
+                        max_seconds=benchmark_node_start_throttle_max_seconds,
+                    )
+                )
+                node_start_throttle_prelude = _test_stack_node_start_throttle_prelude(
+                    delay_seconds=node_start_throttle_delay_seconds,
+                    instance_key=runtime_instance_key,
+                )
 
                 mapping = {
                     "__INSTANCE_KEY__": instance_key,
                     "__COORDINATOR__": coordinator_addr,
                     "__TARGET__": target,
                 }
+                node_runtime_env = copy.deepcopy(runtime_env)
+                node_pre_exec_shell = node_start_throttle_prelude
+                mooncake_node_ssd_path: Optional[str] = None
+                if (
+                    backend_kind == TEST_STACK_BACKEND_MOONCAKE
+                    and mooncake_storage_mode
+                    == TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS
+                ):
+                    assert testbed_mooncake_storage is not None
+                    ssd_offload_root = testbed_mooncake_storage.get("ssd_offload_root")
+                    if ssd_offload_root is not None:
+                        mooncake_node_ssd_path = str(
+                            (
+                                Path(_require_str(ssd_offload_root, "ssd_offload_root"))
+                                / runtime_instance_key
+                            ).resolve()
+                        )
+                        node_pre_exec_shell += (
+                            "mkdir -p "
+                            + _shell_quote(mooncake_node_ssd_path)
+                            + "\n"
+                        )
+                        assert mooncake_per_benchmark_process_ssd_capacity_bytes is not None
+                        node_runtime_env[TEST_STACK_MOONCAKE_SSD_LIMIT_ENV] = str(
+                            mooncake_per_benchmark_process_ssd_capacity_bytes
+                        )
                 inst = _require_dict(_subst_obj_tokens(node_tpl, mapping, "node_template"), "node_template.compiled")
                 inst["id"] = instance_key
                 inst_deployer = _require_dict(inst.get("deployer"), f"node_template[{instance_key}].deployer")
@@ -9692,7 +10364,9 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                             "--coordinator",
                             coordinator_addr,
                         ],
-                        runtime_env=runtime_env,
+                        runtime_env=node_runtime_env,
+                        pre_exec_shell=node_pre_exec_shell,
+                        require_unlimited_memlock=mooncake_requires_unlimited_memlock,
                     )
                 ]
                 node_instances.append(inst)
@@ -9706,15 +10380,25 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                         "kv_node_patch_template.compiled",
                     )
                     kv = _deep_merge_dict(kv, kv_patch)
-                    node_ordinal = len(node_overrides)
                     kv_p2p_listen_port = (
                         int(kv_p2p_port_base)
                         + int(kv_p2p_port_stride) * int(run_index - 1)
                         + int(kv_p2p_slot_offset) * int(p2p_ports_per_slot)
-                        + int(node_ordinal)
+                        + int(benchmark_p2p_port_offset)
                     )
                     if kv_p2p_listen_port <= 0 or kv_p2p_listen_port > 65535:
                         raise ValueError(f"computed kv_p2p_listen_port out of range: {kv_p2p_listen_port}")
+                    p2p_ports_for_node = (
+                        int(threads_per_process)
+                        if scene_mode == TEST_STACK_MODE_MPMC and role == "producer"
+                        else 1
+                    )
+                    kv_p2p_last_listen_port = int(kv_p2p_listen_port) + int(p2p_ports_for_node) - 1
+                    if kv_p2p_last_listen_port <= 0 or kv_p2p_last_listen_port > 65535:
+                        raise ValueError(
+                            "computed kv_p2p_listen_port range out of range: "
+                            f"first={kv_p2p_listen_port} count={p2p_ports_for_node} last={kv_p2p_last_listen_port}"
+                        )
                     fluxonkv_override = kv.get("fluxonkv_spec")
                     if fluxonkv_override is None:
                         fluxonkv_override = {}
@@ -9745,6 +10429,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                     fluxonkv_override["share_mem_path"] = selected_share_mem_path
                     fluxonkv_override["p2p_listen_port"] = int(kv_p2p_listen_port)
                     kv["fluxonkv_spec"] = fluxonkv_override
+                    benchmark_p2p_port_offset += p2p_ports_for_node
                 elif backend_kind == TEST_STACK_BACKEND_ALLUXIO:
                     if target not in alluxio_mount_root_by_target:
                         raise ValueError(
@@ -9756,6 +10441,31 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
                             f"profile.test_stack.runtime_config.alluxio.mount_root_by_target[{target!r}]",
                         )
                     }
+                elif backend_kind == TEST_STACK_BACKEND_MOONCAKE:
+                    mooncake_spec_override: Dict[str, Any] = {
+                        "local_hostname": _test_stack_target_advertise_host(
+                            cluster_nodes=cluster_nodes,
+                            target_name=target,
+                            local_ipv4_addrs=mooncake_local_ipv4_addrs,
+                        )
+                    }
+                    if (
+                        mooncake_storage_mode
+                        == TEST_STACK_MOONCAKE_STORAGE_MODE_PER_BENCHMARK_PROCESS
+                    ):
+                        assert mooncake_per_benchmark_process_dram_bytes is not None
+                        kv["contribute_to_cluster_pool_size"] = {
+                            "dram": mooncake_per_benchmark_process_dram_bytes,
+                            "vram": {},
+                        }
+                        if mooncake_node_ssd_path is not None:
+                            mooncake_spec_override.update(
+                                {
+                                    "enable_ssd_offload": True,
+                                    "ssd_offload_path": mooncake_node_ssd_path,
+                                }
+                            )
+                    kv["mooncake_spec"] = mooncake_spec_override
                 rec: Dict[str, Any] = {"kv": kv}
                 if scene_mode == TEST_STACK_MODE_MPMC:
                     rec["mq_role"] = role
@@ -9818,6 +10528,7 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             script_path=test_stack_runtime["coordinator_script"],
             script_args=[],
             runtime_env=runtime_env,
+            require_unlimited_memlock=mooncake_requires_unlimited_memlock,
         )
     ]
 
@@ -9849,6 +10560,10 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
         "node_roles": node_roles,
         "value_size_list": value_size_list,
     }
+    if mpmc_active_producer_runtime_limit is not None:
+        benchmark_out["mpmc_active_producer_runtime_limit"] = int(
+            mpmc_active_producer_runtime_limit
+        )
     value_size_mode = ts_scene.get("value_size_mode")
     if value_size_mode is None:
         benchmark_out["value_size_mode"] = "FIXED"
@@ -9869,6 +10584,11 @@ def _compile_test_stack_case(resolved_case: Dict[str, Any], *, run_index: int) -
             "read_ratio",
             "write_ratio",
             "request_distribution",
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_CONCURRENCY,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_PUT_GAP_MS,
+            TEST_STACK_SCENE_KEY_KV_BOOTSTRAP_STORAGE_FULL_POLICY,
+            TEST_STACK_SCENE_KEY_KV_GET_OUTPUT,
+            TEST_STACK_SCENE_KEY_KV_CUDA_DEVICE_INDEX,
             TEST_STACK_SCENE_KEY_AFFINITY_LOCALITY_RATIO,
         ):
             if optional_key in ts_scene:
@@ -10160,6 +10880,22 @@ def _cluster_node_is_local_host(
     return False
 
 
+def _test_stack_target_advertise_host(
+    *,
+    cluster_nodes: Dict[str, Dict[str, Any]],
+    target_name: str,
+    local_ipv4_addrs: set[str],
+) -> str:
+    node_cfg = _require_dict(cluster_nodes.get(target_name), f"cluster_nodes[{target_name}]")
+    if _cluster_node_is_local_host(
+        node_cfg,
+        target_name=target_name,
+        local_ipv4_addrs=local_ipv4_addrs,
+    ):
+        return "127.0.0.1"
+    return _require_str(node_cfg.get("ip"), f"cluster_nodes[{target_name}].ip")
+
+
 def _ensure_path_symlink(*, link_path: Path, target_path: Path) -> None:
     link_path = link_path.resolve(strict=False)
     target_path = target_path.resolve()
@@ -10246,19 +10982,18 @@ def _write_release_manifest(*, release_root: Path, relpaths: List[str]) -> None:
 
 def _load_test_stack_cluster_nodes_and_dispatch(resolved_case: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], Any]:
     start_test_bed_mod = _load_test_stack_start_test_bed_module(resolved_case)
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     cluster_nodes = start_test_bed_mod._parse_cluster_nodes(deployconf)
     deploy = resolved_case.get("deploy")
     if isinstance(deploy, dict):
         target_ip_map = deploy.get("target_ip_map")
         if target_ip_map is not None:
             target_ip_map_d = _require_dict(target_ip_map, "resolved_case.deploy.target_ip_map")
-            cluster_nodes_by_ip: Dict[str, List[Dict[str, Any]]] = {}
+            cluster_nodes_by_ip: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
             for hostname, raw_node_cfg in cluster_nodes.items():
                 node_cfg = _require_dict(raw_node_cfg, f"cluster_nodes[{hostname}]")
                 node_ip = _require_str(node_cfg.get("ip"), f"cluster_nodes[{hostname}].ip")
-                cluster_nodes_by_ip.setdefault(node_ip, []).append(node_cfg)
+                cluster_nodes_by_ip.setdefault(node_ip, []).append((hostname, node_cfg))
             cluster_nodes = dict(cluster_nodes)
             for raw_target, raw_ip in target_ip_map_d.items():
                 target = _require_str(raw_target, "resolved_case.deploy.target_ip_map key")
@@ -10268,19 +11003,42 @@ def _load_test_stack_cluster_nodes_and_dispatch(resolved_case: Dict[str, Any]) -
                 matches = cluster_nodes_by_ip.get(node_ip, [])
                 if not matches:
                     continue
-                if len(matches) > 1:
-                    raise ValueError(
-                        "resolved_case.deploy.target_ip_map alias expansion is ambiguous: "
-                        f"target={target!r} ip={node_ip!r} matches={len(matches)}"
+                same_ip_targets = [
+                    _require_str(candidate, "resolved_case.deploy.target_ip_map key")
+                    for candidate, candidate_ip in target_ip_map_d.items()
+                    if _require_str(
+                        candidate_ip,
+                        f"resolved_case.deploy.target_ip_map[{candidate!r}]",
                     )
-                cluster_nodes[target] = copy.deepcopy(matches[0])
+                    == node_ip
+                ]
+                preferred = _controller_target_for_target(
+                    target,
+                    target_ip_map={
+                        candidate: node_ip
+                        for candidate in same_ip_targets
+                    },
+                )
+                selected: Optional[Dict[str, Any]] = None
+                for hostname, node_cfg in matches:
+                    if hostname == preferred:
+                        selected = node_cfg
+                        break
+                if selected is None and len(matches) == 1:
+                    selected = matches[0][1]
+                if selected is None:
+                    available = sorted(hostname for hostname, _node_cfg in matches)
+                    raise ValueError(
+                        "resolved_case.deploy.target_ip_map alias expansion has no canonical active node: "
+                        f"target={target!r} ip={node_ip!r} preferred={preferred!r} active_matches={available}"
+                    )
+                cluster_nodes[target] = copy.deepcopy(selected)
     return cluster_nodes, start_test_bed_mod.manual_dispatch_release
 
 
 def _test_bed_cluster_nodes_from_bundle() -> Dict[str, Dict[str, Any]]:
     start_test_bed_mod = _load_test_stack_start_test_bed_module({})
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     return start_test_bed_mod._parse_cluster_nodes(deployconf)
 
 
@@ -10383,8 +11141,7 @@ def _test_stack_etcd_addresses(resolved_case: Dict[str, Any]) -> List[str]:
     - We derive etcd placement from the test bed deployconf to keep suite configs clean
       (no hardcoded host IPs in ci_test_list.yaml) while remaining deterministic.
     """
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     services = _require_dict(deployconf.get("service"), "deployconf.service")
     etcd = _require_dict(services.get("etcd"), "deployconf.service.etcd")
     port = _require_int(etcd.get("port"), "deployconf.service.etcd.port", min_v=1)
@@ -10404,8 +11161,7 @@ def _test_stack_etcd_addresses(resolved_case: Dict[str, Any]) -> List[str]:
 
 
 def _active_test_stack_target_ip_map(*, ctx: str) -> Dict[str, str]:
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     raw_nodes = _require_list(deployconf.get("cluster_nodes"), "deployconf.cluster_nodes")
     out: Dict[str, str] = {}
     for idx, raw_node in enumerate(raw_nodes):
@@ -10422,8 +11178,7 @@ def _active_test_stack_target_ip_map(*, ctx: str) -> Dict[str, str]:
 
 def _test_stack_greptime_host_port(resolved_case: Dict[str, Any]) -> Tuple[str, int]:
     """Infer Greptime host:port for TEST_STACK master monitoring config from the self-host deployconf."""
-    deployconf_path = _load_test_bed_deployconf_path()
-    deployconf = _require_dict(_load_yaml_file(deployconf_path), f"deployconf {deployconf_path}")
+    _deployconf_path, deployconf = _load_test_bed_deployconf()
     services = _require_dict(deployconf.get("service"), "deployconf.service")
     greptime = _require_dict(services.get("greptime"), "deployconf.service.greptime")
     port = _require_int(greptime.get("port"), "deployconf.service.greptime.port", min_v=1)
@@ -10874,6 +11629,11 @@ def _ci_cleanup_runtime(
             ctx=f"CI cleanup runtime current_deployments {instance_id_text}",
         )
     _wait_ci_ports_free(cleanup_case, timeout_s=timeout_s)
+    _cleanup_ci_case_shared_bundle(
+        cleanup_case,
+        timeout_s=timeout_s,
+        ctx="CI runtime shared bundle cleanup",
+    )
 
 
 def _http_json_allow_error_status(req: urllib.request.Request) -> Tuple[int, Dict[str, Any]]:
@@ -10915,6 +11675,24 @@ def _http_json_allow_error_status(req: urllib.request.Request) -> Tuple[int, Dic
             time.sleep(CONTROLLER_HTTP_RETRY_SLEEP_SECONDS)
 
 
+def _print_controller_transient_retry(
+    *,
+    source: str,
+    url: str,
+    detail: str,
+) -> None:
+    now = time.time()
+    key = (source, url)
+    next_at = _CONTROLLER_TRANSIENT_LOG_NEXT_AT.get(key, 0.0)
+    if now < next_at:
+        return
+    _CONTROLLER_TRANSIENT_LOG_NEXT_AT[key] = now + _CONTROLLER_TRANSIENT_LOG_INTERVAL_SECONDS
+    print(
+        f"[{source}] transient controller error; retrying: url={url} {detail}",
+        flush=True,
+    )
+
+
 def _http_json_allow_error_status_allow_empty_success(
     req: urllib.request.Request,
 ) -> Tuple[int, Any]:
@@ -10945,10 +11723,10 @@ def _http_json_allow_error_status_allow_empty_success(
                         "controller request timed out after retry deadline: "
                         f"url={req.full_url} err=HTTPError: {exc}"
                     ) from exc
-                print(
-                    f"[_http_json_allow_error_status_allow_empty_success] transient HTTP error; retrying: "
-                    f"url={req.full_url} status={exc.code}",
-                    flush=True,
+                _print_controller_transient_retry(
+                    source="_http_json_allow_error_status_allow_empty_success",
+                    url=str(req.full_url),
+                    detail=f"status={exc.code}",
                 )
                 time.sleep(CONTROLLER_HTTP_RETRY_SLEEP_SECONDS)
                 continue
@@ -10963,10 +11741,10 @@ def _http_json_allow_error_status_allow_empty_success(
                     "controller request timed out after retry deadline: "
                     f"url={req.full_url} err={type(exc).__name__}: {exc}"
                 ) from exc
-            print(
-                f"[_http_json_allow_error_status_allow_empty_success] transient transport error; retrying: "
-                f"url={req.full_url} err={type(exc).__name__}: {exc}",
-                flush=True,
+            _print_controller_transient_retry(
+                source="_http_json_allow_error_status_allow_empty_success",
+                url=str(req.full_url),
+                detail=f"err={type(exc).__name__}: {exc}",
             )
             time.sleep(CONTROLLER_HTTP_RETRY_SLEEP_SECONDS)
 
@@ -10984,6 +11762,14 @@ def _cluster_node_ssh_host(node_cfg: Dict[str, Any], *, target_name: str) -> str
     if ssh_host is None:
         return _require_str(node_cfg.get("ip"), f"cluster_nodes[{target_name}].ip")
     return _require_str(ssh_host, f"cluster_nodes[{target_name}].ssh_host")
+
+
+def _cluster_node_execution_mode(node_cfg: Dict[str, Any], *, target_name: str) -> str:
+    raw = node_cfg.get("execution_mode", "ssh")
+    if raw is None:
+        return "ssh"
+    mode = _require_str(raw, f"cluster_nodes[{target_name}].execution_mode").strip()
+    return mode or "ssh"
 
 
 def _sync_run_dir_archive_to_remote_target(
@@ -11094,7 +11880,7 @@ def _run_adapter_action(
     run_dir: Path,
     action: str,
 ) -> Optional[Dict[str, Any]]:
-    if action not in ("deploy", "teardown"):
+    if action not in ("deploy", "collect", "teardown"):
         raise ValueError(f"invalid adapter action: {action}")
 
     deploy = _require_dict(resolved_case.get("deploy"), "resolved_case.deploy")
@@ -11942,10 +12728,6 @@ def _ci_runtime_wheelhouse_root(*, test_rsc_root: Path) -> Path:
     )
 
 
-def _ci_runtime_python_executable() -> str:
-    return _ci_runtime_python_executable_impl()
-
-
 def _ci_runtime_python_abi(*, venv_python: Path) -> str:
     return _ci_runtime_python_abi_impl(
         venv_python=venv_python,
@@ -12326,17 +13108,24 @@ def _test_stack_runtime_command(
     script_path: str,
     script_args: List[str],
     runtime_env: Dict[str, str],
+    pre_exec_shell: str = "",
+    require_unlimited_memlock: bool = False,
     exec_wrapper_argv: Optional[List[str]] = None,
 ) -> str:
+    mooncake_wheel = _test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir)
     assert_env_cmd = _test_stack_runtime_env_assert_command(
         venv_python=venv_python,
-        require_mooncake=_test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir) is not None,
+        require_mooncake=mooncake_wheel is not None,
     )
-    require_unlimited_memlock = _test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir) is not None
+    mooncake_ld_library_path_cmd = (
+        _test_stack_mooncake_cuda_runtime_ld_library_path_command(venv_python=venv_python)
+        if mooncake_wheel is not None
+        else ""
+    )
     vendor_site_packages = (
         run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_VENDOR_SITE_PACKAGES_DIRNAME
     ).resolve()
-    runtime_env_exports = _render_runtime_env_exports(runtime_env)
+    runtime_env_exports = _render_env_exports(runtime_env)
     exec_cmd = ["exec"]
     if exec_wrapper_argv is not None:
         exec_cmd.extend(_shell_quote(arg) for arg in exec_wrapper_argv)
@@ -12348,6 +13137,7 @@ def _test_stack_runtime_command(
         ]
     )
     exec_cmd.extend(_shell_quote(arg) for arg in script_args)
+    nofile_prelude = _test_stack_runtime_nofile_prelude_command()
     memlock_prelude = ""
     if require_unlimited_memlock:
         memlock_prelude = (
@@ -12366,6 +13156,7 @@ def _test_stack_runtime_command(
         )
     return (
         "set -euo pipefail\n"
+        + nofile_prelude
         + memlock_prelude
         + "cd "
         + _shell_quote(str(run_dir.resolve()))
@@ -12374,10 +13165,12 @@ def _test_stack_runtime_command(
         + "export PYTHONPATH="
         + _shell_quote(str(vendor_site_packages))
         + ":${PYTHONPATH:-}\n"
+        + mooncake_ld_library_path_cmd
         + _test_stack_runtime_env_prelude_command()
         + runtime_env_exports
         + assert_env_cmd
         + "\n"
+        + pre_exec_shell
         + " ".join(exec_cmd)
         + "\n"
     )
@@ -12391,17 +13184,23 @@ def _test_stack_runtime_module_command(
     module_args: List[str],
     runtime_env: Dict[str, str],
     pre_exec_shell: str = "",
+    require_unlimited_memlock: bool = False,
     exec_wrapper_argv: Optional[List[str]] = None,
 ) -> str:
+    mooncake_wheel = _test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir)
     assert_env_cmd = _test_stack_runtime_env_assert_command(
         venv_python=venv_python,
-        require_mooncake=_test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir) is not None,
+        require_mooncake=mooncake_wheel is not None,
     )
-    require_unlimited_memlock = _test_stack_runtime_mooncake_wheel_path_opt(run_dir=run_dir) is not None
+    mooncake_ld_library_path_cmd = (
+        _test_stack_mooncake_cuda_runtime_ld_library_path_command(venv_python=venv_python)
+        if mooncake_wheel is not None
+        else ""
+    )
     vendor_site_packages = (
         run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_VENDOR_SITE_PACKAGES_DIRNAME
     ).resolve()
-    runtime_env_exports = _render_runtime_env_exports(runtime_env)
+    runtime_env_exports = _render_env_exports(runtime_env)
     exec_cmd = ["exec"]
     if exec_wrapper_argv is not None:
         exec_cmd.extend(_shell_quote(arg) for arg in exec_wrapper_argv)
@@ -12414,6 +13213,7 @@ def _test_stack_runtime_module_command(
         ]
     )
     exec_cmd.extend(_shell_quote(arg) for arg in module_args)
+    nofile_prelude = _test_stack_runtime_nofile_prelude_command()
     memlock_prelude = ""
     if require_unlimited_memlock:
         memlock_prelude = (
@@ -12432,6 +13232,7 @@ def _test_stack_runtime_module_command(
         )
     return (
         "set -euo pipefail\n"
+        + nofile_prelude
         + memlock_prelude
         + "cd "
         + _shell_quote(str(run_dir.resolve()))
@@ -12440,6 +13241,7 @@ def _test_stack_runtime_module_command(
         + "export PYTHONPATH="
         + _shell_quote(str(vendor_site_packages))
         + ":${PYTHONPATH:-}\n"
+        + mooncake_ld_library_path_cmd
         + _test_stack_runtime_env_prelude_command()
         + runtime_env_exports
         + assert_env_cmd
@@ -12447,6 +13249,19 @@ def _test_stack_runtime_module_command(
         + pre_exec_shell
         + " ".join(exec_cmd)
         + "\n"
+    )
+
+
+def _test_stack_runtime_nofile_prelude_command() -> str:
+    nofile_limit = TEST_STACK_RUNTIME_NOFILE_LIMIT
+    return (
+        f"ulimit -n {nofile_limit}\n"
+        + 'nofile_after="$(ulimit -n)"\n'
+        + f'if [ "${{nofile_after}}" != "{nofile_limit}" ]; then\n'
+        + '  printf \'ERROR: ulimit -n verification failed, got: %s\\n\' "${nofile_after}" >&2\n'
+        + "  grep -i 'open files' /proc/self/limits >&2 || true\n"
+        + "  exit 1\n"
+        + "fi\n"
     )
 
 
@@ -12569,7 +13384,7 @@ def _test_stack_target_host_venv_python(
 
 def _test_stack_runtime_wheel_paths(*, run_dir: Path) -> Tuple[Path]:
     wheels_root = (run_dir / _TEST_STACK_RUNTIME_DIRNAME / _TEST_STACK_RUNTIME_WHEEL_DIRNAME).resolve()
-    wheel_candidates = sorted(path for path in wheels_root.glob("fluxon_py-*.whl") if path.is_file())
+    wheel_candidates = sorted(path for path in wheels_root.glob(RELEASE_WHEEL_GLOB) if path.is_file())
     if len(wheel_candidates) != 1:
         raise ValueError(
             "TEST_STACK runtime must contain exactly one Fluxon wheel: "
@@ -12625,6 +13440,36 @@ def _test_stack_wheel_python_abi_tag(path: Path) -> str:
 
 def _test_stack_runtime_env_prelude_command() -> str:
     return ""
+
+
+def _test_stack_mooncake_cuda_runtime_ld_library_path_command(*, venv_python: Path) -> str:
+    return (
+        "CUDA_RUNTIME_LIB_DIR=\"$("
+        + _shell_quote(str(venv_python))
+        + " - <<'PY'\n"
+        + "from pathlib import Path\n"
+        + "import site\n"
+        + "roots = []\n"
+        + "for getter in (site.getsitepackages,):\n"
+        + "    try:\n"
+        + "        roots.extend(getter())\n"
+        + "    except Exception:\n"
+        + "        pass\n"
+        + "try:\n"
+        + "    roots.append(site.getusersitepackages())\n"
+        + "except Exception:\n"
+        + "    pass\n"
+        + "for root in roots:\n"
+        + "    candidate = Path(root) / 'nvidia' / 'cuda_runtime' / 'lib'\n"
+        + "    if (candidate / 'libcudart.so.12').exists():\n"
+        + "        print(candidate)\n"
+        + "        break\n"
+        + "PY\n"
+        + ")\"\n"
+        + "if [ -n \"${CUDA_RUNTIME_LIB_DIR}\" ]; then\n"
+        + "  export LD_LIBRARY_PATH=\"${CUDA_RUNTIME_LIB_DIR}:${LD_LIBRARY_PATH:-}\"\n"
+        + "fi\n"
+    )
 
 
 def _test_stack_runtime_env_import_probe(*, require_mooncake: bool) -> str:
@@ -12703,6 +13548,11 @@ def _test_stack_runtime_env_prepare_command(
         venv_python=venv_python,
         required_python_abi=required_python_abi,
         require_mooncake=mooncake_wheel is not None,
+    )
+    mooncake_ld_library_path_cmd = (
+        _test_stack_mooncake_cuda_runtime_ld_library_path_command(venv_python=venv_python)
+        if mooncake_wheel is not None
+        else ""
     )
     python_bin_name = "python" + required_python_abi.removeprefix("cpython")
     venv_root = venv_python.parent.parent
@@ -12808,6 +13658,7 @@ def _test_stack_runtime_env_prepare_command(
         + _shell_quote(str(marker_path))
         + "\n"
         + "fi\n"
+        + mooncake_ld_library_path_cmd
         + assert_env_cmd
     )
 
@@ -13698,7 +14549,9 @@ def _ci_prepare_run_inputs(
             "-m",
             "pip",
             "install",
+            "--no-index",
             "--force-reinstall",
+            "--no-deps",
             str(wheel),
         ],
         cwd=str(src_root),
@@ -13918,7 +14771,9 @@ def _ci_prepare_env_path(*, run_dir: Path) -> Path:
 
 def _write_ci_prepare_env_script(*, run_dir: Path, exports: Dict[str, str]) -> Path:
     out_path = _ci_prepare_env_path(run_dir=run_dir)
-    lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    # This file is sourced by ci_runner.sh. It owns environment exports only;
+    # changing the caller's shell options would break explicit rc capture.
+    lines = ["#!/usr/bin/env bash"]
     for name, value in sorted(exports.items()):
         lines.append(f"export {name}={_shell_quote(value)}")
     out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -13928,10 +14783,17 @@ def _write_ci_prepare_env_script(*, run_dir: Path, exports: Dict[str, str]) -> P
 
 def _run_ci_prepare_steps(*, resolved_case: Dict[str, Any], run_dir: Path, src_root: Path) -> Dict[str, str]:
     prepare_steps = _resolved_ci_prepare_steps(resolved_case)
-    if not prepare_steps:
-        return {}
-
     exports: Dict[str, str] = {}
+    test_bed_start_cfg = _load_test_bed_bootstrap_config_path()
+    if _load_test_bed_manifest_opt() is not None:
+        exports[TEST_STACK_START_TEST_BED_CONFIG_ENV] = str(test_bed_start_cfg)
+    local_release_root = _local_release_root_override_opt()
+    if local_release_root is not None:
+        exports[_LOCAL_RELEASE_CACHE_ROOT_OVERRIDE_ENV] = str(local_release_root)
+
+    if not prepare_steps:
+        return exports
+
     for index, step in enumerate(prepare_steps):
         kind = _require_str(step.get("kind"), f"resolved_case.scene.ci.prepare[{index}].kind")
         if kind == CI_PREPARE_KIND_SETUP_DEV_ENV:
@@ -14072,6 +14934,11 @@ def _write_ci_runner_script(
         cmd_lines.append(f"echo {_shell_quote('=' * 80)}")
         cmd_lines.append(f"echo {_shell_quote(f'STEP {idx}: {step_label} :: {cmd}')}")
         cmd_lines.append(f"echo {_shell_quote('=' * 80)}")
+        cmd_lines.append("step_started_at=$(date +%s)")
+        cmd_lines.append(
+            f"echo {_shell_quote(f'[ci_runner] STEP {idx} start label={step_label}')} "
+            '"started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"'
+        )
         if timeout_seconds is None:
             cmd_lines.append(f"{cmd}")
         else:
@@ -14080,6 +14947,12 @@ def _write_ci_runner_script(
             # - Timeout must be configured explicitly per command in suite config (no hidden defaults).
             cmd_lines.append(f"timeout --preserve-status --signal=KILL {int(timeout_seconds)} {cmd}")
         cmd_lines.append("rc=$?")
+        cmd_lines.append("step_finished_at=$(date +%s)")
+        cmd_lines.append(
+            f"echo {_shell_quote(f'[ci_runner] STEP {idx} finish label={step_label}')} "
+            '"rc=$rc elapsed_s=$((step_finished_at - step_started_at)) '
+            'finished_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"'
+        )
         cmd_lines.append('if [ "$rc" -ne 0 ]; then')
         cmd_lines.append('  echo "[ci_runner] FAILED rc=$rc"')
         cmd_lines.append('  fail_and_exit "$rc"')
@@ -14156,39 +15029,63 @@ fi
 	log_dir="{run_dir.as_posix()}/logs/ci_runner"
 	mkdir -p "$log_dir"
 	exit_code_path="$log_dir/exit_code.txt"
+	inflight_path="$log_dir/inflight_attempt.txt"
+	restart_count_path="$log_dir/restart_count.txt"
+	exec >>"$log_dir/stdout.log" 2>&1
+	if [ -f "$restart_count_path" ]; then
+	  restart_count="$(cat "$restart_count_path" 2>/dev/null || echo 0)"
+	else
+	  restart_count=0
+	fi
+	case "$restart_count" in
+	  ''|*[!0-9]*) restart_count=0 ;;
+	esac
+	restart_count=$((restart_count + 1))
+	printf '%s\n' "$restart_count" > "$restart_count_path"
+	echo
+	echo "[ci_runner] start attempt=$restart_count pid=$$ ppid=$PPID host=$(hostname) started_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	hold_until_controller_stop() {{
+	  while true; do
+	    sleep 3600 &
+	    hold_pid=$!
+	    wait "$hold_pid"
+	    hold_pid=""
+	  done
+	}}
+	write_exit_code() {{
+	  printf '%s\n' "$1" > "$exit_code_path"
+	}}
 	# The CI runner workload is a Deployment and may be restarted.
 	# Once exit_code.txt is written, the run is terminal. If we restart, we must not delete it
 	# or re-run tests, otherwise the runner can never converge.
 	if [ -f "$exit_code_path" ]; then
 	  prev="$(cat "$exit_code_path" 2>/dev/null || echo "")"
 	  echo "[ci_runner] found existing exit_code=$prev; holding until controller stop"
-	  while true; do
-	    sleep 3600 &
-	    hold_pid=$!
-	    wait "$hold_pid"
-	    hold_pid=""
-	  done
+	  hold_until_controller_stop
 	fi
-	write_exit_code() {{
-	  printf '%s\n' "$1" > "$exit_code_path"
-	}}
+	if [ -f "$inflight_path" ]; then
+	  prev_attempt="$(cat "$inflight_path" 2>/dev/null || echo "")"
+	  echo "[ci_runner] previous attempt did not write exit_code.txt; refusing to rerun: $prev_attempt"
+	  write_exit_code -1
+	  echo "[ci_runner] wrote exit_code=-1 after restart without terminal exit; holding until controller stop"
+	  hold_until_controller_stop
+	fi
+	printf 'attempt=%s pid=%s ppid=%s host=%s started_at_utc=%s\n' "$restart_count" "$$" "$PPID" "$(hostname)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$inflight_path"
 	fail_and_exit() {{
 	  write_exit_code "$1"
+	  rm -f "$inflight_path"
 	  echo "[ci_runner] wrote exit_code=$1; holding until controller stop"
-	  while true; do
-	    sleep 3600 &
-	    hold_pid=$!
-	    wait "$hold_pid"
-	    hold_pid=""
-	  done
+	  hold_until_controller_stop
 	}}
-exec >"$log_dir/stdout.log" 2>&1
 
 prepare_env_path="{_ci_prepare_env_path(run_dir=run_dir).as_posix()}"
 if [ -f "$prepare_env_path" ]; then
   # CI case prepare writes explicit environment exports here.
   . "$prepare_env_path"
 fi
+# The runner owns error handling even if a supplied prepare file changes shell options.
+set +e
+set -uo pipefail
 
 # Run from src_root so repo-local test commands execute inside the prepared runtime source tree.
 cd {src_root.as_posix()}
@@ -14234,7 +15131,7 @@ def _http_get_json(url: str) -> Dict[str, Any]:
             if int(exc.code) not in CONTROLLER_STATUS_TRANSIENT_HTTP_CODES:
                 raise
             last_err = exc
-        except (TimeoutError, urllib.error.URLError) as exc:
+        except (TimeoutError, urllib.error.URLError, OSError, ConnectionError) as exc:
             last_err = exc
         if time.time() >= deadline:
             if last_err is None:
@@ -14317,6 +15214,20 @@ def _instance_remote_target_access_opt(
 def _run_remote_bash_capture(
     *, target_name: str, node_cfg: Dict[str, Any], remote_cmd: str
 ) -> str:
+    if _cluster_node_execution_mode(node_cfg, target_name=target_name) == "local":
+        completed = subprocess.run(
+            remote_cmd,
+            shell=True,
+            executable="/bin/bash",
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"local bash capture {target_name} failed rc={completed.returncode}\n"
+                f"cmd={remote_cmd}\nstdout={completed.stdout}\nstderr={completed.stderr}"
+            )
+        return completed.stdout
     transport_ctx = _test_bed_manifest_transport_ctx_opt()
     if transport_ctx is not None and target_name == str(transport_ctx["bastion_name"]):
         completed = _run_remote_bash_via_bastion_transport(
@@ -14356,7 +15267,7 @@ def _run_remote_bash_capture(
             argv=argv,
             password=None,
             ctx=ctx,
-            timeout_seconds=None,
+            timeout_seconds=_SSH_TRANSPORT_TIMEOUT_SECONDS,
             emit_output=False,
             max_attempts=1,
         )
@@ -14378,6 +15289,27 @@ def _run_remote_bash_capture(
 def _run_remote_bash(
     *, target_name: str, node_cfg: Dict[str, Any], remote_cmd: str
 ) -> None:
+    if _cluster_node_execution_mode(node_cfg, target_name=target_name) == "local":
+        print("RUN:", remote_cmd, flush=True)
+        completed = subprocess.run(
+            remote_cmd,
+            shell=True,
+            executable="/bin/bash",
+            capture_output=True,
+            text=True,
+        )
+        if completed.stdout:
+            sys.stdout.write(completed.stdout)
+            sys.stdout.flush()
+        if completed.stderr:
+            sys.stderr.write(_clean_ssh_stderr_text(completed.stderr))
+            sys.stderr.flush()
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"local bash {target_name} failed rc={completed.returncode}\n"
+                f"cmd={remote_cmd}"
+            )
+        return
     transport_ctx = _test_bed_manifest_transport_ctx_opt()
     if transport_ctx is not None and target_name == str(transport_ctx["bastion_name"]):
         _run_remote_bash_via_bastion_transport(
@@ -14649,6 +15581,56 @@ def _print_ci_wait_progress(
     return next_offset, next_heartbeat_at
 
 
+def _ci_wait_observed_file_state_debug(state: Optional[_ObservedFileState]) -> str:
+    if state is None:
+        return "missing"
+    return f"size={state.size} mtime_ns={state.mtime_ns}"
+
+
+def _ci_wait_status_debug(status: Dict[str, Any]) -> str:
+    preferred_keys = (
+        "ok",
+        "running",
+        "exit_code",
+        "pid",
+        "started_at",
+        "finished_at",
+        "message",
+        "error",
+        "stderr",
+    )
+    summary = {key: status.get(key) for key in preferred_keys if key in status}
+    if not summary:
+        summary = dict(status)
+    text = json.dumps(summary, ensure_ascii=True, sort_keys=True, default=str)
+    max_chars = 1200
+    if len(text) > max_chars:
+        return text[:max_chars] + "...<truncated>"
+    return text
+
+
+def _print_ci_wait_status_snapshot(
+    *,
+    run_dir: Path,
+    status: Optional[Dict[str, Any]],
+    baseline_state: Optional[_ObservedFileState],
+    current_state: Optional[_ObservedFileState],
+    last_status_err: Optional[str],
+) -> None:
+    now = time.time()
+    status_text = "unavailable" if status is None else _ci_wait_status_debug(status)
+    print(
+        f"{_ci_log_timestamp_prefix(now)} "
+        "[CI wait exit_code] status_snapshot "
+        f"status={status_text} "
+        f"baseline_exit_code_state={_ci_wait_observed_file_state_debug(baseline_state)} "
+        f"current_exit_code_state={_ci_wait_observed_file_state_debug(current_state)} "
+        f"last_status_err={last_status_err} "
+        f"log={str((run_dir / 'logs' / 'ci_runner' / 'stdout.log').resolve())}",
+        flush=True,
+    )
+
+
 def _instance_file_exists(
     resolved_case: Dict[str, Any], *, instance_id: str, path: Path
 ) -> bool:
@@ -14681,6 +15663,8 @@ def _wait_instance_files_present(
     if not paths:
         raise ValueError(f"{ctx}: paths is empty")
     deadline = time.time() + float(timeout_s)
+    last_status: Optional[Dict[str, Any]] = None
+    last_status_err: Optional[str] = None
     while True:
         missing = [
             str(path)
@@ -14689,12 +15673,25 @@ def _wait_instance_files_present(
         ]
         if not missing:
             return
-        status = _instance_status(resolved_case, instance_id=instance_id)
+        try:
+            status = _instance_status(resolved_case, instance_id=instance_id)
+        except _HttpGetJsonTransientError as exc:
+            last_status_err = str(exc)
+            if time.time() >= deadline:
+                raise ValueError(
+                    f"{ctx}: wait timeout with transient controller errors; "
+                    f"missing={missing} last_status={last_status} last_status_err={last_status_err}"
+                ) from exc
+            time.sleep(2.0)
+            continue
+        last_status = status
         exit_code = status.get("exit_code")
         if status.get("ok") is True and status.get("running") is False and isinstance(exit_code, int):
             raise ValueError(f"{ctx}: {instance_id} exited before artifacts were ready: status={status}")
         if time.time() >= deadline:
-            raise ValueError(f"{ctx}: wait timeout; missing={missing} status={status}")
+            raise ValueError(
+                f"{ctx}: wait timeout; missing={missing} status={status} last_status_err={last_status_err}"
+            )
         time.sleep(2.0)
 
 
@@ -14764,6 +15761,128 @@ def _test_stack_external_owner_shared_bundle_wait_instance_ids(
         "TEST_STACK owner shared bundle wait could not match any owner target to node runtime targets: "
         f"owner_targets={sorted(owner_target_to_instance_id.keys())} "
         f"node_runtime_targets={node_runtime_targets}"
+    )
+
+
+def _cleanup_successful_run_dir_data(*, run_dir: Path, relpaths: Tuple[str, ...], ctx: str) -> None:
+    root = run_dir.resolve()
+    free_before = shutil.disk_usage(root).free
+    removed: List[str] = []
+    for raw_relpath in relpaths:
+        relpath = _require_clean_relpath(raw_relpath, f"{ctx} relpath")
+        path = (root / relpath).resolve()
+        if path.parent != root:
+            raise ValueError(f"{ctx} only accepts direct run_dir children: relpath={relpath!r}")
+        if path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+        else:
+            continue
+        removed.append(relpath)
+    free_after = shutil.disk_usage(root).free
+    print(
+        f"[{ctx}] removed={removed} reclaimed_bytes={max(0, free_after - free_before)} run_dir={root}",
+        flush=True,
+    )
+
+
+def _instance_path_exists(
+    resolved_case: Dict[str, Any], *, instance_id: str, path: Path
+) -> bool:
+    if path.exists() or path.is_symlink():
+        return True
+    remote_access = _instance_remote_target_access_opt(resolved_case, instance_id=instance_id)
+    if remote_access is None:
+        return False
+    target_name, node_cfg, dispatch_mod = remote_access
+    sentinel = "__DEVER_REMOTE_PATH_PRESENT__"
+    quoted_path = dispatch_mod.sh_quote(str(path))
+    remote_cmd = (
+        f"if [ -e {quoted_path} ] || [ -L {quoted_path} ]; then printf '%s\\n' "
+        + dispatch_mod.sh_quote(sentinel)
+        + "; fi"
+    )
+    output = _run_remote_bash_capture(target_name=target_name, node_cfg=node_cfg, remote_cmd=remote_cmd)
+    return output == sentinel + "\n"
+
+
+def _instance_remove_directory_and_verify_absent(
+    resolved_case: Dict[str, Any],
+    *,
+    instance_id: str,
+    path: Path,
+    timeout_s: int,
+    ctx: str,
+) -> None:
+    normalized_path = path.resolve()
+    remote_access = _instance_remote_target_access_opt(resolved_case, instance_id=instance_id)
+    if remote_access is None:
+        try:
+            shutil.rmtree(normalized_path)
+        except FileNotFoundError:
+            pass
+    else:
+        target_name, node_cfg, dispatch_mod = remote_access
+        remote_cmd = "rm -rf -- " + dispatch_mod.sh_quote(str(normalized_path))
+        _run_remote_bash(target_name=target_name, node_cfg=node_cfg, remote_cmd=remote_cmd)
+
+    deadline = time.time() + float(timeout_s)
+    while _instance_path_exists(
+        resolved_case,
+        instance_id=instance_id,
+        path=normalized_path,
+    ):
+        if time.time() >= deadline:
+            raise ValueError(f"{ctx}: delete timeout; remaining={normalized_path}")
+        time.sleep(0.5)
+
+
+def _cleanup_ci_case_shared_bundle(
+    resolved_case: Dict[str, Any],
+    *,
+    timeout_s: int,
+    ctx: str,
+) -> None:
+    bundle_dir = _ci_case_shared_bundle_dir(resolved_case)
+    bundle_instance_id = (
+        "owner_0"
+        if _find_deploy_instance_opt(resolved_case, instance_id="owner_0") is not None
+        else "ci_runner"
+    )
+    print(
+        f"[{ctx}] shared_bundle={bundle_dir} instance_id={bundle_instance_id}",
+        flush=True,
+    )
+    _instance_remove_directory_and_verify_absent(
+        resolved_case,
+        instance_id=bundle_instance_id,
+        path=bundle_dir,
+        timeout_s=timeout_s,
+        ctx=ctx,
+    )
+
+
+def _cleanup_successful_ci_case_data(resolved_case: Dict[str, Any], *, run_dir: Path) -> None:
+    _cleanup_ci_case_shared_bundle(
+        resolved_case,
+        timeout_s=30,
+        ctx="CI success shared bundle cleanup",
+    )
+    _cleanup_successful_run_dir_data(
+        run_dir=run_dir,
+        relpaths=CI_SUCCESS_RUNTIME_DATA_RELPATHS,
+        ctx="CI success run data cleanup",
+    )
+
+
+def _cleanup_successful_test_stack_case_data(*, run_dir: Path) -> None:
+    _cleanup_successful_run_dir_data(
+        run_dir=run_dir,
+        relpaths=TEST_STACK_SUCCESS_RUNTIME_DATA_RELPATHS,
+        ctx="TEST_STACK success run data cleanup",
     )
 
 
@@ -15101,6 +16220,7 @@ def _wait_ci_runner_exit_code(
     last_status_err: str | None = None
     log_offset = 0
     next_heartbeat_at = 0.0
+    next_status_snapshot_at = 0.0
     while True:
         log_offset, next_heartbeat_at = _print_ci_wait_progress(
             resolved_case,
@@ -15137,6 +16257,16 @@ def _wait_ci_runner_exit_code(
             status = _instance_status(resolved_case, instance_id="ci_runner")
         except _HttpGetJsonTransientError as exc:
             last_status_err = str(exc)
+            now = time.time()
+            if now >= next_status_snapshot_at:
+                _print_ci_wait_status_snapshot(
+                    run_dir=run_dir,
+                    status=None,
+                    baseline_state=baseline_state,
+                    current_state=current_state,
+                    last_status_err=last_status_err,
+                )
+                next_status_snapshot_at = now + _CI_WAIT_STATUS_SNAPSHOT_INTERVAL_SECONDS
             if time.time() >= deadline:
                 raise ValueError(
                     "ci_runner.exit_code wait timeout with transient controller errors: "
@@ -15144,6 +16274,16 @@ def _wait_ci_runner_exit_code(
                 ) from exc
             time.sleep(2.0)
             continue
+        now = time.time()
+        if now >= next_status_snapshot_at:
+            _print_ci_wait_status_snapshot(
+                run_dir=run_dir,
+                status=status,
+                baseline_state=baseline_state,
+                current_state=current_state,
+                last_status_err=last_status_err,
+            )
+            next_status_snapshot_at = now + _CI_WAIT_STATUS_SNAPSHOT_INTERVAL_SECONDS
         status_exit_code = status.get("exit_code")
         if status.get("ok") is True and status.get("running") is False and isinstance(status_exit_code, int):
             return _require_int(status_exit_code, "ci_runner.status.exit_code", min_v=-255)

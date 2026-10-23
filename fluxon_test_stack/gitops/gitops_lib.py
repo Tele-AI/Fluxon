@@ -222,7 +222,7 @@ def _record_commit_run(
         )
         with ctx.history_lock:
             _record_history(ctx.history_file, repo, branch, commit)
-        _write_result_yaml(
+        _dump_yaml_atomic(
             result_file,
             {
                 "ok": rc == 0,
@@ -249,7 +249,7 @@ def _record_commit_run(
             run_id,
             {"status": "error", "error": str(exc), "finished_ts": datetime.now().isoformat()},
         )
-        _write_result_yaml(
+        _dump_yaml_atomic(
             result_file,
             {
                 "ok": False,
@@ -521,10 +521,6 @@ class ProgressWriter:
         self._f.close()
 
 
-def _write_result_yaml(path: Path, data: dict) -> None:
-    _dump_yaml_atomic(path, data)
-
-
 def _run_commands(*, commands: list[str], run_dir: Path, log_file: Path, progress_file: Path) -> tuple[int, int | None]:
     if not commands:
         raise ValueError("commands must be non-empty")
@@ -611,10 +607,6 @@ def _run_capture(cmd: list[str], cwd: Path | None = None) -> str:
         cwd=str(cwd) if cwd else None,
     )
     return out.decode().strip()
-
-
-def _git_remote_url(repo_path: Path) -> str:
-    return _run_capture(["git", "remote", "get-url", "origin"], cwd=repo_path)
 
 
 def _git_default_branch(repo_path: Path) -> str:
@@ -1732,7 +1724,7 @@ code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace
                 with history_lock:
                     _record_history(history_file, repo, branch, commit)
 
-                _write_result_yaml(
+                _dump_yaml_atomic(
                     result_file,
                     {
                         "ok": rc == 0,
@@ -1755,7 +1747,7 @@ code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace
                     run_id,
                     {"status": "error", "error": str(e), "finished_ts": datetime.now().isoformat()},
                 )
-                _write_result_yaml(
+                _dump_yaml_atomic(
                     result_file,
                     {
                         "ok": False,

@@ -11,13 +11,17 @@ TEST_REQUIREMENTS = ["cargo", "ops", "submodules"]
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Flat index entry for Rust communication facade crate tests."
+        description="Flat index entry for Rust communication facade and closed SDK adapter tests."
     )
     parser.parse_args()
     return run_cargo([
         "test",
         "--manifest-path",
-        str(REPO_ROOT / "fluxon_rs" / "fluxon_commu" / "Cargo.toml"),
+        str(REPO_ROOT / "fluxon_rs" / "Cargo.toml"),
+        "-p",
+        "fluxon_commu",
+        "-p",
+        "fluxon_commu_closed_sdk_consumer",
     ])
 
 

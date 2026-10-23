@@ -1709,6 +1709,10 @@ pub enum PutOptionalArg {
     RejectIfInflightSameKey,
     /// Ask the master to fail-fast when the key already has a committed live replica.
     RejectIfExistSameKey,
+    /// Ask the master to reject a put when the key is already live or inflight.
+    /// This spelling is used by the generic filesystem caller; both forms feed
+    /// the same local admission flag.
+    RejectIfExists,
     /// Disable asynchronous remote replica task after local commit in write-back mode.
     SkipMakeReplicaTask,
     /// Prefer placing the target allocation on a kvclient within this sub_cluster.
@@ -1731,6 +1735,7 @@ impl PutOptionalArgs {
             PutOptionalArg::LeaseId(id) => Some(*id),
             PutOptionalArg::RejectIfInflightSameKey
             | PutOptionalArg::RejectIfExistSameKey
+            | PutOptionalArg::RejectIfExists
             | PutOptionalArg::SkipMakeReplicaTask
             | PutOptionalArg::PreferredSubCluster(_)
             | PutOptionalArg::TestObservePutPhases(_) => None,
@@ -1744,9 +1749,12 @@ impl PutOptionalArgs {
     }
 
     pub fn reject_if_exist_same_key(&self) -> bool {
-        self.0
-            .iter()
-            .any(|arg| matches!(arg, PutOptionalArg::RejectIfExistSameKey))
+        self.0.iter().any(|arg| {
+            matches!(
+                arg,
+                PutOptionalArg::RejectIfExistSameKey | PutOptionalArg::RejectIfExists
+            )
+        })
     }
 
     pub fn make_replica_task(&self) -> bool {
@@ -1763,6 +1771,7 @@ impl PutOptionalArgs {
             PutOptionalArg::LeaseId(_)
             | PutOptionalArg::RejectIfInflightSameKey
             | PutOptionalArg::RejectIfExistSameKey
+            | PutOptionalArg::RejectIfExists
             | PutOptionalArg::SkipMakeReplicaTask
             | PutOptionalArg::TestObservePutPhases(_) => None,
         })
@@ -1774,6 +1783,7 @@ impl PutOptionalArgs {
             PutOptionalArg::LeaseId(_)
             | PutOptionalArg::RejectIfInflightSameKey
             | PutOptionalArg::RejectIfExistSameKey
+            | PutOptionalArg::RejectIfExists
             | PutOptionalArg::SkipMakeReplicaTask
             | PutOptionalArg::PreferredSubCluster(_) => None,
         })
@@ -14953,6 +14963,15 @@ impl ClientKvApiInner {
 impl ClientKvApi {
     pub fn inner(&self) -> &ClientKvApiInner {
         &self.0
+    }
+
+    pub(crate) fn kv_ssd_storage_usage_snapshot(
+        &self,
+    ) -> Vec<crate::kv_ssd_storage::KvSsdStorageDeviceUsage> {
+        self.inner()
+            .kv_ssd_storage_usage_snapshot()
+            .into_iter()
+            .collect()
     }
 
     fn spawn_runtime_observe_reporter(&self) {

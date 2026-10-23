@@ -47,6 +47,7 @@ use fluxon_commu::{
     RdmaLinkLayer, RdmaPhysState, RdmaPortSnapshot, RdmaPortState, cluster_member_base_prefix,
     cluster_member_ext_prefix, cluster_owner_rdma_control_prefix, scan_etcd_prefix_paginated,
 };
+use fluxon_util::etcd::etcd_clients_pool;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Read, Write};
@@ -231,7 +232,9 @@ pub async fn load_transfer_engine_edges_for_cluster(
     etcd_endpoints: &[String],
     cluster_name: &str,
 ) -> anyhow::Result<Vec<TransferEngineEdge>> {
-    let mut etcd = EtcdClient::connect(etcd_endpoints.to_vec(), None)
+    let etcd_pool_entry = etcd_clients_pool().acquire(etcd_endpoints.to_vec());
+    let mut etcd = etcd_pool_entry
+        .client()
         .await
         .with_context(|| "connect etcd (transfer_link scan)".to_string())?;
     let p2p_prefix = transfer_link_p2p_prefix(cluster_name);
@@ -1185,7 +1188,9 @@ async fn build_fs_cluster_snapshot(
     cfg: &MonitorConfig,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<ClusterSnapshot> {
-    let mut etcd = EtcdClient::connect(cfg.etcd_endpoints.clone(), None)
+    let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
+    let mut etcd = etcd_pool_entry
+        .client()
         .await
         .with_context(|| "connect etcd".to_string())?;
 
@@ -1402,6 +1407,7 @@ async fn build_fs_cluster_snapshot(
                 container_memory_limit_bytes: None,
                 members: Vec::new(),
                 segment_devices: Vec::new(),
+                storage_devices: Vec::new(),
             });
 
         if is_p2p_relay {
@@ -1469,7 +1475,9 @@ pub async fn build_cluster_snapshot_with_prom_query_time(
 ) -> anyhow::Result<ClusterSnapshot> {
     let mut warnings: Vec<String> = Vec::new();
     if cfg.member_kind == MemberKind::Mq {
-        let mut etcd = EtcdClient::connect(cfg.etcd_endpoints.clone(), None)
+        let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
+        let mut etcd = etcd_pool_entry
+            .client()
             .await
             .with_context(|| "connect etcd".to_string())?;
         let mut mq = build_mq_snapshot(cfg, &mut warnings, &mut etcd).await?;
@@ -1587,7 +1595,9 @@ pub async fn build_cluster_snapshot_with_prom_query_time(
     if cfg.member_kind == MemberKind::Fs {
         return build_fs_cluster_snapshot(cfg, &mut warnings).await;
     }
-    let mut etcd = EtcdClient::connect(cfg.etcd_endpoints.clone(), None)
+    let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
+    let mut etcd = etcd_pool_entry
+        .client()
         .await
         .with_context(|| "connect etcd".to_string())?;
 
@@ -2128,6 +2138,7 @@ pub async fn build_cluster_snapshot_with_prom_query_time(
                 container_memory_limit_bytes: None,
                 members: Vec::new(),
                 segment_devices: Vec::new(),
+                storage_devices: Vec::new(),
             });
         if is_p2p_relay {
             node_entry.is_p2p_relay = true;
@@ -2214,72 +2225,160 @@ pub async fn build_cluster_snapshot_with_prom_query_time(
                 "missing segment metrics for owner_client: owner_id={} (expected Prom series: kvcache_segment_*_bytes{{node=\"{}\",device}})",
                 owner_id, owner_id
             ));
-            continue;
+        } else {
+            let mut missing_cap: Vec<String> = Vec::new();
+            let mut missing_used: Vec<String> = Vec::new();
+            let mut cap_zero: Vec<String> = Vec::new();
+            let mut used_gt_cap: Vec<String> = Vec::new();
+            for device in devices {
+                let cap = prom_maps
+                    .seg_capacity_bytes_by_node_device
+                    .get(&(owner_id.clone(), device.clone()))
+                    .copied();
+                let used = prom_maps
+                    .seg_used_bytes_by_node_device
+                    .get(&(owner_id.clone(), device.clone()))
+                    .copied();
+                if cap.is_none() {
+                    missing_cap.push(device.clone());
+                }
+                if used.is_none() {
+                    missing_used.push(device.clone());
+                }
+                if let Some(cap) = cap {
+                    if cap == 0.0 {
+                        cap_zero.push(device.clone());
+                    }
+                }
+                if let (Some(used), Some(cap)) = (used, cap) {
+                    if used > cap {
+                        used_gt_cap.push(device.clone());
+                    }
+                }
+                n.segment_devices.push(crate::model::SegmentDeviceSnapshot {
+                    device: device.clone(),
+                    seg_capacity_bytes: cap,
+                    seg_used_bytes: used,
+                });
+                n.storage_devices.push(crate::model::StorageDeviceSnapshot {
+                    resource_kind: "memory_segment".to_string(),
+                    device,
+                    capacity_bytes: cap,
+                    used_bytes: used,
+                });
+            }
+            n.segment_devices.sort_by(|a, b| a.device.cmp(&b.device));
+
+            if !missing_cap.is_empty() {
+                warnings.push(format!(
+                    "segment metrics missing capacity series for owner_id={} devices={}",
+                    owner_id,
+                    missing_cap.join(",")
+                ));
+            }
+            if !missing_used.is_empty() {
+                warnings.push(format!(
+                    "segment metrics missing used series for owner_id={} devices={}",
+                    owner_id,
+                    missing_used.join(",")
+                ));
+            }
+            if !cap_zero.is_empty() {
+                warnings.push(format!(
+                    "segment metrics has cap=0 for owner_id={} devices={}",
+                    owner_id,
+                    cap_zero.join(",")
+                ));
+            }
+            if !used_gt_cap.is_empty() {
+                warnings.push(format!(
+                    "segment metrics has used>cap for owner_id={} devices={}",
+                    owner_id,
+                    used_gt_cap.join(",")
+                ));
+            }
         }
 
-        let mut missing_cap: Vec<String> = Vec::new();
-        let mut missing_used: Vec<String> = Vec::new();
-        let mut cap_zero: Vec<String> = Vec::new();
-        let mut used_gt_cap: Vec<String> = Vec::new();
-        for device in devices {
+        let mut ssd_devices: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for ((node, device), _v) in &prom_maps.kv_ssd_capacity_bytes_by_node_device {
+            if node == &owner_id {
+                ssd_devices.insert(device.clone());
+            }
+        }
+        for ((node, device), _v) in &prom_maps.kv_ssd_used_bytes_by_node_device {
+            if node == &owner_id {
+                ssd_devices.insert(device.clone());
+            }
+        }
+
+        let mut ssd_missing_cap: Vec<String> = Vec::new();
+        let mut ssd_missing_used: Vec<String> = Vec::new();
+        let mut ssd_cap_zero: Vec<String> = Vec::new();
+        let mut ssd_used_gt_cap: Vec<String> = Vec::new();
+        for device in ssd_devices {
             let cap = prom_maps
-                .seg_capacity_bytes_by_node_device
+                .kv_ssd_capacity_bytes_by_node_device
                 .get(&(owner_id.clone(), device.clone()))
                 .copied();
             let used = prom_maps
-                .seg_used_bytes_by_node_device
+                .kv_ssd_used_bytes_by_node_device
                 .get(&(owner_id.clone(), device.clone()))
                 .copied();
             if cap.is_none() {
-                missing_cap.push(device.clone());
+                ssd_missing_cap.push(device.clone());
             }
             if used.is_none() {
-                missing_used.push(device.clone());
+                ssd_missing_used.push(device.clone());
             }
             if let Some(cap) = cap {
                 if cap == 0.0 {
-                    cap_zero.push(device.clone());
+                    ssd_cap_zero.push(device.clone());
                 }
             }
             if let (Some(used), Some(cap)) = (used, cap) {
                 if used > cap {
-                    used_gt_cap.push(device.clone());
+                    ssd_used_gt_cap.push(device.clone());
                 }
             }
-            n.segment_devices.push(crate::model::SegmentDeviceSnapshot {
+            n.storage_devices.push(crate::model::StorageDeviceSnapshot {
+                resource_kind: "kv_ssd".to_string(),
                 device,
-                seg_capacity_bytes: cap,
-                seg_used_bytes: used,
+                capacity_bytes: cap,
+                used_bytes: used,
             });
         }
-        n.segment_devices.sort_by(|a, b| a.device.cmp(&b.device));
+        n.storage_devices
+            .sort_by(|a, b| match a.resource_kind.cmp(&b.resource_kind) {
+                std::cmp::Ordering::Equal => a.device.cmp(&b.device),
+                o => o,
+            });
 
-        if !missing_cap.is_empty() {
+        if !ssd_missing_cap.is_empty() {
             warnings.push(format!(
-                "segment metrics missing capacity series for owner_id={} devices={}",
+                "kv ssd metrics missing capacity series for owner_id={} devices={}",
                 owner_id,
-                missing_cap.join(",")
+                ssd_missing_cap.join(",")
             ));
         }
-        if !missing_used.is_empty() {
+        if !ssd_missing_used.is_empty() {
             warnings.push(format!(
-                "segment metrics missing used series for owner_id={} devices={}",
+                "kv ssd metrics missing used series for owner_id={} devices={}",
                 owner_id,
-                missing_used.join(",")
+                ssd_missing_used.join(",")
             ));
         }
-        if !cap_zero.is_empty() {
+        if !ssd_cap_zero.is_empty() {
             warnings.push(format!(
-                "segment metrics has cap=0 for owner_id={} devices={}",
+                "kv ssd metrics has cap=0 for owner_id={} devices={}",
                 owner_id,
-                cap_zero.join(",")
+                ssd_cap_zero.join(",")
             ));
         }
-        if !used_gt_cap.is_empty() {
+        if !ssd_used_gt_cap.is_empty() {
             warnings.push(format!(
-                "segment metrics has used>cap for owner_id={} devices={}",
+                "kv ssd metrics has used>cap for owner_id={} devices={}",
                 owner_id,
-                used_gt_cap.join(",")
+                ssd_used_gt_cap.join(",")
             ));
         }
     }

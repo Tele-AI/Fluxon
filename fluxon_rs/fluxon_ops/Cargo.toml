@@ -1,6 +1,6 @@
 [package]
 name = "fluxon_ops"
-version = "0.2.2"
+version = "0.2.4"
 edition = "2024"
 
 [dependencies]
@@ -16,7 +16,6 @@ uuid = { workspace = true }
 hyper = { workspace = true }
 libc = { workspace = true }
 askama = { workspace = true }
-etcd-client = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
 hex = "0.4"

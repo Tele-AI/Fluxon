@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use fluxon_proxy;
 use fluxon_util::{
-    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
+    FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, etcd::etcd_clients_pool,
+    fluxon_cli_proxy_desc_etcd_key_v2,
 };
 
 #[derive(Parser)]
@@ -54,10 +55,6 @@ struct ServeConfigYaml {
     fluxon_cli: fluxon_cli::config::MonitorConfigYaml,
 }
 
-fn ops_panel_proxy_desc_etcd_key(service_name: &str, cluster_name: &str) -> String {
-    fluxon_cli_proxy_desc_etcd_key_v2(service_name, cluster_name)
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -69,7 +66,9 @@ async fn main() -> anyhow::Result<()> {
             python,
         } => run_agent(&config, &workdir, &python).await,
         Cmd::Monitor { config, workdir } => run_monitor(&config, &workdir).await,
-        Cmd::SmokeSupervisor { workdir, python } => run_smoke_supervisor(&workdir, &python),
+        Cmd::SmokeSupervisor { workdir, python } => {
+            fluxon_ops::smoke_selection_supervisor(&python, &workdir)
+        }
     }
 }
 
@@ -95,10 +94,6 @@ async fn run_agent(config: &Path, workdir: &Path, python: &Path) -> anyhow::Resu
     let config_yaml = std::fs::read_to_string(config)
         .map_err(|e| anyhow::anyhow!("read config failed: path={} err={}", config.display(), e))?;
     fluxon_ops::run_agent_blocking(&config_yaml, workdir, python).await
-}
-
-fn run_smoke_supervisor(workdir: &Path, python: &Path) -> anyhow::Result<()> {
-    fluxon_ops::smoke_selection_supervisor(python, workdir)
 }
 
 async fn run_serve(config: &Path, workdir: &Path) -> anyhow::Result<()> {
@@ -177,16 +172,15 @@ async fn run_serve(config: &Path, workdir: &Path) -> anyhow::Result<()> {
     );
 
     let etcd_key =
-        ops_panel_proxy_desc_etcd_key(fluxon_ops::OPS_SERVICE_NAME, &cli_cfg.cluster_name);
-    let mut etcd = etcd_client::Client::connect(cli_cfg.etcd_endpoints.clone(), None)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "etcd connect failed while waiting for ops panel: key={} err={}",
-                etcd_key,
-                e
-            )
-        })?;
+        fluxon_cli_proxy_desc_etcd_key_v2(fluxon_ops::OPS_SERVICE_NAME, &cli_cfg.cluster_name);
+    let etcd_pool_entry = etcd_clients_pool().acquire(cli_cfg.etcd_endpoints.clone());
+    let mut etcd = etcd_pool_entry.client().await.map_err(|e| {
+        anyhow::anyhow!(
+            "etcd connect failed while waiting for ops panel: key={} err={}",
+            etcd_key,
+            e
+        )
+    })?;
 
     let ready_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
     loop {

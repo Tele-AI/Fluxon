@@ -6,8 +6,6 @@ use fluxon_fs_core::config::{
     FluxonFsTransferWorkerResultAckWire, FluxonFsTransferWorkerResultWire,
     FluxonFsTransferWorkerStopReasonWire,
 };
-use parking_lot::Mutex;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub const DEFAULT_TRANSFER_JOB_DESIRED_SCAN_CONCURRENCY: i64 = 10;
@@ -488,38 +486,19 @@ impl TransferWorkerSchedulerHandle {
     }
 }
 
-// This handle is process-local dedupe for scan execution only. Correctness does
-// not depend on it because scan_epoch and durable batch equivalence already
-// reject stale or duplicate scan outputs.
 #[derive(Clone)]
 pub(crate) struct TransferScanSchedulerHandle {
     pub(crate) wake: Arc<tokio::sync::Notify>,
-    active_scan_jobs: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl TransferScanSchedulerHandle {
     pub(crate) fn new() -> Self {
         Self {
             wake: Arc::new(tokio::sync::Notify::new()),
-            active_scan_jobs: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
     pub(crate) fn notify(&self) {
         self.wake.notify_waiters();
-    }
-
-    pub(crate) fn try_begin_scan_job(&self, job_id: &str) -> bool {
-        let mut active_scan_jobs = self.active_scan_jobs.lock();
-        if active_scan_jobs.contains(job_id) {
-            return false;
-        }
-        active_scan_jobs.insert(job_id.to_string());
-        true
-    }
-
-    pub(crate) fn finish_scan_job(&self, job_id: &str) {
-        self.active_scan_jobs.lock().remove(job_id);
-        self.notify();
     }
 }

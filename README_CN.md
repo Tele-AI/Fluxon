@@ -2,10 +2,97 @@
 
 ![](./pics/post_en.png)
 
+<div align="center">
+
+面向 AI 原生场景的分布式数据面，提供高性能 RPC、KV Cache、消息队列与文件对象加速能力。
+
+[![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#运行要求)
+[![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#运行要求)
+[![Rust](https://img.shields.io/badge/Rust-1.93.0-000000)](./fluxon_rs/rust-toolchain.toml)
+[![Latest](https://img.shields.io/badge/Latest-v0.2.4-f28500)](./fluxon_release)
+[![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#接口能力)
+
+<details>
+<summary><img src="https://img.shields.io/badge/%E5%BE%AE%E4%BF%A1-%E5%8A%A0%E5%85%A5%E7%BE%A4%E8%81%8A-07C160?logo=wechat&amp;logoColor=white" alt="微信群" /></summary>
+
+添加项目管理员，加入开源交流群。
+
+<img src="./pics/wx.jpg" width="360" alt="项目管理员微信二维码" />
+
+</details>
+
+[中文](./README_CN.md) | [English](./README.md) | [用户文档](https://tele-ai.github.io/Fluxon/cn/) | [English Docs](https://tele-ai.github.io/Fluxon/) | <a href="https://github.com/Tele-AI/Fluxon" title="GitHub 仓库"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
+
+</div>
+
+基于统一的 Rust 存传一体底座，Fluxon 对外提供三类标准化接口，分别面向 AI 系统中的核心瓶颈：
+
+- **KV/RPC（统一键值与 RPC）**：打破数据孤岛，实现推理侧 `KV Cache` 与 `latent cache` 的跨节点、跨进程高效复用
+- **MQ（弹性消息队列）**：解耦系统依赖，支撑异构资源池之间的弹性消息传输
+- **FS（兼容 `S3` 的文件、对象与缓存加速系统）**：统一键值、文件、对象三类缓存能力，并支持 AI 数据与模型文件的远端访问、`S3` 转发和跨集群大规模迁移
+
+<a id="当前目录"></a>
+
+## 🧭 当前目录
+
+- [基准测试](#基准测试)
+- [背景](#背景)
+- [底座能力](#底座能力)
+- [接口能力](#接口能力)
+- [运行要求](#运行要求)
+- [快速开始](#快速开始)
+- [项目结构](#项目结构)
+- [贡献](#贡献)
+- [Contributors](#contributors)
+- [致谢](#致谢)
+- [许可证](#许可证)
+- [Star 增长趋势](#star-增长趋势)
+
+<a id="基准测试"></a>
+
+## 📊 基准测试
+
+基准测试主要覆盖 `RPC`、`KV` 和 `FS` 三类数据面；相关脚本和配置主要位于 `fluxon_test_stack/`。
+
+### Fluxon RPC 基准测试
+
+`RPC Benchmark` 主要展示不同消息规模和并发条件下的调用延迟与吞吐表现，用于观察服务间调用链路的稳定性和尾延迟表现。
+
+![](./pics/fluxon_rpc_bench.png)
+
+### Fluxon KV 基准测试
+
+`TCP Benchmark` 显示，Fluxon 在 `Read-affinity` 和 `Read-Zipf` 两类读多负载上的表现明显优于 `MooncakeStore` 和 `Redis`；`put_only` 当前的主要约束仍在 `inflight` 元数据判重路径，而非 `Payload` 传输。
+
+![](./pics/kv_benchmark_chart.png)
+
+Fluxon KV 还可将 owner 本地 SSD 作为 DRAM 副本的运行期回填层。下图为单机 H100 的 SSD-pressure 实验，以 CUDA event 完成为计数边界；c16 下，Fluxon 在 4/8/16 MiB 组中的 hit payload 吞吐相对两种 Mooncake 拓扑中更快的一种分别达到 3.83×/5.61×/6.73×。
+
+![Fluxon 与 Mooncake 不同 SSD 配置下的 GPU 可用 KV 吞吐和命中率](./pics/kv_ssd_gpu_sweep.png)
+
+完整实验设置、命中率和适用边界见博客：[Fluxon KV SSD 存储：把本地 SSD 接成内存副本的回填层](https://tele-ai.github.io/Fluxon/cn/blog/blog_2_Fluxon_KV_SSD%E5%AD%98%E5%82%A8%EF%BC%9A%E6%8A%8A%E6%9C%AC%E5%9C%B0SSD%E6%8E%A5%E6%88%90%E5%86%85%E5%AD%98%E5%89%AF%E6%9C%AC%E7%9A%84%E5%9B%9E%E5%A1%AB%E5%B1%82)。
+
+### Fluxon FS 基准测试
+
+#### 多机 FS Python 接口
+
+测试结果显示，小文件读取和大文件写入性能已显著优于 `Alluxio`，大文件读取性能基本持平，小文件写入性能仍有进一步优化的空间。
+
+![](./pics/fs_benchmark_chart.png)
+
+#### 单机 S3 接口
+
+在已报告的单机 `rclone v1.60.1` 对比中，FluxonFS 在持久化 PUT 与冷读的全部 18 组对象大小/并发组合中均领先 Alluxio S3 Proxy。热读优势在 4 KiB 对象上最明显，中型与大型对象的顺序热读吞吐整体接近。
+
+![FluxonFS S3 与 Alluxio S3 Proxy 的持久化 PUT、冷读和热读吞吐对比](./pics/fluxon-s3-throughput-overview.svg)
+
+<a id="背景"></a>
+
+## 背景
 
 当 GPU 算力持续提升，AI 系统的瓶颈正在从单点算子扩展到数据面。推理服务需要跨节点复用 `KV Cache`；训练流水线需要在异构资源池之间传递中间态；模型文件与 `Checkpoint` 需要在远端访问与本地缓存间稳定流动。
 
-然而，现有系统多为面向特定场景定制的专用组件，例如面向 `KV Cache` 的 `MooncakeStore`。许多 AI 场景仍缺少成熟的 `AI-native` 组件，算法团队为了快速验证，往往会临时搭建数据搬运模块。随着模型规模与集群弹性一起增长，这种“拼图式”数据面的开销会持续膨胀，逐渐吞噬 CPU、I/O、内存和运维精力，并暴露出 7 个致命的工程痛点：
+然而，现有系统多为面向特定场景定制的专用组件，例如面向 `KV Cache` 的 `MooncakeStore`。许多 AI 场景仍缺少成熟的 `AI-native` 组件，算法团队为了快速验证，往往会临时搭建数据搬运模块。随着模型规模与集群弹性一起增长，这种“拼图式”数据面的开销会持续膨胀，逐渐吞噬 CPU、I/O、内存和运维精力，并暴露出七个关键工程痛点：
 
 - **局部场景经验难以迁移：** 专用 `KV Cache` 系统将缓存语义和 `RDMA` 传输绑定在特定路径上，面对更泛化的数据面场景难以直接平移
 - **资源统一管控不够彻底：** 框架级 `L2` 与外部 `L3` 缓存往往同处单机 `CPU` 内存，`L2` 难以进入统一索引和驱逐治理，增加缓存穿越开销
@@ -15,42 +102,7 @@
 - **对象生命周期难以统一收口：** 缓存、消息和文件各自维护引用和驱逐状态，状态极易散落在业务框架、缓存层和传输层之间
 - **可观测性链路割裂：** 缓存命中、传输路径、对象物化分散在不同系统，性能问题排查时只能在多套指标中拼凑线索
 
-Fluxon 的设计正是围绕这些问题展开。它将数据面资源、对象生命周期、跨节点传输和业务接入分别抽象，纳入同一套存传一体底座统一治理，让系统资源更多用于模型计算本身，而不是耗散在数据面的拼装与搬运上。基于这套统一的 Rust 存传一体底座，Fluxon 向上提供三大标准化接口，直接面向 AI 系统里的核心瓶颈：
-
-- **KV/RPC（统一键值与 RPC）**：打破数据孤岛，实现推理侧 `KV Cache` 与 `latent cache` 的跨节点、跨进程高效复用
-- **MQ（弹性消息队列）**：解耦系统依赖，支撑异构资源池之间的弹性消息传输
-- **FS（兼容 `S3` 的文件、对象与缓存加速系统）**：统一键值、文件、对象三类缓存能力，并支持 AI 数据与模型文件的远端访问、`S3` 转发和跨集群大规模迁移
-
 ![](./pics/fluxon架构图20260423.png)
-
-
-<div align="center">
-
-[![Linux Only](https://img.shields.io/badge/Linux-Only-2ea44f)](#运行要求)
-[![Python](https://img.shields.io/badge/Python-%3E%3D3.10-3776AB)](#运行要求)
-[![Rust](https://img.shields.io/badge/Rust-1.93.0-000000)](./fluxon_rs/rust-toolchain.toml)
-[![Latest](https://img.shields.io/badge/Latest-v0.2.2-f28500)](./fluxon_release)
-[![Interfaces](https://img.shields.io/badge/Interfaces-KV%2FRPC%20%7C%20MQ%20%7C%20FS-1f6feb)](#接口能力)
-
-[中文](./README_CN.md) | [English](./README.md) | [用户文档](https://tele-ai.github.io/Fluxon/cn/) | [English Docs](https://tele-ai.github.io/Fluxon/) | <a href="https://github.com/Tele-AI/Fluxon" title="GitHub 仓库"><img src="https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" width="18" height="18" alt="GitHub repository" /></a>
-
-</div>
-
-<a id="当前目录"></a>
-
-## 🧭 当前目录
-
-- [底座能力](#底座能力)
-- [接口能力](#接口能力)
-- [基准测试](#基准测试)
-- [运行要求](#运行要求)
-- [快速开始](#快速开始)
-- [项目结构](#项目结构)
-- [贡献](#贡献)
-- [Contributors](#contributors)
-- [致谢](#致谢)
-- [许可证](#许可证)
-- [Star 增长趋势](#star-增长趋势)
 
 <a id="底座能力"></a>
 
@@ -109,34 +161,6 @@ Fluxon FS 是一款面向 AI 数据与模型文件、兼容 `S3` 的高性能文
 - **小文件 / 大文件读写特化优化：** 针对不同文件粒度和读写路径分别进行并发与链路优化，提升带宽利用率与整体吞吐
 - **跨集群大规模搬迁：** 支持 `PB` 级数据迁移，并将缓存、传输和失败恢复置于统一链路
 
-<a id="基准测试"></a>
-
-## 📊 基准测试
-
-基准测试主要覆盖 `RPC`、`KV` 和 `FS` 三类数据面；相关脚本和配置主要位于 `fluxon_test_stack/`。
-
-### Fluxon RPC 基准测试
-
-`RPC Benchmark` 主要展示不同消息规模和并发条件下的调用延迟与吞吐表现，用于观察服务间调用链路的稳定性和尾延迟表现。
-
-![](./pics/fluxon_rpc_bench.png)
-
-### Fluxon KV 基准测试
-
-`TCP Benchmark` 显示，Fluxon 在 `Read-affinity` 和 `Read-Zipf` 两类读多负载上的表现明显优于 `MooncakeStore` 和 `Redis`；`put_only` 当前的主要约束仍在 `inflight` 元数据判重路径，而非 `Payload` 传输。
-
-![](./pics/kv_benchmark_chart.png)
-
-### Fluxon FS 基准测试
-
-测试结果显示，小文件读取和大文件写入性能已显著优于 `Alluxio`，大文件读取性能基本持平，小文件写入性能仍有进一步优化的空间。
-
-![](./pics/fs_benchmark_chart.png)
-
-### Fluxon MQ 基准测试
-
-`MQ` 目前主要展示场景问题和数据面设计，自动化运行入口见 `test_runner.py` 与 `fluxon_test_stack/`。
-
 <a id="运行要求"></a>
 
 ## 🧰 运行要求
@@ -162,11 +186,19 @@ Fluxon FS 是一款面向 AI 数据与模型文件、兼容 `S3` 的高性能文
 
 `Quick Start` 用于最短路径体验；正式安装、部署和运维入口见 [用户文档](https://tele-ai.github.io/Fluxon/cn/user_doc/)。
 
+对于接入已有服务平面的 Linux x86_64 Python 进程，可以直接安装公开 distribution：
+
+```bash
+python3 -m pip install fluxon-py
+```
+
+该 distribution 安装的 import 包仍然是 `fluxon_py`。服务平面运行时和完整 release bundle 继续通过 GitHub Releases 提供。
+
 ### KV 快速开始
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.2 \
+  hanbaoaaa/fluxon_quick_start:0.2.4 \
   --mode kv \
   --etcd-client-port 12379 \
   --master-p2p-port 31000 \
@@ -199,7 +231,7 @@ del demo:hello
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.2 \
+  hanbaoaaa/fluxon_quick_start:0.2.4 \
   --mode mq \
   --etcd-client-port 37379 \
   --kv-master-port 34200 \
@@ -230,7 +262,7 @@ exit
 
 ```bash
 docker run --rm -it --network host \
-  hanbaoaaa/fluxon_quick_start:0.2.2 \
+  hanbaoaaa/fluxon_quick_start:0.2.4 \
   --mode fs \
   --etcd-client-port 36379 \
   --kv-master-port 34100 \
@@ -250,62 +282,7 @@ ui
 `FS Quick Start` 会额外打印：
 
 - `fs_s3` 端点
-- `Basic Auth` 入口；`0.2.2` 仅将 `admin / admin` 用作首次设置凭据
-
-新建工作目录首次登录时，必须同时修改用户名和密码，完成前 S3 访问会被拒绝；修改成功后，旧的 `admin / admin` 立即失效。首次发起 S3 请求前等待约 2 秒，让新权限传播到 FS agent。
-
-PyPI 包可以直接启动目录 S3 服务，无需下载源码：
-
-```bash
-python3 -m pip install --upgrade fluxon-py
-```
-
-`serve_s3_single_node.py` 按依赖顺序显式定义 KV master、KV owner 配置，再启动单机 FS S3：
-
-```python
-from fluxon_py.quick_start import serve_s3_single_node
-
-kv_master_config = {
-    "etcd_endpoints": ["127.0.0.1:22379"],
-    "cluster_name": "fluxon_s3",
-    "instance_key": "fluxon_s3_master",
-    "port": 25100,
-    "log_dir": "/absolute/path/to/state/kv-master/log",
-    "monitoring": {
-        "prometheus_base_url": "http://127.0.0.1:24000/v1/prometheus",
-        "prom_remote_write_url": ["http://127.0.0.1:24000/v1/prometheus/write"],
-        "otlp_log_api": {
-            "otlp_endpoint": "http://127.0.0.1:24000/v1/otlp/v1/logs",
-            "db_name": "public",
-            "table_name": "fluxon_logs",
-        },
-    },
-}
-kv_owner_config = {
-    "instance_key": "fluxon_s3_owner",
-    "contribute_to_cluster_pool_size": {"dram": 1073741824, "vram": {}},
-    "fluxonkv_spec": {
-        "etcd_addresses": ["127.0.0.1:22379"],
-        "cluster_name": "fluxon_s3",
-        "share_mem_path": "/dev/shm/fluxon-s3",
-        "sub_cluster": "default",
-        "large_file_paths": ["/absolute/path/to/state/kv-owner/large"],
-    },
-}
-serve_s3_single_node(
-    "/absolute/path/to/data",
-    "/absolute/path/to/state",
-    kv_master_config=kv_master_config,
-    kv_owner_config=kv_owner_config,
-    export_name="local-data",
-)
-```
-
-`serve_s3_single_node` 将两份配置直接交给已有的标准 KV runtime 启动入口，不再增加 KV 进程包装层；名称明确限定了它的单机适用范围。共享内存目录独立且可重建，需要确保所在文件系统容量充足。`export_name` 同时也是 S3 bucket 名；省略时使用 `quick-start-export`。
-
-```bash
-python3 serve_s3_single_node.py
-```
+- `Basic Auth` 入口，默认账号密码是 `admin / admin`
 
 预期运行效果：
 
@@ -342,6 +319,11 @@ python3 serve_s3_single_node.py
 - [开发者 - 2 - 打包中间件和镜像](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---2---%E6%89%93%E5%8C%85%E4%B8%AD%E9%97%B4%E4%BB%B6%E5%92%8C%E9%95%9C%E5%83%8F/)
 - [开发者 - 3 - 文档写作规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---3---%E6%96%87%E6%A1%A3%E5%86%99%E4%BD%9C%E8%A7%84%E7%BA%A6/)
 - [开发者 - 4 - 发布 Release](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---4---%E5%8F%91%E5%B8%83-Release/)
+- [开发者 - 5 - 技术文档审校](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---5---%E6%8A%80%E6%9C%AF%E6%96%87%E6%A1%A3%E5%AE%A1%E6%A0%A1/)
+- [开发者 - 6 - Code Review 规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---6---Code-Review-%E8%A7%84%E7%BA%A6/)
+- [开发者 - 7 - 事件订阅与全量快照规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---7---%E4%BA%8B%E4%BB%B6%E8%AE%A2%E9%98%85%E4%B8%8E%E5%85%A8%E9%87%8F%E5%BF%AB%E7%85%A7%E8%A7%84%E7%BA%A6/)
+- [开发者 - 8 - 数据结构与索引设计规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---8---%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E4%B8%8E%E7%B4%A2%E5%BC%95%E8%AE%BE%E8%AE%A1%E8%A7%84%E7%BA%A6/)
+- [开发者 - 9 - 测试扩展配置](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---9---%E6%B5%8B%E8%AF%95%E6%89%A9%E5%B1%95%E9%85%8D%E7%BD%AE/)
 
 <a id="contributors"></a>
 

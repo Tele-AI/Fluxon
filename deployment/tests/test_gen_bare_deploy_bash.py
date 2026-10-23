@@ -20,6 +20,8 @@ import yaml
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEPLOYMENT_DIR = SCRIPT_DIR.parent
 GENERATOR_PATH = DEPLOYMENT_DIR / "gen_bare_deploy_bash.py"
+STANDALONE_STARTUP_DEADLINE_SECONDS = 60
+ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS = 60
 
 
 def main() -> int:
@@ -64,6 +66,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("bootstrap_start_reuses_already_present_selection", test_bootstrap_start_reuses_already_present_selection),
         ("bare_start_fails_when_child_exits_within_startup_window", test_bare_start_fails_when_child_exits_within_startup_window),
         ("pid_ready_check_requires_full_stable_window_after_first_child_observation", test_pid_ready_check_requires_full_stable_window_after_first_child_observation),
+        ("pid_ready_check_allows_extra_direct_children", test_pid_ready_check_allows_extra_direct_children),
         ("atomic_group_start_does_not_auto_stop_on_failure", test_atomic_group_start_does_not_auto_stop_on_failure),
         ("atomic_group_preserves_nested_heredoc_terminator", test_atomic_group_preserves_nested_heredoc_terminator),
         ("atomic_group_stop_script_is_shell_valid", test_atomic_group_stop_script_is_shell_valid),
@@ -198,10 +201,11 @@ def test_atomic_group_start_does_not_auto_stop_on_failure() -> None:
         assert 'echo "[rollout] probable-ready failed svc=$SERVICE label=$SUPERVISOR_LABEL supervisor_pid=$SUPERVISOR_PID"' in script, script
         assert 'wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID"' in script, script
         assert 'GROUP_STARTUP_DEADLINE_SECONDS=' not in script, script
-        assert script.count('STARTUP_DEADLINE_SECONDS=20') == 2, script
+        assert script.count(f"STARTUP_DEADLINE_SECONDS={ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS}") == 2, script
         _assert_deadline_after_launch(
             script=script,
             wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[rollout]"',
+            deadline_seconds=ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS,
         )
         assert "export SERVICE_PORT=23456" in script, script
         assert "unset SERVICE_PORT" in script, script
@@ -371,6 +375,7 @@ def test_normalized_testbed_master_exports_service_port_for_atomic_group() -> No
         _assert_deadline_after_launch(
             script=master_block,
             wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[rollout]"',
+            deadline_seconds=ATOMIC_GROUP_STARTUP_DEADLINE_SECONDS,
         )
         assert "wait_service_tcp_ready" not in master_block, master_block
         print("PASS: test_normalized_testbed_master_exports_service_port_for_atomic_group")
@@ -501,11 +506,15 @@ def test_supervisor_label_uses_stable_selection_suffix() -> None:
 
         plain_start = (outdir / "start_svc_plain.sh").read_text(encoding="utf-8")
         plain_stop = (outdir / "stop_svc_plain.sh").read_text(encoding="utf-8")
+        svc_a_stop = (outdir / "stop_svc_a.sh").read_text(encoding="utf-8")
         group_start = (outdir / "start_grp_ab.sh").read_text(encoding="utf-8")
         group_stop = (outdir / "stop_grp_ab.sh").read_text(encoding="utf-8")
 
         assert 'SUPERVISOR_LABEL=DaemonSet/fluxon-bench-n3-runtime-20260428-bastion-bootstrap-svc_plain' in plain_start, plain_start
-        assert 'SUPERVISOR_LABEL=DaemonSet/fluxon-bench-n3-runtime-20260428-bastion-bootstrap-svc_plain' in plain_stop, plain_stop
+        assert 'DaemonSet/fluxon-bench-n3-runtime-20260428-bastion-bootstrap-svc_plain' in plain_stop, plain_stop
+        assert 'DaemonSet/fluxon-bench-n3-runtime-20260428-bastion-bootstrap-svc_a' in svc_a_stop, svc_a_stop
+        assert 'DaemonSet/fluxon-bench-n3-runtime-20260428-bastion-bootstrap-grp_ab__svc_a' in svc_a_stop, svc_a_stop
+        assert 'DaemonSet/fluxon-bench-n3-runtime-20260428-bastion-bootstrap-grp_ab__svc_b' not in svc_a_stop, svc_a_stop
         assert 'SUPERVISOR_LABEL=DaemonSet/fluxon-bench-n3-runtime-20260428-bastion-bootstrap-grp_ab__svc_a' in group_start, group_start
         assert 'SUPERVISOR_LABEL=DaemonSet/fluxon-bench-n3-runtime-20260428-bastion-bootstrap-grp_ab__svc_b' in group_start, group_start
         assert 'SUPERVISOR_LABEL=DaemonSet/fluxon-bench-n3-runtime-20260428-bastion-bootstrap-grp_ab__svc_b' in group_stop, group_stop
@@ -812,6 +821,117 @@ def test_pid_ready_check_requires_full_stable_window_after_first_child_observati
         print("PASS: test_pid_ready_check_requires_full_stable_window_after_first_child_observation")
 
 
+def test_pid_ready_check_allows_extra_direct_children() -> None:
+    proc_lifecycle = _load_python_module(
+        module_name="test_proc_lifecycle_codegen_runtime_extra_children",
+        path=DEPLOYMENT_DIR / "utils" / "proc_lifecycle_codegen.py",
+    )
+    helpers = proc_lifecycle.render_bash_proc_lifecycle_funcs_pid_tree(
+        timeouts=proc_lifecycle.StopTimeouts(term_seconds=60, kill_seconds=10, supersede_seconds=30)
+    )
+    with tempfile.TemporaryDirectory(prefix="test_proc_lifecycle_extra_child_") as td:
+        tmpdir = Path(td)
+        shell_script = tmpdir / "probe.sh"
+        supervisor_script = tmpdir / "multi_child_supervisor.py"
+        child_script = tmpdir / "sleep_child.py"
+
+        child_script.write_text(
+            textwrap.dedent(
+                """
+                #!/usr/bin/env python3
+                import signal
+                import time
+
+                def _handle_signal(_signum, _frame):
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, _handle_signal)
+                signal.signal(signal.SIGINT, _handle_signal)
+
+                while True:
+                    time.sleep(0.2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        supervisor_script.write_text(
+            textwrap.dedent(
+                f"""
+                #!/usr/bin/env python3
+                import signal
+                import subprocess
+                import sys
+                import time
+                from pathlib import Path
+
+                children = []
+
+                def _shutdown(_signum, _frame):
+                    for child in children:
+                        if child.poll() is None:
+                            child.terminate()
+                    deadline = time.time() + 5
+                    for child in children:
+                        while child.poll() is None and time.time() < deadline:
+                            time.sleep(0.05)
+                        if child.poll() is None:
+                            child.kill()
+                    raise SystemExit(0)
+
+                signal.signal(signal.SIGTERM, _shutdown)
+                signal.signal(signal.SIGINT, _shutdown)
+
+                primary = subprocess.Popen([sys.executable, str(Path({str(child_script)!r}))])
+                children.append(primary)
+                extra = subprocess.Popen([sys.executable, str(Path({str(child_script)!r}))])
+                children.append(extra)
+                while True:
+                    if primary.poll() is not None:
+                        raise SystemExit(primary.returncode or 0)
+                    time.sleep(0.2)
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        shell_script.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env bash
+                set -euo pipefail
+                {helpers}
+                python3 {shlex.quote(str(supervisor_script))} &
+                root_pid="$!"
+                startup_deadline_seconds=8
+                wait_service_probably_ready_pid_tree "svc_plain" "$root_pid" 3 "$startup_deadline_seconds" "[test]"
+                wait_rc="$?"
+                kill "$root_pid" >/dev/null 2>&1 || true
+                wait "$root_pid" >/dev/null 2>&1 || true
+                exit "$wait_rc"
+                """
+            ),
+            encoding="utf-8",
+        )
+        shell_script.chmod(0o755)
+
+        result = subprocess.run(
+            ["bash", str(shell_script)],
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(DEPLOYMENT_DIR.parent),
+            timeout=20,
+        )
+        assert result.returncode == 0, (
+            f"expected startup gate success rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        assert "probable-ready: ok svc=svc_plain" in result.stdout, result.stdout
+        assert "multiple direct child pids" not in result.stdout, result.stdout
+        print("PASS: test_pid_ready_check_allows_extra_direct_children")
+
+
 def test_atomic_group_preserves_nested_heredoc_terminator() -> None:
     with tempfile.TemporaryDirectory(prefix="test_gen_bare_deploy_bash_atomic_heredoc_") as td:
         tmpdir = Path(td)
@@ -981,9 +1101,9 @@ def _wait_until_selection_absent(
     raise RuntimeError(f"timeout waiting selection absent: label={label} scope_key={scope_key}")
 
 
-def _assert_deadline_after_launch(*, script: str, wait_call: str) -> None:
+def _assert_deadline_after_launch(*, script: str, wait_call: str, deadline_seconds: int) -> None:
     launch_check = 'if [[ ! "$SUPERVISOR_PID" =~ ^[0-9]+$ ]]; then'
-    deadline_assign = 'STARTUP_DEADLINE_SECONDS=20'
+    deadline_assign = f"STARTUP_DEADLINE_SECONDS={deadline_seconds}"
     assert launch_check in script, script
     assert deadline_assign in script, script
     assert wait_call in script, script
@@ -998,6 +1118,7 @@ def _assert_standalone_deadline_after_launch(script: str) -> None:
     _assert_deadline_after_launch(
         script=script,
         wait_call='wait_service_probably_ready_pid_tree "$SERVICE" "$SUPERVISOR_PID" 10 "$STARTUP_DEADLINE_SECONDS" "[bare]"',
+        deadline_seconds=STANDALONE_STARTUP_DEADLINE_SECONDS,
     )
 
 

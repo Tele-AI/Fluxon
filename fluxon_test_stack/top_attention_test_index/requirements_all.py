@@ -20,7 +20,6 @@ ALL_TEST_REQUIREMENTS: tuple[str, ...] = (
     "ops",
     "python-wheel-build",
     "submodules",
-    "test-stack-targets",
     "tikv",
 )
 
@@ -37,7 +36,6 @@ TEST_REQUIREMENT_DESCRIPTIONS: dict[str, str] = {
     "ops": "A reachable Fluxon Ops control plane is required by the test-stack execution flow.",
     "python-wheel-build": "Python wheel build dependencies must be available.",
     "submodules": "Required git submodules must be initialized for build-using tests.",
-    "test-stack-targets": "A TEST_STACK config with reachable target hosts is required.",
     "tikv": "A TiKV/PD runtime is required, either external or started by the test.",
 }
 

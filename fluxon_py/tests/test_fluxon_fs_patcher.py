@@ -21,9 +21,9 @@ from fluxon_py.config import FluxonKvClientConfig  # noqa: E402
 from fluxon_py.fluxon_fs.patcher import FluxonFsPatcher, _FluxonRemoteFileRaw  # noqa: E402
 from fluxon_py.kvclient import new_store  # noqa: E402
 from fluxon_py.api_error import KeyNotFoundError  # noqa: E402
-from fluxon_py.tests.test_lib import (  # noqa: E402
-    load_test_fluxon_cluster_name,
-    load_test_fluxon_share_mem_path,
+from setup_and_pack.utils.repo_config_utils import (  # noqa: E402
+    load_test_fluxon_cluster_name_from_test_config,
+    load_test_fluxon_share_mem_path_from_test_config,
 )
 
 
@@ -37,8 +37,8 @@ def _new_test_dir(tag: str) -> Path:
 
 def _load_ci_cluster() -> tuple[str, str]:
     return (
-        load_test_fluxon_cluster_name(),
-        load_test_fluxon_share_mem_path(),
+        load_test_fluxon_cluster_name_from_test_config(),
+        load_test_fluxon_share_mem_path_from_test_config(),
     )
 
 

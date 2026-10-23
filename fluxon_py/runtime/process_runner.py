@@ -5,8 +5,8 @@ from collections.abc import Mapping
 import atexit
 import ctypes
 from dataclasses import dataclass
-import enum
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -22,6 +22,7 @@ from ..config import _to_plain_yaml_obj
 
 RuntimeConfigInput = Path | Mapping[str, Any]
 FORCE_KILL_WAIT_SECONDS = 10.0
+_PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -43,19 +44,10 @@ class RuntimeSingletonSpec:
     workdir_path: Path
 
 
-class ChildStopMode(enum.Enum):
-    # Keep this compatibility surface for installed scripts that still import
-    # the old stop-mode API while the runtime converges on the attached-child
-    # model. Child shutdown no longer branches on this enum.
-    PROCESS = "process"
-    PROCESS_GROUP = "process_group"
-
-
 @dataclass(frozen=True)
 class ManagedSubprocess:
     label: str
     proc: subprocess.Popen[Any]
-    stop_mode: ChildStopMode = ChildStopMode.PROCESS
 
 
 def resolve_runtime_config_path(
@@ -236,21 +228,48 @@ def register_ctrlc_callback(
     *,
     thread_name: str,
 ) -> Callable[[], None]:
+    """Run one SIGINT/SIGTERM callback on a dedicated listener thread."""
+
     signal_set = {signal.SIGINT, signal.SIGTERM}
 
     if threading.current_thread() is threading.main_thread():
         old_sigint = signal.getsignal(signal.SIGINT)
         old_sigterm = signal.getsignal(signal.SIGTERM)
+        callback_requests: queue.SimpleQueue[str | None] = queue.SimpleQueue()
+        callback_requested = False
+
+        def _listener() -> None:
+            reason = callback_requests.get()
+            if reason is not None:
+                on_ctrlc(reason)
+
+        listener = threading.Thread(target=_listener, name=thread_name, daemon=True)
+        listener.start()
 
         def _handler(signum: int, _frame: object) -> None:
-            on_ctrlc(_signal_reason(signum))
+            nonlocal callback_requested
+            if callback_requested:
+                return
+            callback_requested = True
+            # A Python signal frame can interrupt PyO3 while the main thread owns
+            # MQ operation locks. Run potentially blocking cleanup on the listener.
+            callback_requests.put(_signal_reason(signum))
 
         signal.signal(signal.SIGINT, _handler)
         signal.signal(signal.SIGTERM, _handler)
 
+        restored = False
+
         def _restore() -> None:
+            nonlocal restored
+            if restored:
+                return
+            restored = True
             signal.signal(signal.SIGINT, old_sigint)
             signal.signal(signal.SIGTERM, old_sigterm)
+            if not callback_requested:
+                callback_requests.put(None)
+            listener.join()
 
         return _restore
 
@@ -499,6 +518,7 @@ def _start_runtime_process(
 ) -> subprocess.Popen[bytes]:
     popen_kwargs: dict[str, Any] = {
         "preexec_fn": build_parent_death_sigterm_preexec(expected_parent_pid=os.getpid()),
+        "env": _build_runtime_subprocess_env(),
     }
     if cwd is not None:
         popen_kwargs["cwd"] = str(cwd)
@@ -518,6 +538,22 @@ def _start_runtime_process(
         log_file.close()
 
     return proc
+
+
+def _build_runtime_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    package_root = str(_PACKAGE_ROOT)
+    pythonpath_parts: list[str] = [package_root]
+    if existing_pythonpath:
+        for entry in existing_pythonpath.split(os.pathsep):
+            stripped = entry.strip()
+            if not stripped or stripped == package_root:
+                continue
+            pythonpath_parts.append(stripped)
+    env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
 
 
 def _set_parent_death_sigterm(*, expected_parent_pid: int) -> None:

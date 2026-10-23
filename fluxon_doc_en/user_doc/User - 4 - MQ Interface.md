@@ -72,6 +72,55 @@ Key rules:
 - `new_or_bind_with_unique_key(...)` is not a standalone public entrypoint; it must run on top of a store
 - Shutdown order is fixed: close the MQ handle first, then close `store`
 
+## Shutdown Lifecycle
+
+User and test code uses only two layers of public API, in this fixed order:
+
+```python
+producer.close().unwrap("close MQ producer failed")
+# For a consumer process instead:
+# consumer.close().unwrap("close MQ consumer failed")
+
+store.close().unwrap("close KV store failed")
+```
+
+If one `store` owns multiple MQ handles, call `close()` on every handle and consume each result before `store.close()` runs. Both layers return `Result[OkNone, ApiError]`. Close errors must be recorded or propagated rather than silently discarded.
+
+The endpoint close result distinguishes resource classes:
+
+| Close action | Failure semantics |
+| --- | --- |
+| Stop data paths, the MQ runtime, background tasks, and local handles | Must complete; `close()` returns `ApiError` on failure. |
+| Delete lease-backed role, ready, membership, and weight keys | Make one best-effort delete pass; on failure, log a warning, release keepalive handles, and let the backend lease TTL reclaim the keys. |
+| Runtime etcd operations such as create, bind, publish, ready claim, message acknowledgement, and offset updates | Keep a strong contract; the active operation returns an error on failure. |
+
+A leased-key cleanup warning means eager reclamation was deferred to TTL; it does not mean that the local endpoint remains open. Callers must still consume the `close()` result, but must not inspect private objects or retry distributed-key deletion themselves.
+
+```mermaid
+sequenceDiagram
+    participant App as Application / test
+    participant Endpoint as Producer / Consumer
+    participant Internal as Endpoint-owned MQ resources
+    participant Store as KvClient
+
+    App->>Endpoint: close()
+    Endpoint->>Internal: stop data paths and release internal resources
+    Internal-->>Endpoint: local close complete; leased keys deleted or deferred to TTL
+    Endpoint-->>App: Result[OkNone, ApiError]
+    App->>Store: close()
+    Store-->>App: Result[OkNone, ApiError]
+```
+
+The ownership boundary is:
+
+| Owner | Responsibility |
+| --- | --- |
+| Application / test | Call public `producer.close()` / `consumer.close()`, check its `Result`, then call `store.close()`. |
+| MQ endpoint | Within `close()`, stop send/receive paths, close owned subchannels and the MQ runtime, and finish endpoint-owned keepalive and background tasks; warn and activate the TTL fallback when leased-key deletion fails. Fluxon KV lease keepalive remains inside the Rust lifecycle. |
+| `KvClient` | Release KV client resources after every MQ endpoint has closed. |
+
+The endpoint's internal lifecycle is not part of the caller-facing API. User code, examples, and tests must not create lease-manager objects or Python keepalive callbacks, access private fields, raw shutdown controllers, or the MQ framework. Sleeps, forced process exits, and silently discarded `close()` results are not substitutes for the two public close calls above.
+
 ## Minimal MQ Example
 
 The public minimal example is `examples/start_mpmc_demo.py`.

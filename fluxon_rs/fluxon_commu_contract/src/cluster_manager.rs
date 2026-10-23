@@ -10,8 +10,8 @@ pub use crate::member_metadata::{
 };
 pub use crate::transfer::{
     META_KEY_TRANSFER_BACKEND_EPOCH, META_KEY_TRANSFER_READY, P2pTransportKind,
-    TransferLinkEtcdWrite, TransferLinkEtcdWriterHandle, TransferLinkP2pSnapshotSource,
-    TransferLinkP2pState, TransferLinkRecord, TransferLinkTeState, TransferReadyInfo,
+    TransferLinkEtcdWrite, TransferLinkEtcdWriterHandle, TransferLinkP2pState, TransferLinkRecord,
+    TransferLinkTeState, TransferReadyInfo,
 };
 
 use bitcode::{Decode, Encode};

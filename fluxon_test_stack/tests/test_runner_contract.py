@@ -44,12 +44,12 @@ def main() -> int:
 def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[], None]]]:
     checks: List[Tuple[str, Callable[[], None]]] = [
         (
-            "tcp_thread_keeps_protocol_implicit",
-            test_tcp_thread_keeps_protocol_implicit,
+            "network_config_contract",
+            test_network_config_contract,
         ),
         (
-            "explicit_protocol_is_preserved",
-            test_explicit_protocol_is_preserved,
+            "test_spec_protocol_type_contract",
+            test_test_spec_protocol_type_contract,
         ),
         (
             "post_read_remote_policy_is_forwarded_strictly",
@@ -58,6 +58,14 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         (
             "suite_requires_benchmark_bundle_only_for_bench_cases",
             test_suite_requires_benchmark_bundle_only_for_bench_cases,
+        ),
+        (
+            "ci_lock_name_is_scoped_by_ops_cluster_name",
+            test_ci_lock_name_is_scoped_by_ops_cluster_name,
+        ),
+        (
+            "suite_cluster_name_is_scoped_by_workdir",
+            test_suite_cluster_name_is_scoped_by_workdir,
         ),
         (
             "ci_top_attention_doc_page_build_uses_online_docker_image",
@@ -148,46 +156,97 @@ def _suite_cfg_with_declared_ci_commands(command_map: dict[str, list[dict]]) -> 
     return suite_cfg
 
 
-def test_tcp_thread_keeps_protocol_implicit() -> None:
-    kv_base = {
-        "instance_key": "bench_base",
-        "fluxonkv_spec": {"cluster_name": "bench"},
-    }
-    merged_test_spec_config = {
-        "p2p_transport_impl": "tcp_thread",
-        "transport_mode": "transfer_with_rpc",
-    }
-    actual = _TEST_RUNNER._resolve_test_stack_fluxon_protocol_cfg(
-        kv_base=copy.deepcopy(kv_base),
-        merged_test_spec_config=copy.deepcopy(merged_test_spec_config),
-        ctx="profile.test_stack.runtime_config.kv_base",
+def test_network_config_contract() -> None:
+    actual = _TEST_RUNNER._normalize_test_stack_fluxon_network_config(
+        {"rdma_device_names": " mlx5_0 ", "tcp_reactor_mode": "event_driven"},
+        "network",
     )
-    if actual is not None:
-        print(
-            "FAIL: test_tcp_thread_keeps_protocol_implicit - "
-            f"expected None, got {actual!r}"
-        )
-        return
-    print("PASS: test_tcp_thread_keeps_protocol_implicit")
-
-
-def test_explicit_protocol_is_preserved() -> None:
-    kv_base = {
-        "protocol": {"protocol_type": "rdma"},
-    }
-    actual = _TEST_RUNNER._resolve_test_stack_fluxon_protocol_cfg(
-        kv_base=copy.deepcopy(kv_base),
-        merged_test_spec_config={"p2p_transport_impl": "tcp_thread"},
-        ctx="profile.test_stack.runtime_config.kv_base",
-    )
-    expected = {"protocol_type": "rdma"}
+    expected = {"rdma_device_names": "mlx5_0", "tcp_reactor_mode": "event_driven"}
     if actual != expected:
+        print(f"FAIL: test_network_config_contract - expected {expected!r}, got {actual!r}")
+        return
+
+    try:
+        _TEST_RUNNER._forbid_removed_fluxon_kv_config_keys(
+            {"protocol": {}, "fluxonkv_spec": {}},
+            "kv_base",
+        )
+    except ValueError:
+        pass
+    else:
+        print("FAIL: test_network_config_contract - removed protocol block should fail")
+        return
+
+    for removed_name in ("event_mode", "tcp_thread_reactor"):
+        try:
+            _TEST_RUNNER._normalize_test_stack_fluxon_network_config(
+                {removed_name: "event_driven"},
+                "network",
+            )
+        except ValueError:
+            continue
+        print(f"FAIL: test_network_config_contract - removed {removed_name} should fail")
+        return
+
+    print("PASS: test_network_config_contract")
+
+
+def test_test_spec_protocol_type_contract() -> None:
+    defaulted = _TEST_RUNNER._normalize_test_spec_config({}, "test_spec_config")
+    if "protocol_type" in defaulted:
         print(
-            "FAIL: test_explicit_protocol_is_preserved - "
-            f"expected {expected!r}, got {actual!r}"
+            "FAIL: test_test_spec_protocol_type_contract - "
+            f"omitted protocol_type should stay implicit, got {defaulted!r}"
         )
         return
-    print("PASS: test_explicit_protocol_is_preserved")
+
+    tcp = _TEST_RUNNER._normalize_test_spec_config(
+        {
+            "protocol_type": "tcp",
+            "transport_mode": "transfer_with_rpc",
+            "require_transfer_rpc_fast_path_ready_timeout_seconds": 30,
+        },
+        "test_spec_config",
+    )
+    if tcp.get("protocol_type") != "tcp" or "rdma_device_names" in tcp:
+        print(
+            "FAIL: test_test_spec_protocol_type_contract - "
+            f"unexpected tcp config: {tcp!r}"
+        )
+        return
+
+    try:
+        _TEST_RUNNER._normalize_test_spec_config(
+            {"protocol_type": "tcp", "rdma_device_names": ["mlx5_0"]},
+            "test_spec_config",
+        )
+    except ValueError:
+        pass
+    else:
+        print(
+            "FAIL: test_test_spec_protocol_type_contract - "
+            "tcp with rdma_device_names should fail"
+        )
+        return
+
+    for field_name, value in (
+        ("protocol_type", "tcp"),
+        ("rdma_device_names", ["mlx5_0"]),
+    ):
+        try:
+            _TEST_RUNNER._normalize_test_spec_config(
+                {"side_transfer_role": "worker", field_name: value},
+                "test_spec_config",
+            )
+        except ValueError:
+            continue
+        print(
+            "FAIL: test_test_spec_protocol_type_contract - "
+            f"side-transfer worker {field_name} should fail"
+        )
+        return
+
+    print("PASS: test_test_spec_protocol_type_contract")
 
 
 def test_post_read_remote_policy_is_forwarded_strictly() -> None:
@@ -265,6 +324,53 @@ def test_suite_requires_benchmark_bundle_only_for_bench_cases() -> None:
         )
         return
     print("PASS: test_suite_requires_benchmark_bundle_only_for_bench_cases")
+
+
+def test_ci_lock_name_is_scoped_by_ops_cluster_name() -> None:
+    first = _TEST_RUNNER._ci_lock_name_for_ops_cluster_name("fluxon_testbed")
+    second = _TEST_RUNNER._ci_lock_name_for_ops_cluster_name("fluxon_testbed_mq_large_30680")
+    if first == second:
+        print("FAIL: test_ci_lock_name_is_scoped_by_ops_cluster_name - names should differ")
+        return
+    if first == "bench_ci.lock" or second == "bench_ci.lock":
+        print("FAIL: test_ci_lock_name_is_scoped_by_ops_cluster_name - lock name must not be global")
+        return
+    if first != _TEST_RUNNER._ci_lock_name_for_ops_cluster_name("fluxon_testbed"):
+        print("FAIL: test_ci_lock_name_is_scoped_by_ops_cluster_name - name should be deterministic")
+        return
+    print("PASS: test_ci_lock_name_is_scoped_by_ops_cluster_name")
+
+
+def test_suite_cluster_name_is_scoped_by_workdir() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        workdir_a = Path(td) / "run-a"
+        workdir_b = Path(td) / "run-b"
+        workdir_a.mkdir()
+        workdir_b.mkdir()
+
+        first = _TEST_RUNNER._suite_cluster_name_for_workdir(workdir_a)
+        second = _TEST_RUNNER._suite_cluster_name_for_workdir(workdir_a)
+        other = _TEST_RUNNER._suite_cluster_name_for_workdir(workdir_b)
+
+    if first != second:
+        print(
+            "FAIL: test_suite_cluster_name_is_scoped_by_workdir - "
+            f"expected stable name, got {first!r} then {second!r}"
+        )
+        return
+    if first == other:
+        print(
+            "FAIL: test_suite_cluster_name_is_scoped_by_workdir - "
+            f"different workdirs must not share cluster namespace: {first!r}"
+        )
+        return
+    if not first.startswith("fluxon_benchmark_") or not other.startswith("fluxon_benchmark_"):
+        print(
+            "FAIL: test_suite_cluster_name_is_scoped_by_workdir - "
+            f"unexpected names: {first!r}, {other!r}"
+        )
+        return
+    print("PASS: test_suite_cluster_name_is_scoped_by_workdir")
 
 
 def test_ci_top_attention_doc_page_build_uses_online_docker_image() -> None:

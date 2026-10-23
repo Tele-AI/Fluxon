@@ -54,3 +54,11 @@ pub fn new_fs_framework(name: impl Into<String>) -> Framework {
     fw.init_attach_views();
     fw
 }
+
+/// Spawn one FS-owned actor and register its completion with the FS framework.
+pub(crate) fn spawn_fs_task<F>(framework: &Framework, name: impl Into<String>, future: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    framework.spawn_registered_boxed(name, Box::pin(future))
+}

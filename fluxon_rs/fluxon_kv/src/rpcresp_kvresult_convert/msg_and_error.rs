@@ -376,6 +376,9 @@ impl From<fluxon_commu::TransferEngineError> for TransferEngineError {
             fluxon_commu::TransferEngineError::BackendFatal { detail } => {
                 TransferEngineError::BackendFatal { detail }
             }
+            fluxon_commu::TransferEngineError::RequiredDirectFastPathNotReady => {
+                TransferEngineError::RequiredDirectFastPathNotReady {}
+            }
         }
     }
 }
@@ -562,6 +565,9 @@ crate::define_err_group! {
         ,
         (811, BackendFatal { detail: String },
             msg: "Transfer backend fatal: detail={detail}")
+        ,
+        (812, RequiredDirectFastPathNotReady { },
+            msg: "Required direct fast path is not ready")
     }
 }
 

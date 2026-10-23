@@ -1726,9 +1726,9 @@ mod tests {
     const LOCAL_TRANSFER_TEST_CHILD_TRANSFER_STATE_STORE_JSON_ENV: &str =
         "FLUXON_FS_TEST_CHILD_TRANSFER_STATE_STORE_JSON";
     const LOCAL_TRANSFER_TEST_IO_ROOT: &str =
-        "/mnt/nvme0/fluxon_fs_transfer_tikv/rust_local_checker_io";
+        "/tmp/fluxon-example/fluxon_fs_transfer_tikv/rust_local_checker_io";
     const LOCAL_TRANSFER_TEST_TIKV_WORK_ROOT: &str =
-        "/mnt/nvme0/fluxon_fs_transfer_tikv/rust_local_checker";
+        "/tmp/fluxon-example/fluxon_fs_transfer_tikv/rust_local_checker";
     const LOCAL_TRANSFER_TEST_TIKV_READY_TIMEOUT_SECS: u64 = 180;
     const LOCAL_TRANSFER_TEST_TIKV_PD_LEASE_SECS: u64 = 60;
     const LOCAL_TRANSFER_TEST_TIKV_UNIFIED_READPOOL_MAX_THREADS: u64 = 4;
@@ -2240,13 +2240,6 @@ mod tests {
     }
 
     fn collect_actual_ready_batches(
-        transfer_state_store: FluxonFsTransferStateStoreConfig,
-        job_id: &str,
-    ) -> Vec<ActualBatch> {
-        collect_actual_ready_batches_with_store(transfer_state_store, job_id)
-    }
-
-    fn collect_actual_ready_batches_with_store(
         transfer_state_store: FluxonFsTransferStateStoreConfig,
         job_id: &str,
     ) -> Vec<ActualBatch> {
@@ -3118,7 +3111,7 @@ max-background-jobs = {LOCAL_TRANSFER_TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
 
         let expected_batches = collect_expected_batches(&src, 15, &[]);
         let actual_batches =
-            collect_actual_ready_batches_with_store(tikv.transfer_state_store.clone(), summary.job_id.as_str());
+            collect_actual_ready_batches(tikv.transfer_state_store.clone(), summary.job_id.as_str());
         let mut seen_actual_relpaths = BTreeSet::new();
         for actual in &actual_batches {
             for (relpath, _) in actual.entries.iter() {
@@ -3205,7 +3198,7 @@ max-background-jobs = {LOCAL_TRANSFER_TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         let expected_batches =
             collect_expected_batches(&src, batch_ready_bytes, skip_entries.as_slice());
         let actual_batches =
-            collect_actual_ready_batches_with_store(tikv.transfer_state_store.clone(), summary.job_id.as_str());
+            collect_actual_ready_batches(tikv.transfer_state_store.clone(), summary.job_id.as_str());
         assert_actual_batches_match_expected(actual_batches.as_slice(), expected_batches.as_slice());
 
         let actual_file_set = actual_batches
@@ -3247,7 +3240,7 @@ max-background-jobs = {LOCAL_TRANSFER_TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         .unwrap();
 
         let actual_batches =
-            collect_actual_ready_batches_with_store(tikv.transfer_state_store.clone(), summary.job_id.as_str());
+            collect_actual_ready_batches(tikv.transfer_state_store.clone(), summary.job_id.as_str());
         assert_actual_batches_match_expected(
             actual_batches.as_slice(),
             &[

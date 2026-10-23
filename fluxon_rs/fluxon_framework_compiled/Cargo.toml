@@ -1,6 +1,6 @@
 [package]
 name = "fluxon_framework_compiled"
-version = "0.2.2"
+version = "0.2.4"
 edition = "2024"
 
 [dependencies]
@@ -12,6 +12,7 @@ limit_thirdparty = { path = "../limit_thirdparty" }
 fluxon_util = { path = "../fluxon_util" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 crossbeam-queue = "0.3"
 uuid = { workspace = true }
 

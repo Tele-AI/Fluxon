@@ -27,12 +27,16 @@ use fluxon_commu_contract::{
 
 pub mod rdma_probe;
 
-pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 8;
-pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 10;
+pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 7;
+pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 9;
 pub const FLUXON_COMMU_CLOSED_HOST_CALLBACKS_ABI_VERSION: u32 = 8;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK: i32 = 0;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_ERR: i32 = 1;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_USER_RPC_ERR: i32 = 2;
+
+// ABI 9 reports this capability miss through the transfer-engine error detail.
+// Keep the wire marker private and interpret it only at fast-path call sites.
+const ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER: &str = "fluxon_direct_fast_path_not_ready";
 
 type HostAsyncBytesFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>;
 
@@ -231,6 +235,8 @@ pub enum ClosedSdkConsumerError {
     RuntimeError {
         error: ClosedRuntimeError,
     },
+    /// Only explicit fast-path requirements use this error; optional attempts return `Ok(false)`.
+    RequiredDirectFastPathNotReady,
     RuntimeUnexpectedResponse {
         detail: String,
     },
@@ -276,6 +282,9 @@ impl Display for ClosedSdkConsumerError {
             Self::RuntimeError { error } => {
                 write!(f, "closed SDK runtime call failed: {error:?}")
             }
+            Self::RequiredDirectFastPathNotReady => {
+                write!(f, "closed SDK required direct fast path is not ready")
+            }
             Self::RuntimeUnexpectedResponse { detail } => {
                 write!(
                     f,
@@ -295,6 +304,37 @@ impl Display for ClosedSdkConsumerError {
                 )
             }
         }
+    }
+}
+
+fn is_abi9_direct_fast_path_not_ready(error: &ClosedSdkConsumerError) -> bool {
+    matches!(
+        error,
+        ClosedSdkConsumerError::RuntimeError {
+            error: ClosedRuntimeError::TransferEngine { detail },
+        } if detail == ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER
+    )
+}
+
+fn optional_direct_fast_path_call<T>(
+    result: Result<T, ClosedSdkConsumerError>,
+) -> Result<Option<T>, ClosedSdkConsumerError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if is_abi9_direct_fast_path_not_ready(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn required_direct_fast_path_call<T>(
+    result: Result<T, ClosedSdkConsumerError>,
+) -> Result<T, ClosedSdkConsumerError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if is_abi9_direct_fast_path_not_ready(&error) => {
+            Err(ClosedSdkConsumerError::RequiredDirectFastPathNotReady)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1594,28 +1634,20 @@ async fn invoke_completion_async_with_post_submit(
         .map_err(|_| ClosedSdkConsumerError::RuntimeCompletionDropped)
 }
 
-async fn invoke_completion_async(
-    submit: impl FnOnce(
-        *mut c_void,
-        Option<extern "C" fn(*mut c_void, FluxonCommuClosedRuntimeCompletionResult)>,
-    ) -> i32,
-) -> Result<(i32, Bytes), ClosedSdkConsumerError> {
-    invoke_completion_async_with_keepalive(None, submit).await
-}
-
 pub async fn runtime_invoke(
     request: &ClosedRuntimeRequest,
 ) -> Result<ClosedRuntimeResponse, ClosedSdkConsumerError> {
     let encoded_request = bitcode::encode(request);
-    let (status_code, payload) = invoke_completion_async(|user_data, callback| unsafe {
-        fluxon_commu_closed_runtime_call_async(
-            encoded_request.as_ptr(),
-            encoded_request.len(),
-            user_data,
-            callback,
-        )
-    })
-    .await?;
+    let (status_code, payload) =
+        invoke_completion_async_with_keepalive(None, |user_data, callback| unsafe {
+            fluxon_commu_closed_runtime_call_async(
+                encoded_request.as_ptr(),
+                encoded_request.len(),
+                user_data,
+                callback,
+            )
+        })
+        .await?;
     match status_code {
         FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK => {
             bitcode::decode::<ClosedRuntimeResponse>(payload.as_ref()).map_err(|error| {
@@ -1931,7 +1963,7 @@ pub async fn transfer_engine_transfer_data_no_copy(
     initial_local_segment_guard_handle: Option<u64>,
     require_fast_path: bool,
 ) -> Result<fluxon_commu_contract::TransferBreakdown, ClosedSdkConsumerError> {
-    match transfer_engine_call(
+    let call = transfer_engine_call(
         handle,
         ClosedRuntimeTransferEngineCall::TransferDataNoCopy {
             peer_node,
@@ -1943,8 +1975,13 @@ pub async fn transfer_engine_transfer_data_no_copy(
             require_fast_path,
         },
     )
-    .await?
-    {
+    .await;
+    let response = if require_fast_path {
+        required_direct_fast_path_call(call)?
+    } else {
+        call?
+    };
+    match response {
         ClosedRuntimeTransferEngineResponse::TransferBreakdownValue(breakdown) => Ok(breakdown),
         other => Err(ClosedSdkConsumerError::RuntimeUnexpectedResponse {
             detail: format!("{other:?}"),
@@ -1958,16 +1995,21 @@ pub async fn transfer_engine_try_send_wire_direct(
     peer_transfer_backend_epoch: u64,
     wire_bytes: Vec<u8>,
 ) -> Result<bool, ClosedSdkConsumerError> {
-    match transfer_engine_call(
-        handle,
-        ClosedRuntimeTransferEngineCall::TrySendWireDirect {
-            peer_gen,
-            peer_transfer_backend_epoch,
-            wire_bytes,
-        },
-    )
-    .await?
-    {
+    let Some(response) = optional_direct_fast_path_call(
+        transfer_engine_call(
+            handle,
+            ClosedRuntimeTransferEngineCall::TrySendWireDirect {
+                peer_gen,
+                peer_transfer_backend_epoch,
+                wire_bytes,
+            },
+        )
+        .await,
+    )?
+    else {
+        return Ok(false);
+    };
+    match response {
         ClosedRuntimeTransferEngineResponse::BoolValue(value) => Ok(value),
         other => Err(ClosedSdkConsumerError::RuntimeUnexpectedResponse {
             detail: format!("{other:?}"),

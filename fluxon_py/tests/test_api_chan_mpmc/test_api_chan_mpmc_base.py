@@ -53,7 +53,9 @@ from fluxon_py.api_ext_chan import (  # noqa: E402
     _new_unique_mapping_key,
 )
 from fluxon_py._api_ext_chan import mpsc  # noqa: E402
+from fluxon_py._api_ext_chan.mpsc import _new_etcd_consumer_key  # noqa: E402
 from fluxon_py._api_ext_chan.mpmc import (  # noqa: E402
+    _new_mpmc_ready_channel_key,
     _new_mpmc_ready_channels_prefix,
     _new_mpmc_meta_key,
 )
@@ -260,6 +262,8 @@ def run_main(env: "ChannelState", args: argparse.Namespace) -> None:
         test_mpmc_member_lease_expiry_closes_owner()
         clean_etcd()
         test_mpmc_same_process_second_producer_survives_first_close()
+        clean_etcd()
+        test_existing_subconsumer_reuses_mpmc_member_lease()
         clean_etcd()
         scenario_dynamic_producer_consumer(
             env,
@@ -692,6 +696,102 @@ def test_mpmc_same_process_second_producer_survives_first_close() -> None:
                 _ = close_res.unwrap_error()
         if producer_a is not None:
             close_res = producer_a.close()
+            if close_res.is_ok():
+                _ = close_res.unwrap()
+            else:
+                _ = close_res.unwrap_error()
+        release(env)
+        clean_etcd()
+
+
+def test_existing_subconsumer_reuses_mpmc_member_lease() -> None:
+    setup_test_environment(logging)
+    env = create_channel_env()
+    producer: Optional[MPMCChanProducer] = None
+    consumer: Optional[MPMCChanConsumer] = None
+    mapping_key = "mpmc_existing_subconsumer_member_lease"
+    try:
+        clean_etcd()
+        producer_store = require_store(
+            env,
+            "mpmc_existing_subconsumer_member_lease_producer_store",
+        )
+        producer = new_test_producer(
+            "new_or_bind",
+            producer_store,
+            None,
+            CHAN_CONFIG_TEST,
+            mapping_key,
+            ChanType.MPMC,
+        )
+        assert isinstance(producer, MPMCChanProducer)
+
+        first_put = producer.put_data(
+            {
+                "unique_id": "mpmc-existing-subconsumer-member-lease",
+                "payload": b"mpmc-existing-subconsumer-member-lease",
+            }
+        )
+        assert first_put.is_ok(), (
+            "producer must create the first unready sub-MPSC: "
+            f"{first_put.unwrap_error()}"
+        )
+        _ = first_put.unwrap()
+        created_mpsc_ids = set(producer.mpsc_producers)
+        assert len(created_mpsc_ids) == 1, (
+            "test requires exactly one existing unready sub-MPSC before consumer bind, "
+            f"got {sorted(created_mpsc_ids, key=int)}"
+        )
+
+        consumer_store = require_store(
+            env,
+            "mpmc_existing_subconsumer_member_lease_consumer_store",
+        )
+        consumer = new_test_consumer(
+            "new_or_bind",
+            consumer_store,
+            None,
+            CHAN_CONFIG_TEST,
+            mapping_key,
+            ChanType.MPMC,
+        )
+        assert isinstance(consumer, MPMCChanConsumer)
+        assert consumer.bound_mpsc_id in created_mpsc_ids, (
+            "consumer must bind the existing unready sub-MPSC for this regression test"
+        )
+        assert consumer.mpsc_consumer is not None
+
+        mpmc_id = consumer.get_chan_id()
+        mpsc_id = consumer.bound_mpsc_id
+        consumer_id = consumer.mpsc_consumer.get_consumer_id()
+        member_lease_id = int(consumer.mpmc_channel.mpmc_member_lease.id)
+        ready_key = _new_mpmc_ready_channel_key(mpmc_id, mpsc_id)
+        membership_key = _new_etcd_consumer_key(mpsc_id, consumer_id)
+
+        ready_value, ready_meta = consumer.etcd_client.get(ready_key)
+        membership_value, membership_meta = consumer.etcd_client.get(membership_key)
+        assert ready_value is not None and ready_meta is not None, (
+            f"missing ready key {ready_key}"
+        )
+        assert membership_value is not None and membership_meta is not None, (
+            f"missing consumer membership key {membership_key}"
+        )
+        ready_lease_id = int(ready_meta.lease_id)
+        membership_lease_id = int(membership_meta.lease_id)
+        assert ready_lease_id == member_lease_id
+        assert membership_lease_id == member_lease_id, (
+            "existing subconsumer membership must share the MPMC member lease: "
+            f"membership={membership_lease_id}, member={member_lease_id}"
+        )
+    finally:
+        if consumer is not None:
+            close_res = consumer.close()
+            if close_res.is_ok():
+                _ = close_res.unwrap()
+            else:
+                _ = close_res.unwrap_error()
+        if producer is not None:
+            close_res = producer.close()
             if close_res.is_ok():
                 _ = close_res.unwrap()
             else:

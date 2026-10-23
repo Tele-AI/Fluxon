@@ -5,9 +5,16 @@ This page defines how Fluxon user docs, developer docs, and design docs should b
 - Let readers reach the stable conclusion as quickly as possible.
 - Keep docs aligned with code, public contracts, and actual behavior.
 
+For a sweep-by-sweep workflow and a reusable one-shot prompt, see [Technical Documentation Copy Editing](./Developer%20-%205%20-%20Technical%20Documentation%20Copy%20Editing.md).
+
 ## 1. General Rules
 
 - Lead with the conclusion, then expand. A reader should know what the page answers within the first 30 seconds.
+- Keep the opening at one abstraction level. State only the problem, core points, and document map; leave local implementation details, measurement methodology, and per-section evidence in their corresponding sections.
+- Use labels that match the content in headings, introductions, and table headers. Call a summary “core points,” a capability inventory “current status,” and reserve “conclusion” for a claim supported by the preceding argument.
+- Group responsibilities and actions by subject. When introducing multiple roles, finish one role before moving to the next so readers do not have to reconstruct a subject's responsibilities from scattered clauses.
+- Place the rationale or mechanism close to an important architecture claim, especially for responsibility boundaries, lifetimes, and data direction. Do not state only the outcome and scatter its reason later in the document.
+- Match claim strength to evidence strength. State verified behavior and results directly; qualify design goals or expected benefits with terms such as “expected,” “aims to,” or “may”; remove or explicitly bound outcomes that lack supporting evidence.
 - Prefer natural engineering terms. Avoid invented or template-heavy wording such as `root object`, `first-level branch`, or `authority object` unless the term is truly necessary.
 - Write for readers, not as a dump of the author's thinking process. Remove template filler such as "this section does not discuss" or "why this branch belongs to the previous layer."
 - If a paragraph can become a table, list, or diagram, do that instead of forcing a long linear explanation.
@@ -19,6 +26,7 @@ This page defines how Fluxon user docs, developer docs, and design docs should b
 - Do not lift a local fact into a system-level conclusion without tracing the full path at the same abstraction level.
 - If the opening enumerates pain points, goals, evaluation dimensions, or explicit questions, the later sections should answer against that same list. Do not open on one axis and expand on another.
 - Keep one canonical name, spelling, and capitalization for one concept across a page and across the doc set. Roles, component names, and acronyms should stay consistent.
+- Put reusable repository-level implementation rules in synchronized bilingual developer docs. Add one concise entry under `Contract Index` in both `AGENTS.md` and `AGENTS_CN.md`; do not duplicate the full rule in the index.
 
 ## 2. Design Docs
 
@@ -103,3 +111,4 @@ Before landing a doc, check at least these items:
 - Mixed-script spacing, backticks, terminology spelling, and capitalization are consistent.
 - Table-of-contents links, anchors, image paths, and external links all resolve correctly.
 - Code fences declare the right language, such as `bash`, `python`, or `yaml`.
+- New repository-level implementation rules have synchronized entries in the `AGENTS.md` and `AGENTS_CN.md` contract indexes.

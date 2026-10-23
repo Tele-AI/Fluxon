@@ -103,6 +103,9 @@ pub enum TransferEngineError {
     RegisterLocalSegmentFailed { detail: String },
     #[error("Unregister local segment failed: detail={detail}")]
     UnregisterLocalSegmentFailed { detail: String },
+    /// Only explicit fast-path requirements use this error; optional attempts return `Ok(false)`.
+    #[error("Required direct fast path is not ready")]
+    RequiredDirectFastPathNotReady,
     #[error("Create transfer engine failed: detail={detail}")]
     CreateEngineFailed { detail: String },
     #[error("Transfer backend restarting: detail={detail}")]
@@ -615,6 +618,7 @@ pub struct DesiredTransferPeer {
 #[doc(hidden)]
 #[async_trait]
 pub trait TransferRpcFastPath: Send + Sync {
+    /// Returns `Ok(false)` when the direct path is unavailable so transport fallback can proceed.
     async fn try_send_wire_direct(
         &self,
         peer_gen: &PeerGen,

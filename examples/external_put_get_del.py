@@ -15,9 +15,6 @@ def main() -> None:
                 "cluster_name": CLUSTER_NAME,
                 "share_mem_path": SHARE_MEM_PATH,
             },
-            "test_spec_config": {
-                "disable_observability": True,
-            },
         }
     )
     store = new_store(cfg).unwrap("new_store failed")

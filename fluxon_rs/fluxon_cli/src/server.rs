@@ -24,6 +24,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{RwLock, watch};
 
+use fluxon_util::etcd::{PooledEtcdClient, etcd_clients_pool};
 use fluxon_util::{
     FluxonCliProxyDescriptorV2, FluxonCliProxyTransportV2, fluxon_cli_proxy_desc_etcd_key_v2,
     fluxon_cli_proxy_desc_etcd_service_prefix_v2,
@@ -52,17 +53,6 @@ fn new_proxy_client() -> hyper::Client<hyper_rustls::HttpsConnector<HttpConnecto
         .enable_http1()
         .build();
     hyper::Client::builder().build::<_, Body>(https)
-}
-
-fn fluxon_cli_proxy_desc_etcd_key(service_name: &str, cluster_name: &str) -> String {
-    // English note: keep this etcd key format stable because it forms a lightweight "registry"
-    // contract between fluxon_cli (consumer) and business panels (publishers).
-    //
-    // Causal chain:
-    // - fluxon_cli must proxy panels without understanding any business-specific API paths.
-    // - Each service publishes a small descriptor (base_url + allowlist) into etcd.
-    // - fluxon_cli reads the descriptor and performs a pure L7 proxy based on the allowlist.
-    fluxon_cli_proxy_desc_etcd_key_v2(service_name, cluster_name)
 }
 
 #[derive(Debug, Clone)]
@@ -351,13 +341,10 @@ fn available_member_kind_query_strs() -> Vec<&'static str> {
         .collect()
 }
 
-fn parse_member_kind(s: &str) -> Option<MemberKind> {
-    MemberKind::parse_query_str(s)
-}
-
 #[derive(Clone)]
 struct AppState {
     cfg: Arc<MonitorConfig>,
+    etcd_pool_entry: PooledEtcdClient,
     log_schema_cache: Arc<LogSchemaCache>,
     proxy_client: hyper::Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>,
     registered_panel_proxy_backend: Option<RegisteredPanelProxyBackend>,
@@ -1161,7 +1148,7 @@ async fn index(State(st): State<Arc<AppState>>, req: Request<Body>) -> Response 
 }
 
 async fn landing(State(st): State<Arc<AppState>>) -> Response {
-    let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+    let mut etcd = match st.etcd_pool_entry.client().await {
         Ok(c) => c,
         Err(e) => {
             return text_response(
@@ -1184,7 +1171,7 @@ async fn landing(State(st): State<Arc<AppState>>) -> Response {
 }
 
 async fn api_clusters(State(st): State<Arc<AppState>>) -> Response {
-    let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+    let mut etcd = match st.etcd_pool_entry.client().await {
         Ok(c) => c,
         Err(e) => {
             return text_response(
@@ -1329,7 +1316,7 @@ async fn topology_page(
                 }
 
                 let prefix = format!("/fluxon_fs_mount_registry/{}/mounts/", cluster_name);
-                match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+                match st.etcd_pool_entry.client().await {
                     Ok(mut etcd) => {
                         let mut mounts: Vec<crate::model::FsMountRegistryRecordSnapshot> =
                             Vec::new();
@@ -1416,7 +1403,7 @@ async fn topology_page(
                 }
 
                 let key = format!("/fluxon_fs_export_registry/{}/snapshot", cluster_name);
-                match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+                match st.etcd_pool_entry.client().await {
                     Ok(mut etcd) => match etcd.get(key.clone(), None).await {
                         Ok(resp) => {
                             let mut exports: Vec<crate::model::FsExportRegistryRecordSnapshot> =
@@ -1540,7 +1527,7 @@ async fn ops_fluxon_kv_update_rdma_devices(
         }
     };
 
-    let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+    let mut etcd = match st.etcd_pool_entry.client().await {
         Ok(client) => client,
         Err(err) => {
             return text_response(
@@ -1722,7 +1709,7 @@ async fn view(
             ),
         );
     };
-    let Some(member_kind) = parse_member_kind(member_kind_raw) else {
+    let Some(member_kind) = MemberKind::parse_query_str(member_kind_raw) else {
         return text_response(
             StatusCode::BAD_REQUEST,
             format!("invalid member_kind: {}", member_kind_raw),
@@ -1767,7 +1754,7 @@ async fn cli(
     Query(q): Query<ClusterQuery>,
 ) -> Response {
     let Some(cluster_name) = q.cluster_name.as_ref() else {
-        let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+        let mut etcd = match st.etcd_pool_entry.client().await {
             Ok(c) => c,
             Err(e) => {
                 return text_response(
@@ -1811,7 +1798,7 @@ async fn cli(
             "missing query param: member_kind\nUsage:\n  /cli?cluster_name=<name>&member_kind=<kind>\n  /api/clusters\n".to_string(),
         );
     };
-    let Some(member_kind) = parse_member_kind(member_kind_raw) else {
+    let Some(member_kind) = MemberKind::parse_query_str(member_kind_raw) else {
         return text_response(
             StatusCode::BAD_REQUEST,
             format!("invalid member_kind: {}", member_kind_raw),
@@ -2360,7 +2347,7 @@ async fn api_logs(State(st): State<Arc<AppState>>, Query(q): Query<LogsApiQuery>
             "missing query param: member_kind".to_string(),
         );
     };
-    let Some(member_kind) = parse_member_kind(member_kind_raw) else {
+    let Some(member_kind) = MemberKind::parse_query_str(member_kind_raw) else {
         return text_response(
             StatusCode::BAD_REQUEST,
             format!("invalid member_kind: {}", member_kind_raw),
@@ -2917,7 +2904,7 @@ async fn proxy_registered_service_impl(
         .map(|s| s.to_string())
         .unwrap_or_else(|| "".to_string());
 
-    let mut etcd = match EtcdClient::connect(st.cfg.etcd_endpoints.clone(), None).await {
+    let mut etcd = match st.etcd_pool_entry.client().await {
         Ok(c) => c,
         Err(e) => {
             return text_response(
@@ -2929,7 +2916,7 @@ async fn proxy_registered_service_impl(
             );
         }
     };
-    let etcd_key = fluxon_cli_proxy_desc_etcd_key(service_name, cluster_name);
+    let etcd_key = fluxon_cli_proxy_desc_etcd_key_v2(service_name, cluster_name);
     let resp = match etcd.get(etcd_key.clone(), None).await {
         Ok(v) => v,
         Err(e) => {
@@ -3353,11 +3340,13 @@ pub async fn serve_http_from_tcp(
     listener: std::net::TcpListener,
     registered_panel_proxy_backend: Option<RegisteredPanelProxyBackend>,
 ) -> anyhow::Result<()> {
+    let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
     let cfg = Arc::new(cfg);
     let log_schema_cache = Arc::new(LogSchemaCache::new());
     let proxy_client = new_proxy_client();
     let app = build_router(Arc::new(AppState {
         cfg,
+        etcd_pool_entry,
         log_schema_cache,
         proxy_client,
         registered_panel_proxy_backend,
@@ -3379,6 +3368,7 @@ pub async fn serve_http_with_shutdown_from_tcp<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let etcd_pool_entry = etcd_clients_pool().acquire(cfg.etcd_endpoints.clone());
     let cfg = Arc::new(cfg);
     let log_schema_cache = Arc::new(LogSchemaCache::new());
     let proxy_client = new_proxy_client();
@@ -3390,6 +3380,7 @@ where
 
     let app = build_router(Arc::new(AppState {
         cfg,
+        etcd_pool_entry,
         log_schema_cache,
         proxy_client,
         registered_panel_proxy_backend,

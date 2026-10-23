@@ -23,9 +23,11 @@ BASE_CONFIG = SCRIPT_DIR / "build_pack_fluxonkv_pylib_img" / "pypack_builder_man
 GENERATED_CONFIG = SCRIPT_DIR / "build_pack_fluxonkv_pylib_img" / "pypack_builder_manylinux_2_28.generated.yaml"
 PREPARE_ARTIFACT_COPY_STEP_NAME = "copy_prepare_build_artifacts"
 LEGACY_COPY_STEP_NAME = "copy_sources_and_pyo3_build"
+FLUXON_FS_VIDEO_FFMPEG_STEP_NAME = "install_fluxon_fs_video_ffmpeg"
 RUST_TOOLCHAIN_PLACEHOLDER = "__FLUXON_RUST_TOOLCHAIN__"
 FLUXON_RS_TOOLCHAIN_TOML = Path("fluxon_rs") / "rust-toolchain.toml"
 PREPARE_BUILD_YAML = Path("setup_and_pack") / "pub_prepare_build.yaml"
+RPM_FUSION_FREE_RELEASE_RPM = "https://download1.rpmfusion.org/free/el/rpmfusion-free-release-8.noarch.rpm"
 
 
 def _host_arch_name() -> str:
@@ -227,8 +229,28 @@ def extend_builder_config(config: dict) -> None:
     script_installs[:] = [
         step
         for step in script_installs
-        if step.get("name") not in {PREPARE_ARTIFACT_COPY_STEP_NAME, LEGACY_COPY_STEP_NAME}
+        if step.get("name")
+        not in {
+            PREPARE_ARTIFACT_COPY_STEP_NAME,
+            LEGACY_COPY_STEP_NAME,
+            FLUXON_FS_VIDEO_FFMPEG_STEP_NAME,
+        }
     ]
+
+    script_installs.append(
+        {
+            "name": FLUXON_FS_VIDEO_FFMPEG_STEP_NAME,
+            "commands": [
+                "rpm -q rpmfusion-free-release >/dev/null 2>&1 || "
+                f"yum install -y {RPM_FUSION_FREE_RELEASE_RPM}",
+                "yum install -y --setopt=tsflags=nodocs --setopt=install_weak_deps=False ffmpeg-devel",
+                "pkg-config --modversion libavformat libavcodec libavutil libswscale",
+                "pkg-config --cflags libavcodec",
+                "yum clean all",
+                "rm -rf /var/cache/yum",
+            ],
+        }
+    )
 
     if not copies_field:
         return

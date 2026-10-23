@@ -420,6 +420,11 @@ impl MasterLeaseManager {
         self.grant_lease_unchecked(ttl).await
     }
 
+    #[cfg(test)]
+    pub async fn expire_lease_for_test(&self, lease_id: LeaseID) -> Result<(), LeaseMgrError> {
+        Self::cleanup_single_lease_static(self.inner().view(), lease_id).await
+    }
+
     async fn grant_lease_unchecked(&self, ttl: LeaseSecTTl) -> Result<LeaseID, LeaseMgrError> {
         let inner = self.inner();
 

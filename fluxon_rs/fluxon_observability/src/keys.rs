@@ -51,6 +51,13 @@ pub const PROM_METRIC_PROCESS_CPU_USAGE_PERCENT: &str = "process_cpu_usage_perce
 pub const PROM_METRIC_CONTAINER_MEMORY_USAGE_BYTES: &str = "container_memory_usage_bytes";
 pub const PROM_METRIC_CONTAINER_MEMORY_LIMIT_BYTES: &str = "container_memory_limit_bytes";
 
+// ---------------- KV owner storage observe schema ----------------
+//
+// Memory segment metrics are emitted by the master from MasterSegManager. KV SSD
+// metrics are emitted by each owner because SSD shard/ring state is owner-local.
+pub const PROM_METRIC_KV_SSD_CAPACITY_BYTES: &str = "kv_ssd_capacity_bytes";
+pub const PROM_METRIC_KV_SSD_USED_BYTES: &str = "kv_ssd_used_bytes";
+
 // ---------------- Tokio runtime observe schema (stable runtime metrics) ----------------
 //
 // These gauges intentionally use only stable Tokio runtime metrics APIs.

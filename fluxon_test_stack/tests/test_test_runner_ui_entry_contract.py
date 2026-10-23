@@ -58,9 +58,20 @@ class TestTestRunnerUiEntryContract(unittest.TestCase):
                 str(gitops_cfg),
             ]
             with mock.patch.object(sys, "argv", argv):
-                with mock.patch.object(_UI.test_runner, "run_ui_service") as run_mock:
+                with mock.patch.object(
+                    _UI.test_runner,
+                    "_redirect_process_stdio_to_log",
+                ) as redirect_mock, mock.patch.object(
+                    _UI.test_runner,
+                    "run_ui_service",
+                ) as run_mock:
                     _UI.main()
 
+            self.assertTrue(workdir.is_dir())
+            redirect_mock.assert_called_once_with(
+                workdir.resolve(),
+                filename="test_runner_ui.log",
+            )
             run_mock.assert_called_once()
             kwargs = run_mock.call_args.kwargs
             self.assertEqual(kwargs["workdir_root"], workdir.resolve())

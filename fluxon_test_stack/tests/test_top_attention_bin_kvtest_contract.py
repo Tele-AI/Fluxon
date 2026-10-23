@@ -54,7 +54,7 @@ class TestTopAttentionBinKvtestContract(unittest.TestCase):
                         },
                         "scene_config": {
                             "kv_transport_feature": "tcp_thread_transport",
-                            "kv_test_rounds": "p2p_only",
+                            "kv_test_rounds": "p2p_only,p2p_only_ssd",
                         },
                         "scene_runtime": {
                             "etcd": {"ip": "127.0.0.1", "port": 19180},
@@ -95,7 +95,7 @@ class TestTopAttentionBinKvtestContract(unittest.TestCase):
             )
             self.assertEqual(
                 run_cargo.call_args.kwargs["env"]["FLUXON_KV_TEST_ROUNDS"],
-                "p2p_only",
+                "p2p_only,p2p_only_ssd",
             )
 
 

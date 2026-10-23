@@ -1,0 +1,111 @@
+name: create_release_tag
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: create-release-tag
+  cancel-in-progress: false
+
+jobs:
+  create-tag:
+    name: Validate release commit and create tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out selected release commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve release metadata from the repository
+        id: release_meta
+        run: python3 fluxon_release/resolve_release_meta.py --github-output "$GITHUB_OUTPUT"
+
+      - name: Validate release metadata
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES_FILE: ${{ steps.release_meta.outputs.release_notes_file }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo "create_release_tag must run from the default branch: expected refs/heads/$DEFAULT_BRANCH, got $GITHUB_REF" >&2
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          test -f "$RELEASE_NOTES_FILE"
+      - name: Create release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$RELEASE_TAG" \
+            -f sha="$GITHUB_SHA"
+
+      - name: Start release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          dispatch_payload="$(
+            jq -n \
+              --arg release_tag "$RELEASE_TAG" \
+              --arg source_sha "$GITHUB_SHA" \
+              '{
+                event_type: "publish_release",
+                client_payload: {
+                  release_tag: $release_tag,
+                  source_sha: $source_sha
+                }
+              }'
+          )"
+          for attempt in 1 2 3; do
+            if gh api \
+              --method POST \
+              "repos/$GITHUB_REPOSITORY/dispatches" \
+              --input - <<<"$dispatch_payload"; then
+              exit 0
+            fi
+            if [[ "$attempt" == "3" ]]; then
+              echo "Failed to dispatch publish_release after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep "$((attempt * 2))"
+          done
+
+      - name: Write tag summary
+        env:
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          {
+            echo "## Release tag created"
+            echo
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Main CI gate: intentionally skipped"
+            echo "- Release workflow: dispatched to build and validate release artifacts"
+            echo "- Next: wait for release-readiness review."
+          } >> "$GITHUB_STEP_SUMMARY"

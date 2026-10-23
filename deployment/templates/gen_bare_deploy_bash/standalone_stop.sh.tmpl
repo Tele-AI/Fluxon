@@ -3,13 +3,19 @@ set -euo pipefail
 
 SERVICE={{SERVICE_ASSIGN}}
 NAME_PREFIX={{NAME_PREFIX_ASSIGN}}
-{{ALLOWED_NODES_BLOCK}}{{HOST_PRELUDE}}{{COMMON_NODE_RESOLUTION_TAIL}}{{SELECTION_SUPERVISOR_PATH_BLOCK}}SUPERVISOR_LABEL={{SUPERVISOR_LABEL_ASSIGN}}
+{{ALLOWED_NODES_BLOCK}}{{HOST_PRELUDE}}{{COMMON_NODE_RESOLUTION_TAIL}}{{SELECTION_SUPERVISOR_PATH_BLOCK}}{{STOP_LABELS_BLOCK}}
 # English note:
 # - Generated bare stop is retained as a manual operator tool.
 # - Automation must not depend on this path for handover or rollout convergence.
 # - The command only asks the shared selection supervisor to retire the concrete selection
-#   identity identified by label on this node.
-if ! python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR" --missing-ok >/dev/null; then
-  echo "[bare] stop failed svc=$SERVICE label=$SUPERVISOR_LABEL hostworkdir=$HOSTWORKDIR"
+#   identities that may own this service on this node.
+STOP_FAILED=0
+for SUPERVISOR_LABEL in "${STOP_SUPERVISOR_LABELS[@]}"; do
+  if ! python3 "$SELECTION_SUPERVISOR" stop --label "$SUPERVISOR_LABEL" --scope-key "$HOSTWORKDIR" --missing-ok >/dev/null; then
+    echo "[bare] stop failed svc=$SERVICE label=$SUPERVISOR_LABEL hostworkdir=$HOSTWORKDIR"
+    STOP_FAILED=1
+  fi
+done
+if [ "$STOP_FAILED" -ne 0 ]; then
   exit 1
 fi

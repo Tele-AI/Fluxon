@@ -1,0 +1,526 @@
+name: publish_release
+
+on:
+  repository_dispatch:
+    types:
+      - publish_release
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: publish-release-${{ github.event.client_payload.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-release:
+    name: Verify release tag and metadata
+    if: >-
+      github.event.action == 'publish_release' &&
+      github.event.sender.type == 'Bot' &&
+      github.event.sender.login == 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.release_meta.outputs.prerelease }}
+      quickstart_archive: ${{ steps.release_meta.outputs.quickstart_archive }}
+      quickstart_image: ${{ steps.release_meta.outputs.quickstart_image }}
+      release_notes_file: ${{ steps.release_meta.outputs.release_notes_file }}
+      release_tag: ${{ steps.release_meta.outputs.release_tag }}
+      release_title: ${{ steps.release_meta.outputs.release_title }}
+      release_version: ${{ steps.release_meta.outputs.release_version }}
+      source_sha: ${{ steps.release_ref.outputs.source_sha }}
+    steps:
+      - name: Resolve and verify release ref
+        id: release_ref
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.client_payload.release_tag }}
+          SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid release commit SHA: $SOURCE_SHA" >&2
+            exit 1
+          fi
+
+          object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.type')"
+          object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')"
+          for _ in 1 2 3 4 5; do
+            if [[ "$object_type" == "commit" ]]; then
+              break
+            fi
+            if [[ "$object_type" != "tag" ]]; then
+              echo "Unexpected git object type for $RELEASE_TAG: $object_type" >&2
+              exit 1
+            fi
+            object_type="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.type')"
+            object_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '.object.sha')"
+          done
+          if [[ "$object_type" != "commit" || "$object_sha" != "$SOURCE_SHA" ]]; then
+            echo "Tag/source commit mismatch: tag=$object_sha source=$SOURCE_SHA type=$object_type" >&2
+            exit 1
+          fi
+
+          compare_status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$SOURCE_SHA...$DEFAULT_BRANCH" --jq '.status')"
+          if [[ "$compare_status" != "ahead" && "$compare_status" != "identical" ]]; then
+            echo "Tagged commit is not in the default-branch history: status=$compare_status" >&2
+            exit 1
+          fi
+
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check out tagged release
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ steps.release_ref.outputs.source_sha }}
+
+      - name: Resolve release metadata
+        id: release_meta
+        env:
+          RELEASE_TAG: ${{ github.event.client_payload.release_tag }}
+        run: |
+          python3 fluxon_release/resolve_release_meta.py \
+            --git-ref "refs/tags/$RELEASE_TAG" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Verify release notes file
+        env:
+          RELEASE_NOTES_FILE: ${{ steps.release_meta.outputs.release_notes_file }}
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$RELEASE_NOTES_FILE" ]]; then
+            echo "Missing release notes for $RELEASE_TAG: $RELEASE_NOTES_FILE" >&2
+            exit 1
+          fi
+
+  pack-release:
+    name: Build release artifacts
+    needs: verify-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged release
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.verify-release.outputs.source_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.10"
+
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git \
+            pigz \
+            protobuf-compiler \
+            python3-venv \
+            rsync
+
+      - name: Verify Docker availability
+        run: |
+          command -v docker >/dev/null
+          if ! docker info >/dev/null 2>&1; then
+            sudo systemctl start docker
+            docker info >/dev/null
+          fi
+          docker version
+
+      - name: Install Python dependencies
+        run: python3 -m pip install PyYAML
+
+      - name: Prepare CI directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data"
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data/manylinux-release"
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data/manylinux-cache/cargo-registry"
+          mkdir -p "$RUNNER_TEMP/fluxon-pack-release/project-data/manylinux-cache/cargo-git"
+
+      - name: Build manylinux builder image
+        run: python3 setup_and_pack/build_pack_fluxonkv_pylib_img.py
+
+      - name: Generate CI pack_release config
+        run: |
+          python3 setup_and_pack/ci/gen_pack_release_ci_config.py \
+            --out-dir setup_and_pack \
+            --project-data-root "$RUNNER_TEMP/fluxon-pack-release/project-data"
+
+      - name: Run pack_release
+        run: python3 setup_and_pack/pack_release.py --release-dir fluxon_release
+
+      - name: Build Quick Start image
+        run: python3 examples/fluxon_quick_start/build_image.py --mode existing_release --release-dir fluxon_release
+
+      - name: Archive Quick Start image
+        env:
+          QUICKSTART_ARCHIVE: ${{ needs.verify-release.outputs.quickstart_archive }}
+          QUICKSTART_IMAGE: ${{ needs.verify-release.outputs.quickstart_image }}
+        run: docker save "$QUICKSTART_IMAGE" | gzip -1 > "$QUICKSTART_ARCHIVE"
+
+      - name: Archive release directory
+        run: tar czf fluxon_release.tar.gz fluxon_release
+
+      - name: Stage release-built wheel candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(fluxon_release/fluxon_py-*.whl)
+          if [[ "${#wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one release-built wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/release-wheel-candidate"
+          cp "${wheels[0]}" "$RUNNER_TEMP/release-wheel-candidate/"
+
+      - name: Upload release-built wheel candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-wheel-candidate-${{ needs.verify-release.outputs.source_sha }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          path: ${{ runner.temp }}/release-wheel-candidate/*.whl
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-artifacts-${{ needs.verify-release.outputs.release_tag }}
+          if-no-files-found: error
+          path: |
+            fluxon_release.tar.gz
+            ${{ needs.verify-release.outputs.quickstart_archive }}
+
+  prepare-pypi-wheel:
+    name: Validate release-built PyPI wheel
+    needs:
+      - verify-release
+      - pack-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged release
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.verify-release.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Verify tagged repository metadata
+        env:
+          RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
+        run: |
+          python3 fluxon_release/resolve_release_meta.py \
+            --git-ref "refs/tags/$RELEASE_TAG"
+
+      - name: Download release-built wheel candidate
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-wheel-candidate-${{ needs.verify-release.outputs.source_sha }}
+          path: ${{ runner.temp }}/release-wheel-candidate
+
+      - name: Validate wheel contract
+        id: wheel
+        env:
+          RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
+        run: |
+          python3 setup_and_pack/validate_pypi_wheel.py \
+            --release-dir "$RUNNER_TEMP/release-wheel-candidate" \
+            --release-tag "$RELEASE_TAG" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Check wheel metadata rendering
+        run: |
+          python3 -m pip install --disable-pip-version-check packaging==24.2 twine==6.2.0
+          python3 -m twine check "${{ steps.wheel.outputs.wheel_path }}"
+
+      - name: Stage validated wheel
+        env:
+          WHEEL_PATH: ${{ steps.wheel.outputs.wheel_path }}
+          WHEEL_SHA256: ${{ steps.wheel.outputs.wheel_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pypi-dist"
+          cp "$WHEEL_PATH" "$RUNNER_TEMP/pypi-dist/"
+          cd "$RUNNER_TEMP/pypi-dist"
+          echo "$WHEEL_SHA256  $(basename "$WHEEL_PATH")" | sha256sum --check -
+
+      - name: Upload validated PyPI wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pypi-wheel-${{ needs.verify-release.outputs.source_sha }}
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+          path: ${{ runner.temp }}/pypi-dist/*.whl
+
+  release-readiness-review:
+    name: Deterministic checks and Codex review
+    needs:
+      - verify-release
+      - pack-release
+      - prepare-pypi-wheel
+    environment: OPENAI_API_KEY
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out reviewed release commit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.verify-release.outputs.source_sha }}
+
+      - name: Download packed release artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-artifacts-${{ needs.verify-release.outputs.release_tag }}
+
+      - name: Download validated PyPI wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: pypi-wheel-${{ needs.verify-release.outputs.source_sha }}
+          path: release-review/pypi-wheel
+
+      - name: Build deterministic release evidence
+        env:
+          QUICKSTART_ARCHIVE: ${{ needs.verify-release.outputs.quickstart_archive }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
+          SOURCE_SHA: ${{ needs.verify-release.outputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-review/extracted
+          python3 fluxon_release/resolve_release_meta.py \
+            --git-ref "refs/tags/$RELEASE_TAG"
+          test -f "fluxon_release/release_notes/$RELEASE_TAG.md"
+          test -f fluxon_release.tar.gz
+          test -f "$QUICKSTART_ARCHIVE"
+
+          sha256sum fluxon_release.tar.gz "$QUICKSTART_ARCHIVE" > release-review/release-artifacts.sha256
+          sha256sum release-review/pypi-wheel/*.whl > release-review/pypi-wheel.sha256
+          tar -tzf fluxon_release.tar.gz > release-review/fluxon-release-files.txt
+          tar -xzf fluxon_release.tar.gz -C release-review/extracted
+          shopt -s nullglob
+          release_wheels=(release-review/extracted/fluxon_release/fluxon_py-*.whl)
+          pypi_wheels=(release-review/pypi-wheel/fluxon_py-*.whl)
+          if [[ "${#release_wheels[@]}" -ne 1 || "${#pypi_wheels[@]}" -ne 1 ]]; then
+            echo "Expected exactly one release wheel and one validated PyPI wheel" >&2
+            exit 1
+          fi
+          cmp "${release_wheels[0]}" "${pypi_wheels[0]}"
+          printf '%s\n' \
+            "release_wheel=${release_wheels[0]}" \
+            "pypi_wheel=${pypi_wheels[0]}" \
+            "sha256=$(sha256sum "${pypi_wheels[0]}" | awk '{print $1}')" \
+            > release-review/release-wheel-identity.txt
+          (
+            cd release-review/extracted/fluxon_release
+            sha256sum --check fluxon_release.sha256
+          ) > release-review/release-manifest-check.txt
+          printf '%s\n' \
+            "release_tag=$RELEASE_TAG" \
+            "source_sha=$SOURCE_SHA" \
+            "validation_mode=release_build_without_main_ci" \
+            > release-review/release-metadata.txt
+
+      - name: Require OpenAI API configuration
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$OPENAI_API_KEY" || -z "$OPENAI_BASE_URL" ]]; then
+            echo "The OPENAI_API_KEY environment must provide OPENAI_API_KEY and OPENAI_BASE_URL" >&2
+            exit 1
+          fi
+
+      - name: Run read-only Codex release review
+        id: run_codex
+        uses: openai/codex-action@52fe01ec70a42f454c9d2ebd47598f9fd6893d56 # v1.11
+        with:
+          allow-bots: true
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          responses-api-endpoint: ${{ format('{0}/responses', secrets.OPENAI_BASE_URL) }}
+          prompt-file: .github/codex/release-readiness-prompt.md
+          permission-profile: ":read-only"
+          safety-strategy: drop-sudo
+          effort: high
+
+      - name: Add Codex report to the workflow summary
+        if: ${{ steps.run_codex.outputs.final-message != '' }}
+        env:
+          CODEX_REPORT: ${{ steps.run_codex.outputs.final-message }}
+        shell: bash
+        run: |
+          {
+            echo "## Codex release-readiness review"
+            echo
+            printf '%s\n' "$CODEX_REPORT"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-github-release:
+    name: Publish GitHub Release
+    needs:
+      - verify-release
+      - pack-release
+      - release-readiness-review
+    runs-on: ubuntu-latest
+    environment:
+      name: github-release
+      url: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.verify-release.outputs.release_tag }}
+    permissions:
+      contents: write
+    steps:
+      - name: Check out approved release metadata
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.verify-release.outputs.source_sha }}
+
+      - name: Download approved release artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-artifacts-${{ needs.verify-release.outputs.release_tag }}
+
+      - name: Publish GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.verify-release.outputs.prerelease }}
+          QUICKSTART_ARCHIVE: ${{ needs.verify-release.outputs.quickstart_archive }}
+          RELEASE_NOTES_FILE: ${{ needs.verify-release.outputs.release_notes_file }}
+          RELEASE_TAG: ${{ needs.verify-release.outputs.release_tag }}
+          RELEASE_TITLE: ${{ needs.verify-release.outputs.release_title }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_files=(
+            "fluxon_release.tar.gz"
+            "$QUICKSTART_ARCHIVE"
+          )
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            edit_args=(
+              release edit "$RELEASE_TAG"
+              --title "$RELEASE_TITLE"
+              --notes-file "$RELEASE_NOTES_FILE"
+            )
+            if [[ "$PRERELEASE" == "true" ]]; then
+              edit_args+=(--prerelease)
+            fi
+            gh "${edit_args[@]}"
+            gh release upload "$RELEASE_TAG" "${release_files[@]}" --clobber
+            exit 0
+          fi
+
+          args=(
+            release create "$RELEASE_TAG"
+            "${release_files[@]}"
+            --title "$RELEASE_TITLE"
+            --notes-file "$RELEASE_NOTES_FILE"
+            --verify-tag
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}"
+
+  publish-pypi:
+    name: Publish wheel to PyPI
+    needs:
+      - verify-release
+      - prepare-pypi-wheel
+      - release-readiness-review
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/fluxon-py/
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    steps:
+      - name: Download validated PyPI wheel
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: pypi-wheel-${{ needs.verify-release.outputs.source_sha }}
+          path: pypi-dist
+
+      - name: Publish wheel with trusted identity
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: pypi-dist/
+
+  publish-docker-image:
+    name: Publish Quick Start image to Docker Hub
+    needs:
+      - verify-release
+      - pack-release
+      - release-readiness-review
+    runs-on: ubuntu-latest
+    environment:
+      name: docker-image
+      url: https://hub.docker.com/r/hanbaoaaa/fluxon_quick_start/tags
+    steps:
+      - name: Download approved Docker image
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-artifacts-${{ needs.verify-release.outputs.release_tag }}
+
+      - name: Load and verify Docker image
+        env:
+          QUICKSTART_ARCHIVE: ${{ needs.verify-release.outputs.quickstart_archive }}
+          QUICKSTART_IMAGE: ${{ needs.verify-release.outputs.quickstart_image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker load --input "$QUICKSTART_ARCHIVE"
+          docker image inspect "$QUICKSTART_IMAGE" >/dev/null
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
+            echo "The docker-image environment must provide DOCKERHUB_USERNAME and DOCKERHUB_TOKEN" >&2
+            exit 1
+          fi
+          printf '%s' "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+
+      - name: Publish versioned Docker image
+        env:
+          QUICKSTART_IMAGE: ${{ needs.verify-release.outputs.quickstart_image }}
+          RELEASE_VERSION: ${{ needs.verify-release.outputs.release_version }}
+          TARGET_REPOSITORY: hanbaoaaa/fluxon_quick_start
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_image="$TARGET_REPOSITORY:$RELEASE_VERSION"
+          docker tag "$QUICKSTART_IMAGE" "$target_image"
+          docker push "$target_image"
+          echo "Published Docker image: $target_image" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out from Docker Hub
+        if: ${{ always() }}
+        run: docker logout

@@ -37,6 +37,9 @@ import logging
 MQ_UNIQUE_KEY_PREFIX = "/mq_unique_keys/"
 MQ_UNIQUE_LOCK_PREFIX = "/mq_unique_locks/"
 MQ_UNIQUE_LOCK_WAIT_MULTIPLIER = 200
+MQ_UNIQUE_FAST_BIND_READ_RETRY_ATTEMPTS = 3
+MQ_UNIQUE_FAST_BIND_READ_RETRY_BASE_SECONDS = 0.2
+MQ_UNIQUE_FAST_BIND_READ_RETRY_MAX_SECONDS = 1.0
 
 
 def _new_unique_mapping_key(unique_id: str) -> str:
@@ -288,23 +291,75 @@ def new_or_bind_with_unique_key(
             unique_id,
             existing_chan_id,
         )
-        result = chan_bind(api, chan_config, existing_chan_id, chan_type, chan_role, etcd_client)
-        if not result.is_ok():
-            err = result.unwrap_error()
-            if _is_stale_bind_error(err):
-                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(err)
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-                ChanBindError(f"Bind failed for chan_id={existing_chan_id}: {err}")
+        return _construct_bound_channel(
+            api,
+            chan_config,
+            existing_chan_id,
+            chan_type,
+            chan_role,
+            etcd_client,
+        )
+
+    def _try_bind_existing_channel_without_lock() -> Result[object, ApiError]:
+        """
+        Bind fast when the unique mapping is already published.
+
+        The distributed lock is only needed to create a channel or clean stale
+        metadata. Existing mappings can bind directly and avoid turning a large
+        producer fan-out into hundreds of serialized etcd lock acquisitions.
+        """
+        last_read_exc: Optional[Exception] = None
+        for read_attempt in range(MQ_UNIQUE_FAST_BIND_READ_RETRY_ATTEMPTS):
+            try:
+                existing_chan_id_res = _read_unique_chan_id()
+                break
+            except Exception as e:  # noqa: BLE001
+                last_read_exc = e
+                if read_attempt >= MQ_UNIQUE_FAST_BIND_READ_RETRY_ATTEMPTS - 1:
+                    return Result[object, ApiError].new_error(
+                        EtcdError(
+                            message=f"Failed to read unique key before lock: {unique_key!r}, err={e}",
+                            component="api_ext_chan.new_or_bind_with_unique_key",
+                            transport=TransportName.GRPC,
+                            transport_user=TransportUser.ETCD,
+                        )
+                    )
+                sleep_s = min(
+                    MQ_UNIQUE_FAST_BIND_READ_RETRY_MAX_SECONDS,
+                    MQ_UNIQUE_FAST_BIND_READ_RETRY_BASE_SECONDS * (2 ** read_attempt),
+                )
+                logging.warning(
+                    "unique key fast-bind read failed transiently; retrying: unique_key=%s attempt=%s/%s sleep_seconds=%.2f err=%s",
+                    unique_key,
+                    read_attempt + 1,
+                    MQ_UNIQUE_FAST_BIND_READ_RETRY_ATTEMPTS,
+                    sleep_s,
+                    e,
+                )
+                time.sleep(sleep_s)
+        else:
+            assert last_read_exc is not None
+            return Result[object, ApiError].new_error(
+                EtcdError(
+                    message=f"Failed to read unique key before lock: {unique_key!r}, err={last_read_exc}",
+                    component="api_ext_chan.new_or_bind_with_unique_key",
+                    transport=TransportName.GRPC,
+                    transport_user=TransportUser.ETCD,
+                )
             )
 
-        _ = result.unwrap()
-        result = get_chan_by_id(chan_type, existing_chan_id)
-        del_chan_by_id(chan_type, existing_chan_id)
-        if result.is_ok():
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(result.unwrap())
-        return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-            ChanBindError(f"Channel {existing_chan_id} not found in active nodes, error: {result.unwrap_error()}")
-        )
+        if not existing_chan_id_res.is_ok():
+            return Result[object, ApiError].new_error(existing_chan_id_res.unwrap_error())
+
+        existing_chan_id_exists, existing_chan_id = existing_chan_id_res.unwrap()
+        if not existing_chan_id_exists:
+            return Result[object, ApiError].new_ok(("no_mapping", None))
+
+        assert existing_chan_id is not None
+        bind_res = _bind_existing_channel(existing_chan_id)
+        if bind_res.is_ok():
+            return Result[object, ApiError].new_ok(bind_res.unwrap())
+        return Result[object, ApiError].new_error(bind_res.unwrap_error())
 
     def _resolve_or_create_under_lock() -> Result[object, ApiError]:
         """
@@ -426,93 +481,121 @@ def new_or_bind_with_unique_key(
                 ChanCreateError(f"RETRY: exception in new_or_bind_with_unique_key: {e}")
             )
 
-    final_value: Optional[object] = None
-    final_error: Optional[ApiError] = None
-    max_attempts = 3
-    for attempt_idx in range(max_attempts):
-        try:
-            lock_token = _acquire_lock(key=lock_key, ttl_seconds=120)
-        except Exception as e:  # noqa: BLE001
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-                EtcdError(
-                    message=f"Failed to acquire etcd lock: {lock_key}, err={e}",
-                    component="api_ext_chan.new_or_bind_with_unique_key",
-                    transport=TransportName.GRPC,
-                    transport_user=TransportUser.ETCD,
+    def _new_or_bind_without_fast_path() -> Result[
+        Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer],
+        ApiError,
+    ]:
+        final_value: Optional[object] = None
+        final_error: Optional[ApiError] = None
+        max_attempts = 3
+        for attempt_idx in range(max_attempts):
+            try:
+                lock_token = _acquire_lock(key=lock_key, ttl_seconds=120)
+            except Exception as e:  # noqa: BLE001
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
+                    EtcdError(
+                        message=f"Failed to acquire etcd lock: {lock_key}, err={e}",
+                        component="api_ext_chan.new_or_bind_with_unique_key",
+                        transport=TransportName.GRPC,
+                        transport_user=TransportUser.ETCD,
+                    )
                 )
-            )
 
-        try:
-            first_res = _call_resolve_under_lock()
-            if first_res.is_ok():
-                final_value = first_res.unwrap()
-                final_error = None
-            else:
-                err = first_res.unwrap_error()
-                logging.warning(
-                    "new_or_bind_with_unique_key retry once under lock: unique_key=%s err=%s",
-                    unique_key,
-                    err,
-                )
-                second_res = _call_resolve_under_lock()
-                if second_res.is_ok():
-                    final_value = second_res.unwrap()
+            try:
+                first_res = _call_resolve_under_lock()
+                if first_res.is_ok():
+                    final_value = first_res.unwrap()
                     final_error = None
                 else:
-                    final_value = None
-                    final_error = second_res.unwrap_error()
-        finally:
-            _release_lock(key=lock_key, token=lock_token)
+                    err = first_res.unwrap_error()
+                    logging.warning(
+                        "new_or_bind_with_unique_key retry once under lock: unique_key=%s err=%s",
+                        unique_key,
+                        err,
+                    )
+                    second_res = _call_resolve_under_lock()
+                    if second_res.is_ok():
+                        final_value = second_res.unwrap()
+                        final_error = None
+                    else:
+                        final_value = None
+                        final_error = second_res.unwrap_error()
+            finally:
+                _release_lock(key=lock_key, token=lock_token)
 
-        if final_value is None:
-            assert final_error is not None
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(final_error)
+            if final_value is None:
+                assert final_error is not None
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(final_error)
 
-        if not (isinstance(final_value, tuple) and len(final_value) == 2 and final_value[0] == "bind_existing"):
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(final_value)
+            if not (
+                isinstance(final_value, tuple)
+                and len(final_value) == 2
+                and final_value[0] == "bind_existing"
+            ):
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(final_value)
 
-        bind_chan_id = final_value[1]
-        bind_res = _bind_existing_channel(bind_chan_id)
-        if bind_res.is_ok():
-            return bind_res
+            bind_chan_id = final_value[1]
+            bind_res = _bind_existing_channel(bind_chan_id)
+            if bind_res.is_ok():
+                return bind_res
 
-        bind_err = bind_res.unwrap_error()
-        if not _is_stale_bind_error(bind_err):
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(bind_err)
-
-        logging.warning(
-            "existing channel bind failed with stale state outside lock; cleanup and retry. unique_key=%s chan_id=%s err=%s attempt=%s/%s",
-            unique_key,
-            bind_chan_id,
-            bind_err,
-            attempt_idx + 1,
-            max_attempts,
-        )
-        try:
-            cleanup_lock_token = _acquire_lock(key=lock_key, ttl_seconds=120)
-        except Exception as e:  # noqa: BLE001
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-                EtcdError(
-                    message=f"Failed to reacquire etcd lock for stale cleanup: {lock_key}, err={e}",
-                    component="api_ext_chan.new_or_bind_with_unique_key",
-                    transport=TransportName.GRPC,
-                    transport_user=TransportUser.ETCD,
+            bind_err = bind_res.unwrap_error()
+            if not _is_stale_bind_error(bind_err):
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
+                    ChanBindError(f"Bind failed for chan_id={bind_chan_id}: {bind_err}")
                 )
-            )
-        try:
-            cleanup_res = _cleanup_stale_mapping_under_lock(expected_chan_id=bind_chan_id)
-        finally:
-            _release_lock(key=lock_key, token=cleanup_lock_token)
-        if not cleanup_res.is_ok():
-            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
-                cleanup_res.unwrap_error()
-            )
 
-        final_value = None
-        final_error = bind_err
+            logging.warning(
+                "existing channel bind failed with stale state outside lock; cleanup and retry. unique_key=%s chan_id=%s err=%s attempt=%s/%s",
+                unique_key,
+                bind_chan_id,
+                bind_err,
+                attempt_idx + 1,
+                max_attempts,
+            )
+            try:
+                cleanup_lock_token = _acquire_lock(key=lock_key, ttl_seconds=120)
+            except Exception as e:  # noqa: BLE001
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
+                    EtcdError(
+                        message=f"Failed to reacquire etcd lock for stale cleanup: {lock_key}, err={e}",
+                        component="api_ext_chan.new_or_bind_with_unique_key",
+                        transport=TransportName.GRPC,
+                        transport_user=TransportUser.ETCD,
+                    )
+                )
+            try:
+                cleanup_res = _cleanup_stale_mapping_under_lock(expected_chan_id=bind_chan_id)
+            finally:
+                _release_lock(key=lock_key, token=cleanup_lock_token)
+            if not cleanup_res.is_ok():
+                return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(
+                    cleanup_res.unwrap_error()
+                )
 
-    assert final_error is not None
-    return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(final_error)
+            final_value = None
+            final_error = bind_err
+
+        assert final_error is not None
+        return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_error(final_error)
+
+    fast_bind_res = _try_bind_existing_channel_without_lock()
+    if fast_bind_res.is_ok():
+        fast_bind_value = fast_bind_res.unwrap()
+        if not (
+            isinstance(fast_bind_value, tuple)
+            and len(fast_bind_value) == 2
+            and fast_bind_value[0] == "no_mapping"
+        ):
+            return Result[Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer], ApiError].new_ok(fast_bind_value)
+    else:
+        logging.warning(
+            "existing channel fast bind failed; falling back to locked resolve. unique_key=%s err=%s",
+            unique_key,
+            fast_bind_res.unwrap_error(),
+        )
+
+    return _new_or_bind_without_fast_path()
 
 
 def new_etcd_client(api: KvClient) -> Result[etcd3.Etcd3Client, ApiError]:
@@ -639,6 +722,127 @@ def chan_new(
         )
 
 
+def _construct_bound_channel(
+    api: KvClient,
+    chan_config: Dict[str, int],
+    chan_id: str,
+    chan_type: ChanType,
+    chan_role: ChanRole,
+    etcd_client: Optional[etcd3.Etcd3Client] = None,
+) -> Result[
+    Union[MPSCChanProducer, MPSCChanConsumer, MPMCChanProducer, MPMCChanConsumer],
+    ApiError,
+]:
+    """Construct one bound channel without publishing it through the process registry."""
+
+    if chan_type == ChanType.MPSC:
+        if chan_role == ChanRole.PRODUCER:
+            try:
+                producer = MPSCChanProducer(api, chan_id, chan_config, etcd_client)
+            except (InvalidConfigurationError, PayloadLeaseNotFoundError) as e:
+                return Result.new_error(e)
+            except Exception as e:
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message=f"MPSC producer initialize error! {e}",
+                    )
+                )
+            if not isinstance(producer.chan_id, str) or not producer.chan_id.isdigit():
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message="MPSC producer initialize error!",
+                    )
+                )
+            return Result.new_ok(producer)
+        elif chan_role == ChanRole.CONSUMER:
+            try:
+                consumer = MPSCChanConsumer(api, chan_id, chan_config, etcd_client)
+            except (InvalidConfigurationError, PayloadLeaseNotFoundError) as e:
+                return Result.new_error(e)
+            except Exception as e:
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message=f"MPSC consumer initialize error! {e}",
+                    )
+                )
+            if not isinstance(consumer.chan_id, str) or not consumer.chan_id.isdigit():
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message="MPSC consumer initialize error!",
+                    )
+                )
+            return Result.new_ok(consumer)
+        else:
+            return Result.new_error(
+                InvalidConfigurationError(
+                    message="Invalid MPSC channel role",
+                )
+            )
+    elif chan_type == ChanType.MPMC:
+        if chan_role == ChanRole.PRODUCER:
+            try:
+                producer = MPMCChanProducer(api, chan_id, chan_config, etcd_client)
+            except InvalidConfigurationError as e:
+                if "lease not found" in str(e).lower() or "payload lease" in str(e).lower():
+                    return Result.new_error(
+                        InvalidConfigurationError(
+                            message=str(e),
+                            config_key="mpmc_meta_stale",
+                        )
+                    )
+                return Result.new_error(e)
+            except Exception as e:
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message=f"MPMC producer initialize error! {e}",
+                    )
+                )
+            if not isinstance(producer.mpmc_id, str) or not producer.mpmc_id.isdigit():
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message="MPMC producer initialize error!",
+                    )
+                )
+            return Result.new_ok(producer)
+        elif chan_role == ChanRole.CONSUMER:
+            try:
+                consumer = MPMCChanConsumer(api, chan_id, chan_config, etcd_client)
+            except InvalidConfigurationError as e:
+                if "lease not found" in str(e).lower() or "payload lease" in str(e).lower():
+                    return Result.new_error(
+                        InvalidConfigurationError(
+                            message=str(e),
+                            config_key="mpmc_meta_stale",
+                        )
+                    )
+                return Result.new_error(e)
+            except Exception as e:
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message=f"MPMC consumer initialize error! {e}",
+                    )
+                )
+            if not isinstance(consumer.mpmc_id, str) or not consumer.mpmc_id.isdigit():
+                return Result.new_error(
+                    InvalidConfigurationError(
+                        message="MPMC consumer initialize error!",
+                    )
+                )
+            return Result.new_ok(consumer)
+        else:
+            return Result.new_error(
+                InvalidConfigurationError(
+                    message="Invalid MPMC channel role",
+                )
+            )
+    else:
+        return Result.new_error(
+            InvalidConfigurationError(
+                message="Invalid channel type or role",
+            )
+        )
+
+
 def chan_bind(
     api: KvClient,
     chan_config: Dict[str, int],
@@ -647,120 +851,20 @@ def chan_bind(
     chan_role: ChanRole,
     etcd_client: Optional[etcd3.Etcd3Client] = None,
 ) -> Result[bool, ApiError]:
-    if chan_type == ChanType.MPSC:
-        if chan_role == ChanRole.PRODUCER:
-            producer = None
-            try:
-                producer = MPSCChanProducer(api, chan_id, chan_config, etcd_client)
-            except (InvalidConfigurationError, PayloadLeaseNotFoundError) as e:
-                return Result[bool, ApiError].new_error(e)
-            except Exception as e:
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message=f"MPSC producer initialize error! {e}",
-                    )
-                )
-            if not isinstance(producer.chan_id, str) or not producer.chan_id.isdigit():
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message="MPSC producer initialize error!",
-                    )
-                )
-            CHANID_2_NODES[chan_type.value + "_" + producer.chan_id] = producer
-            return Result(True)
-        elif chan_role == ChanRole.CONSUMER:
-            consumer = None
-            try:
-                consumer = MPSCChanConsumer(api, chan_id, chan_config, etcd_client)
-            except (InvalidConfigurationError, PayloadLeaseNotFoundError) as e:
-                return Result[bool, ApiError].new_error(e)
-            except Exception as e:
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message=f"MPSC consumer initialize error! {e}",
-                    )
-                )
-            if not isinstance(consumer.chan_id, str) or not consumer.chan_id.isdigit():
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message="MPSC consumer initialize error!",
-                    )
-                )
-            CHANID_2_NODES[chan_type.value + "_" + consumer.chan_id] = consumer
-            return Result(True)
-        else:
-            return Result[bool, ApiError].new_error(
-                InvalidConfigurationError(
-                    message="Invalid MPSC channel role",
-                )
-            )
-    elif chan_type == ChanType.MPMC:
-        if chan_role == ChanRole.PRODUCER:
-            producer = None
-            try:
-                producer = MPMCChanProducer(api, chan_id, chan_config, etcd_client)
-            except InvalidConfigurationError as e:
-                if "lease not found" in str(e).lower() or "payload lease" in str(e).lower():
-                    return Result[bool, ApiError].new_error(
-                        InvalidConfigurationError(
-                            message=str(e),
-                            config_key="mpmc_meta_stale",
-                        )
-                    )
-                return Result[bool, ApiError].new_error(e)
-            except Exception as e:
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message=f"MPMC producer initialize error! {e}",
-                    )
-                )
-            if not isinstance(producer.mpmc_id, str) or not producer.mpmc_id.isdigit():
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message="MPMC producer initialize error!",
-                    )
-                )
-            CHANID_2_NODES[chan_type.value + "_" + producer.mpmc_id] = producer
-            return Result(True)
-        elif chan_role == ChanRole.CONSUMER:
-            consumer = None
-            try:
-                consumer = MPMCChanConsumer(api, chan_id, chan_config, etcd_client)
-            except InvalidConfigurationError as e:
-                if "lease not found" in str(e).lower() or "payload lease" in str(e).lower():
-                    return Result[bool, ApiError].new_error(
-                        InvalidConfigurationError(
-                            message=str(e),
-                            config_key="mpmc_meta_stale",
-                        )
-                    )
-                return Result[bool, ApiError].new_error(e)
-            except Exception as e:
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message=f"MPMC consumer initialize error! {e}",
-                    )
-                )
-            if not isinstance(consumer.mpmc_id, str) or not consumer.mpmc_id.isdigit():
-                return Result[bool, ApiError].new_error(
-                    InvalidConfigurationError(
-                        message="MPMC consumer initialize error!",
-                    )
-                )
-            CHANID_2_NODES[chan_type.value + "_" + consumer.mpmc_id] = consumer
-            return Result(True)
-        else:
-            return Result[bool, ApiError].new_error(
-                InvalidConfigurationError(
-                    message="Invalid MPMC channel role",
-                )
-            )
-    else:
-        return Result[bool, ApiError].new_error(
-            InvalidConfigurationError(
-                message="Invalid channel type or role",
-            )
-        )
+    """Bind a channel and publish it through the legacy process registry."""
+
+    result = _construct_bound_channel(
+        api,
+        chan_config,
+        chan_id,
+        chan_type,
+        chan_role,
+        etcd_client,
+    )
+    if not result.is_ok():
+        return Result.new_error(result.unwrap_error())
+    set_chan_by_id(chan_type, chan_id, result.unwrap())
+    return Result.new_ok(True)
 
 
 def chan_unbind(chan_type: ChanType, chan_id: str) -> Result[bool, ApiError]:

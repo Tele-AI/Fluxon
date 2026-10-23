@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
+use fluxon_kv::master_kv_router::msg_pack::GetSourceKind;
 use fluxon_kv::memholder::{
     ExternalMemHolder as RustExternalMemHolder, UserMemHolder as RustMemHolder,
 };
 use parking_lot::RwLock;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
 use super::{ApiResult, new_general_error};
@@ -18,11 +20,26 @@ enum MemHolderInner {
 #[pyclass]
 pub struct MemHolder {
     holder: MemHolderInner,
+    source_kind: Option<GetSourceKind>,
     access_cache: RwLock<Option<PyObject>>,
+}
+
+fn benchmark_source_kind_name(source_kind: GetSourceKind) -> &'static str {
+    match source_kind {
+        GetSourceKind::Memory => "memory",
+        GetSourceKind::Ssd => "ssd",
+    }
 }
 
 #[pymethods]
 impl MemHolder {
+    /// Return the source selected for this GET operation.
+    fn _benchmark_source_kind(&self) -> PyResult<&'static str> {
+        self.source_kind
+            .map(benchmark_source_kind_name)
+            .ok_or_else(|| PyRuntimeError::new_err("GET source is unavailable for this holder"))
+    }
+
     /// Decode the held flat dict as a Python dict.
     ///
     /// The binary parsing runs without the Python GIL; only Python object creation holds the GIL.
@@ -55,9 +72,10 @@ impl MemHolder {
 }
 
 impl MemHolder {
-    pub(crate) fn new(holder: Arc<RustMemHolder>) -> Self {
+    pub(crate) fn new(holder: Arc<RustMemHolder>, source_kind: GetSourceKind) -> Self {
         Self {
             holder: MemHolderInner::Seg(holder),
+            source_kind: Some(source_kind),
             access_cache: RwLock::new(None),
         }
     }
@@ -65,6 +83,7 @@ impl MemHolder {
     pub(crate) fn new_owned(bytes: Vec<u8>) -> Self {
         Self {
             holder: MemHolderInner::Owned(Arc::<[u8]>::from(bytes)),
+            source_kind: None,
             access_cache: RwLock::new(None),
         }
     }
@@ -112,11 +131,17 @@ impl MemHolder {
 #[pyclass]
 pub struct ExternalMemHolder {
     pub(crate) holder: Arc<RustExternalMemHolder>,
+    source_kind: GetSourceKind,
     access_cache: RwLock<Option<PyObject>>,
 }
 
 #[pymethods]
 impl ExternalMemHolder {
+    /// Return the source selected for this GET operation.
+    fn _benchmark_source_kind(&self) -> &'static str {
+        benchmark_source_kind_name(self.source_kind)
+    }
+
     /// Decode the held flat dict as a Python dict.
     ///
     /// The binary parsing runs without the Python GIL; only Python object creation holds the GIL.
@@ -144,9 +169,10 @@ impl ExternalMemHolder {
 }
 
 impl ExternalMemHolder {
-    pub(crate) fn new(holder: Arc<RustExternalMemHolder>) -> Self {
+    pub(crate) fn new(holder: Arc<RustExternalMemHolder>, source_kind: GetSourceKind) -> Self {
         Self {
             holder,
+            source_kind,
             access_cache: RwLock::new(None),
         }
     }

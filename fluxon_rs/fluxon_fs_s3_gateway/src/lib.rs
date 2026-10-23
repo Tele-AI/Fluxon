@@ -6,7 +6,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, heade
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, delete, get, post, put};
 use base64::Engine as _;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, NaiveDateTime, TimeZone as _, Utc};
 use fluxon_fs_core::config::{
     FluxonFsAccessModel, FluxonFsAccessUser, FluxonFsExport, FluxonFsExportRoutingMode,
@@ -32,10 +32,17 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use hmac::{Hmac, Mac as _};
 use parking_lot::{Mutex, RwLock};
-use rusqlite::{Connection, params};
+use quick_xml::escape::unescape as xml_unescape;
+use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tower::ServiceExt as _;
 use uuid::Uuid;
 
@@ -175,6 +182,16 @@ pub struct GatewayAccessConfig {
     pub transfer_state_store: Option<FluxonFsTransferStateStoreConfig>,
 }
 
+const ACCESS_META_INITIAL_CREDENTIALS_REQUIRED: &str = "initial_credentials_change_required";
+const ACCESS_META_VALUE_TRUE: &str = "true";
+const ACCESS_META_VALUE_FALSE: &str = "false";
+
+fn is_default_bootstrap_credentials(model: &FluxonFsAccessModel) -> bool {
+    model.users.len() == 1
+        && model.users[0].username == "admin"
+        && model.users[0].password == "admin"
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsMountRegistryRecord {
     pub external_instance_key: String,
@@ -257,6 +274,82 @@ pub trait FsS3Backend: Send + Sync {
         offset: i64,
         data: Vec<u8>,
     ) -> BoxFuture<'static, Result<(), S3Error>>;
+    fn supports_put_small_object(&self) -> bool {
+        false
+    }
+    fn put_small_object(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+        _data: Bytes,
+    ) -> BoxFuture<'static, Result<(), S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "put_small_object is not supported by this backend".to_string(),
+            })
+        })
+    }
+    fn supports_write_session(&self) -> bool {
+        false
+    }
+    fn write_session_preferred_payload_bytes(&self) -> usize {
+        FS_RPC_CHUNK_BYTES
+    }
+    fn open_write_session(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+    ) -> BoxFuture<'static, Result<Arc<str>, S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "write session is not supported by this backend".to_string(),
+            })
+        })
+    }
+    fn buffer_write_session_payload(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+        _session_id: Arc<str>,
+        _offset: i64,
+        _data: Bytes,
+    ) -> BoxFuture<'static, Result<(), S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "write session is not supported by this backend".to_string(),
+            })
+        })
+    }
+    fn finalize_write_session(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+        _session_id: Arc<str>,
+        _final_size: i64,
+    ) -> BoxFuture<'static, Result<(), S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "write-session finalize is not supported by this backend".to_string(),
+            })
+        })
+    }
+    fn abort_write_session(
+        &self,
+        _request_identity: FluxonFsRequestIdentity,
+        _export_name: Arc<str>,
+        _relpath: Arc<str>,
+        _session_id: Arc<str>,
+    ) -> BoxFuture<'static, Result<(), S3Error>> {
+        Box::pin(async {
+            Err(S3Error::Internal {
+                detail: "write session is not supported by this backend".to_string(),
+            })
+        })
+    }
     fn truncate(
         &self,
         request_identity: FluxonFsRequestIdentity,
@@ -390,6 +483,7 @@ pub struct GatewayState {
     transfer_reconcile_handle: Option<Arc<TiKvTransferReconcileHandle>>,
     permission_list: Arc<RwLock<Vec<FluxonFsS3PermissionAccount>>>,
     pending_credentials_change_usernames: Arc<RwLock<BTreeSet<String>>>,
+    initial_credentials_change_required: Arc<AtomicBool>,
     fs_cache: Arc<FluxonFsGlobalConfig>,
     s3_cfg: FluxonFsS3GatewayConfig,
     backend: Arc<dyn FsS3Backend>,
@@ -645,7 +739,11 @@ impl GatewayState {
         transfer_history_query: Option<TransferHistoryQueryConfig>,
     ) -> Result<Self, String> {
         let access_db = Arc::new(Mutex::new(open_access_db(&access.access_db_path)?));
-        let (permission_list, pending_credentials_change_usernames) = {
+        let (
+            permission_list,
+            pending_credentials_change_usernames,
+            initial_credentials_change_required,
+        ) = {
             let mut conn = access_db.lock();
             let permission_list = load_or_bootstrap_permission_list_from_db(
                 &mut conn,
@@ -655,7 +753,18 @@ impl GatewayState {
             )?;
             let pending_credentials_change_usernames =
                 load_pending_credentials_change_usernames_from_db(&conn)?;
-            (permission_list, pending_credentials_change_usernames)
+            let initial_credentials_change_required = if access.require_bootstrap_credentials_change
+            {
+                persist_initial_credentials_change_required_to_db(&conn, true)?;
+                true
+            } else {
+                load_initial_credentials_change_required_from_db(&conn)?
+            };
+            (
+                permission_list,
+                pending_credentials_change_usernames,
+                initial_credentials_change_required,
+            )
         };
         let external_base_path = normalize_external_base_path(&external_base_path);
         let transfer_worker_scheduler = TransferWorkerSchedulerHandle::new();
@@ -691,6 +800,9 @@ impl GatewayState {
             permission_list: Arc::new(RwLock::new(permission_list)),
             pending_credentials_change_usernames: Arc::new(RwLock::new(
                 pending_credentials_change_usernames,
+            )),
+            initial_credentials_change_required: Arc::new(AtomicBool::new(
+                initial_credentials_change_required,
             )),
             fs_cache,
             s3_cfg,
@@ -993,6 +1105,11 @@ impl GatewayState {
         Ok(())
     }
 
+    fn initial_credentials_change_required(&self) -> bool {
+        self.initial_credentials_change_required
+            .load(Ordering::Acquire)
+    }
+
     pub(crate) fn load_effective_fs_exports(
         &self,
     ) -> Result<BTreeMap<String, FluxonFsExport>, String> {
@@ -1017,14 +1134,6 @@ impl GatewayState {
         };
         self.backend.ensure_export_config(export_name, &export)?;
         Ok(Some(export))
-    }
-
-    pub fn try_begin_transfer_scan_job(&self, job_id: &str) -> bool {
-        self.transfer_scan_scheduler.try_begin_scan_job(job_id)
-    }
-
-    pub fn finish_transfer_scan_job(&self, job_id: &str) {
-        self.transfer_scan_scheduler.finish_scan_job(job_id);
     }
 
     pub fn transfer_job_live_detail_snapshot(
@@ -1536,6 +1645,53 @@ impl GatewayState {
         Ok(())
     }
 
+    fn complete_initial_credentials_change(
+        &self,
+        current_username: &str,
+        current_password: &str,
+        new_username: String,
+        new_password: String,
+    ) -> Result<(), String> {
+        let mut conn = self.access_db.lock();
+        if !load_initial_credentials_change_required_from_db(&conn)? {
+            return Err("initial credentials have already been changed".to_string());
+        }
+
+        let mut permission_list = load_permission_list_from_db(&conn)?;
+        if new_username != current_username
+            && permission_list
+                .iter()
+                .any(|account| account.username == new_username)
+        {
+            return Err(format!("username already exists: {}", new_username));
+        }
+        let account = permission_list
+            .iter_mut()
+            .find(|account| account.username == current_username)
+            .ok_or_else(|| {
+                format!(
+                    "bootstrap account no longer exists in access db: {}",
+                    current_username
+                )
+            })?;
+        if account.password != current_password {
+            return Err("bootstrap credentials changed; authenticate again".to_string());
+        }
+        account.username = new_username;
+        account.password = new_password;
+
+        let normalized_permission_list =
+            persist_permission_list_to_db_with_initial_credentials_state(
+                &mut conn,
+                &permission_list,
+                false,
+            )?;
+        *self.permission_list.write() = normalized_permission_list;
+        self.initial_credentials_change_required
+            .store(false, Ordering::Release);
+        Ok(())
+    }
+
     fn create_ui_transfer_task(
         &self,
         owner_username: String,
@@ -1758,33 +1914,35 @@ fn open_access_db(path: &str) -> Result<Connection, String> {
     if path.trim().is_empty() {
         return Err("access_db_path must be non-empty".to_string());
     }
-    let db_path = std::path::Path::new(path);
-    if let Some(parent_dir) = db_path.parent() {
-        if !parent_dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent_dir).map_err(|e| {
-                format!(
-                    "create access db parent dir failed: path={} parent={} err={}",
-                    path,
-                    parent_dir.display(),
-                    e
-                )
-            })?;
+    let is_in_memory = path == ":memory:";
+    let db_path = FsPath::new(path);
+    if !is_in_memory {
+        if let Some(parent_dir) = db_path.parent() {
+            if !parent_dir.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent_dir).map_err(|e| {
+                    format!(
+                        "create access db parent dir failed: path={} parent={} err={}",
+                        path,
+                        parent_dir.display(),
+                        e
+                    )
+                })?;
+            }
         }
     }
     #[cfg(unix)]
-    if path != ":memory:" {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-
-        let file = std::fs::OpenOptions::new()
+    if !is_in_memory {
+        let file = OpenOptions::new()
+            .create(true)
             .read(true)
             .write(true)
-            .create(true)
             .mode(0o600)
             .open(db_path)
-            .map_err(|e| format!("create access db with private permissions failed: {}", e))?;
+            .map_err(|e| format!("create access db with mode 0600 failed: {}", e))?;
         drop(file);
-        std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| format!("set access db permissions to 0600 failed: {}", e))?;
+    }
+    if !is_in_memory {
+        restrict_access_db_permissions(db_path)?;
     }
     let conn = Connection::open(path).map_err(|e| format!("open access db failed: {}", e))?;
     conn.execute_batch(
@@ -1796,6 +1954,10 @@ CREATE TABLE IF NOT EXISTS access_users (
     username TEXT PRIMARY KEY,
     password TEXT NOT NULL,
     can_manage_users INTEGER NOT NULL CHECK (can_manage_users IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS access_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS access_scope (
     scope_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1846,6 +2008,9 @@ CREATE TABLE IF NOT EXISTS fs_export_overlay_upsert (
     )
     .map_err(|e| format!("initialize access db schema failed: {}", e))?;
     ensure_fs_export_registry_export_json_column(&conn)?;
+    if !is_in_memory {
+        restrict_access_db_permissions(db_path)?;
+    }
     Ok(conn)
 }
 
@@ -1919,6 +2084,59 @@ fn load_pending_credentials_change_usernames_from_db(
         );
     }
     Ok(usernames)
+}
+
+fn persist_initial_credentials_change_required_to_db(
+    conn: &Connection,
+    required: bool,
+) -> Result<(), String> {
+    let value = if required {
+        ACCESS_META_VALUE_TRUE
+    } else {
+        ACCESS_META_VALUE_FALSE
+    };
+    conn.execute(
+        "INSERT INTO access_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![ACCESS_META_INITIAL_CREDENTIALS_REQUIRED, value],
+    )
+    .map_err(|e| {
+        format!(
+            "persist access metadata {} failed: {}",
+            ACCESS_META_INITIAL_CREDENTIALS_REQUIRED, e
+        )
+    })?;
+    Ok(())
+}
+
+fn load_initial_credentials_change_required_from_db(conn: &Connection) -> Result<bool, String> {
+    let value = conn
+        .query_row(
+            "SELECT value FROM access_meta WHERE key = ?1",
+            params![ACCESS_META_INITIAL_CREDENTIALS_REQUIRED],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| {
+            format!(
+                "load access metadata {} failed: {}",
+                ACCESS_META_INITIAL_CREDENTIALS_REQUIRED, e
+            )
+        })?;
+    match value.as_deref() {
+        Some(ACCESS_META_VALUE_TRUE) => Ok(true),
+        Some(ACCESS_META_VALUE_FALSE) => Ok(false),
+        Some(value) => Err(format!(
+            "invalid access metadata {} value: {}",
+            ACCESS_META_INITIAL_CREDENTIALS_REQUIRED, value
+        )),
+        None => {
+            let model = load_access_model_from_db(conn)?;
+            let required = is_default_bootstrap_credentials(&model);
+            persist_initial_credentials_change_required_to_db(conn, required)?;
+            Ok(required)
+        }
+    }
 }
 
 fn load_access_model_from_db(conn: &Connection) -> Result<AccessModel, String> {
@@ -2003,7 +2221,7 @@ fn load_permission_list_from_db(
     conn: &Connection,
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
     let model = load_access_model_from_db(conn)?;
-    permission_list_from_access_model(&model)
+    s3_permission_list_from_access_model(&model)
 }
 
 fn load_or_bootstrap_permission_list_from_db(
@@ -2027,9 +2245,23 @@ fn persist_access_model_to_db(
     model: &AccessModel,
     mark_credentials_change_pending: bool,
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
-    let permission_list = permission_list_from_access_model(model)?;
-    let normalized_model = access_model_from_permission_list(&permission_list)?;
-    let normalized_permission_list = permission_list_from_access_model(&normalized_model)?;
+    persist_access_model_to_db_with_initial_credentials_state(
+        conn,
+        model,
+        None,
+        mark_credentials_change_pending,
+    )
+}
+
+fn persist_access_model_to_db_with_initial_credentials_state(
+    conn: &mut Connection,
+    model: &AccessModel,
+    initial_credentials_change_required: Option<bool>,
+    mark_credentials_change_pending: bool,
+) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
+    let permission_list = s3_permission_list_from_access_model(model)?;
+    let normalized_model = access_model_from_s3_permission_list(&permission_list)?;
+    let normalized_permission_list = s3_permission_list_from_access_model(&normalized_model)?;
     // English note: control-plane mutations rewrite the normalized access snapshot inside one
     // transaction. Data-plane authorization reads stay on the in-memory cache, so this does not
     // add per-request DB cost.
@@ -2101,8 +2333,14 @@ fn persist_access_model_to_db(
                 )
             })?;
         }
+    } else {
+        tx.execute("DELETE FROM access_pending_credentials_change", [])
+            .map_err(|e| format!("clear completed credentials-change markers failed: {}", e))?;
     }
 
+    if let Some(required) = initial_credentials_change_required {
+        persist_initial_credentials_change_required_to_db(&tx, required)?;
+    }
     tx.commit()
         .map_err(|e| format!("commit state db transaction failed: {}", e))?;
     Ok(normalized_permission_list)
@@ -2114,6 +2352,20 @@ fn persist_permission_list_to_db(
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
     let model = access_model_from_permission_list(permission_list)?;
     persist_access_model_to_db(conn, &model, false)
+}
+
+fn persist_permission_list_to_db_with_initial_credentials_state(
+    conn: &mut Connection,
+    permission_list: &[FluxonFsS3PermissionAccount],
+    initial_credentials_change_required: bool,
+) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
+    let model = access_model_from_s3_permission_list(permission_list)?;
+    persist_access_model_to_db_with_initial_credentials_state(
+        conn,
+        &model,
+        Some(initial_credentials_change_required),
+        false,
+    )
 }
 
 fn persist_fs_mount_registry_record_to_db(
@@ -2695,6 +2947,43 @@ fn normalize_external_base_path(path: &str) -> String {
     format!("/{}", no_trailing)
 }
 
+#[cfg(unix)]
+fn restrict_access_db_file_permissions(path: &FsPath) -> Result<(), String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(format!(
+                "stat access db file permissions failed: path={} err={}",
+                path.display(),
+                err
+            ));
+        }
+    };
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(path, permissions).map_err(|err| {
+        format!(
+            "set access db file permissions failed: path={} mode=0600 err={}",
+            path.display(),
+            err
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn restrict_access_db_file_permissions(_path: &FsPath) -> Result<(), String> {
+    Ok(())
+}
+
+fn restrict_access_db_permissions(path: &FsPath) -> Result<(), String> {
+    restrict_access_db_file_permissions(path)?;
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    restrict_access_db_file_permissions(wal_path.as_path())?;
+    let shm_path = PathBuf::from(format!("{}-shm", path.display()));
+    restrict_access_db_file_permissions(shm_path.as_path())
+}
+
 #[derive(Debug, Clone)]
 struct AuthAccount {
     username: String,
@@ -2776,6 +3065,12 @@ fn permission_rule_grants_read(rule: &fluxon_fs_core::config::FluxonFsS3Permissi
             && permission_rule_has_action(rule, FluxonFsS3PermissionAction::GetObject))
 }
 
+fn account_can_manage_permissions(account: &AuthAccount) -> bool {
+    account.can_manage_users
+}
+
+// Keep the legacy local names as private adapters while the core contract uses
+// the explicit S3 permission conversion names.
 fn access_model_from_permission_list(
     permission_list: &[FluxonFsS3PermissionAccount],
 ) -> Result<AccessModel, String> {
@@ -2786,10 +3081,6 @@ fn permission_list_from_access_model(
     model: &AccessModel,
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
     s3_permission_list_from_access_model(model)
-}
-
-fn account_can_manage_permissions(account: &AuthAccount) -> bool {
-    account.can_manage_users
 }
 
 fn account_has_bucket_access(account: &AuthAccount, bucket: &str) -> bool {
@@ -3620,18 +3911,17 @@ async fn handle_any_authed_impl(
             }
             let bucket_arc: Arc<str> = Arc::from(bucket);
             let rel_arc: Arc<str> = Arc::from(rel.as_str());
-            ensure_parent_dirs(&st, request_identity.clone(), bucket_arc.clone(), &rel).await?;
-            let (etag, size) = put_object_stream_with_sha256_etag(
+            if !(st.backend.supports_put_small_object() && st.backend.supports_write_session()) {
+                ensure_parent_dirs(&st, request_identity.clone(), bucket_arc.clone(), &rel).await?;
+            }
+            let (etag, _size) = put_object_stream_with_sha256_etag(
                 &st,
                 request_identity.clone(),
-                bucket_arc.clone(),
-                rel_arc.clone(),
+                bucket_arc,
+                rel_arc,
                 body,
             )
             .await?;
-            st.backend
-                .truncate(request_identity.clone(), bucket_arc, rel_arc, size)
-                .await?;
             Ok(resp_empty_with_etag(StatusCode::OK, &etag))
         }
         (Method::DELETE, Some(key)) => {
@@ -3961,6 +4251,228 @@ async fn get_object_stream(
     Ok(Body::wrap_stream::<_, Bytes, S3Error>(stream))
 }
 
+struct HybridObjectWriter {
+    backend: Arc<dyn FsS3Backend>,
+    request_identity: FluxonFsRequestIdentity,
+    bucket: Arc<str>,
+    rel: Arc<str>,
+    received_size: i64,
+    pending_offset: i64,
+    pending: BytesMut,
+    session_id: Option<Arc<str>>,
+    session_supported: bool,
+    put_small_object_supported: bool,
+    session_payload_bytes: usize,
+}
+
+impl HybridObjectWriter {
+    fn new(
+        st: &GatewayState,
+        request_identity: FluxonFsRequestIdentity,
+        bucket: Arc<str>,
+        rel: Arc<str>,
+    ) -> Self {
+        let session_supported = st.backend.supports_write_session();
+        let put_small_object_supported = st.backend.supports_put_small_object();
+        let session_payload_bytes = st.backend.write_session_preferred_payload_bytes().max(1);
+        Self {
+            backend: st.backend.clone(),
+            request_identity,
+            bucket,
+            rel,
+            received_size: 0,
+            pending_offset: 0,
+            pending: BytesMut::new(),
+            session_id: None,
+            session_supported,
+            put_small_object_supported,
+            session_payload_bytes,
+        }
+    }
+
+    fn checked_projected_size(&self, data_len: usize) -> Result<i64, S3Error> {
+        let data_len = i64::try_from(data_len).map_err(|_| S3Error::InvalidRequest {
+            detail: "PUT Object body is too large".to_string(),
+        })?;
+        self.received_size
+            .checked_add(data_len)
+            .ok_or_else(|| S3Error::InvalidRequest {
+                detail: "PUT Object body size overflow".to_string(),
+            })
+    }
+
+    async fn open_session(&mut self) -> Result<(), S3Error> {
+        if self.session_id.is_some() {
+            return Ok(());
+        }
+        let session_id = self
+            .backend
+            .open_write_session(
+                self.request_identity.clone(),
+                self.bucket.clone(),
+                self.rel.clone(),
+            )
+            .await?;
+        self.session_id = Some(session_id);
+        Ok(())
+    }
+
+    async fn write_chunk_payload(&self, start_offset: i64, data: &[u8]) -> Result<(), S3Error> {
+        let mut offset = start_offset;
+        for part in data.chunks(FS_RPC_CHUNK_BYTES) {
+            self.backend
+                .write_chunk(
+                    self.request_identity.clone(),
+                    self.bucket.clone(),
+                    self.rel.clone(),
+                    offset,
+                    part.to_vec(),
+                )
+                .await?;
+            offset =
+                offset
+                    .checked_add(part.len() as i64)
+                    .ok_or_else(|| S3Error::InvalidRequest {
+                        detail: "PUT Object offset overflow".to_string(),
+                    })?;
+        }
+        Ok(())
+    }
+
+    async fn flush_session_pending(&mut self, flush_tail: bool) -> Result<(), S3Error> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(());
+        };
+        while self.pending.len() >= self.session_payload_bytes
+            || (flush_tail && !self.pending.is_empty())
+        {
+            let payload_len = if self.pending.len() >= self.session_payload_bytes {
+                self.session_payload_bytes
+            } else {
+                self.pending.len()
+            };
+            let payload = self.pending.split_to(payload_len).freeze();
+            let offset = self.pending_offset;
+            self.backend
+                .buffer_write_session_payload(
+                    self.request_identity.clone(),
+                    self.bucket.clone(),
+                    self.rel.clone(),
+                    session_id.clone(),
+                    offset,
+                    payload,
+                )
+                .await?;
+            self.pending_offset = self
+                .pending_offset
+                .checked_add(payload_len as i64)
+                .ok_or_else(|| S3Error::InvalidRequest {
+                    detail: "PUT Object offset overflow".to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn write(&mut self, data: Bytes) -> Result<(), S3Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let projected_size = self.checked_projected_size(data.len())?;
+
+        // Backends without the optional session contract retain the original
+        // streaming chunk behavior. The live Fluxon backend advertises session
+        // support, while lightweight test/checker backends can keep the default.
+        if !self.session_supported {
+            self.write_chunk_payload(self.received_size, data.as_ref())
+                .await?;
+            self.received_size = projected_size;
+            self.pending_offset = projected_size;
+            return Ok(());
+        }
+
+        let should_promote = self.session_id.is_some()
+            || projected_size >= fs_s3::FS_S3_WRITE_SESSION_THRESHOLD_BYTES as i64;
+        if should_promote {
+            self.open_session().await?;
+        }
+
+        debug_assert_eq!(
+            self.pending_offset
+                .saturating_add(self.pending.len() as i64),
+            self.received_size
+        );
+        self.pending.extend_from_slice(data.as_ref());
+        self.received_size = projected_size;
+        if self.session_id.is_some() {
+            self.flush_session_pending(false).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<i64, S3Error> {
+        if let Some(session_id) = self.session_id.clone() {
+            self.flush_session_pending(true).await?;
+            self.backend
+                .finalize_write_session(
+                    self.request_identity.clone(),
+                    self.bucket.clone(),
+                    self.rel.clone(),
+                    session_id,
+                    self.received_size,
+                )
+                .await?;
+            self.session_id = None;
+            return Ok(self.received_size);
+        }
+
+        if self.session_supported && self.put_small_object_supported {
+            debug_assert_eq!(self.pending_offset, 0);
+            let payload = self.pending.split().freeze();
+            self.backend
+                .put_small_object(
+                    self.request_identity.clone(),
+                    self.bucket.clone(),
+                    self.rel.clone(),
+                    payload,
+                )
+                .await?;
+            self.pending_offset = self.received_size;
+            return Ok(self.received_size);
+        }
+
+        if !self.pending.is_empty() {
+            let payload = self.pending.split().freeze();
+            self.write_chunk_payload(self.pending_offset, payload.as_ref())
+                .await?;
+            self.pending_offset = self.received_size;
+        }
+        self.backend
+            .truncate(
+                self.request_identity.clone(),
+                self.bucket.clone(),
+                self.rel.clone(),
+                self.received_size,
+            )
+            .await?;
+        Ok(self.received_size)
+    }
+
+    async fn abort(&mut self) {
+        let Some(session_id) = self.session_id.take() else {
+            return;
+        };
+        let _ = self
+            .backend
+            .abort_write_session(
+                self.request_identity.clone(),
+                self.bucket.clone(),
+                self.rel.clone(),
+                session_id,
+            )
+            .await;
+    }
+}
+
 async fn put_object_stream_with_sha256_etag(
     st: &GatewayState,
     request_identity: FluxonFsRequestIdentity,
@@ -3969,30 +4481,30 @@ async fn put_object_stream_with_sha256_etag(
     mut body: Body,
 ) -> Result<(String, i64), S3Error> {
     let mut hasher = Sha256::new();
-    let mut off: i64 = 0;
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk.map_err(|e| S3Error::Internal {
-            detail: format!("read request body failed: {}", e),
-        })?;
-        if chunk.is_empty() {
-            continue;
+    let mut writer = HybridObjectWriter::new(st, request_identity, bucket, rel);
+    let write_result: Result<i64, S3Error> = async {
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.map_err(|e| S3Error::Internal {
+                detail: format!("read request body failed: {}", e),
+            })?;
+            if chunk.is_empty() {
+                continue;
+            }
+            hasher.update(&chunk);
+            writer.write(chunk).await?;
         }
-        hasher.update(&chunk);
-        for part in chunk.chunks(FS_RPC_CHUNK_BYTES) {
-            st.backend
-                .write_chunk(
-                    request_identity.clone(),
-                    bucket.clone(),
-                    rel.clone(),
-                    off,
-                    part.to_vec(),
-                )
-                .await?;
-            off += part.len() as i64;
-        }
+        writer.finish().await
     }
+    .await;
+    let size = match write_result {
+        Ok(size) => size,
+        Err(err) => {
+            writer.abort().await;
+            return Err(err);
+        }
+    };
     let etag = hex::encode(hasher.finalize());
-    Ok((etag, off))
+    Ok((etag, size))
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -4443,24 +4955,18 @@ async fn multipart_upload_part(
     }
 
     let part_path = multipart_part_path(upload_id, part_number)?;
-    ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), &part_path).await?;
+    if !(st.backend.supports_put_small_object() && st.backend.supports_write_session()) {
+        ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), &part_path).await?;
+    }
     let part_path_arc: Arc<str> = Arc::from(part_path.as_str());
-    let (etag, size) = put_object_stream_with_sha256_etag(
+    let (etag, _size) = put_object_stream_with_sha256_etag(
         st,
         request_identity.clone(),
         bucket.clone(),
-        part_path_arc.clone(),
+        part_path_arc,
         body,
     )
     .await?;
-    st.backend
-        .truncate(
-            request_identity.clone(),
-            bucket.clone(),
-            part_path_arc,
-            size,
-        )
-        .await?;
 
     let etag_path = multipart_part_etag_path(upload_id, part_number)?;
     let etag_path_arc: Arc<str> = Arc::from(etag_path.as_str());
@@ -4791,108 +5297,99 @@ async fn multipart_complete(
         })?;
     let parts = parse_complete_multipart_body(&body_bytes)?;
     let mut out_hasher = Sha256::new();
-    let mut off: i64 = 0;
-    ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), key).await?;
-
-    for p in parts.iter() {
-        let part_path = multipart_part_path(upload_id, p.part_number)?;
-        let etag_path = multipart_part_etag_path(upload_id, p.part_number)?;
-        let etag_path_arc: Arc<str> = Arc::from(etag_path.as_str());
-        let etag_stat = st
-            .backend
-            .stat(
-                request_identity.clone(),
-                bucket.clone(),
-                etag_path_arc.clone(),
-            )
-            .await?;
-        if !etag_stat.exists {
-            return Err(S3Error::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        let n_et = std::cmp::min(etag_stat.size, FS_RPC_CHUNK_BYTES as i64);
-        let etag_bytes = st
-            .backend
-            .read_chunk_cached(
-                request_identity.clone(),
-                bucket.clone(),
-                etag_path_arc,
-                0,
-                n_et,
-                etag_stat.size,
-                etag_stat.mtime_ns,
-            )
-            .await?;
-        let etag_got = String::from_utf8_lossy(&etag_bytes).trim().to_string();
-        if etag_got != p.etag {
-            return Err(S3Error::InvalidRequest {
-                detail: format!(
-                    "etag mismatch for part {}: expected={} got={}",
-                    p.part_number, p.etag, etag_got
-                ),
-            });
-        }
-        let part_path_arc: Arc<str> = Arc::from(part_path.as_str());
-        let st_part = st
-            .backend
-            .stat(
-                request_identity.clone(),
-                bucket.clone(),
-                part_path_arc.clone(),
-            )
-            .await?;
-        if !st_part.exists {
-            return Err(S3Error::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        let mut left = st_part.size;
-        let mut read_off: i64 = 0;
-        while left > 0 {
-            let n = std::cmp::min(left, FS_RPC_CHUNK_BYTES as i64);
-            let chunk = st
+    if !(st.backend.supports_put_small_object() && st.backend.supports_write_session()) {
+        ensure_parent_dirs(st, request_identity.clone(), bucket.clone(), key).await?;
+    }
+    let final_relpath: Arc<str> = Arc::from(key);
+    let mut writer =
+        HybridObjectWriter::new(st, request_identity.clone(), bucket.clone(), final_relpath);
+    let assemble_result: Result<i64, S3Error> = async {
+        for p in parts.iter() {
+            let part_path = multipart_part_path(upload_id, p.part_number)?;
+            let etag_path = multipart_part_etag_path(upload_id, p.part_number)?;
+            let etag_path_arc: Arc<str> = Arc::from(etag_path.as_str());
+            let etag_stat = st
+                .backend
+                .stat(
+                    request_identity.clone(),
+                    bucket.clone(),
+                    etag_path_arc.clone(),
+                )
+                .await?;
+            if !etag_stat.exists {
+                return Err(S3Error::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            let n_et = std::cmp::min(etag_stat.size, FS_RPC_CHUNK_BYTES as i64);
+            let etag_bytes = st
                 .backend
                 .read_chunk_cached(
                     request_identity.clone(),
                     bucket.clone(),
-                    part_path_arc.clone(),
-                    read_off,
-                    n,
-                    st_part.size,
-                    st_part.mtime_ns,
+                    etag_path_arc,
+                    0,
+                    n_et,
+                    etag_stat.size,
+                    etag_stat.mtime_ns,
                 )
                 .await?;
-            if chunk.is_empty() {
-                break;
+            let etag_got = String::from_utf8_lossy(&etag_bytes).trim().to_string();
+            if etag_got != p.etag {
+                return Err(S3Error::InvalidRequest {
+                    detail: format!(
+                        "etag mismatch for part {}: expected={} got={}",
+                        p.part_number, p.etag, etag_got
+                    ),
+                });
             }
-            let nbytes = chunk.len() as i64;
-            out_hasher.update(&chunk);
-            // Chunk the write to satisfy the agent RPC size bound.
-            for part in chunk.chunks(FS_RPC_CHUNK_BYTES) {
-                st.backend
-                    .write_chunk(
+            let part_path_arc: Arc<str> = Arc::from(part_path.as_str());
+            let st_part = st
+                .backend
+                .stat(
+                    request_identity.clone(),
+                    bucket.clone(),
+                    part_path_arc.clone(),
+                )
+                .await?;
+            if !st_part.exists {
+                return Err(S3Error::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            let mut left = st_part.size;
+            let mut read_off: i64 = 0;
+            while left > 0 {
+                let n = std::cmp::min(left, FS_RPC_CHUNK_BYTES as i64);
+                let chunk = st
+                    .backend
+                    .read_chunk_cached(
                         request_identity.clone(),
                         bucket.clone(),
-                        Arc::from(key),
-                        off,
-                        part.to_vec(),
+                        part_path_arc.clone(),
+                        read_off,
+                        n,
+                        st_part.size,
+                        st_part.mtime_ns,
                     )
                     .await?;
-                off += part.len() as i64;
+                if chunk.is_empty() {
+                    break;
+                }
+                let nbytes = chunk.len() as i64;
+                out_hasher.update(&chunk);
+                writer.write(Bytes::from(chunk)).await?;
+                read_off += nbytes;
+                left -= nbytes;
             }
-            read_off += nbytes;
-            left -= nbytes;
         }
+        writer.finish().await
     }
-    st.backend
-        .truncate(
-            request_identity.clone(),
-            bucket.clone(),
-            Arc::from(key),
-            off,
-        )
-        .await?;
+    .await;
+    if let Err(err) = assemble_result {
+        writer.abort().await;
+        return Err(err);
+    }
     let etag = hex::encode(out_hasher.finalize());
     cleanup_upload(st, request_identity, bucket.clone(), upload_id).await?;
     Ok(resp_xml(
@@ -5016,6 +5513,14 @@ fn auth_verify_sigv4(st: &GatewayState, headers: &HeaderMap) -> Result<AuthCtx, 
             detail: format!("invalid access key: {}", access_key),
         });
     };
+    if st.initial_credentials_change_required()
+        || st.account_requires_credentials_change(account.username.as_str())
+    {
+        return Err(S3Error::AccessDenied {
+            detail: "change the initial admin credentials in the Web UI before using S3"
+                .to_string(),
+        });
+    }
     Ok(AuthCtx {
         username: account.username.clone(),
         secret_key: account.password.clone(),
@@ -5482,7 +5987,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{self, Child, Command, Stdio};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
     use std::time::Instant;
@@ -5492,13 +5997,15 @@ mod tests {
     use axum::body::HttpBody as _;
     use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
     use axum::routing::any;
+    use bytes::Bytes;
     use chrono::Utc;
     use parking_lot::Mutex;
     use tower::ServiceExt as _;
 
     use super::{
         FS_RPC_CHUNK_BYTES, FsMasterAdminBackend, FsS3Backend, FsTransferCreateJobArg,
-        GatewayAccessConfig, GatewayState, S3Error, encode_transfer_manifest_blob,
+        GatewayAccessConfig, GatewayState, HybridObjectWriter, S3Error,
+        encode_transfer_manifest_blob,
     };
     use crate::transfer::encode_transfer_manifest_blob_with_empty_dirs;
     use fluxon_fs_core::config::{
@@ -5518,10 +6025,11 @@ mod tests {
         FluxonFsTransferWorkerFileResultWire, FluxonFsTransferWorkerResultWire,
         export_rpc_paths_for_export_name_v1, transfer_collect_info_output_relpath,
     };
+    use sha2::{Digest as _, Sha256};
     use std::sync::OnceLock;
     use uuid::Uuid;
 
-    const TEST_TIKV_WORK_ROOT: &str = "/mnt/nvme0/fluxon_fs_transfer_tikv/rust_gateway";
+    const TEST_TIKV_WORK_ROOT: &str = "/tmp/fluxon-example/fluxon_fs_transfer_tikv/rust_gateway";
     const TEST_TIKV_READY_TIMEOUT_SECS: u64 = 180;
     const TEST_TIKV_PD_LEASE_SECS: u64 = 60;
     const TEST_TIKV_UNIFIED_READPOOL_MAX_THREADS: u64 = 4;
@@ -5774,14 +6282,36 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct ObjectWriteMetrics {
+        chunk_writes: Vec<(i64, usize)>,
+        regular_truncates: Vec<i64>,
+        small_object_puts: Vec<usize>,
+        session_opens: usize,
+        session_payloads: Vec<(i64, usize)>,
+        session_finalizes: Vec<i64>,
+        session_aborts: usize,
+    }
+
     #[derive(Clone, Default)]
     struct ObjectBackend {
         objects: Arc<Mutex<BTreeMap<(String, String), Vec<u8>>>>,
         directories: Arc<Mutex<BTreeSet<(String, String)>>>,
         rename_count: Arc<AtomicUsize>,
+        write_session_payload_bytes: Option<usize>,
+        write_metrics: Arc<Mutex<ObjectWriteMetrics>>,
+        fail_next_session_payload: Arc<AtomicBool>,
+        next_session_id: Arc<AtomicUsize>,
     }
 
     impl ObjectBackend {
+        fn with_write_session(payload_bytes: usize) -> Self {
+            Self {
+                write_session_payload_bytes: Some(payload_bytes.max(1)),
+                ..Self::default()
+            }
+        }
+
         fn insert(&self, bucket: &str, key: &str, data: &[u8]) {
             self.objects
                 .lock()
@@ -5799,6 +6329,18 @@ mod tests {
                 .lock()
                 .get(&(bucket.to_string(), key.to_string()))
                 .cloned()
+        }
+
+        fn write_metrics(&self) -> ObjectWriteMetrics {
+            self.write_metrics.lock().clone()
+        }
+
+        fn reset_write_metrics(&self) {
+            *self.write_metrics.lock() = ObjectWriteMetrics::default();
+        }
+
+        fn fail_next_session_payload(&self) {
+            self.fail_next_session_payload.store(true, Ordering::SeqCst);
         }
 
         fn has_directory_coverage(&self, bucket: &str, key: &str) -> bool {
@@ -6024,6 +6566,10 @@ mod tests {
                 let offset_usize: usize = offset.try_into().map_err(|_| S3Error::Internal {
                     detail: format!("offset overflow: {}", offset),
                 })?;
+                this.write_metrics
+                    .lock()
+                    .chunk_writes
+                    .push((offset, data.len()));
                 let mut objects = this.objects.lock();
                 let entry = objects.entry((bucket, key)).or_default();
                 let needed =
@@ -6036,6 +6582,131 @@ mod tests {
                     entry.resize(needed, 0);
                 }
                 entry[offset_usize..needed].copy_from_slice(&data);
+                Ok(())
+            })
+        }
+
+        fn supports_put_small_object(&self) -> bool {
+            true
+        }
+
+        fn put_small_object(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            export_name: Arc<str>,
+            relpath: Arc<str>,
+            data: Bytes,
+        ) -> futures::future::BoxFuture<'static, Result<(), S3Error>> {
+            let this = self.clone();
+            let bucket = export_name.to_string();
+            let key = relpath.to_string();
+            Box::pin(async move {
+                this.write_metrics.lock().small_object_puts.push(data.len());
+                this.objects
+                    .lock()
+                    .insert((bucket, key), data.as_ref().to_vec());
+                Ok(())
+            })
+        }
+
+        fn supports_write_session(&self) -> bool {
+            self.write_session_payload_bytes.is_some()
+        }
+
+        fn write_session_preferred_payload_bytes(&self) -> usize {
+            self.write_session_payload_bytes
+                .unwrap_or(FS_RPC_CHUNK_BYTES)
+        }
+
+        fn open_write_session(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            _export_name: Arc<str>,
+            _relpath: Arc<str>,
+        ) -> futures::future::BoxFuture<'static, Result<Arc<str>, S3Error>> {
+            let this = self.clone();
+            Box::pin(async move {
+                this.write_metrics.lock().session_opens += 1;
+                let id = this.next_session_id.fetch_add(1, Ordering::SeqCst) + 1;
+                let session_id: Arc<str> = Arc::from(format!("test-session-{}", id));
+                Ok(session_id)
+            })
+        }
+
+        fn buffer_write_session_payload(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            export_name: Arc<str>,
+            relpath: Arc<str>,
+            _session_id: Arc<str>,
+            offset: i64,
+            data: Bytes,
+        ) -> futures::future::BoxFuture<'static, Result<(), S3Error>> {
+            let this = self.clone();
+            let bucket = export_name.to_string();
+            let key = relpath.to_string();
+            Box::pin(async move {
+                this.write_metrics
+                    .lock()
+                    .session_payloads
+                    .push((offset, data.len()));
+                if this.fail_next_session_payload.swap(false, Ordering::SeqCst) {
+                    return Err(S3Error::Internal {
+                        detail: "injected write-session payload failure".to_string(),
+                    });
+                }
+                let offset_usize: usize = offset.try_into().map_err(|_| S3Error::Internal {
+                    detail: format!("offset overflow: {}", offset),
+                })?;
+                let needed =
+                    offset_usize
+                        .checked_add(data.len())
+                        .ok_or_else(|| S3Error::Internal {
+                            detail: "write overflow".to_string(),
+                        })?;
+                let mut objects = this.objects.lock();
+                let entry = objects.entry((bucket, key)).or_default();
+                if entry.len() < needed {
+                    entry.resize(needed, 0);
+                }
+                entry[offset_usize..needed].copy_from_slice(data.as_ref());
+                Ok(())
+            })
+        }
+
+        fn finalize_write_session(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            export_name: Arc<str>,
+            relpath: Arc<str>,
+            _session_id: Arc<str>,
+            final_size: i64,
+        ) -> futures::future::BoxFuture<'static, Result<(), S3Error>> {
+            let this = self.clone();
+            let bucket = export_name.to_string();
+            let key = relpath.to_string();
+            Box::pin(async move {
+                let size_usize: usize = final_size.try_into().map_err(|_| S3Error::Internal {
+                    detail: format!("size overflow: {}", final_size),
+                })?;
+                this.write_metrics.lock().session_finalizes.push(final_size);
+                let mut objects = this.objects.lock();
+                let entry = objects.entry((bucket, key)).or_default();
+                entry.resize(size_usize, 0);
+                Ok(())
+            })
+        }
+
+        fn abort_write_session(
+            &self,
+            _request_identity: FluxonFsRequestIdentity,
+            _export_name: Arc<str>,
+            _relpath: Arc<str>,
+            _session_id: Arc<str>,
+        ) -> futures::future::BoxFuture<'static, Result<(), S3Error>> {
+            let this = self.clone();
+            Box::pin(async move {
+                this.write_metrics.lock().session_aborts += 1;
                 Ok(())
             })
         }
@@ -6054,6 +6725,7 @@ mod tests {
                 let size_usize: usize = size.try_into().map_err(|_| S3Error::Internal {
                     detail: format!("size overflow: {}", size),
                 })?;
+                this.write_metrics.lock().regular_truncates.push(size);
                 let mut objects = this.objects.lock();
                 let entry = objects.entry((bucket, key)).or_default();
                 entry.resize(size_usize, 0);
@@ -6465,6 +7137,83 @@ mod tests {
         }
         std::fs::remove_file(&db_path).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_open_access_db_keeps_memory_path_in_memory() {
+        let literal_path = Path::new(":memory:");
+        assert!(!literal_path.exists());
+        let conn = open_access_db(":memory:").unwrap();
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'access_users'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+        drop(conn);
+        assert!(!literal_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_access_db_sets_mode_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = test_tikv_work_root().join(format!(
+            "fluxon_fs_s3_gateway_access_mode_pid{}_{}",
+            process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("access.db");
+        File::create(&db_path).unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let conn = open_access_db(db_path.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(conn);
+
+        std::fs::remove_file(&db_path).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_extract_xml_tag_text_decodes_etag_entities() {
+        assert_eq!(
+            super::extract_xml_tag_text("<ETag>&#34;abc&#34;</ETag>", "ETag").unwrap(),
+            "\"abc\""
+        );
+        assert_eq!(
+            super::extract_xml_tag_text("<ETag>&quot;abc&quot;</ETag>", "ETag").unwrap(),
+            "\"abc\""
+        );
+        assert_eq!(
+            super::extract_xml_tag_text("<ETag>&#x22;abc&#x22;</ETag>", "ETag").unwrap(),
+            "\"abc\""
+        );
+        assert_eq!(
+            super::extract_xml_tag_text("<ETag>\"abc\"</ETag>", "ETag").unwrap(),
+            "\"abc\""
+        );
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_body_accepts_rclone_quoted_etag_entities() {
+        let parts = super::parse_complete_multipart_body(
+            br#"<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                <Part><ETag>&#34;etag-one&#34;</ETag><PartNumber>1</PartNumber></Part>
+                <Part><ETag>&#34;etag-two&#34;</ETag><PartNumber>2</PartNumber></Part>
+            </CompleteMultipartUpload>"#,
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].etag, "etag-one");
+        assert_eq!(parts[1].part_number, 2);
+        assert_eq!(parts[1].etag, "etag-two");
     }
 
     fn test_gateway_access_config() -> GatewayAccessConfig {
@@ -6961,29 +7710,29 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
     #[test]
     fn test_build_fs_master_admin_managed_agent_exports_uses_runtime_and_overlay_per_agent() {
         let online_agent_ids = BTreeSet::from([
-            "fluxon_fs_agent_infra44-ThinkStation-PX".to_string(),
-            "fluxon_fs_agent_infra46-ThinkStation-PX".to_string(),
+            "fluxon_fs_agent_example-node-a".to_string(),
+            "fluxon_fs_agent_example-node-b".to_string(),
         ]);
         let runtime_agent_exports = vec![
             super::FsMasterAdminRuntimeAgentExports {
-                agent_instance_key: "fluxon_fs_agent_infra44-ThinkStation-PX".to_string(),
+                agent_instance_key: "fluxon_fs_agent_example-node-a".to_string(),
                 runtime_exports: vec![
                     super::FsMasterAdminRuntimeExportRecord {
-                        export_name: "deployer-runtime-infra44".to_string(),
-                        remote_root_dir_abs: "/mnt/nvme0/store_team_dev/fluxon_deploy".to_string(),
+                        export_name: "deployer-runtime-example-node-a".to_string(),
+                        remote_root_dir_abs: "/tmp/fluxon-example/deploy".to_string(),
                     },
                     super::FsMasterAdminRuntimeExportRecord {
                         export_name: "fluxon-release".to_string(),
-                        remote_root_dir_abs:
-                            "/mnt/nvme0/store_team_dev/fluxon_deploy/fluxon_release".to_string(),
+                        remote_root_dir_abs: "/tmp/fluxon-example/deploy/fluxon_release"
+                            .to_string(),
                     },
                 ],
             },
             super::FsMasterAdminRuntimeAgentExports {
-                agent_instance_key: "fluxon_fs_agent_infra46-ThinkStation-PX".to_string(),
+                agent_instance_key: "fluxon_fs_agent_example-node-b".to_string(),
                 runtime_exports: vec![super::FsMasterAdminRuntimeExportRecord {
-                    export_name: "deployer-runtime-infra46".to_string(),
-                    remote_root_dir_abs: "/mnt/nvme0/store_team_dev/fluxon_deploy".to_string(),
+                    export_name: "deployer-runtime-example-node-b".to_string(),
+                    remote_root_dir_abs: "/tmp/fluxon-example/deploy".to_string(),
                 }],
             },
         ];
@@ -7001,7 +7750,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 .iter()
                 .map(|record| record.export_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["deployer-runtime-infra44", "fluxon-release"]
+            vec!["deployer-runtime-example-node-a", "fluxon-release"]
         );
         assert_eq!(
             managed_agent_exports[1]
@@ -7009,7 +7758,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
                 .iter()
                 .map(|record| record.export_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["deployer-runtime-infra46"]
+            vec!["deployer-runtime-example-node-b"]
         );
     }
 
@@ -7017,12 +7766,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
     async fn test_snapshot_fs_master_admin_filters_offline_agents() {
         let fs_master_admin_backend = StaticFsMasterAdminBackend {
             members: vec![
-                test_agent_member("fluxon_fs_agent_infra44-ThinkStation-PX"),
-                test_agent_member("fluxon_fs_agent_infra46-ThinkStation-PX"),
+                test_agent_member("fluxon_fs_agent_example-node-a"),
+                test_agent_member("fluxon_fs_agent_example-node-b"),
             ],
-            online_member_ids: BTreeSet::from([
-                "fluxon_fs_agent_infra44-ThinkStation-PX".to_string()
-            ]),
+            online_member_ids: BTreeSet::from(["fluxon_fs_agent_example-node-a".to_string()]),
         };
         let st = GatewayState::new(
             "test_cluster".to_string(),
@@ -7046,28 +7793,28 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         )
         .unwrap();
         st.replace_fs_export_registry_for_agent(
-            "fluxon_fs_agent_infra44-ThinkStation-PX",
+            "fluxon_fs_agent_example-node-a",
             &[super::FsExportRegistryRecord {
-                export_name: "deployer-runtime-infra44".to_string(),
-                agent_instance_key: "fluxon_fs_agent_infra44-ThinkStation-PX".to_string(),
-                remote_root_dir_abs: "/mnt/nvme0/store_team_dev/fluxon_deploy".to_string(),
+                export_name: "deployer-runtime-example-node-a".to_string(),
+                agent_instance_key: "fluxon_fs_agent_example-node-a".to_string(),
+                remote_root_dir_abs: "/tmp/fluxon-example/deploy".to_string(),
                 export: super::agent_registry_export_for_name_and_root_v1(
-                    "deployer-runtime-infra44",
-                    "/mnt/nvme0/store_team_dev/fluxon_deploy",
+                    "deployer-runtime-example-node-a",
+                    "/tmp/fluxon-example/deploy",
                 ),
                 updated_unix_ms: 1,
             }],
         )
         .unwrap();
         st.replace_fs_export_registry_for_agent(
-            "fluxon_fs_agent_infra46-ThinkStation-PX",
+            "fluxon_fs_agent_example-node-b",
             &[super::FsExportRegistryRecord {
-                export_name: "deployer-runtime-infra46".to_string(),
-                agent_instance_key: "fluxon_fs_agent_infra46-ThinkStation-PX".to_string(),
-                remote_root_dir_abs: "/mnt/nvme0/store_team_dev/fluxon_deploy".to_string(),
+                export_name: "deployer-runtime-example-node-b".to_string(),
+                agent_instance_key: "fluxon_fs_agent_example-node-b".to_string(),
+                remote_root_dir_abs: "/tmp/fluxon-example/deploy".to_string(),
                 export: super::agent_registry_export_for_name_and_root_v1(
-                    "deployer-runtime-infra46",
-                    "/mnt/nvme0/store_team_dev/fluxon_deploy",
+                    "deployer-runtime-example-node-b",
+                    "/tmp/fluxon-example/deploy",
                 ),
                 updated_unix_ms: 1,
             }],
@@ -7079,12 +7826,12 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert_eq!(snapshot.runtime_agent_exports.len(), 1);
         assert_eq!(
             snapshot.runtime_agent_exports[0].agent_instance_key,
-            "fluxon_fs_agent_infra44-ThinkStation-PX"
+            "fluxon_fs_agent_example-node-a"
         );
         assert_eq!(snapshot.managed_agent_exports.len(), 1);
         assert_eq!(
             snapshot.managed_agent_exports[0].agent_instance_key,
-            "fluxon_fs_agent_infra44-ThinkStation-PX"
+            "fluxon_fs_agent_example-node-a"
         );
     }
 
@@ -7198,6 +7945,45 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             buckets,
             build_test_gateway_access_config_without_transfer(test_access_db_path()),
             "",
+        )
+    }
+
+    fn test_state_with_bootstrap_access_model(
+        backend: Arc<dyn FsS3Backend>,
+        buckets: &[&str],
+        access_db_path: String,
+        bootstrap_access_model: FluxonFsAccessModel,
+    ) -> Arc<GatewayState> {
+        let mut exports = BTreeMap::new();
+        for bucket in buckets {
+            exports.insert((*bucket).to_string(), test_export(bucket));
+        }
+        Arc::new(
+            GatewayState::new(
+                "test_cluster".to_string(),
+                String::new(),
+                GatewayAccessConfig {
+                    access_db_path,
+                    bootstrap_access_model,
+                    transfer_state_store: None,
+                },
+                Arc::new(FluxonFsGlobalConfig {
+                    stale_window_ms: 0,
+                    write_session_target_inflight_bytes:
+                        FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
+                    rules: Vec::new(),
+                    exports,
+                }),
+                FluxonFsS3GatewayConfig {
+                    get_object_inflight_pieces: 4,
+                    kv_miss_policy: FluxonFsS3KvMissPolicy::RemoteRead,
+                },
+                backend,
+                Arc::new(TestFsMasterAdminBackend),
+                None,
+                None,
+            )
+            .unwrap(),
         )
     }
 
@@ -10565,6 +11351,231 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert_eq!(restarted_s3_response.status(), StatusCode::OK);
     }
 
+    fn sigv4_auth_headers(access_key: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!(
+                "AWS4-HMAC-SHA256 Credential={}/20260808/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=00",
+                access_key
+            ))
+            .unwrap(),
+        );
+        headers.insert("x-amz-date", HeaderValue::from_static("20260808T000000Z"));
+        headers
+    }
+
+    #[tokio::test]
+    async fn test_initial_credentials_require_setup_and_persist_renamed_account() {
+        let root = test_tikv_work_root().join(format!(
+            "fluxon_fs_s3_gateway_initial_credentials_pid{}_{}",
+            process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db_path = root.join("access.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let bootstrap_model = FluxonFsAccessModel {
+            users: vec![FluxonFsAccessUser {
+                username: "admin".to_string(),
+                password: "admin".to_string(),
+                can_manage_users: true,
+            }],
+            scope_access: Vec::new(),
+        };
+        let st = test_state_with_bootstrap_access_model(
+            Arc::new(ObjectBackend::default()),
+            &["demo"],
+            db_path_text.clone(),
+            bootstrap_model.clone(),
+        );
+
+        assert!(st.initial_credentials_change_required());
+        let err = super::auth_verify_sigv4(&st, &sigv4_auth_headers("admin")).unwrap_err();
+        assert!(
+            matches!(err, S3Error::AccessDenied { detail } if detail.contains("change the initial admin credentials"))
+        );
+        let mut malformed_proxy_headers = HeaderMap::new();
+        malformed_proxy_headers.insert(super::HDR_ORIGINAL_URI, HeaderValue::from_static("/"));
+        let malformed_redirect =
+            super::ui_initial_credentials_redirect(&malformed_proxy_headers, &st);
+        assert_eq!(
+            malformed_redirect
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap(),
+            "/ui/account/password/"
+        );
+
+        let admin_auth = basic_auth_headers("admin", "admin")
+            .get(axum::http::header::AUTHORIZATION)
+            .unwrap()
+            .clone();
+        let redirect = super::build_router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/")
+                    .header(axum::http::header::AUTHORIZATION, admin_auth.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(redirect.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap(),
+            "/ui/account/password/"
+        );
+
+        let setup_page = super::build_router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/account/password/")
+                    .header(axum::http::header::AUTHORIZATION, admin_auth.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup_page.status(), StatusCode::OK);
+        let setup_body = hyper::body::to_bytes(setup_page.into_body()).await.unwrap();
+        let setup_html = String::from_utf8_lossy(&setup_body);
+        assert!(setup_html.contains("Change Credentials"));
+        assert!(setup_html.contains("name=\"new_username\""));
+
+        let setup_response = super::build_router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ui/account/password/")
+                    .header(axum::http::header::AUTHORIZATION, admin_auth.clone())
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(Body::from(
+                        "new_username=operator&new_password=s3-secret&confirm_new_password=s3-secret",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup_response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            setup_response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap(),
+            "../../"
+        );
+
+        assert!(!st.initial_credentials_change_required());
+        assert!(super::find_account_by_username(&st, "admin").is_none());
+        let account = super::find_account_by_username(&st, "operator").unwrap();
+        assert_eq!(account.password, "s3-secret");
+        assert!(account.can_manage_users);
+        assert!(super::auth_verify_sigv4(&st, &sigv4_auth_headers("operator")).is_ok());
+
+        let old_credentials = super::build_router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/")
+                    .header(axum::http::header::AUTHORIZATION, admin_auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_credentials.status(), StatusCode::UNAUTHORIZED);
+
+        let new_auth = basic_auth_headers("operator", "s3-secret")
+            .get(axum::http::header::AUTHORIZATION)
+            .unwrap()
+            .clone();
+        let buckets_page = super::build_router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/")
+                    .header(axum::http::header::AUTHORIZATION, new_auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(buckets_page.status(), StatusCode::OK);
+
+        let password_page = super::build_router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/account/password/")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        basic_auth_headers("operator", "s3-secret")
+                            .get(axum::http::header::AUTHORIZATION)
+                            .unwrap()
+                            .clone(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(password_page.status(), StatusCode::OK);
+        let password_page_body = hyper::body::to_bytes(password_page.into_body())
+            .await
+            .unwrap();
+        let password_page_html = String::from_utf8_lossy(&password_page_body);
+        assert!(password_page_html.contains("Change Password"));
+        assert!(!password_page_html.contains("name=\"new_username\""));
+
+        let password_update = super::build_router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ui/account/password/")
+                    .header(
+                        axum::http::header::AUTHORIZATION,
+                        basic_auth_headers("operator", "s3-secret")
+                            .get(axum::http::header::AUTHORIZATION)
+                            .unwrap()
+                            .clone(),
+                    )
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(Body::from(
+                        "current_password=s3-secret&new_password=next-secret&confirm_new_password=next-secret",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(password_update.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            super::find_account_by_username(&st, "operator")
+                .unwrap()
+                .password,
+            "next-secret"
+        );
+
+        drop(st);
+        let restarted = test_state_with_bootstrap_access_model(
+            Arc::new(ObjectBackend::default()),
+            &["demo"],
+            db_path_text,
+            bootstrap_model,
+        );
+        assert!(!restarted.initial_credentials_change_required());
+        assert!(super::find_account_by_username(&restarted, "admin").is_none());
+        assert!(super::find_account_by_username(&restarted, "operator").is_some());
+        drop(restarted);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn test_ui_require_identity_admin_can_view_as() {
         let backend = Arc::new(ObjectBackend::default());
@@ -10700,7 +11711,7 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             },
         ];
 
-        let model = super::access_model_from_permission_list(&permission_list).unwrap();
+        let model = super::access_model_from_s3_permission_list(&permission_list).unwrap();
         assert_eq!(
             model.users,
             vec![
@@ -10739,9 +11750,10 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             ]
         );
 
-        let roundtrip_permission_list = super::permission_list_from_access_model(&model).unwrap();
+        let roundtrip_permission_list =
+            super::s3_permission_list_from_access_model(&model).unwrap();
         let roundtrip_model =
-            super::access_model_from_permission_list(&roundtrip_permission_list).unwrap();
+            super::access_model_from_s3_permission_list(&roundtrip_permission_list).unwrap();
         assert_eq!(roundtrip_model, model);
     }
 
@@ -10755,8 +11767,9 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             }],
             scope_access: Vec::new(),
         };
-        let permission_list = super::permission_list_from_access_model(&model).unwrap();
-        let roundtrip_model = super::access_model_from_permission_list(&permission_list).unwrap();
+        let permission_list = super::s3_permission_list_from_access_model(&model).unwrap();
+        let roundtrip_model =
+            super::access_model_from_s3_permission_list(&permission_list).unwrap();
         assert_eq!(roundtrip_model.users, model.users);
         assert!(roundtrip_model.scope_access.is_empty());
     }
@@ -11159,13 +12172,13 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
     #[tokio::test]
     async fn test_bucket_root_put_is_noop_success_for_existing_export() {
         let backend = Arc::new(ObjectBackend::default());
-        let st = test_state_with_buckets(backend, &["deployer-runtime-infra44"]);
+        let st = test_state_with_buckets(backend, &["deployer-runtime-example-node-a"]);
         let resp = super::handle_any_authed_impl(
             st.clone(),
             test_auth_ctx(&st),
             Method::PUT,
-            "deployer-runtime-infra44".to_string(),
-            "/deployer-runtime-infra44".parse().unwrap(),
+            "deployer-runtime-example-node-a".to_string(),
+            "/deployer-runtime-example-node-a".parse().unwrap(),
             HeaderMap::new(),
             Body::empty(),
         )
@@ -11221,14 +12234,14 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
     #[tokio::test]
     async fn test_put_object_after_bucket_root_put_writes_object() {
         let backend = Arc::new(ObjectBackend::default());
-        let st = test_state_with_buckets(backend.clone(), &["deployer-runtime-infra44"]);
+        let st = test_state_with_buckets(backend.clone(), &["deployer-runtime-example-node-a"]);
 
         let bucket_resp = super::handle_any_authed_impl(
             st.clone(),
             test_auth_ctx(&st),
             Method::PUT,
-            "deployer-runtime-infra44".to_string(),
-            "/deployer-runtime-infra44".parse().unwrap(),
+            "deployer-runtime-example-node-a".to_string(),
+            "/deployer-runtime-example-node-a".parse().unwrap(),
             HeaderMap::new(),
             Body::empty(),
         )
@@ -11240,8 +12253,8 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
             st.clone(),
             test_auth_ctx(&st),
             Method::PUT,
-            "deployer-runtime-infra44/download/rclone-e2e.txt".to_string(),
-            "/deployer-runtime-infra44/download/rclone-e2e.txt"
+            "deployer-runtime-example-node-a/download/rclone-e2e.txt".to_string(),
+            "/deployer-runtime-example-node-a/download/rclone-e2e.txt"
                 .parse()
                 .unwrap(),
             HeaderMap::new(),
@@ -11253,10 +12266,196 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         assert_eq!(object_resp.status(), StatusCode::OK);
         assert_eq!(
             backend
-                .get("deployer-runtime-infra44", "download/rclone-e2e.txt")
+                .get("deployer-runtime-example-node-a", "download/rclone-e2e.txt")
                 .unwrap(),
             b"fluxon-rclone-e2e\n".to_vec()
         );
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_put_uses_single_small_object_rpc_below_session_threshold() {
+        let threshold = fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES;
+        let data = vec![0x31; threshold - 1];
+        let backend = ObjectBackend::with_write_session(FS_RPC_CHUNK_BYTES * 2);
+        let st = test_state_with_buckets_without_transfer(Arc::new(backend.clone()), &["demo"]);
+
+        let (_etag, size) = super::put_object_stream_with_sha256_etag(
+            &st,
+            test_request_identity(),
+            Arc::from("demo"),
+            Arc::from("small.bin"),
+            Body::from(data.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(size, data.len() as i64);
+        assert_eq!(backend.get("demo", "small.bin"), Some(data));
+        let metrics = backend.write_metrics();
+        assert_eq!(metrics.session_opens, 0);
+        assert!(metrics.session_payloads.is_empty());
+        assert!(metrics.session_finalizes.is_empty());
+        assert_eq!(metrics.session_aborts, 0);
+        assert!(metrics.chunk_writes.is_empty());
+        assert!(metrics.regular_truncates.is_empty());
+        assert_eq!(metrics.small_object_puts, vec![threshold - 1]);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_writer_promotes_at_threshold_and_truncates_short_overwrite() {
+        let threshold = fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES;
+        let session_payload_bytes = FS_RPC_CHUNK_BYTES * 2;
+        let backend = ObjectBackend::with_write_session(session_payload_bytes);
+        backend.insert("demo", "large.bin", &vec![0xee; threshold + 4096]);
+        let st = test_state_with_buckets_without_transfer(Arc::new(backend.clone()), &["demo"]);
+        let mut writer = HybridObjectWriter::new(
+            &st,
+            test_request_identity(),
+            Arc::from("demo"),
+            Arc::from("large.bin"),
+        );
+
+        let mut expected = vec![0x41; threshold - 1];
+        writer.write(Bytes::from(expected.clone())).await.unwrap();
+        assert_eq!(backend.write_metrics().session_opens, 0);
+
+        writer.write(Bytes::from_static(b"B")).await.unwrap();
+        expected.push(b'B');
+        assert_eq!(backend.write_metrics().session_opens, 1);
+
+        let tail = vec![0x43; 123];
+        writer.write(Bytes::from(tail.clone())).await.unwrap();
+        expected.extend_from_slice(&tail);
+        let size = writer.finish().await.unwrap();
+
+        assert_eq!(size, expected.len() as i64);
+        assert_eq!(backend.get("demo", "large.bin"), Some(expected.clone()));
+        let metrics = backend.write_metrics();
+        assert!(metrics.chunk_writes.is_empty());
+        assert!(metrics.regular_truncates.is_empty());
+        assert_eq!(metrics.session_opens, 1);
+        assert_eq!(
+            metrics.session_payloads,
+            vec![
+                (0, session_payload_bytes),
+                (session_payload_bytes as i64, session_payload_bytes),
+                (threshold as i64, 123),
+            ]
+        );
+        assert_eq!(metrics.session_finalizes, vec![expected.len() as i64]);
+        assert_eq!(metrics.session_aborts, 0);
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_put_aborts_session_after_payload_failure() {
+        let threshold = fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES;
+        let backend = ObjectBackend::with_write_session(threshold);
+        backend.fail_next_session_payload();
+        let st = test_state_with_buckets_without_transfer(Arc::new(backend.clone()), &["demo"]);
+
+        let err = super::put_object_stream_with_sha256_etag(
+            &st,
+            test_request_identity(),
+            Arc::from("demo"),
+            Arc::from("failed.bin"),
+            Body::from(vec![0x55; threshold]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, S3Error::Internal { detail } if detail.contains("injected")));
+        let metrics = backend.write_metrics();
+        assert_eq!(metrics.session_opens, 1);
+        assert_eq!(metrics.session_payloads, vec![(0, threshold)]);
+        assert!(metrics.session_finalizes.is_empty());
+        assert_eq!(metrics.session_aborts, 1);
+    }
+
+    #[tokio::test]
+    async fn test_multipart_complete_uses_hybrid_session_and_preserves_bytes_and_etag() {
+        let threshold = fluxon_fs_core::s3_gateway::FS_S3_WRITE_SESSION_THRESHOLD_BYTES;
+        let backend = ObjectBackend::with_write_session(FS_RPC_CHUNK_BYTES * 2);
+        let st = test_state_with_buckets_without_transfer(Arc::new(backend.clone()), &["demo"]);
+        let request_identity = test_request_identity();
+        let upload_id = super::multipart_create_upload_id(
+            &st,
+            request_identity.clone(),
+            Arc::from("demo"),
+            "joined.bin",
+        )
+        .await
+        .unwrap();
+        let part1 = vec![0x61; threshold / 2];
+        let part2 = vec![0x62; threshold - part1.len()];
+
+        let part1_resp = super::multipart_upload_part(
+            &st,
+            request_identity.clone(),
+            Arc::from("demo"),
+            "joined.bin",
+            &upload_id,
+            1,
+            Body::from(part1.clone()),
+        )
+        .await
+        .unwrap();
+        let etag1 = part1_resp
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        let part2_resp = super::multipart_upload_part(
+            &st,
+            request_identity.clone(),
+            Arc::from("demo"),
+            "joined.bin",
+            &upload_id,
+            2,
+            Body::from(part2.clone()),
+        )
+        .await
+        .unwrap();
+        let etag2 = part2_resp
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        backend.reset_write_metrics();
+
+        let complete_xml = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&#34;{}&#34;</ETag></Part><Part><PartNumber>2</PartNumber><ETag>&#34;{}&#34;</ETag></Part></CompleteMultipartUpload>",
+            etag1, etag2
+        );
+        let complete_resp = super::multipart_complete(
+            &st,
+            request_identity,
+            Arc::from("demo"),
+            "joined.bin",
+            &upload_id,
+            Body::from(complete_xml),
+        )
+        .await
+        .unwrap();
+
+        let mut expected = part1;
+        expected.extend_from_slice(&part2);
+        assert_eq!(backend.get("demo", "joined.bin"), Some(expected.clone()));
+        let expected_etag = hex::encode(Sha256::digest(&expected));
+        let response_body = hyper::body::to_bytes(complete_resp.into_body())
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response_body).contains(&expected_etag));
+        let metrics = backend.write_metrics();
+        assert!(metrics.chunk_writes.is_empty());
+        assert_eq!(metrics.session_opens, 1);
+        assert_eq!(metrics.session_finalizes, vec![threshold as i64]);
+        assert_eq!(metrics.session_aborts, 0);
     }
 
     #[tokio::test]

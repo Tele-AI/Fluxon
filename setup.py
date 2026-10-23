@@ -6,6 +6,8 @@ Setup script for fluxon
 from setuptools import setup, find_packages
 import os
 
+from setup_and_pack.package_contract import PYTHON_DISTRIBUTION_NAME
+
 # Read version from __init__.py
 def get_version():
     init_file = os.path.join(os.path.dirname(__file__), 'fluxon_py', '__init__.py')
@@ -13,7 +15,7 @@ def get_version():
         for line in f:
             if line.startswith('__version__'):
                 return line.split('=')[1].strip().strip('"\'')
-    return "0.2.2"
+    raise RuntimeError(f"Missing __version__ in {init_file}")
 
 # Read README if exists
 def get_long_description():
@@ -48,14 +50,20 @@ _extras = {
 }
 
 setup(
-    name='fluxon-py',
+    name=PYTHON_DISTRIBUTION_NAME,
     version=get_version(),
     description='Fluxon - high-performance distributed cache and message queue for AI workloads',
     long_description=get_long_description(),
     long_description_content_type='text/markdown',
     author='TeleAI Infra Team',
-    author_email='',
-    url='',
+    url='https://github.com/Tele-AI/Fluxon',
+    project_urls={
+        'Documentation': 'https://tele-ai.github.io/Fluxon/',
+        'Issues': 'https://github.com/Tele-AI/Fluxon/issues',
+        'Source': 'https://github.com/Tele-AI/Fluxon',
+    },
+    license='Apache-2.0',
+    license_files=('LICENSE',),
     packages=find_packages(include=["fluxon_py", "fluxon_py.*"]),
     python_requires='>=3.10',
     install_requires=get_install_requires(),
@@ -63,6 +71,8 @@ setup(
     classifiers=[
         'Development Status :: 3 - Alpha',
         'Intended Audience :: Developers',
+        'License :: OSI Approved :: Apache Software License',
+        'Operating System :: POSIX :: Linux',
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.10',
         'Programming Language :: Python :: 3.11',

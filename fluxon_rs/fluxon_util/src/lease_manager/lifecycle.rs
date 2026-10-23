@@ -8,21 +8,23 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 use anyhow::{Context, Result as AnyResult};
 use etcd_client::Client;
 
 use super::keepalive_actor::{
-    self, ActorRegisterInvocation, EtcdState, LeaseKey, OneTtlKeepAliveInner, ensure_inner_running,
+    self, ActorRegisterInvocation, EtcdState, LeaseActorMapKey, LeaseKeepaliveFailure,
+    LeaseKeepaliveFailurePolicy, LeaseKeepaliveOperation, LeaseKey, OneTtlKeepAliveInner,
+    ensure_inner_running,
 };
 use super::lease_backend_handle::{LeaseBackendHandle, LeaseBackendInner};
-use super::lease_backend_uid::{LeaseBackendUid, LeaseRegisterKind, LeaseType};
+use super::lease_backend_uid::{KvKeepaliveLease, LeaseBackendUid, LeaseRegisterKind, LeaseType};
 use super::lease_handle::{GeneralLease, LeaseEntry, LeaseEntryKind};
 use crate::auto_clean_map::{AutoCleanMap, AutoCleanMapEntry};
+use crate::etcd::{PooledEtcdClient, etcd_clients_pool};
 
 const INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES: usize = 5;
-const INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS: u64 = 60_000;
+const INITIAL_ETCD_KEEPALIVE_PROBE_TOTAL_BUDGET_MS: u64 = 60_000;
 
 // ---------- Debug Helpers: register_by / keepalive log ----------
 
@@ -73,8 +75,8 @@ pub fn snapshot_active_lease_debug() -> Vec<(i64, LeaseBackendUid, u64, Option<S
     // leases will not appear here even if an actor is still running
     // its final tick.
     let mut out = Vec::new();
-    for (ttl, inner) in actor_map().snapshot_map(|ttl, inner| (*ttl, inner.clone())) {
-        let ttl_seconds = ttl;
+    for (actor_key, inner) in actor_map().snapshot_map(|key, inner| (*key, inner.clone())) {
+        let ttl_seconds = actor_key.ttl_seconds();
         let entries: Vec<(LeaseKey, ())> = inner.registry.snapshot_map(|k, _| (k.clone(), ())); // only need the key
         for (key, _) in entries.into_iter() {
             let backend = key.backend_uid().clone();
@@ -96,19 +98,25 @@ fn backend_map() -> &'static AutoCleanMap<LeaseBackendUid, LeaseBackendInner> {
 /// Acquire a backend handle that carries the AutoCleanMapEntry guard.
 pub fn acquire_backend_handle(
     uid: LeaseBackendUid,
-    kv_cb: Option<Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>>,
+    kv_keepalive: Option<KvKeepaliveLease>,
     etcd_client: Option<Client>,
+    etcd_pool_entry: Option<PooledEtcdClient>,
     rt: tokio::runtime::Handle,
 ) -> LeaseBackendHandle {
     let entry: AutoCleanMapEntry<LeaseBackendUid, LeaseBackendInner> =
         backend_map().get_or_init(uid.clone(), || match &uid {
-            LeaseBackendUid::KvClientWithCallbacks { cluster, .. } => {
-                let cb = kv_cb.expect(
-                    "kvclient backend acquire requires keepalive callback on first creation",
+            LeaseBackendUid::KvClient {
+                cluster,
+                instance_key,
+                ..
+            } => {
+                let keepalive = kv_keepalive.expect(
+                    "kvclient backend acquire requires keepalive operation on first creation",
                 );
                 LeaseBackendInner::KvClient {
                     _cluster: cluster.clone(),
-                    keepalive_cb: cb,
+                    _instance_key: instance_key.clone(),
+                    keepalive,
                     rt: rt.clone(),
                 }
             }
@@ -121,6 +129,8 @@ pub fn acquire_backend_handle(
                     .to_vec();
                 LeaseBackendInner::Etcd {
                     _endpoints: endpoints,
+                    _pool_entry: etcd_pool_entry
+                        .expect("etcd backend acquire requires pool entry on first creation"),
                     client,
                     states: AutoCleanMap::new(),
                     rt: rt.clone(),
@@ -130,42 +140,109 @@ pub fn acquire_backend_handle(
     LeaseBackendHandle::from_entry(entry)
 }
 
-// get_handle() removed: no external callers; backend acquisition flows through guards.
+fn acquire_existing_backend_handle(uid: &LeaseBackendUid) -> Option<LeaseBackendHandle> {
+    backend_map()
+        .get_existing(uid)
+        .map(LeaseBackendHandle::from_entry)
+}
+
+/// Clone the client owned by a live registered etcd backend.
+///
+/// MPMC subchannels use this contract after their parent member lease has
+/// registered the backend. Failing here exposes an ownership-ordering bug
+/// instead of silently opening one connection per subchannel.
+pub fn registered_etcd_client(uid: &LeaseBackendUid) -> AnyResult<Client> {
+    if uid.kind() != LeaseType::Etcd {
+        anyhow::bail!("registered_etcd_client requires an Etcd backend uid");
+    }
+    acquire_existing_backend_handle(uid)
+        .and_then(|handle| handle.etcd_client())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "etcd backend is not registered for endpoints {:?}",
+                uid.endpoints().unwrap_or_default()
+            )
+        })
+}
 
 // ---------- Per-TTL Actor Map & Registration Helpers ----------
 
-// Rust-side keepalive callback type for KvClient entries.
-pub(crate) type OnKeepalive = Arc<dyn Fn(u64) -> AnyResult<()> + Send + Sync + 'static>;
+pub(crate) type OnKeepalive = KvKeepaliveLease;
 
-fn actor_map() -> &'static AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>> {
-    static MAP: OnceLock<AutoCleanMap<i64, Arc<OneTtlKeepAliveInner>>> = OnceLock::new();
+fn register_periodic_keepalive(
+    actor_guard: &AutoCleanMapEntry<LeaseActorMapKey, Arc<OneTtlKeepAliveInner>>,
+    key: &LeaseKey,
+    handle: LeaseBackendHandle,
+) -> super::keepalive_actor::LeaseKeepaliveRegistration<LeaseKey> {
+    let operation_handle = handle.clone();
+    let operation: LeaseKeepaliveOperation<LeaseKey> = Arc::new(move |key| {
+        let handle = operation_handle.clone();
+        Box::pin(async move {
+            handle
+                .keepalive(key.lease_id())
+                .await
+                .map_err(|err| format!("{err:?}"))
+        })
+    });
+    let lease_id = key.lease_id();
+    let on_failure = Arc::new(move |failure: LeaseKeepaliveFailure| {
+        keepalive_actor::log_keepalive_error_rate_limited(lease_id, || match failure {
+            LeaseKeepaliveFailure::Operation(err) => tracing::error!(
+                lease_id,
+                error = %err,
+                "lease keepalive operation failed; retrying this lease"
+            ),
+            LeaseKeepaliveFailure::Timeout { timeout } => tracing::error!(
+                lease_id,
+                timeout_ms = timeout.as_millis(),
+                "lease keepalive operation timed out; retrying this lease"
+            ),
+        });
+    });
+    actor_guard
+        .actor
+        .register_replacing(
+            key.clone(),
+            operation,
+            LeaseKeepaliveFailurePolicy::RetryAfter(keepalive_actor::MQ_KEEPALIVE_RETRY_DELAY),
+            on_failure,
+        )
+        .expect("new MQ lease registry entry must own a unique keepalive registration")
+}
+
+fn actor_map() -> &'static AutoCleanMap<LeaseActorMapKey, Arc<OneTtlKeepAliveInner>> {
+    static MAP: OnceLock<AutoCleanMap<LeaseActorMapKey, Arc<OneTtlKeepAliveInner>>> =
+        OnceLock::new();
     MAP.get_or_init(|| AutoCleanMap::new())
 }
 
 /// Register a lease entry into `inner.registry`.
 ///
-/// 注意：KvClient 路径下不再在这里做额外的“立即 keepalive”：
-/// - 第一轮 keepalive 已在 `register_lease_for_keepalive` 中通过
-///   `spawn_blocking` 同步执行，并将错误显式返回给调用方；
-/// - actor 仅负责在后续 tick 中按 TTL 周期驱动 keepalive，避免出现
-///   “入口和 actor 各自做一次 probe” 的双重语义。
+/// KvClient registration does not run an immediate keepalive here:
+/// - the validated branch relies on its caller-owned control-plane contract;
+/// - the regular branch probes synchronously in `register_lease_for_keepalive`;
+/// - the actor only drives later TTL-cadence keepalives.
 pub(crate) fn actor_register_entry(
-    actor_guard: &AutoCleanMapEntry<i64, Arc<OneTtlKeepAliveInner>>,
+    actor_guard: &AutoCleanMapEntry<LeaseActorMapKey, Arc<OneTtlKeepAliveInner>>,
     key: LeaseKey,
     inv: &ActorRegisterInvocation,
     rt: tokio::runtime::Handle,
 ) -> AutoCleanMapEntry<LeaseKey, LeaseEntry> {
     match inv {
-        ActorRegisterInvocation::KvClient { cb, .. } => {
+        ActorRegisterInvocation::KvClient { keepalive, .. } => {
             let registry = &(**actor_guard).registry;
             let (entry, created) = registry.get_or_init_with(key.clone(), || {
                 let handle = acquire_backend_handle(
                     key.backend_uid().clone(),
-                    Some(cb.clone()),
+                    Some(keepalive.clone()),
+                    None,
                     None,
                     rt.clone(),
                 );
+                let keepalive_registration =
+                    register_periodic_keepalive(actor_guard, &key, handle.clone());
                 LeaseEntry {
+                    _keepalive_registration: keepalive_registration,
                     kind: LeaseEntryKind::KvClient { handle },
                     _actor_guard: actor_guard.clone(),
                     key: key.clone(),
@@ -173,24 +250,27 @@ pub(crate) fn actor_register_entry(
                 }
             });
             if !created {
-                tracing::warn!(
-                    "duplicate KvClient lease registration ignored: backend={:?} lease_id={}",
+                tracing::debug!(
+                    "reuse KvClient lease registration: backend={:?} lease_id={}",
                     key.backend_uid(),
                     key.lease_id()
                 );
             }
             entry
         }
-        ActorRegisterInvocation::Etcd {
-            client,
-            revoke_on_drop,
-        } => {
+        ActorRegisterInvocation::Etcd { client } => {
             let registry = &(**actor_guard).registry;
             let (entry, created) = registry.get_or_init_with(key.clone(), || {
+                let endpoints = key
+                    .backend_uid()
+                    .endpoints()
+                    .expect("etcd backend uid must carry endpoints")
+                    .to_vec();
                 let handle = acquire_backend_handle(
                     key.backend_uid().clone(),
                     None,
                     Some(client.clone()),
+                    Some(etcd_clients_pool().acquire(endpoints)),
                     rt.clone(),
                 );
                 let lid = key.lease_id();
@@ -203,19 +283,19 @@ pub(crate) fn actor_register_entry(
                         last_stage: "init",
                     }))
                 });
+                let keepalive_registration =
+                    register_periodic_keepalive(actor_guard, &key, handle.clone());
                 LeaseEntry {
-                    kind: LeaseEntryKind::Etcd {
-                        handle,
-                        revoke_on_drop: *revoke_on_drop,
-                    },
+                    _keepalive_registration: keepalive_registration,
+                    kind: LeaseEntryKind::Etcd { handle },
                     _actor_guard: actor_guard.clone(),
                     key: key.clone(),
                     _etcd_state_guard: Some(state_guard),
                 }
             });
             if !created {
-                tracing::warn!(
-                    "duplicate Etcd lease registration ignored: backend={:?} lease_id={}",
+                tracing::debug!(
+                    "reuse Etcd lease registration: backend={:?} lease_id={}",
                     key.backend_uid(),
                     key.lease_id()
                 );
@@ -230,7 +310,6 @@ pub(crate) fn actor_get_or_spawn_and_register(
     ttl_seconds: i64,
     key: LeaseKey,
     inv: &ActorRegisterInvocation,
-    spawn_cb: impl FnOnce(Arc<OneTtlKeepAliveInner>),
     rt: tokio::runtime::Handle,
 ) -> AutoCleanMapEntry<LeaseKey, LeaseEntry> {
     if let ActorRegisterInvocation::KvClient {
@@ -240,47 +319,25 @@ pub(crate) fn actor_get_or_spawn_and_register(
         record_register_by(key.lease_id(), lbl.clone());
     }
 
-    let (actor_entry, created) = actor_map().get_or_init_with(ttl_seconds, || {
-        let inner = Arc::new(OneTtlKeepAliveInner {
-            ttl_seconds,
-            registry: AutoCleanMap::new(),
-            running_state: Mutex::new(false),
-        });
-        spawn_cb(inner.clone());
-        inner
+    let actor_key = LeaseActorMapKey::new(ttl_seconds, rt.id());
+    let (actor_entry, _created) = actor_map().get_or_init_with(actor_key, || {
+        Arc::new(OneTtlKeepAliveInner::new(ttl_seconds))
     });
 
     let entry = actor_register_entry(&actor_entry, key.clone(), inv, rt.clone());
-    // If the actor existed previously but might be exiting, ensure it is running.
-    if !created {
-        let inner = (*actor_entry).clone();
-        let rth = rt.clone();
-        rt.spawn(async move {
-            ensure_inner_running(rth, inner).await;
-        });
-    }
+    ensure_inner_running(rt, (*actor_entry).clone());
     entry
 }
 
 // ---------- LeaseEntry Drop (centralized lifecycle cleanup) ----------
-// Why no interaction with the actor is needed on Drop:
-// - The registry is an AutoCleanMap<LeaseKey, LeaseEntry>. The user-facing
-//   GeneralLease holds an AutoCleanMapEntry<LeaseKey, LeaseEntry> guard. When
-//   that guard is dropped, the map entry is removed and the value (LeaseEntry)
-//   is dropped immediately.
-// - The actor loop drives keepalives by taking a snapshot of the registry each
-//   tick via snapshot_filter_map. Once an entry is removed, future snapshots no
-//   longer include it, so there is no need to send an explicit "unregister"
-//   message to the actor.
-// - Concurrency window: if a snapshot containing this entry has already been
-//   taken for the current tick while Drop happens, the snapshot holds clones
-//   (e.g., Arc<EtcdState>). That snapshot may perform one last keepalive for
-//   this tick and then release naturally; the next tick will not see the entry.
-//   This one-last-tick behavior is benign and has no side effects beyond the
-//   regular cadence (we do not perform any keepalive during Drop).
-// - Therefore, Drop only performs local cleanup/logging and, for Etcd when
-//   revoke_on_drop is true, triggers a one-shot revoke; keepalive stopping is
-//   achieved by the entry removal itself.
+// The user-facing GeneralLease holds an AutoCleanMapEntry guard. Registrations
+// for the same key share one LeaseEntry, so the value is dropped only after the
+// last user guard is released. Its `_keepalive_registration` field is declared
+// first and therefore unregisters the exact actor generation before backend and
+// actor-map guards are released. An already-polled keepalive future may finish,
+// but its generation check prevents it from rescheduling a removed lease.
+// Semantic owners still delete their own metadata during graceful close; lease
+// TTL remains the crash-cleanup fallback.
 impl Drop for LeaseEntry {
     fn drop(&mut self) {
         let lease_id = self.key.lease_id();
@@ -288,34 +345,7 @@ impl Drop for LeaseEntry {
             LeaseEntryKind::KvClient { .. } => {
                 debug_keepalive_log(lease_id, "kvclient lease unregistered");
             }
-            LeaseEntryKind::Etcd {
-                handle,
-                revoke_on_drop,
-                ..
-            } => {
-                if *revoke_on_drop {
-                    if let Some(mut cli) = handle.etcd_client() {
-                        let lid = lease_id as i64;
-                        // Use the runtime handle carried by the backend handle (LeaseBackendInner)
-                        let rt = handle.runtime_handle();
-                        rt.spawn(async move {
-                            if let Err(e) = cli.lease_revoke(lid).await {
-                                tracing::warn!(
-                                    "failed to revoke lease_id={} on drop: {:?}",
-                                    lid,
-                                    e
-                                );
-                            } else {
-                                tracing::debug!("revoked lease_id={} on drop", lid);
-                            }
-                        });
-                    } else {
-                        tracing::warn!(
-                            lease_id,
-                            "etcd revoke_on_drop: missing etcd client in backend handle"
-                        );
-                    }
-                }
+            LeaseEntryKind::Etcd { .. } => {
                 debug_keepalive_log(lease_id, "etcd lease unregistered");
             }
         }
@@ -331,23 +361,36 @@ pub async fn register_lease_for_keepalive(
     kind: LeaseRegisterKind,
     rt: tokio::runtime::Handle,
 ) -> AnyResult<GeneralLease> {
+    let skip_initial_etcd_probe = matches!(&kind, LeaseRegisterKind::EtcdValidated);
+    let skip_initial_kvclient_probe = matches!(&kind, LeaseRegisterKind::KvClientValidated { .. });
     match kind {
-        LeaseRegisterKind::Etcd { revoke_on_drop } => match backend_uid.kind() {
+        LeaseRegisterKind::Etcd | LeaseRegisterKind::EtcdValidated => match backend_uid.kind() {
             LeaseType::Etcd => {
-                record_register_by(lease_id, format!("{:?},ttl={}", &backend_uid, ttl_seconds));
+                if get_register_by(lease_id).is_none() {
+                    record_register_by(lease_id, format!("{:?},ttl={}", &backend_uid, ttl_seconds));
+                }
                 let endpoints = backend_uid
                     .endpoints()
                     .expect("etcd backend must carry endpoints");
-                let client = Client::connect(endpoints, None).await.with_context(|| {
-                    format!("failed to connect etcd for endpoints {:?}", endpoints)
-                })?;
-
-                let backend_handle = acquire_backend_handle(
-                    backend_uid.clone(),
-                    None,
-                    Some(client.clone()),
-                    rt.clone(),
-                );
+                let backend_handle = match acquire_existing_backend_handle(&backend_uid) {
+                    Some(handle) => handle,
+                    None => {
+                        let pool_entry = etcd_clients_pool().acquire(endpoints.to_vec());
+                        let client = pool_entry.client().await.with_context(|| {
+                            format!("failed to connect etcd for endpoints {:?}", endpoints)
+                        })?;
+                        acquire_backend_handle(
+                            backend_uid.clone(),
+                            None,
+                            Some(client),
+                            Some(pool_entry),
+                            rt.clone(),
+                        )
+                    }
+                };
+                let client = backend_handle
+                    .etcd_client()
+                    .expect("etcd backend handle must contain an etcd client");
                 let shared_state_guard = backend_handle.ensure_etcd_state(lease_id, || {
                     Arc::new(tokio::sync::Mutex::new(EtcdState {
                         client: client.clone(),
@@ -358,96 +401,102 @@ pub async fn register_lease_for_keepalive(
                     }))
                 });
 
-                // Fail fast: validate the lease id is alive on the target etcd cluster.
-                // We assume keepalive is always expected to work; if it does not, surfacing
-                // an error here is preferable to letting later writes fail with "lease not found".
-                let mut last_probe_err: Option<anyhow::Error> = None;
-                for attempt in 1..=INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
-                    let mut st = shared_state_guard.lock().await;
-                    match tokio::time::timeout(
-                        Duration::from_millis(INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS),
-                        st.keepalive_once(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {
-                            drop(st);
-                            if attempt > 1 {
-                                tracing::warn!(
-                                    lease_id,
-                                    attempt,
-                                    total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
-                                    budget_ms = INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
-                                    "initial etcd keepalive probe succeeded after retry"
-                                );
-                            }
-                            last_probe_err = None;
-                            break;
-                        }
-                        Ok(Err(err)) => {
-                            let last_stage = st.last_stage();
-                            st.reset_stream();
-                            drop(st);
-                            tracing::warn!(
-                                lease_id,
-                                attempt,
-                                total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
-                                budget_ms = INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
-                                stage = last_stage,
-                                "initial etcd keepalive probe failed, will {}: {:?}",
-                                if attempt < INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
-                                    "retry"
-                                } else {
-                                    "stop"
-                                },
-                                err
-                            );
-                            last_probe_err = Some(err.context(format!(
-                                "initial etcd keepalive probe failed for lease_id={} attempt={}/{}",
-                                lease_id, attempt, INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES
-                            )));
-                        }
-                        Err(_) => {
-                            let last_stage = st.last_stage();
-                            st.reset_stream();
-                            drop(st);
-                            let err = anyhow::anyhow!(
-                                "initial etcd keepalive probe timed out for lease_id={} attempt={}/{} budget_ms={} stage={}",
-                                lease_id,
-                                attempt,
-                                INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
-                                INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
-                                last_stage
-                            );
-                            tracing::warn!(
-                                lease_id,
-                                attempt,
-                                total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
-                                budget_ms = INITIAL_ETCD_KEEPALIVE_PROBE_BUDGET_MS,
-                                stage = last_stage,
-                                "initial etcd keepalive probe timed out, will {}",
-                                if attempt < INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
-                                    "retry"
-                                } else {
-                                    "stop"
+                if skip_initial_etcd_probe {
+                    tracing::debug!(
+                        lease_id,
+                        ttl_seconds,
+                        "skip initial etcd keepalive probe for caller-validated lease"
+                    );
+                } else {
+                    // Fail fast: validate the lease id is alive on the target etcd cluster.
+                    // We assume keepalive is always expected to work; if it does not, surfacing
+                    // an error here is preferable to letting later writes fail with "lease not found".
+                    // Etcd RPCs normally return on their transport deadline. This timeout is
+                    // one backstop for the complete retry loop; resetting it per attempt would
+                    // silently turn the 60-second registration contract into five minutes.
+                    let total_budget =
+                        Duration::from_millis(INITIAL_ETCD_KEEPALIVE_PROBE_TOTAL_BUDGET_MS);
+                    let mut current_attempt = 0;
+                    let probe_result = tokio::time::timeout(total_budget, async {
+                        let mut last_probe_err: Option<anyhow::Error> = None;
+                        for attempt in 1..=INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
+                            current_attempt = attempt;
+                            let mut st = shared_state_guard.lock().await;
+                            match st.keepalive_once().await {
+                                Ok(()) => {
+                                    drop(st);
+                                    if attempt > 1 {
+                                        tracing::warn!(
+                                            lease_id,
+                                            attempt,
+                                            total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
+                                            total_budget_ms =
+                                                INITIAL_ETCD_KEEPALIVE_PROBE_TOTAL_BUDGET_MS,
+                                            "initial etcd keepalive probe succeeded after retry"
+                                        );
+                                    }
+                                    last_probe_err = None;
+                                    break;
                                 }
-                            );
-                            last_probe_err = Some(err);
+                                Err(err) => {
+                                    let last_stage = st.last_stage();
+                                    st.reset_stream();
+                                    drop(st);
+                                    tracing::warn!(
+                                        lease_id,
+                                        attempt,
+                                        total = INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
+                                        total_budget_ms =
+                                            INITIAL_ETCD_KEEPALIVE_PROBE_TOTAL_BUDGET_MS,
+                                        stage = last_stage,
+                                        "initial etcd keepalive probe failed, will {}: {:?}",
+                                        if attempt < INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES {
+                                            "retry"
+                                        } else {
+                                            "stop"
+                                        },
+                                        err
+                                    );
+                                    last_probe_err = Some(err.context(format!(
+                                        "initial etcd keepalive probe failed for lease_id={} attempt={}/{}",
+                                        lease_id, attempt, INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES
+                                    )));
+                                }
+                            }
+                        }
+                        last_probe_err
+                    })
+                    .await;
+
+                    match probe_result {
+                        Ok(None) => {}
+                        Ok(Some(err)) => return Err(err),
+                        Err(_) => {
+                            let last_stage = match shared_state_guard.try_lock() {
+                                Ok(mut st) => {
+                                    let stage = st.last_stage();
+                                    st.reset_stream();
+                                    stage
+                                }
+                                Err(_) => "state_lock_busy",
+                            };
+                            return Err(anyhow::anyhow!(
+                                "initial etcd keepalive probe exceeded total budget for lease_id={} attempt={}/{} total_budget_ms={} stage={}",
+                                lease_id,
+                                current_attempt,
+                                INITIAL_ETCD_KEEPALIVE_PROBE_RETRIES,
+                                INITIAL_ETCD_KEEPALIVE_PROBE_TOTAL_BUDGET_MS,
+                                last_stage
+                            ));
                         }
                     }
-                }
-                if let Some(err) = last_probe_err {
-                    return Err(err);
                 }
 
                 let entry = keepalive_actor::actor_register_lease(
                     backend_uid.clone(),
                     lease_id,
                     ttl_seconds,
-                    ActorRegisterInvocation::Etcd {
-                        client,
-                        revoke_on_drop,
-                    },
+                    ActorRegisterInvocation::Etcd { client },
                     rt.clone(),
                 );
                 Ok(GeneralLease::Etcd {
@@ -466,95 +515,77 @@ pub async fn register_lease_for_keepalive(
                 );
             }
         },
-        LeaseRegisterKind::KvClient { register_by } => match backend_uid.kind() {
+        LeaseRegisterKind::KvClient { register_by }
+        | LeaseRegisterKind::KvClientValidated { register_by } => match backend_uid.kind() {
             LeaseType::KvClient => {
                 record_register_by(lease_id, register_by.clone());
-                let cb = backend_uid.kv_keepalive_cb().ok_or_else(|| {
-                    anyhow::anyhow!("kvclient keepalive callback missing in LeaseBackendUid; construct kv backend via kv_client_with_callbacks()")
+                let keepalive = backend_uid.kv_keepalive().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Fluxon KV keepalive operation missing from KvClient lease backend"
+                    )
                 })?;
-                // Perform a synchronous first keepalive with up to 3 attempts.
-                // Only if all 3 attempts fail do we surface an error to the caller.
-                // No extra fallback paths are added; we simply repeat the same
-                // operation because transient network jitter during the very first
-                // probe is common in distributed setups.
-                const INITIAL_KVCLIENT_KEEPALIVE_RETRIES: usize = 3; // business requirement
-                let mut last_err: Option<anyhow::Error> = None;
-                for attempt in 1..=INITIAL_KVCLIENT_KEEPALIVE_RETRIES {
-                    let res = limit_thirdparty::tokio::task::spawn_blocking({
-                        let cb = cb.clone();
-                        let lid = lease_id;
-                        move || (cb)(lid)
-                    })
-                    .await;
-
-                    match res {
-                        Ok(Ok(())) => {
-                            // success on attempt N; proceed to register into keepalive actor
-                            if attempt > 1 {
-                                tracing::debug!(
+                if skip_initial_kvclient_probe {
+                    tracing::debug!(
+                        lease_id,
+                        ttl_seconds,
+                        "skip initial kvclient keepalive for caller-validated lease"
+                    );
+                } else {
+                    // Validate a regular registration synchronously. Retrying the
+                    // same operation handles transient transport jitter without
+                    // introducing another fallback path.
+                    const INITIAL_KVCLIENT_KEEPALIVE_RETRIES: usize = 3;
+                    let mut last_err: Option<anyhow::Error> = None;
+                    for attempt in 1..=INITIAL_KVCLIENT_KEEPALIVE_RETRIES {
+                        match (keepalive)(lease_id).await {
+                            Ok(()) => {
+                                if attempt > 1 {
+                                    tracing::debug!(
+                                        lease_id,
+                                        attempt,
+                                        total = INITIAL_KVCLIENT_KEEPALIVE_RETRIES,
+                                        "initial kvclient keepalive succeeded after retry"
+                                    );
+                                }
+                                last_err = None;
+                                break;
+                            }
+                            Err(err) => {
+                                tracing::warn!(
                                     lease_id,
                                     attempt,
                                     total = INITIAL_KVCLIENT_KEEPALIVE_RETRIES,
-                                    "initial kvclient keepalive succeeded after retry"
+                                    "initial kvclient keepalive failed, will {}: {:?}",
+                                    if attempt < INITIAL_KVCLIENT_KEEPALIVE_RETRIES {
+                                        "retry"
+                                    } else {
+                                        "stop"
+                                    },
+                                    err
                                 );
+                                last_err = Some(err);
                             }
-                            last_err = None;
+                        }
+
+                        if last_err.is_none() {
                             break;
                         }
-                        Ok(Err(err)) => {
-                            tracing::warn!(
-                                lease_id,
-                                attempt,
-                                total = INITIAL_KVCLIENT_KEEPALIVE_RETRIES,
-                                "initial kvclient keepalive failed, will {}: {:?}",
-                                if attempt < INITIAL_KVCLIENT_KEEPALIVE_RETRIES {
-                                    "retry"
-                                } else {
-                                    "stop"
-                                },
-                                err
-                            );
-                            last_err = Some(err);
-                        }
-                        Err(join_err) => {
-                            tracing::warn!(
-                                lease_id,
-                                attempt,
-                                total = INITIAL_KVCLIENT_KEEPALIVE_RETRIES,
-                                "spawn_blocking join failed for initial kvclient keepalive, will {}: {:?}",
-                                if attempt < INITIAL_KVCLIENT_KEEPALIVE_RETRIES {
-                                    "retry"
-                                } else {
-                                    "stop"
-                                },
-                                join_err
-                            );
-                            last_err = Some(anyhow::anyhow!(
-                                "spawn_blocking join failed for initial keepalive: {:?}",
-                                join_err
-                            ));
-                        }
                     }
-
-                    if last_err.is_none() {
-                        // succeeded, exit attempt loop
-                        break;
+                    if let Some(err) = last_err {
+                        anyhow::bail!(
+                            "initial kvclient keepalive failed for lease_id={} after {} attempts: {:?}",
+                            lease_id,
+                            INITIAL_KVCLIENT_KEEPALIVE_RETRIES,
+                            err
+                        );
                     }
-                }
-                if let Some(err) = last_err {
-                    anyhow::bail!(
-                        "initial kvclient keepalive failed for lease_id={} after {} attempts: {:?}",
-                        lease_id,
-                        INITIAL_KVCLIENT_KEEPALIVE_RETRIES,
-                        err
-                    );
                 }
                 let entry = keepalive_actor::actor_register_lease(
                     backend_uid.clone(),
                     lease_id,
                     ttl_seconds,
                     ActorRegisterInvocation::KvClient {
-                        cb,
+                        keepalive,
                         label: Some(register_by),
                     },
                     rt,
@@ -569,5 +600,122 @@ pub async fn register_lease_for_keepalive(
                 anyhow::bail!("LeaseRegisterKind::KvClient requires KvClient backend uid");
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(9_000_000);
+
+    #[test]
+    fn new_actor_spawn_observes_first_registered_lease() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let ttl_seconds = 120_000 + id as i64;
+        let backend_uid = LeaseBackendUid::kv_client(
+            format!("lifecycle_test_cluster_{id}"),
+            format!("lifecycle_test_client_{id}"),
+            Arc::new(|_| Box::pin(async { Ok(1) })),
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        );
+        let key = LeaseKey::new(backend_uid.clone(), id);
+        let inv = ActorRegisterInvocation::KvClient {
+            keepalive: backend_uid.kv_keepalive().expect("kv keepalive operation"),
+            label: None,
+        };
+        let entry = actor_get_or_spawn_and_register(ttl_seconds, key, &inv, rt.handle().clone());
+
+        assert_eq!(entry._actor_guard.actor.registered_lease_count(), 1);
+    }
+
+    #[test]
+    fn caller_validated_kvclient_registration_skips_synchronous_probe() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let id = NEXT_TEST_ID.fetch_add(2, Ordering::SeqCst);
+        let keepalive_calls = Arc::new(AtomicU64::new(0));
+        let calls_from_operation = keepalive_calls.clone();
+        let backend_uid = LeaseBackendUid::kv_client(
+            format!("validated_kvclient_test_cluster_{id}"),
+            format!("validated_kvclient_test_client_{id}"),
+            Arc::new(|_| Box::pin(async { Ok(1) })),
+            Arc::new(move |_| {
+                calls_from_operation.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }),
+        );
+
+        rt.block_on(async {
+            let regular = register_lease_for_keepalive(
+                backend_uid.clone(),
+                120_000,
+                id,
+                LeaseRegisterKind::KvClient {
+                    register_by: format!("regular_{id}"),
+                },
+                rt.handle().clone(),
+            )
+            .await
+            .expect("regular registration");
+            assert_eq!(keepalive_calls.load(Ordering::SeqCst), 1);
+
+            let validated = register_lease_for_keepalive(
+                backend_uid,
+                120_000,
+                id + 1,
+                LeaseRegisterKind::KvClientValidated {
+                    register_by: format!("validated_{}", id + 1),
+                },
+                rt.handle().clone(),
+            )
+            .await
+            .expect("caller-validated registration");
+            assert_eq!(
+                keepalive_calls.load(Ordering::SeqCst),
+                1,
+                "caller-validated registration must not run a duplicate synchronous keepalive"
+            );
+
+            drop(validated);
+            drop(regular);
+        });
+    }
+
+    #[test]
+    fn pooled_etcd_registration_exposes_parent_client_immediately() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let endpoints = vec![format!("http://127.0.0.1:{}", 10_000 + id % 50_000)];
+        let backend_uid = LeaseBackendUid::etcd_from(endpoints.clone());
+
+        rt.block_on(async {
+            let lease = register_lease_for_keepalive(
+                backend_uid.clone(),
+                120_000,
+                id,
+                LeaseRegisterKind::EtcdValidated,
+                rt.handle().clone(),
+            )
+            .await
+            .expect("caller-validated pooled etcd registration");
+
+            registered_etcd_client(&backend_uid)
+                .expect("MPMC subchannels must synchronously reuse the parent etcd client");
+
+            let expected_pool_entry = etcd_clients_pool().acquire(endpoints);
+            let backend_handle = acquire_existing_backend_handle(&backend_uid)
+                .expect("registered etcd backend handle");
+            match &*backend_handle.entry {
+                LeaseBackendInner::Etcd { _pool_entry, .. } => assert!(
+                    _pool_entry.shares_entry_with(&expected_pool_entry),
+                    "lease backend must retain the connected pool entry"
+                ),
+                LeaseBackendInner::KvClient { .. } => panic!("expected etcd backend"),
+            }
+
+            drop(lease);
+        });
     }
 }

@@ -38,7 +38,7 @@ Entries:
 - `_kv_py_core.py`: Python KV backend/core smoke coverage
 - `_relay_mq.py`: MQ relay docker coverage
 - `_mq_core.py`: non-Ctrl-C MQ correctness coverage
-- `_largescale_mq.py`: TEST_STACK large-scale MQ benchmark wrapper (defaults to 30 owners at 5GiB, 300 producers, 8 consumers)
+- `_largescale_mq.py`: TEST_STACK large-scale MQ benchmark wrapper (defaults to 4 owners at 1GiB, 320 producers, 8 consumers, 1 worker thread per process, and 256-byte values)
 - `_mq_mpsc.py`: MPSC API channel coverage
 - `_mq_mpmc.py`: MPMC API channel coverage
 - `_mq_mpmc_bench.py`: heavier MPMC bench scripts
@@ -68,9 +68,11 @@ Operational note:
 
 - `_largescale_mq.py` generates a temporary `bench_mq` suite and then forwards
   to `fluxon_test_stack/test_runner.py`. The selected TEST_STACK profile must
-  provide at least 308 common non-bastion deploy targets in `target_ip_map` for
-  the default 300-producer/8-consumer topology; pass `--config` for the large
-  cluster suite before running it.
+  provide at least 168 common non-bastion deploy targets in `target_ip_map` for
+  the default 160-producer/8-consumer topology. For same-host CI, pass
+  `--single-host-logical-targets` and a testbed bundle; the wrapper copies the
+  bundle into `<workdir>/testbed_bundle` and rewrites bundle-local metadata
+  before invoking the runner.
 - All `_cargo_*.py` wrappers are direct-process entrypoints. They do not forward
   `pytest` selectors or `cargo test` passthrough flags unless the wrapper
   explicitly defines that surface.

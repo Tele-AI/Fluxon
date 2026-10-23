@@ -48,6 +48,7 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
     checks: List[Tuple[str, Callable[[], None]]] = [
         ("writes_namespace_annotation", test_writes_namespace_annotation),
         ("preserves_hostworkdir_runtime_token", test_preserves_hostworkdir_runtime_token),
+        ("host_prelude_honors_preset_node_id", test_host_prelude_honors_preset_node_id),
         ("ops_entrypoints_use_direct_scripts", test_ops_entrypoints_use_direct_scripts),
         ("rejects_missing_namespace", test_rejects_missing_namespace),
     ]
@@ -165,6 +166,51 @@ def test_preserves_hostworkdir_runtime_token() -> None:
         assert 'mkdir -p "${HOSTWORKDIR}/svc_${NODE_ID}"' in script, script
         assert "/hostworkdir/svc_" not in script, script
         print("PASS: test_preserves_hostworkdir_runtime_token")
+
+
+def test_host_prelude_honors_preset_node_id() -> None:
+    with tempfile.TemporaryDirectory(prefix="test_gen_k8s_daemonset_preset_node_") as td:
+        tmpdir = Path(td)
+        config_path = tmpdir / "deployconf.yaml"
+        outdir = tmpdir / "out"
+        config_path.write_text(
+            textwrap.dedent(
+                """
+                namespace: fluxon_testbed
+                name_prefix: fluxon-testbed
+                image: example.com/fluxon:test
+                cluster_nodes:
+                  - hostname: node-a
+                    ip: 127.0.0.1
+                    hostworkdir: /tmp/node-a
+                  - hostname: node-b
+                    ip: 127.0.0.1
+                    hostworkdir: /tmp/node-b
+                global_envs:
+                  FLUXON_CLUSTER_NODE_IDS: "node-a node-b"
+                service:
+                  svc_plain:
+                    entrypoint: echo "${NODE_ID}:${HOSTWORKDIR}"
+                    node_bind:
+                      node: ["node-a", "node-b"]
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        result = _run_generator(config_path=config_path, outdir=outdir)
+        assert result.returncode == 0, f"generator failed: stdout={result.stdout} stderr={result.stderr}"
+
+        manifest_path = outdir / "svc_plain.daemonset.yaml"
+        with manifest_path.open("r", encoding="utf-8") as f:
+            manifest = yaml.safe_load(f)
+        script = manifest["spec"]["template"]["spec"]["containers"][0]["args"][0]
+        assert 'NODE_ID="${NODE_ID:-}"' in script, script
+        assert 'Unknown preset NODE_ID: $NODE_ID' in script, script
+        assert 'if [ -z "$NODE_ID" ]; then\nfor n in "${ALL_NODES[@]}"; do' in script, script
+        assert 'node-b) HOST_IP=' in script and 'HOSTWORKDIR=' in script, script
+        print("PASS: test_host_prelude_honors_preset_node_id")
 
 
 def test_ops_entrypoints_use_direct_scripts() -> None:

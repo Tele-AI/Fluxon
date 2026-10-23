@@ -2,8 +2,8 @@ use std::{env, fs, path::Path, path::PathBuf};
 
 const CLOSED_SDK_ROOT_ENV: &str = "FLUXON_COMMU_CLOSED_SDK_ROOT";
 const DEFAULT_CLOSED_SDK_ROOT_REPO_RELATIVE: &str = "fluxon_release/closed_sdk";
-const EXPECTED_SCHEMA_VERSION: u32 = 8;
-const EXPECTED_ABI_VERSION: u32 = 10;
+const EXPECTED_SCHEMA_VERSION: u32 = 7;
+const EXPECTED_ABI_VERSION: u32 = 9;
 const EXPECTED_BOUNDARY_MODE: &str = "closed-sdk-consumer";
 const EXPECTED_TRANSFER_LINK_SNAPSHOT_MODE: &str = "watch-v1";
 

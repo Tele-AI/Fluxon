@@ -520,13 +520,15 @@ class _FluxonRemoteFileRaw(io.RawIOBase):
                 self._flush_pre_session_buffer_via_chunk_rpc()
             if self._write_session_id is not None:
                 try:
-                    self._flush_write_session_buffer()
-                    size, mtime_ns = self._agent.remote_close_write_session_by_handle_with_identity(
-                        self._export_name,
-                        self._relpath,
-                        self._write_session_id,
-                        self._file_abs,
-                        self._identity,
+                    size, mtime_ns = (
+                        self._agent.remote_finalize_write_session_by_handle_with_identity(
+                            self._export_name,
+                            self._relpath,
+                            self._write_session_id,
+                            int(self._size),
+                            self._file_abs,
+                            self._identity,
+                        )
                     )
                     self._size = int(size)
                     self._mtime_ns = int(mtime_ns)
@@ -806,6 +808,36 @@ class FluxonFsPatcher:
         export_name: str,
     ) -> None:
         self._agent.mount_remote_dir(local_mount_dir_abs, export_name)
+
+    def open_video_reader(
+        self,
+        *,
+        export_name: str,
+        relpath: str,
+        height: int,
+        width: int,
+        num_threads: int = 8,
+    ) -> Any:
+        from .video import FluxonFsVideoReader
+
+        return FluxonFsVideoReader._open(
+            agent=self._agent,
+            export_name=export_name,
+            relpath=relpath,
+            height=height,
+            width=width,
+            num_threads=num_threads,
+            request_identity=self._request_identity,
+        )
+
+    def open_video_reader_pool(self, *, max_readers: int = 32) -> Any:
+        from .video import FluxonFsVideoReaderPool
+
+        return FluxonFsVideoReaderPool(
+            agent=self._agent,
+            request_identity=self._request_identity,
+            max_readers=max_readers,
+        )
 
     def publish_export(
         self,

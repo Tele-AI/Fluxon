@@ -7,6 +7,13 @@ pub use fluxon_commu::{
 
 pub(crate) const META_KEY_KV_SSD_STORAGE: &str = "kv_ssd_storage";
 
+pub(crate) fn member_has_kv_ssd_storage(member: &ClusterMember) -> bool {
+    member
+        .metadata
+        .get(META_KEY_KV_SSD_STORAGE)
+        .is_some_and(|value| value == "true")
+}
+
 pub mod app_logic_ext;
 
 #[cfg(test)]

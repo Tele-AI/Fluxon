@@ -72,7 +72,6 @@ from fluxon_py.tests.test_lib import (  # noqa: E402
     new_test_producer,
     setup_test_environment,
     run_with_argmatrix,
-    pre_kill_existing_test_processes,
 )
 
 logging = init_logger()
@@ -1627,9 +1626,11 @@ def _wait_fluxon_member_absent(instance_key: str, *, timeout_s: int = TEST_TIMEO
     only wait for expiry to minimize test intrusion.
     """
     # Lazy import to avoid expanding top-level dependencies.
-    from fluxon_py.tests.test_lib import load_test_fluxon_cluster_name  # type: ignore
+    from setup_and_pack.utils.repo_config_utils import (
+        load_test_fluxon_cluster_name_from_test_config,
+    )
 
-    cluster = load_test_fluxon_cluster_name()
+    cluster = load_test_fluxon_cluster_name_from_test_config()
     key = f"/fluxon_kv_member_base/{cluster}/members/{instance_key}"
     deadline = time.time() + float(timeout_s)
     with etcd3.client(ETCD_HOST, ETCD_PORT) as etcd_client:

@@ -1,6 +1,6 @@
 [package]
 name = "fluxon_kv"
-version = "0.2.2"
+version = "0.2.4"
 edition = "2024"
 
 [features]
@@ -76,6 +76,7 @@ bytes = "1"
 pprof = { version = "0.15", features = ["flamegraph"] }
 hex = "0.4"
 sha2 = "0.10"
+io-uring = "0.7"
 foyer = { version = "0.22.3", features = ["serde"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect", "handshake"], optional = true }
 

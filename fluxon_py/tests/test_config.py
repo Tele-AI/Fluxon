@@ -48,17 +48,20 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
         ("fluxonkv_sub_cluster_config", test_fluxonkv_sub_cluster_config),
         ("fluxonkv_owner_requires_sub_cluster", test_fluxonkv_owner_requires_sub_cluster),
         ("fluxonkv_owner_requires_large_file_paths", test_fluxonkv_owner_requires_large_file_paths),
+        ("fluxonkv_large_limit_size_contract", test_fluxonkv_large_limit_size_contract),
+        ("fluxonkv_size_string_contract", test_fluxonkv_size_string_contract),
         ("fluxonkv_external_forbids_large_file_paths", test_fluxonkv_external_forbids_large_file_paths),
         ("fluxonkv_owner_segment_memfd", test_fluxonkv_owner_segment_memfd),
         ("fluxonkv_owner_ssd_capacity", test_fluxonkv_owner_ssd_capacity),
         ("fluxonkv_p2p_relay_removed", test_fluxonkv_p2p_relay_removed),
         ("fluxon_client_config_yaml_shape", test_fluxon_client_config_yaml_shape),
-        ("fluxonkv_protocol_field", test_fluxonkv_protocol_field),
+        ("fluxonkv_network_field", test_fluxonkv_network_field),
         ("fluxonkv_runtime_defaults_are_internal", test_fluxonkv_runtime_defaults_are_internal),
         ("fluxonkv_removed_rdma_config_keys", test_fluxonkv_removed_rdma_config_keys),
         ("fluxonkv_owner_placement_class", test_fluxonkv_owner_placement_class),
         ("fluxonkv_owner_hot_writeback", test_fluxonkv_owner_hot_writeback),
         ("fluxonkv_test_spec_config", test_fluxonkv_test_spec_config),
+        ("mooncake_ssd_offload_config", test_mooncake_ssd_offload_config),
         ("fluxon_pyo3_import_authority", test_fluxon_pyo3_import_authority),
     ]
     if selected_test_id is None:
@@ -314,6 +317,76 @@ def test_fluxonkv_owner_requires_large_file_paths():
         print(f"❌ FAIL: test_fluxonkv_owner_requires_large_file_paths - {e}")
 
 
+def test_fluxonkv_large_limit_size_contract():
+    """Ensure KV SSD limits align one-to-one with large_file_paths."""
+    try:
+        valid = _owner_fluxonkv_base_config(tag="large_limit_size_valid")
+        valid["fluxonkv_spec"]["large_limit_size"] = [1048576]
+        rendered = FluxonKvClientConfig(valid).to_fluxon_kv_client_config_yaml_str()
+        loaded = yaml.safe_load(rendered)
+        assert loaded["fluxonkv_spec"]["large_limit_size"] == [1048576]
+
+        mismatch = _owner_fluxonkv_base_config(tag="large_limit_size_mismatch")
+        mismatch["fluxonkv_spec"]["large_file_paths"] = [
+            "/tmp/kvcache_large/large_limit_size_mismatch_a",
+            "/tmp/kvcache_large/large_limit_size_mismatch_b",
+        ]
+        mismatch["fluxonkv_spec"]["large_limit_size"] = [1048576]
+        try:
+            FluxonKvClientConfig(mismatch)
+            print("❌ FAIL: test_fluxonkv_large_limit_size_contract - length mismatch should be rejected")
+            return
+        except ValueError:
+            pass
+
+        too_small = _owner_fluxonkv_base_config(tag="large_limit_size_too_small")
+        too_small["fluxonkv_spec"]["large_limit_size"] = [1]
+        try:
+            FluxonKvClientConfig(too_small)
+            print("❌ FAIL: test_fluxonkv_large_limit_size_contract - value below 512 should be rejected")
+            return
+        except ValueError:
+            pass
+
+        external = {
+            "instance_key": "test_external",
+            "contribute_to_cluster_pool_size": {"dram": 0, "vram": {}},
+            "fluxonkv_spec": {
+                "cluster_name": "test_cluster",
+                "share_mem_path": "/tmp/kvcache_shared_memory/test",
+                "large_limit_size": [1048576],
+            },
+        }
+        try:
+            FluxonKvClientConfig(external)
+            print("❌ FAIL: test_fluxonkv_large_limit_size_contract - external large_limit_size should be rejected")
+            return
+        except ValueError:
+            pass
+
+        print("✅ PASS: test_fluxonkv_large_limit_size_contract")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_large_limit_size_contract - {e}")
+
+
+def test_fluxonkv_size_string_contract():
+    """Ensure memory contribution and KV SSD limits accept size strings."""
+    try:
+        cfg = _owner_fluxonkv_base_config(tag="size_string")
+        cfg["contribute_to_cluster_pool_size"]["dram"] = "1.1GB"
+        cfg["contribute_to_cluster_pool_size"]["vram"] = {"0": "0.5GB"}
+        cfg["fluxonkv_spec"]["large_limit_size"] = ["512.9B"]
+        config = FluxonKvClientConfig(copy.deepcopy(cfg))
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["contribute_to_cluster_pool_size"]["dram"] == 70 * 16 * 1024 * 1024
+        assert loaded["contribute_to_cluster_pool_size"]["vram"]["0"] == 512 * 1024 * 1024
+        assert loaded["fluxonkv_spec"]["large_limit_size"] == [512]
+
+        print("✅ PASS: test_fluxonkv_size_string_contract")
+    except Exception as e:
+        print(f"❌ FAIL: test_fluxonkv_size_string_contract - {e}")
+
+
 def test_fluxonkv_external_forbids_large_file_paths():
     """Ensure zero-contribution external config cannot declare owner-only large_file_paths."""
     try:
@@ -471,13 +544,13 @@ def test_fluxon_client_config_yaml_shape():
         print(f"❌ FAIL: test_fluxon_client_config_yaml_shape - {e}")
 
 
-def test_fluxonkv_protocol_field():
-    """Ensure Rust-generated side-worker YAML protocol blocks survive Python validation."""
+def test_fluxonkv_network_field():
+    """Ensure network tuning uses the canonical block and rejects removed fields."""
     try:
         cfg = {
             "instance_key": "test_instance__side_0",
-            "protocol": {
-                "protocol_type": "tcp",
+            "network": {
+                "tcp_reactor_mode": "event_driven",
             },
             "fluxonkv_spec": {
                 "cluster_name": "test_cluster",
@@ -491,13 +564,46 @@ def test_fluxonkv_protocol_field():
         }
         config = FluxonKvClientConfig(copy.deepcopy(cfg))
         loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
-        assert loaded["protocol"]["protocol_type"] == "tcp"
-        assert config.protocol_type == "tcp"
-        assert config.protocol_rdma_device_names is None
+        assert "protocol_type" not in loaded["network"]
+        assert loaded["network"]["tcp_reactor_mode"] == "event_driven"
+        assert config.network_rdma_device_names is None
         assert config.fluxonkv_spec_transfer_engine == "p2p"
-        print("✅ PASS: test_fluxonkv_protocol_field")
+
+        removed_block = copy.deepcopy(cfg)
+        removed_block["protocol"] = removed_block.pop("network")
+        try:
+            FluxonKvClientConfig(removed_block)
+            raise AssertionError("removed protocol block should be rejected")
+        except ValueError as exc:
+            assert "protocol" in str(exc)
+
+        removed_selector = copy.deepcopy(cfg)
+        removed_selector["network"]["protocol_type"] = "rdma"
+        try:
+            FluxonKvClientConfig(removed_selector)
+            raise AssertionError("removed protocol_type should be rejected")
+        except ValueError as exc:
+            assert "protocol_type" in str(exc)
+
+        for removed_name in ("event_mode", "tcp_thread_reactor"):
+            removed_mode_name = copy.deepcopy(cfg)
+            removed_mode_name["network"] = {removed_name: "event_driven"}
+            try:
+                FluxonKvClientConfig(removed_mode_name)
+                raise AssertionError(f"removed {removed_name} should be rejected")
+            except ValueError as exc:
+                assert removed_name in str(exc)
+
+        worker_override = copy.deepcopy(cfg)
+        worker_override["test_spec_config"]["protocol_type"] = "tcp"
+        try:
+            FluxonKvClientConfig(worker_override)
+            raise AssertionError("side-transfer worker protocol_type should be rejected")
+        except ValueError as exc:
+            assert "side-transfer workers" in str(exc)
+        print("✅ PASS: test_fluxonkv_network_field")
     except Exception as e:
-        print(f"❌ FAIL: test_fluxonkv_protocol_field - {e}")
+        print(f"❌ FAIL: test_fluxonkv_network_field - {e}")
 
 
 def test_fluxonkv_runtime_defaults_are_internal():
@@ -506,7 +612,8 @@ def test_fluxonkv_runtime_defaults_are_internal():
         base = _owner_fluxonkv_base_config(tag="runtime_defaults")
         config = FluxonKvClientConfig(copy.deepcopy(base))
         assert config.fluxonkv_spec_transfer_engine == "closed"
-        assert config.protocol_rdma_device_names is None
+        assert config.network_rdma_device_names is None
+        assert "protocol_type" not in config.config_dict["test_spec_config"]
         loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
         assert "transfer_engine" not in loaded["fluxonkv_spec"]
         assert "rdma_device_names" not in loaded
@@ -691,6 +798,50 @@ def test_fluxonkv_test_spec_config():
         except ValueError:
             pass
 
+        tcp_protocol = _owner_fluxonkv_base_config(tag="test_spec_tcp_protocol")
+        tcp_protocol["test_spec_config"] = {
+            "protocol_type": "tcp",
+            "transport_mode": "transfer_with_rpc",
+            "require_transfer_rpc_fast_path_ready_timeout_seconds": 30,
+        }
+        config = FluxonKvClientConfig(tcp_protocol)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["test_spec_config"]["protocol_type"] == "tcp"
+        assert "rdma_device_names" not in loaded["test_spec_config"]
+        assert config.test_spec_protocol_type == "tcp"
+
+        explicit_rdma = _owner_fluxonkv_base_config(tag="test_spec_rdma_protocol")
+        explicit_rdma["test_spec_config"] = {"protocol_type": "rdma"}
+        config = FluxonKvClientConfig(explicit_rdma)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["test_spec_config"]["protocol_type"] == "rdma"
+        assert config.test_spec_protocol_type == "rdma"
+
+        invalid_protocol = _owner_fluxonkv_base_config(tag="test_spec_invalid_protocol")
+        invalid_protocol["test_spec_config"] = {"protocol_type": "quic"}
+        try:
+            FluxonKvClientConfig(invalid_protocol)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - invalid protocol_type should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
+        tcp_with_rdma_devices = _owner_fluxonkv_base_config(tag="test_spec_tcp_with_rdma")
+        tcp_with_rdma_devices["test_spec_config"] = {
+            "protocol_type": "tcp",
+            "rdma_device_names": ["mlx5_0"],
+        }
+        try:
+            FluxonKvClientConfig(tcp_with_rdma_devices)
+            print(
+                "❌ FAIL: test_fluxonkv_test_spec_config - tcp with rdma_device_names should be rejected"
+            )
+            return
+        except ValueError:
+            pass
+
         rdma_devices = copy.deepcopy(base)
         rdma_devices["test_spec_config"]["transport_mode"] = "transfer_with_rpc"
         rdma_devices["test_spec_config"]["rdma_device_names"] = [" mlx5_4 ", "mlx5_0", "mlx5_4"]
@@ -705,6 +856,10 @@ def test_fluxonkv_test_spec_config():
         rdma_devices["protocol"] = {
             "protocol_type": "rdma",
             "tcp_thread_reactor": "event_driven",
+        }
+        rdma_devices["network"] = {
+            "tcp_reactor_mode": "event_driven",
+
         }
         rdma_devices["test_spec_config"]["tcp_thread_bulk_lane_count"] = 4
         rdma_devices["test_spec_config"]["tcp_thread_control_lane_count"] = 3
@@ -734,6 +889,8 @@ def test_fluxonkv_test_spec_config():
         assert loaded["test_spec_config"]["rdma_device_names"] == ["mlx5_0", "mlx5_4"]
         assert loaded["test_spec_config"]["tcp_thread_reactor_shard_count"] == 2
         assert loaded["protocol"]["tcp_thread_reactor"] == "event_driven"
+        assert loaded["network"]["tcp_reactor_mode"] == "event_driven"
+
         assert loaded["test_spec_config"]["tcp_thread_bulk_lane_count"] == 4
         assert loaded["test_spec_config"]["tcp_thread_control_lane_count"] == 3
         assert loaded["test_spec_config"]["replica_task_max_inflight"] == 16
@@ -751,7 +908,7 @@ def test_fluxonkv_test_spec_config():
             loaded["test_spec_config"]["require_transfer_rpc_fast_path_ready_timeout_seconds"]
             == 45
         )
-        assert config.protocol_rdma_device_names == "mlx5_0,mlx5_4"
+        assert config.network_rdma_device_names == "mlx5_0,mlx5_4"
 
         invalid_remote_put_admission = copy.deepcopy(rdma_devices)
         del invalid_remote_put_admission["test_spec_config"][
@@ -894,11 +1051,43 @@ def test_fluxonkv_test_spec_config():
         except ValueError:
             pass
 
+        assert "tcp_reactor_mode" not in loaded["test_spec_config"]
+        assert "network" not in loaded
+        assert config.test_spec_protocol_type == "rdma"
+
+        busy_poll = copy.deepcopy(implicit_transport)
+        busy_poll["network"] = {
+            "tcp_reactor_mode": "busy_poll",
+        }
+        config = FluxonKvClientConfig(busy_poll)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["network"]["tcp_reactor_mode"] == "busy_poll"
+
+        invalid_network_wait_mode = copy.deepcopy(implicit_transport)
+        invalid_network_wait_mode["network"] = {
+            "tcp_reactor_mode": "epoll",
+        }
+        try:
+            FluxonKvClientConfig(invalid_network_wait_mode)
+            raise AssertionError("invalid tcp_reactor_mode should be rejected")
+        except ValueError:
+            pass
+
+        misplaced_tcp_reactor_mode = copy.deepcopy(implicit_transport)
+        misplaced_tcp_reactor_mode["test_spec_config"]["tcp_reactor_mode"] = "event_driven"
+        try:
+            FluxonKvClientConfig(misplaced_tcp_reactor_mode)
+            raise AssertionError("test_spec_config tcp_reactor_mode should be rejected")
+        except ValueError:
+            pass
+
+
         legacy_p2p = copy.deepcopy(implicit_transport)
         legacy_p2p["p2p"] = {"tcp_thread_reactor_wait_mode": "event_driven"}
         try:
             FluxonKvClientConfig(legacy_p2p)
             raise AssertionError("legacy p2p reactor config should be rejected")
+
         except ValueError:
             pass
 
@@ -907,9 +1096,38 @@ def test_fluxonkv_test_spec_config():
             "protocol_type": "rdma",
             "tcp_thread_reactor_wait_mode": "event_driven",
         }
+        legacy_network_field_name = copy.deepcopy(implicit_transport)
+        legacy_network_field_name["network"] = {
+            "tcp_thread_reactor_wait_mode": "event_driven",
+        }
+
         try:
             FluxonKvClientConfig(legacy_field_name)
             raise AssertionError("legacy reactor field name should be rejected")
+        except ValueError:
+            pass
+
+        legacy_network_field_name["network"] = {
+            "tcp_thread_reactor_wait_mode": "event_driven",
+        }
+        try:
+            FluxonKvClientConfig(legacy_network_field_name)
+            raise AssertionError("legacy network reactor field name should be rejected")
+        except ValueError:
+            pass
+
+        foyer_backend = copy.deepcopy(base)
+        foyer_backend["test_spec_config"] = {"kv_ssd_storage_backend": "foyer"}
+        config = FluxonKvClientConfig(foyer_backend)
+        loaded = yaml.safe_load(config.to_fluxon_kv_client_config_yaml_str())
+        assert loaded["test_spec_config"]["kv_ssd_storage_backend"] == "foyer"
+
+        invalid_foyer_uring = copy.deepcopy(foyer_backend)
+        invalid_foyer_uring["test_spec_config"]["kv_ssd_uring_mode"] = "iovec"
+        try:
+            FluxonKvClientConfig(invalid_foyer_uring)
+            raise AssertionError("foyer with iovec should be rejected")
+
         except ValueError:
             pass
 
@@ -1045,6 +1263,36 @@ def test_fluxonkv_test_spec_config():
         print(f"❌ FAIL: test_fluxonkv_test_spec_config - {e}")
 
 
+def test_mooncake_ssd_offload_config():
+    """Test Mooncake SSD offload fields are accepted and preserved."""
+    try:
+        cfg = config_dict()
+        cfg["mooncake_spec"]["enable_ssd_offload"] = True
+        cfg["mooncake_spec"]["ssd_offload_path"] = "/tmp/mooncake-offload"
+        cfg["mooncake_spec"]["skip_get_size_on_get"] = True
+        cfg["mooncake_spec"]["local_hostname"] = "192.0.2.10"
+        config = FluxonKvClientConfig(cfg)
+        assert config.mooncake_spec_enable_ssd_offload is True
+        assert config.mooncake_spec_ssd_offload_path == "/tmp/mooncake-offload"
+        assert config.mooncake_spec_skip_get_size_on_get is True
+        assert config.mooncake_spec_local_hostname == "192.0.2.10"
+        loaded = yaml.safe_load(config.to_yaml_str())
+        assert loaded["mooncake_spec"]["enable_ssd_offload"] is True
+        assert loaded["mooncake_spec"]["ssd_offload_path"] == "/tmp/mooncake-offload"
+        assert loaded["mooncake_spec"]["skip_get_size_on_get"] is True
+        assert loaded["mooncake_spec"]["local_hostname"] == "192.0.2.10"
+
+        default_cfg = config_dict()
+        default_config = FluxonKvClientConfig(default_cfg)
+        assert default_config.mooncake_spec_enable_ssd_offload is False
+        assert default_config.mooncake_spec_ssd_offload_path == ""
+        assert default_config.mooncake_spec_skip_get_size_on_get is False
+        assert default_config.mooncake_spec_local_hostname == "test_instance"
+        print("✅ PASS: test_mooncake_ssd_offload_config")
+    except Exception as e:
+        print(f"❌ FAIL: test_mooncake_ssd_offload_config - {e}")
+
+
 def config_dict():
     return {
         "instance_key": "test_instance",
@@ -1090,7 +1338,6 @@ def test_load_from_dict(cfg):
         assert config.instance_key == "test_instance"
         assert config.contribute_to_cluster_pool_size["dram"] == 16777216
         assert config.contribute_to_cluster_pool_size["vram"] == {}
-        assert config.protocol_type == "rdma"
         assert config.mooncake_spec_local_buffer_size == 16777216
         assert config.mooncake_spec_metadata_server == "http://localhost:8080/metadata"
         assert config.mooncake_spec_master_server_address == "localhost:8081"
@@ -1105,7 +1352,6 @@ def test_load_from_file(config_file_path):
     try:
         config = FluxonKvClientConfig.from_file(config_file_path)
         assert config.instance_key == "test_instance"
-        assert config.protocol_type == "rdma"
         assert config.mooncake_spec_local_buffer_size == 16777216
         print("✅ PASS: test_load_from_file")
     except Exception as e:
@@ -1127,12 +1373,13 @@ def test_to_yaml_str_roundtrip(cfg: dict):
 def test_verification(cfg):
     """Test configuration verification for invalid values."""
     try:
-        invalid_config = copy.deepcopy(cfg)
-        invalid_config["contribute_to_cluster_pool_size"]["dram"] = 16777217
-        FluxonKvClientConfig(invalid_config)
-        print("❌ FAIL: Invalid dram size should be rejected")
-    except ValueError:
-        print("✅ PASS: Invalid dram size correctly rejected")
+        aligned_config = copy.deepcopy(cfg)
+        aligned_config["contribute_to_cluster_pool_size"]["dram"] = 16777217
+        config = FluxonKvClientConfig(aligned_config)
+        assert config.contribute_to_cluster_pool_size["dram"] == 16777216
+        print("✅ PASS: Unaligned dram size correctly aligned")
+    except Exception as e:
+        print(f"❌ FAIL: Unaligned dram size should be aligned - {e}")
 
     try:
         invalid_config = copy.deepcopy(cfg)
@@ -1223,12 +1470,13 @@ def test_verification(cfg):
         print(f"❌ FAIL: Valid GPU configuration should be accepted - {e}")
 
     try:
-        invalid_gpu_config = copy.deepcopy(cfg)
-        invalid_gpu_config["contribute_to_cluster_pool_size"]["vram"] = {"0": 16777217}
-        FluxonKvClientConfig(invalid_gpu_config)
-        print("❌ FAIL: Invalid GPU configuration should be rejected")
-    except ValueError:
-        print("✅ PASS: Invalid GPU configuration correctly rejected")
+        aligned_gpu_config = copy.deepcopy(cfg)
+        aligned_gpu_config["contribute_to_cluster_pool_size"]["vram"] = {"0": 16777217}
+        config = FluxonKvClientConfig(aligned_gpu_config)
+        assert config.contribute_to_cluster_pool_size["vram"]["0"] == 16777216
+        print("✅ PASS: Unaligned GPU configuration correctly aligned")
+    except Exception as e:
+        print(f"❌ FAIL: Unaligned GPU configuration should be aligned - {e}")
 
 
 if __name__ == "__main__":

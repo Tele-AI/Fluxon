@@ -9,7 +9,7 @@
     "runtime_authority_crate": "fluxon_commu_private_impl",
     "transfer_link_snapshot_mode": "watch-v1"
   },
-  "public_workspace_input_sha256": "813d5267b713d0d9e84cfa3d0e438be9f7fb8e9c3ad586836b8aee508577ba84",
+  "public_workspace_input_sha256": "59c66ec1fe0dc849a3e2a9f8ce4c721cfee6a387286bd25d3d28bf6ca1705197",
   "layout": {
     "native": "native",
     "lib": "lib"

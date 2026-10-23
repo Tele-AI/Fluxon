@@ -5,7 +5,6 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::task::{Context, Poll};
 
-use fluxon_util::run_async_from_sync::SyncAsyncBridge;
 use parking_lot::MutexGuard;
 use tokio::task::JoinHandle;
 
@@ -108,19 +107,6 @@ impl Debug for TryUtf8VecU8 {
 
 pub struct SendNonNull<T>(pub NonNull<T>);
 unsafe impl<T> Send for SendNonNull<T> {}
-
-pub fn call_async_from_sync<Fut>(fut: Fut) -> Fut::Output
-where
-    Fut: std::future::Future,
-{
-    // English note:
-    // Keep this compatibility wrapper delegating to the single authority bridge implementation
-    // in fluxon_util. This preserves one public entry point here without keeping a second
-    // spawn+channel sync-async bridge implementation.
-    tokio::runtime::Handle::current()
-        .run_async_from_sync(fut)
-        .unwrap_or_else(|e| panic!("call_async_from_sync failed: {}", e))
-}
 
 pub unsafe fn non_null<T>(v: &T) -> std::ptr::NonNull<T> {
     let ptr = v as *const T as *mut T;

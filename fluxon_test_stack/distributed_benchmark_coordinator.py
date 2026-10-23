@@ -39,7 +39,11 @@ try:
         canonicalize_kv_node_role,
     )
     from .benchmark_node_kv import (
+        BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX,
+        BENCHMARK_KEY_KV_GET_OUTPUT,
         merge_kv_benchmark_extras,
+        normalize_kv_cuda_device_index,
+        normalize_kv_get_output,
     )
     from .benchmark_node_rpc import (
         FLUXON_PHASE_PATH_BUCKET_FAST,
@@ -57,7 +61,11 @@ except ImportError:
         canonicalize_kv_node_role,
     )
     from benchmark_node_kv import (
+        BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX,
+        BENCHMARK_KEY_KV_GET_OUTPUT,
         merge_kv_benchmark_extras,
+        normalize_kv_cuda_device_index,
+        normalize_kv_get_output,
     )
     from benchmark_node_rpc import (
         FLUXON_PHASE_PATH_BUCKET_FAST,
@@ -90,6 +98,8 @@ class MsgType(Enum):
     REGISTER = "register"
     READY = "ready"
     START = "start"
+    RUNTIME_READY = "runtime_ready"
+    RUNTIME_START = "runtime_start"
     RESULT = "result"
     ROUND_STATUS = "round_status"
 
@@ -104,6 +114,9 @@ COMPLETION_STATUS_RESULT_TIMEOUT = "RESULT_TIMEOUT"
 ROUND_GATE_STATUS_WAITING = "waiting"
 ROUND_GATE_STATUS_COMPLETED = "completed"
 ROUND_GATE_STATUS_FAILED = "failed"
+ROUND_GATE_TERMINAL_STATUSES = frozenset(
+    (ROUND_GATE_STATUS_COMPLETED, ROUND_GATE_STATUS_FAILED)
+)
 P2P_RECV_PROM_COMPONENT_RPC_TRANSPORT = "rpc_transport"
 P2P_RECV_PROM_COMPONENT_LOCAL_IPC = "local_ipc"
 P2P_RECV_PROM_METRIC_RECV_COMPLETED = "recv_completed"
@@ -277,6 +290,20 @@ def get_op_timeout_seconds(config_path: str) -> float:
     return op_timeout_seconds
 
 
+def get_kv_get_output(config_path: str) -> str:
+    benchmark_cfg = _load_benchmark_section(config_path)
+    return normalize_kv_get_output(
+        benchmark_cfg.get(BENCHMARK_KEY_KV_GET_OUTPUT)
+    ).value
+
+
+def get_kv_cuda_device_index(config_path: str) -> int:
+    benchmark_cfg = _load_benchmark_section(config_path)
+    return normalize_kv_cuda_device_index(
+        benchmark_cfg.get(BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX)
+    )
+
+
 def _parse_value_size_weighted_set(
     raw_val: Any,
     *,
@@ -361,6 +388,8 @@ VALUE_SIZE_SWEEP_LIST = get_benchmark_value_size_sweep_list(
     KVCACHE_CONFIG_PATH
 )
 OP_TIMEOUT_SECONDS = get_op_timeout_seconds(KVCACHE_CONFIG_PATH)
+KV_GET_OUTPUT = get_kv_get_output(KVCACHE_CONFIG_PATH)
+KV_CUDA_DEVICE_INDEX = get_kv_cuda_device_index(KVCACHE_CONFIG_PATH)
 print(
     f"ℹ️ 从配置加载 THREADS_PER_PROCESS={THREADS_PER_PROCESS}, MAX_BENCHMARK_SECONDS={MAX_BENCHMARK_SECONDS}, "
     f"METRIC_WARMUP_SECONDS={METRIC_WARMUP_SECONDS}, START_IDLE_SECONDS={START_IDLE_SECONDS}"
@@ -369,6 +398,8 @@ print(
     f"ℹ️ 从配置加载 value_size_list={VALUE_SIZE_SWEEP_LIST}"
 )
 print(f"ℹ️ 从配置加载 OP_TIMEOUT_SECONDS: {OP_TIMEOUT_SECONDS}")
+print(f"ℹ️ 从配置加载 KV_GET_OUTPUT: {KV_GET_OUTPUT}")
+print(f"ℹ️ 从配置加载 KV_CUDA_DEVICE_INDEX: {KV_CUDA_DEVICE_INDEX}")
 
 
 def get_consumer_sim_handle_ms_range(config_path: str) -> Optional[Tuple[int, int]]:
@@ -424,9 +455,24 @@ def get_consumer_sim_handle_ms_range(config_path: str) -> Optional[Tuple[int, in
     return (min_ms, max_ms)
 
 
-def _load_benchmark_config(config_path: str) -> Dict[str, Any]:
-    """加载 CONFIG['benchmark']，用于统一读取 value_size / mode 等字段。"""
-    return _load_benchmark_section(config_path)
+def get_mpmc_active_producer_runtime_limit(config_path: str) -> Optional[int]:
+    """Read the optional MPMC active producer runtime limit."""
+    benchmark_cfg = _load_benchmark_section(config_path)
+    raw_limit = benchmark_cfg.get("mpmc_active_producer_runtime_limit")
+    if raw_limit is None:
+        return None
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "benchmark.mpmc_active_producer_runtime_limit must be an integer"
+        ) from exc
+    if limit <= 0:
+        raise ValueError(
+            "benchmark.mpmc_active_producer_runtime_limit must be > 0, "
+            f"got: {raw_limit!r}"
+        )
+    return limit
 
 
 def get_value_size_from_config(config_path: str) -> int:
@@ -442,7 +488,7 @@ def get_test_mode_from_config(config_path: str) -> str:
 
     Allowed values: KVSTORE / KVSTORE_WITH_LOCAL_CACHE / RPC / MPMC
     """
-    benchmark_cfg = _load_benchmark_config(config_path)
+    benchmark_cfg = _load_benchmark_section(config_path)
     if "mode" not in benchmark_cfg:
         print("❌ benchmark.mode 未配置")
         exit(1)
@@ -468,6 +514,8 @@ def _write_benchmark_result_file(all_summaries: List[Dict[str, Any]]) -> None:
         "value_size_weighted_set": VALUE_SIZE_WEIGHTED_SET,
         "max_benchmark_seconds": MAX_BENCHMARK_SECONDS,
         "metric_warmup_seconds": METRIC_WARMUP_SECONDS,
+        BENCHMARK_KEY_KV_GET_OUTPUT: KV_GET_OUTPUT,
+        BENCHMARK_KEY_KV_CUDA_DEVICE_INDEX: KV_CUDA_DEVICE_INDEX,
         "runs": all_summaries,
     }
     out_p = Path(out_path)
@@ -554,6 +602,13 @@ print(
     f"ℹ️ 从配置加载 CONSUMER_SIM_HANDLE_MS_RANGE: {CONSUMER_SIM_HANDLE_MS_RANGE}"
 )
 
+MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT = get_mpmc_active_producer_runtime_limit(KVCACHE_CONFIG_PATH)
+print(
+    f"ℹ️ 从配置加载 MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT: {MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT}"
+)
+MPMC_PRODUCER_RUNTIME_MODE_ACTIVE = "active"
+MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY = "logical_only"
+
 
 CURR_TEST_MODE = get_test_mode_from_config(KVCACHE_CONFIG_PATH)
 print(f"ℹ️ 从配置加载 CURR_TEST_MODE: {CURR_TEST_MODE}")
@@ -605,6 +660,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("coordinator")
 
+START_WAITING_WARNING_LOG_INTERVAL_SECONDS = 10.0
+
 
 @dataclass
 class TestConfig:
@@ -650,6 +707,9 @@ class NodeConfig:
     mq_weight: float = 1.0
     mq_config: Optional[dict] = None
     mq_unique_id: Optional[str] = None
+    mpmc_producer_runtime_mode: Optional[str] = None
+    expected_mpmc_consumer_workers: Optional[int] = None
+    mpmc_producer_prefeed_leader: Optional[bool] = None
     # Optional: simulated MQ consumer handling time (milliseconds range)
     consumer_sim_handle_ms_range: Optional[Tuple[int, int]] = None
     network_sample: Optional[Dict[str, Any]] = None
@@ -671,6 +731,7 @@ class NodeMetrics:
     get_hit_operations: int
     get_miss_operations: int
     get_error_operations: int
+    get_source_summary: Dict[str, Any]
     avg_latency_us: float
     p50_latency_us: float
     p99_latency_us: float
@@ -696,6 +757,33 @@ class NodeMetrics:
     tcp_thread_transport_summary: Dict[str, Any]
     p2p_receive_transport_summary: Dict[str, Any]
     p2p_rpc_completion_summary: Dict[str, Any]
+
+
+class _ResultRecordDisposition(Enum):
+    RECORDED_WAITING = "recorded_waiting"
+    RECORDED_COMPLETED = "recorded_completed"
+    IGNORED_TERMINAL = "ignored_terminal"
+
+
+@dataclass(frozen=True)
+class _ResultRecordOutcome:
+    disposition: _ResultRecordDisposition
+    reported_result_node_count: int
+    terminal_status: Optional[str]
+
+
+class _RoundCompletionDisposition(Enum):
+    COMPLETED = "completed"
+    FORCED_MISSING_CONSUMERS = "forced_missing_consumers"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class _RoundCompletionOutcome:
+    disposition: _RoundCompletionDisposition
+    reported_node_ids: Tuple[str, ...]
+    missing_node_ids: Tuple[str, ...]
+    forced_consumer_node_ids: Tuple[str, ...] = ()
 
 
 def _describe_value_size_config(
@@ -1420,6 +1508,85 @@ def _aggregate_p2p_rpc_completion_summary(
     )
 
 
+def _aggregate_get_source_summary(results: List[NodeMetrics]) -> Dict[str, Any]:
+    """Aggregate per-node GET source observations without inventing attribution."""
+    memory_hits = 0
+    ssd_hits = 0
+    unknown_hits = 0
+    observed_hits = 0
+    complete_node_count = 0
+    observation_kinds: set[str] = set()
+
+    for result in results:
+        hit_count = max(0, int(result.get_hit_operations))
+        raw_summary = result.get_source_summary
+        if not isinstance(raw_summary, dict):
+            unknown_hits += hit_count
+            observed_hits += hit_count
+            observation_kinds.add("unavailable")
+            continue
+
+        raw_observation_kind = raw_summary.get("observation_kind")
+        observation_kind = (
+            str(raw_observation_kind).strip()
+            if isinstance(raw_observation_kind, str)
+            else ""
+        )
+        observation_kinds.add(observation_kind or "unavailable")
+
+        count_keys = (
+            "get_memory_hit_operations",
+            "get_ssd_hit_operations",
+            "get_unknown_source_operations",
+            "get_observed_hit_operations",
+        )
+        raw_counts = [raw_summary.get(key) for key in count_keys]
+        counts_are_valid = all(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            for value in raw_counts
+        )
+        if not counts_are_valid:
+            unknown_hits += hit_count
+            observed_hits += hit_count
+            continue
+
+        node_memory_hits, node_ssd_hits, node_unknown_hits, node_observed_hits = (
+            int(value) for value in raw_counts
+        )
+        counts_are_consistent = (
+            node_observed_hits == hit_count
+            and node_memory_hits + node_ssd_hits + node_unknown_hits
+            == node_observed_hits
+        )
+        if not counts_are_consistent:
+            unknown_hits += hit_count
+            observed_hits += hit_count
+            continue
+
+        memory_hits += node_memory_hits
+        ssd_hits += node_ssd_hits
+        unknown_hits += node_unknown_hits
+        observed_hits += node_observed_hits
+        if bool(raw_summary.get("complete")) and node_unknown_hits == 0:
+            complete_node_count += 1
+
+    node_count = len(results)
+    return {
+        "observation_kinds": sorted(observation_kinds),
+        "get_memory_hit_operations": memory_hits,
+        "get_ssd_hit_operations": ssd_hits,
+        "get_unknown_source_operations": unknown_hits,
+        "get_observed_hit_operations": observed_hits,
+        "complete": (
+            node_count > 0
+            and complete_node_count == node_count
+            and unknown_hits == 0
+        ),
+        "node_count": node_count,
+        "complete_node_count": complete_node_count,
+    }
+
+
 def _build_aggregated_bench_points(results: List[NodeMetrics]) -> Dict[str, Any]:
     total_ops = sum(r.total_operations for r in results)
     total_successful_ops = sum(r.successful_operations for r in results)
@@ -1460,6 +1627,7 @@ def _build_aggregated_bench_points(results: List[NodeMetrics]) -> Dict[str, Any]
         [(float(r.inflight_avg), int(r.total_operations)) for r in results]
     )
     inflight_max = max((int(r.inflight_max) for r in results), default=0)
+    get_source_summary = _aggregate_get_source_summary(results)
     return {
         "total_ops": total_ops,
         "total_successful_ops": total_successful_ops,
@@ -1468,6 +1636,7 @@ def _build_aggregated_bench_points(results: List[NodeMetrics]) -> Dict[str, Any]
         "get_hit_operations": get_hit_operations,
         "get_miss_operations": get_miss_operations,
         "get_error_operations": get_error_operations,
+        "get_source_summary": get_source_summary,
         "total_duration_seconds": total_duration,
         "throughput_ops_per_sec": throughput_ops_per_sec,
         "total_throughput_ops_per_sec": total_throughput_ops_per_sec,
@@ -1504,10 +1673,15 @@ class CoordinatorServer:
         # safely even after the coordinator advances to the next round.
         self.round_gate_states: Dict[str, Dict[str, Any]] = {}
         self.ready_nodes_for_current_test: set[str] = set()
+        self.runtime_ready_nodes_for_current_test: set[str] = set()
         self.lock = threading.Lock()
         self.all_nodes_ready = threading.Event()
+        self.all_runtime_ready = threading.Event()
         self.all_results_received = threading.Event()
         self.test_config: Optional[TestConfig] = None
+        self._start_waiting_warning_lock = threading.Lock()
+        self._start_waiting_warning_next_log_ts = 0.0
+        self._start_waiting_warning_suppressed_count = 0
         # Multi-round test control (value-size sweep only; process fanout is deploy-time fixed).
         self.current_round_index: int = 0
         self.total_rounds: int = 1
@@ -1522,6 +1696,11 @@ class CoordinatorServer:
         self.instance_role_map: Dict[str, str] = {}
         # map instance_key -> key_prefix, derived deterministically from role + ordinal in config
         self.instance_key_prefix_map: Dict[str, str] = {}
+        # map MPMC producer instance_key -> active/logical_only runtime mode
+        self.instance_mpmc_producer_runtime_mode_map: Dict[str, str] = {}
+        # Exactly one active producer is elected to perform cluster prefeed.
+        self.instance_mpmc_producer_prefeed_leader_map: Dict[str, bool] = {}
+        self.expected_mpmc_consumer_workers: int = 0
         # map instance_key -> affinity slot index, assigned explicitly per benchmark member
         self.instance_affinity_slot_map: Dict[str, int] = {}
         self.instance_network_sample_map: Dict[str, Dict[str, Any]] = {}
@@ -1693,6 +1872,9 @@ class CoordinatorServer:
                 self.instance_mq_map = {}
                 self.instance_role_map = {}
                 self.instance_key_prefix_map = {}
+                self.instance_mpmc_producer_runtime_mode_map = {}
+                self.instance_mpmc_producer_prefeed_leader_map = {}
+                self.expected_mpmc_consumer_workers = 0
                 self.instance_affinity_slot_map = {}
                 self.instance_network_sample_map = {}
                 missing_keys = []
@@ -1764,6 +1946,10 @@ class CoordinatorServer:
                             "producer": 0,
                             "consumer": 0,
                         }
+                        producer_runtime_mode_counts: Dict[str, int] = {
+                            MPMC_PRODUCER_RUNTIME_MODE_ACTIVE: 0,
+                            MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY: 0,
+                        }
                         for i, ik0 in enumerate(instance_keys_in_order):
                             role0 = NODE_ROLES[i]
                             ord0 = counters.get(role0, 0)
@@ -1772,13 +1958,57 @@ class CoordinatorServer:
                                 kp = "benchmark_kv"
                             elif role0 in ("producer", "consumer"):
                                 kp = f"benchmark_{role0}_{ord0}"
+                                if role0 == "producer":
+                                    runtime_mode = MPMC_PRODUCER_RUNTIME_MODE_ACTIVE
+                                    if (
+                                        MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT is not None
+                                        and ord0 >= MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT
+                                    ):
+                                        runtime_mode = MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY
+                                    self.instance_mpmc_producer_runtime_mode_map[ik0] = runtime_mode
+                                    producer_runtime_mode_counts[runtime_mode] += 1
                             else:
                                 raise ValueError(f"unexpected node role: {role0}")
                             self.instance_key_prefix_map[ik0] = kp
                             self.instance_affinity_slot_map[ik0] = i
+                        if CURR_TEST_MODE == TestMode.MPMC.value:
+                            self.expected_mpmc_consumer_workers = (
+                                counters["consumer"] * THREADS_PER_PROCESS
+                            )
+                            active_producer_keys = [
+                                instance_key
+                                for instance_key in instance_keys_in_order
+                                if self.instance_role_map[instance_key] == "producer"
+                                and self.instance_mpmc_producer_runtime_mode_map.get(instance_key)
+                                == MPMC_PRODUCER_RUNTIME_MODE_ACTIVE
+                            ]
+                            if self.expected_mpmc_consumer_workers <= 0:
+                                raise ValueError(
+                                    "MPMC benchmark requires at least one consumer worker"
+                                )
+                            if not active_producer_keys:
+                                raise ValueError(
+                                    "MPMC benchmark requires at least one active producer"
+                                )
+                            leader_key = active_producer_keys[0]
+                            self.instance_mpmc_producer_prefeed_leader_map = {
+                                instance_key: instance_key == leader_key
+                                for instance_key in instance_keys_in_order
+                                if self.instance_role_map[instance_key] == "producer"
+                            }
+                            logger.info(
+                                "🔧 MPMC producer runtime modes: active=%s logical_only=%s "
+                                "limit=%s prefeed_leader=%s expected_consumer_workers=%s",
+                                producer_runtime_mode_counts[MPMC_PRODUCER_RUNTIME_MODE_ACTIVE],
+                                producer_runtime_mode_counts[MPMC_PRODUCER_RUNTIME_MODE_LOGICAL_ONLY],
+                                MPMC_ACTIVE_PRODUCER_RUNTIME_LIMIT,
+                                leader_key,
+                                self.expected_mpmc_consumer_workers,
+                            )
 
         except Exception as e:
             # By rule: if config is invalid, print the error; do not fallback/recover.
+            self.server_start_error = f"invalid benchmark configuration: {e}"
             logger.error(f"❌ 读取或解析KVCache配置失败: {e}")
 
     def start(self):
@@ -1926,6 +2156,18 @@ class CoordinatorServer:
                     logger.warning(f"❌ 向节点 {node_id} 发送就绪响应失败")
             elif msg_type == "start":
                 self.handle_start_request(message, client_socket)
+            elif msg_type == "runtime_ready":
+                if not node_id:
+                    node_id = message.get("node_id")
+                logger.debug(f"✅ 处理 runtime_ready 消息: {node_id}")
+                if not self.handle_runtime_ready(message, client_socket):
+                    logger.warning(f"❌ 向节点 {node_id} 发送 runtime_ready 响应失败")
+            elif msg_type == "runtime_start":
+                if not node_id:
+                    node_id = message.get("node_id")
+                logger.debug(f"▶️ 处理 runtime_start 消息: {node_id}")
+                if not self.handle_runtime_start_request(message, client_socket):
+                    logger.warning(f"❌ 向节点 {node_id} 发送 runtime_start 响应失败")
             elif msg_type == "result":
                 if not node_id:
                     node_id = message.get("node_id")
@@ -1964,6 +2206,28 @@ class CoordinatorServer:
             except Exception:
                 pass
 
+    def _log_start_waiting_warning(self, *, node_id: Any) -> None:
+        now = time.monotonic()
+        with self._start_waiting_warning_lock:
+            if now < self._start_waiting_warning_next_log_ts:
+                self._start_waiting_warning_suppressed_count += 1
+                return
+
+            suppressed_count = self._start_waiting_warning_suppressed_count
+            self._start_waiting_warning_suppressed_count = 0
+            self._start_waiting_warning_next_log_ts = (
+                now + START_WAITING_WARNING_LOG_INTERVAL_SECONDS
+            )
+
+        if suppressed_count > 0:
+            logger.warning(
+                "⚠️ 节点 %s 发送请求开始测试，但尚未所有节点就绪; suppressed_waiting_warnings=%s",
+                node_id,
+                suppressed_count,
+            )
+        else:
+            logger.warning(f"⚠️ 节点 {node_id} 发送请求开始测试，但尚未所有节点就绪")
+
     def handle_start_request(self, message: Dict, client_socket: socket.socket):
         node_id = message.get("node_id")
         if not self.test_config:
@@ -1977,7 +2241,7 @@ class CoordinatorServer:
             return
 
         if not self.all_nodes_ready.is_set():
-            logger.warning(f"⚠️ 节点 {node_id} 发送请求开始测试，但尚未所有节点就绪")
+            self._log_start_waiting_warning(node_id=node_id)
             # Reply directly
             response = {
                 "status": "waiting",  # Keep waiting
@@ -2009,6 +2273,80 @@ class CoordinatorServer:
             }
             if not self._send_tcp_response(client_socket, response):
                 logger.warning(f"❌ 向节点 {node_id} 发送开始测试响应失败")
+
+    def handle_runtime_ready(self, message: Dict, client_socket: socket.socket) -> bool:
+        """Handle post-START runtime-ready state for MPMC benchmarks."""
+        node_id = message.get("node_id")
+        if not isinstance(node_id, str) or not node_id.strip():
+            return self._send_tcp_response(
+                client_socket,
+                {"status": "error", "error": "runtime_ready missing node_id"},
+            )
+        with self.lock:
+            if node_id not in self.registered_nodes:
+                logger.warning("⚠️ 未注册的节点报告 runtime_ready: %s", node_id)
+                return self._send_tcp_response(
+                    client_socket,
+                    {"status": "error", "error": f"unregistered node: {node_id}"},
+                )
+            self.runtime_ready_nodes_for_current_test.add(node_id)
+            ready_count = len(self.runtime_ready_nodes_for_current_test)
+            ready_node_ids = sorted(self.runtime_ready_nodes_for_current_test)
+            all_runtime_ready = ready_count >= self.expected_nodes
+            if all_runtime_ready:
+                self.all_runtime_ready.set()
+            logger.info(
+                "✅ MPMC runtime ready: node_id=%s runtime_ready=%s/%s",
+                node_id,
+                ready_count,
+                self.expected_nodes,
+            )
+        status = "success" if all_runtime_ready else "waiting"
+        return self._send_tcp_response(
+            client_socket,
+            {
+                "status": status,
+                "runtime_ready_count": ready_count,
+                "runtime_ready_node_ids": ready_node_ids,
+                "expected_nodes": int(self.expected_nodes),
+            },
+        )
+
+    def handle_runtime_start_request(self, message: Dict, client_socket: socket.socket) -> bool:
+        """Allow MPMC nodes to start the timed window only after all runtimes are ready."""
+        node_id = message.get("node_id")
+        if not isinstance(node_id, str) or not node_id.strip():
+            return self._send_tcp_response(
+                client_socket,
+                {"status": "error", "error": "runtime_start missing node_id"},
+            )
+        with self.lock:
+            if node_id not in self.registered_nodes:
+                logger.warning("⚠️ 未注册的节点请求 runtime_start: %s", node_id)
+                return self._send_tcp_response(
+                    client_socket,
+                    {"status": "error", "error": f"unregistered node: {node_id}"},
+                )
+            ready_count = len(self.runtime_ready_nodes_for_current_test)
+            ready_node_ids = sorted(self.runtime_ready_nodes_for_current_test)
+            all_runtime_ready = ready_count >= self.expected_nodes
+        status = "success" if all_runtime_ready else "waiting"
+        if status == "success":
+            logger.info(
+                "🎯 MPMC runtime start released: node_id=%s runtime_ready=%s/%s",
+                node_id,
+                ready_count,
+                self.expected_nodes,
+            )
+        return self._send_tcp_response(
+            client_socket,
+            {
+                "status": status,
+                "runtime_ready_count": ready_count,
+                "runtime_ready_node_ids": ready_node_ids,
+                "expected_nodes": int(self.expected_nodes),
+            },
+        )
 
     @staticmethod
     def _deep_merge(dst: dict, patch: dict) -> dict:
@@ -2163,6 +2501,9 @@ class CoordinatorServer:
             mq_role_effective: Optional[str] = None
             mq_weight_effective: float = 1.0
             mq_final_cfg: Optional[Dict[str, Any]] = None
+            mpmc_producer_runtime_mode: Optional[str] = None
+            expected_mpmc_consumer_workers: Optional[int] = None
+            mpmc_producer_prefeed_leader: Optional[bool] = None
             if active_test_mode == TestMode.MPMC.value:
                 mq_role_effective = mq_role
                 mq_weight_effective = float(mq_weight)
@@ -2171,6 +2512,26 @@ class CoordinatorServer:
                     mq_final_cfg = self._deep_merge(mq_final_cfg, mq_patch)
                 mq_final_cfg["role"] = mq_role_effective
                 mq_final_cfg["weight"] = mq_weight_effective
+                if assigned_role == "producer":
+                    mpmc_producer_runtime_mode = (
+                        self.instance_mpmc_producer_runtime_mode_map.get(
+                            instance_key,
+                            MPMC_PRODUCER_RUNTIME_MODE_ACTIVE,
+                        )
+                    )
+                    mpmc_producer_prefeed_leader = (
+                        self.instance_mpmc_producer_prefeed_leader_map.get(instance_key)
+                    )
+                    if not isinstance(mpmc_producer_prefeed_leader, bool):
+                        raise ValueError(
+                            "missing explicit MPMC producer prefeed leader assignment: "
+                            f"instance_key={instance_key}"
+                        )
+                expected_mpmc_consumer_workers = self.expected_mpmc_consumer_workers
+                if expected_mpmc_consumer_workers <= 0:
+                    raise ValueError(
+                        "expected_mpmc_consumer_workers must be positive for MPMC"
+                    )
 
             node_config = NodeConfig(
                 node_id=response_node_id,
@@ -2192,6 +2553,9 @@ class CoordinatorServer:
                 mq_weight=mq_weight_effective,
                 mq_config=mq_final_cfg,
                 mq_unique_id=self.mq_unique_id,
+                mpmc_producer_runtime_mode=mpmc_producer_runtime_mode,
+                expected_mpmc_consumer_workers=expected_mpmc_consumer_workers,
+                mpmc_producer_prefeed_leader=mpmc_producer_prefeed_leader,
                 consumer_sim_handle_ms_range=CONSUMER_SIM_HANDLE_MS_RANGE,
                 network_sample=copy.deepcopy(self.instance_network_sample_map.get(instance_key)),
                 prometheus_base_url=self.prometheus_base_url,
@@ -2233,6 +2597,7 @@ class CoordinatorServer:
             "node_id": response_node_id,
             "node_role": assigned_role,
             "test_mode": active_test_mode,
+            "expected_nodes": int(self.expected_nodes),
             "threads_per_process": THREADS_PER_PROCESS,
             "max_benchmark_seconds": MAX_BENCHMARK_SECONDS,
             "cluster_ready_timeout_seconds": CLUSTER_READY_TIMEOUT_SECONDS,
@@ -2257,6 +2622,16 @@ class CoordinatorServer:
             response_config["mq"] = node_config.mq_config
         if node_config.mq_unique_id is not None:
             response_config["mq_new_or_bind_unique_key"] = node_config.mq_unique_id
+        if node_config.mpmc_producer_runtime_mode is not None:
+            response_config["mpmc_producer_runtime_mode"] = node_config.mpmc_producer_runtime_mode
+        if node_config.expected_mpmc_consumer_workers is not None:
+            response_config["expected_mpmc_consumer_workers"] = (
+                node_config.expected_mpmc_consumer_workers
+            )
+        if node_config.mpmc_producer_prefeed_leader is not None:
+            response_config["mpmc_producer_prefeed_leader"] = (
+                node_config.mpmc_producer_prefeed_leader
+            )
         benchmark_cfg = _load_benchmark_section(KVCACHE_CONFIG_PATH)
         response_config = merge_kv_benchmark_extras(response_config, benchmark_cfg)
         response_config = merge_rpc_benchmark_extras(response_config, benchmark_cfg)
@@ -2340,6 +2715,9 @@ class CoordinatorServer:
                 get_hit_operations=results_data.get("get_hit_operations", 0),
                 get_miss_operations=results_data.get("get_miss_operations", 0),
                 get_error_operations=results_data.get("get_error_operations", 0),
+                get_source_summary=copy.deepcopy(
+                    results_data.get("get_source_summary", {})
+                ),
                 avg_latency_us=results_data.get("avg_latency_us", 0.0),
                 p50_latency_us=results_data.get("p50_latency_us", 0.0),
                 p99_latency_us=results_data.get("p99_latency_us", 0.0),
@@ -2372,21 +2750,24 @@ class CoordinatorServer:
                 ),
             )
 
-            reported_result_node_count = self._upsert_test_result(metrics)
-            logger.info(f"📊 收到节点 {node_id} 的测试结果")
-            self._update_round_gate_waiting(
-                test_id=metrics.test_id,
-                completion_error=None,
-            )
-
-            # Count completion by unique node_id, not raw message count.
-            if reported_result_node_count >= self.expected_nodes:
-                logger.info("🎉 所有节点都已上报结果")
-                self._set_round_gate_terminal(
-                    test_id=metrics.test_id,
-                    status=ROUND_GATE_STATUS_COMPLETED,
-                    completion_error=None,
+            record_outcome = self._record_test_result(metrics)
+            if (
+                record_outcome.disposition
+                == _ResultRecordDisposition.IGNORED_TERMINAL
+            ):
+                logger.info(
+                    "Ignored result reported after round termination: "
+                    f"test_id={metrics.test_id} node_id={node_id} "
+                    f"terminal_status={record_outcome.terminal_status}"
                 )
+            else:
+                logger.info(f"📊 收到节点 {node_id} 的测试结果")
+
+            if (
+                record_outcome.disposition
+                == _ResultRecordDisposition.RECORDED_COMPLETED
+            ):
+                logger.info("🎉 所有节点都已上报结果")
                 self.all_results_received.set()
 
             # Send ack response
@@ -2410,8 +2791,10 @@ class CoordinatorServer:
                 "completion_error": None,
             }
             self.ready_nodes_for_current_test = set()
+            self.runtime_ready_nodes_for_current_test = set()
             # 新一轮测试前清理状态
             self.all_nodes_ready.clear()
+            self.all_runtime_ready.clear()
             self.all_results_received.clear()
         logger.info(f"Test started: {config.test_id}")
         logger.info(f"Config: {config}")
@@ -2422,54 +2805,63 @@ class CoordinatorServer:
                 return None
             return str(self.test_config.test_id)
 
-    def _update_round_gate_waiting(
-        self,
-        *,
-        test_id: str,
-        completion_error: Optional[str],
-    ) -> None:
-        with self.lock:
-            state = self.round_gate_states.setdefault(
-                str(test_id),
-                {
-                    "status": ROUND_GATE_STATUS_WAITING,
-                    "expected_nodes": int(self.expected_nodes),
-                    "reported_result_node_count": 0,
-                    "completion_error": None,
-                },
-            )
-            results = self.test_results.get(str(test_id), [])
-            state["status"] = ROUND_GATE_STATUS_WAITING
-            state["expected_nodes"] = int(self.expected_nodes)
-            state["reported_result_node_count"] = len(
-                {str(node.node_id) for node in results}
-            )
-            state["completion_error"] = completion_error
+    def _round_gate_state_locked(self, *, test_id: str) -> Dict[str, Any]:
+        return self.round_gate_states.setdefault(
+            str(test_id),
+            {
+                "status": ROUND_GATE_STATUS_WAITING,
+                "expected_nodes": int(self.expected_nodes),
+                "reported_result_node_count": 0,
+                "completion_error": None,
+            },
+        )
 
-    def _set_round_gate_terminal(
-        self,
-        *,
-        test_id: str,
-        status: str,
-        completion_error: Optional[str],
-    ) -> None:
+    def _upsert_test_result_locked(self, metrics: NodeMetrics) -> int:
+        test_id = str(metrics.test_id)
+        results = self.test_results.setdefault(test_id, [])
+        node_id = str(metrics.node_id)
+        for idx, existing in enumerate(results):
+            if str(existing.node_id) == node_id:
+                results[idx] = metrics
+                break
+        else:
+            results.append(metrics)
+        return len({str(node.node_id) for node in results})
+
+    def _record_test_result(self, metrics: NodeMetrics) -> _ResultRecordOutcome:
+        """Record one result unless the round has already reached a terminal state."""
+        test_id = str(metrics.test_id)
         with self.lock:
-            state = self.round_gate_states.setdefault(
-                str(test_id),
-                {
-                    "status": ROUND_GATE_STATUS_WAITING,
-                    "expected_nodes": int(self.expected_nodes),
-                    "reported_result_node_count": 0,
-                    "completion_error": None,
-                },
-            )
-            results = self.test_results.get(str(test_id), [])
+            state = self._round_gate_state_locked(test_id=test_id)
+            status = str(state["status"])
+            if status in ROUND_GATE_TERMINAL_STATUSES:
+                return _ResultRecordOutcome(
+                    disposition=_ResultRecordDisposition.IGNORED_TERMINAL,
+                    reported_result_node_count=int(
+                        state["reported_result_node_count"]
+                    ),
+                    terminal_status=status,
+                )
+
+            reported_result_node_count = self._upsert_test_result_locked(metrics)
+            expected_nodes = int(state["expected_nodes"])
+            if reported_result_node_count >= expected_nodes:
+                status = ROUND_GATE_STATUS_COMPLETED
+                disposition = _ResultRecordDisposition.RECORDED_COMPLETED
+            else:
+                status = ROUND_GATE_STATUS_WAITING
+                disposition = _ResultRecordDisposition.RECORDED_WAITING
+
             state["status"] = status
-            state["expected_nodes"] = int(self.expected_nodes)
-            state["reported_result_node_count"] = len(
-                {str(node.node_id) for node in results}
+            state["reported_result_node_count"] = reported_result_node_count
+            state["completion_error"] = None
+            return _ResultRecordOutcome(
+                disposition=disposition,
+                reported_result_node_count=reported_result_node_count,
+                terminal_status=(
+                    status if status in ROUND_GATE_TERMINAL_STATUSES else None
+                ),
             )
-            state["completion_error"] = completion_error
 
     def _round_gate_snapshot(self, *, test_id: str) -> Dict[str, Any]:
         with self.lock:
@@ -2541,6 +2933,10 @@ class CoordinatorServer:
                 or str(node_id) in reported_node_ids
             )
 
+    def _runtime_ready_node_ids(self) -> List[str]:
+        with self.lock:
+            return sorted(str(node_id) for node_id in self.runtime_ready_nodes_for_current_test)
+
     def _missing_result_node_ids(self) -> List[str]:
         with self.lock:
             reported = set()
@@ -2611,6 +3007,29 @@ class CoordinatorServer:
             )
             return False
 
+    def wait_for_runtime_ready(self, *, timeout_s: float) -> bool:
+        """Wait for all MPMC nodes to finish runtime setup before result timing starts."""
+        if timeout_s <= 0:
+            raise ValueError(f"wait_for_runtime_ready timeout_s must be > 0, got {timeout_s}")
+
+        completed = self.all_runtime_ready.wait(timeout=timeout_s)
+        if completed:
+            return True
+
+        runtime_ready_nodes = self._runtime_ready_node_ids()
+        with self.lock:
+            registered_nodes = sorted(str(node_id) for node_id in self.registered_nodes.keys())
+        missing_runtime_ready_nodes = sorted(
+            node_id for node_id in registered_nodes if node_id not in runtime_ready_nodes
+        )
+        logger.error(
+            "❌ MPMC runtime nodes did not become ready before deadline: "
+            f"timeout_s={timeout_s} expected_nodes={self.expected_nodes} "
+            f"runtime_ready_nodes={runtime_ready_nodes} "
+            f"missing_runtime_ready_nodes={missing_runtime_ready_nodes}"
+        )
+        return False
+
     def _build_completion_metadata(
         self,
         *,
@@ -2620,6 +3039,7 @@ class CoordinatorServer:
     ) -> Dict[str, Any]:
         registered_node_ids = self._registered_node_ids()
         ready_node_ids = self._ready_node_ids()
+        runtime_ready_node_ids = self._runtime_ready_node_ids()
         reported_result_node_ids = self._reported_result_node_ids()
         pending_result_node_ids = self._missing_result_node_ids()
         return {
@@ -2630,6 +3050,8 @@ class CoordinatorServer:
             "registered_node_ids": registered_node_ids,
             "ready_node_count": len(ready_node_ids),
             "ready_node_ids": ready_node_ids,
+            "runtime_ready_node_count": len(runtime_ready_node_ids),
+            "runtime_ready_node_ids": runtime_ready_node_ids,
             "reported_result_node_count": len(reported_result_node_ids),
             "reported_result_node_ids": reported_result_node_ids,
             "pending_result_node_count": len(pending_result_node_ids),
@@ -2652,150 +3074,226 @@ class CoordinatorServer:
                 aggregated[str(error_key)] = aggregated.get(str(error_key), 0) + int(count)
         return aggregated
 
-    def _upsert_test_result(self, metrics: NodeMetrics) -> int:
+    @staticmethod
+    def _missing_consumer_placeholder(
+        *,
+        test_id: str,
+        node_id: str,
+        node_role: str,
+    ) -> NodeMetrics:
+        return NodeMetrics(
+            test_id=test_id,
+            node_id=node_id,
+            node_role=node_role,
+            total_operations=1,
+            successful_operations=0,
+            failed_operations=1,
+            get_total_operations=0,
+            get_hit_operations=0,
+            get_miss_operations=0,
+            get_error_operations=0,
+            get_source_summary={},
+            avg_latency_us=0.0,
+            p50_latency_us=0.0,
+            p99_latency_us=0.0,
+            p95_latency_us=0.0,
+            throughput_ops_per_sec=0.0,
+            total_throughput_ops_per_sec=0.0,
+            get_total_throughput_ops_per_sec=0.0,
+            get_hit_throughput_ops_per_sec=0.0,
+            get_miss_throughput_ops_per_sec=0.0,
+            total_bytes_processed=0,
+            total_duration_seconds=0.0,
+            error_details={"forced_missing_consumer_result_timeout": 1},
+            top_slowest_operations=[],
+            inflight_max=0,
+            inflight_avg=0.0,
+            observed_value_size_histogram={},
+            observed_value_size_avg=0.0,
+            observed_value_size_min=0,
+            observed_value_size_max=0,
+            fluxon_phase_summary={},
+            network_bandwidth={},
+            tcp_thread_transport_summary={},
+            p2p_receive_transport_summary={},
+            p2p_rpc_completion_summary={},
+        )
+
+    def _finalize_round_after_result_wait(
+        self,
+        *,
+        test_id: str,
+        test_mode: str,
+        wait_completed: bool,
+        completion_error: str,
+    ) -> _RoundCompletionOutcome:
+        """Finalize one result snapshot while holding the result/gate lock."""
         with self.lock:
-            test_id = metrics.test_id
-            if test_id not in self.test_results:
-                self.test_results[test_id] = []
-            results = self.test_results[test_id]
-            node_id = str(metrics.node_id)
-            for idx, existing in enumerate(results):
-                if str(existing.node_id) == node_id:
-                    results[idx] = metrics
-                    break
-            else:
-                results.append(metrics)
-            return len({str(node.node_id) for node in results})
+            state = self._round_gate_state_locked(test_id=test_id)
+            status = str(state["status"])
+            if status not in (
+                ROUND_GATE_STATUS_WAITING,
+                ROUND_GATE_STATUS_COMPLETED,
+                ROUND_GATE_STATUS_FAILED,
+            ):
+                raise RuntimeError(
+                    f"unknown round gate status for test_id={test_id}: {status}"
+                )
+
+            results = self.test_results.setdefault(test_id, [])
+            reported_node_ids = tuple(
+                sorted({str(node.node_id) for node in results})
+            )
+            registered_nodes = {
+                str(node_id): metadata
+                for node_id, metadata in self.registered_nodes.items()
+            }
+            missing_node_ids = tuple(
+                sorted(
+                    node_id
+                    for node_id in registered_nodes
+                    if node_id not in reported_node_ids
+                )
+            )
+
+            if status == ROUND_GATE_STATUS_COMPLETED:
+                return _RoundCompletionOutcome(
+                    disposition=_RoundCompletionDisposition.COMPLETED,
+                    reported_node_ids=reported_node_ids,
+                    missing_node_ids=missing_node_ids,
+                )
+            if status == ROUND_GATE_STATUS_FAILED:
+                return _RoundCompletionOutcome(
+                    disposition=_RoundCompletionDisposition.FAILED,
+                    reported_node_ids=reported_node_ids,
+                    missing_node_ids=missing_node_ids,
+                )
+
+            expected_nodes = int(state["expected_nodes"])
+            if len(reported_node_ids) >= expected_nodes:
+                state["status"] = ROUND_GATE_STATUS_COMPLETED
+                state["reported_result_node_count"] = len(reported_node_ids)
+                state["completion_error"] = None
+                return _RoundCompletionOutcome(
+                    disposition=_RoundCompletionDisposition.COMPLETED,
+                    reported_node_ids=reported_node_ids,
+                    missing_node_ids=missing_node_ids,
+                )
+
+            if wait_completed:
+                raise RuntimeError(
+                    "all_results_received was set before the round had enough "
+                    f"unique results: test_id={test_id} "
+                    f"reported={len(reported_node_ids)} expected={expected_nodes}"
+                )
+
+            missing_consumers = tuple(
+                node_id
+                for node_id in missing_node_ids
+                if str((registered_nodes[node_id] or {}).get("node_role"))
+                == "consumer"
+            )
+            missing_non_consumers = tuple(
+                node_id
+                for node_id in missing_node_ids
+                if node_id not in missing_consumers
+            )
+            has_producer_result = any(
+                isinstance(result, NodeMetrics) and result.node_role == "producer"
+                for result in results
+            )
+            can_force_missing_consumers = (
+                test_mode == TestMode.MPMC.value
+                and bool(missing_consumers)
+                and not missing_non_consumers
+                and has_producer_result
+                and len(reported_node_ids) + len(missing_consumers)
+                >= expected_nodes
+            )
+
+            if can_force_missing_consumers:
+                for node_id in missing_consumers:
+                    metadata = registered_nodes[node_id] or {}
+                    role = metadata.get("node_role")
+                    node_role = str(role) if isinstance(role, str) else "consumer"
+                    self._upsert_test_result_locked(
+                        self._missing_consumer_placeholder(
+                            test_id=test_id,
+                            node_id=node_id,
+                            node_role=node_role,
+                        )
+                    )
+
+                reported_node_ids = tuple(
+                    sorted({str(node.node_id) for node in results})
+                )
+                state["status"] = ROUND_GATE_STATUS_COMPLETED
+                state["reported_result_node_count"] = len(reported_node_ids)
+                state["completion_error"] = None
+                return _RoundCompletionOutcome(
+                    disposition=(
+                        _RoundCompletionDisposition.FORCED_MISSING_CONSUMERS
+                    ),
+                    reported_node_ids=reported_node_ids,
+                    missing_node_ids=missing_node_ids,
+                    forced_consumer_node_ids=missing_consumers,
+                )
+
+            state["status"] = ROUND_GATE_STATUS_FAILED
+            state["reported_result_node_count"] = len(reported_node_ids)
+            state["completion_error"] = completion_error
+            return _RoundCompletionOutcome(
+                disposition=_RoundCompletionDisposition.FAILED,
+                reported_node_ids=reported_node_ids,
+                missing_node_ids=missing_node_ids,
+            )
 
     def wait_for_completion(self, *, timeout_s: float) -> bool:
         """Wait for all node results with a config-derived deadline."""
         if timeout_s <= 0:
             raise ValueError(f"wait_for_completion timeout_s must be > 0, got {timeout_s}")
-        test_id = self._current_test_id()
-        completed = self.all_results_received.wait(timeout=timeout_s)
-        if completed:
-            if test_id is not None:
-                self._set_round_gate_terminal(
-                    test_id=test_id,
-                    status=ROUND_GATE_STATUS_COMPLETED,
-                    completion_error=None,
-                )
-            return True
-        missing_nodes = self._missing_result_node_ids()
-        reported_nodes = self._reported_result_node_ids()
+        with self.lock:
+            if self.test_config is None:
+                raise RuntimeError("wait_for_completion requires active test_config")
+            test_id = str(self.test_config.test_id)
+            test_mode = str(self.test_config.test_mode)
+
+        wait_completed = self.all_results_received.wait(timeout=timeout_s)
         completion_error = (
             "benchmark result wait timed out after "
             f"{timeout_s:.1f}s"
         )
-        logger.error(
-            "❌ benchmark result wait timed out: "
-            f"timeout_s={timeout_s} expected_nodes={self.expected_nodes} "
-            f"reported_nodes={reported_nodes} missing_nodes={missing_nodes}"
+        outcome = self._finalize_round_after_result_wait(
+            test_id=test_id,
+            test_mode=test_mode,
+            wait_completed=wait_completed,
+            completion_error=completion_error,
         )
 
-        # English note:
-        # - In MPMC mode, producer/consumer are separate logical nodes.
-        # - If only consumer nodes are missing results, we force a placeholder metrics
-        #   record for each missing consumer so the run can converge deterministically,
-        #   while keeping the anomaly visible in error_details.
-        # - If any non-consumer node is missing (e.g. producer), we still fail the run.
-        if self.test_config and self.test_config.test_mode == TestMode.MPMC.value:
-            missing_non_consumer: list[str] = []
-            missing_consumers: list[str] = []
-            with self.lock:
-                for node_id in missing_nodes:
-                    meta = self.registered_nodes.get(node_id) or {}
-                    role = meta.get("node_role")
-                    role_s = str(role) if isinstance(role, str) else "unknown"
-                    if role_s == "consumer":
-                        missing_consumers.append(str(node_id))
-                    else:
-                        missing_non_consumer.append(str(node_id))
-
-            if not missing_non_consumer and missing_consumers:
-                # Only force-complete if we have at least one producer result.
-                has_producer_result = False
-                with self.lock:
-                    for raw in self.test_results.get(self.test_config.test_id, []):
-                        if isinstance(raw, NodeMetrics) and raw.node_role == "producer":
-                            has_producer_result = True
-                            break
-
-                if has_producer_result:
-                    forced_error_label = "forced_missing_consumer_result_timeout"
-                    with self.lock:
-                        test_id = self.test_config.test_id
-                        if test_id not in self.test_results:
-                            self.test_results[test_id] = []
-                        for node_id in missing_consumers:
-                            meta = self.registered_nodes.get(node_id) or {}
-                            role = meta.get("node_role")
-                            role_s = str(role) if isinstance(role, str) else "consumer"
-                            # Force a placeholder result with explicit error_details so downstream
-                            # can surface the anomaly without stalling the whole suite.
-                            self.test_results[test_id].append(
-                                NodeMetrics(
-                                    test_id=test_id,
-                                    node_id=str(node_id),
-                                    node_role=role_s,
-                                    total_operations=1,
-                                    successful_operations=0,
-                                    failed_operations=1,
-                                    get_total_operations=0,
-                                    get_hit_operations=0,
-                                    get_miss_operations=0,
-                                    get_error_operations=0,
-                                    avg_latency_us=0.0,
-                                    p50_latency_us=0.0,
-                                    p99_latency_us=0.0,
-                                    p95_latency_us=0.0,
-                                    throughput_ops_per_sec=0.0,
-                                    total_throughput_ops_per_sec=0.0,
-                                    get_total_throughput_ops_per_sec=0.0,
-                                    get_hit_throughput_ops_per_sec=0.0,
-                                    get_miss_throughput_ops_per_sec=0.0,
-                                    total_bytes_processed=0,
-                                    total_duration_seconds=0.0,
-                                    error_details={
-                                        forced_error_label: 1,
-                                    },
-                                    top_slowest_operations=[],
-                                    inflight_max=0,
-                                    inflight_avg=0.0,
-                                    observed_value_size_histogram={},
-                                    observed_value_size_avg=0.0,
-                                    observed_value_size_min=0,
-                                    observed_value_size_max=0,
-                                    fluxon_phase_summary={},
-                                    network_bandwidth={},
-                                    tcp_thread_transport_summary={},
-                                    p2p_receive_transport_summary={},
-                                    p2p_rpc_completion_summary={},
-                                )
-                            )
-
-                        logger.error(
-                            "⚠️ force-completed MPMC run by inserting placeholder results for missing consumer nodes: "
-                            f"test_id={test_id} missing_consumers={missing_consumers} "
-                            f"reported_nodes={reported_nodes} timeout_s={timeout_s}"
-                        )
-
-                        if len({str(node.node_id) for node in self.test_results[test_id]}) >= self.expected_nodes:
-                            self._set_round_gate_terminal(
-                                test_id=test_id,
-                                status=ROUND_GATE_STATUS_COMPLETED,
-                                completion_error=None,
-                            )
-                            self.all_results_received.set()
-                    return True
-
-        if test_id is not None:
-            self._set_round_gate_terminal(
-                test_id=test_id,
-                status=ROUND_GATE_STATUS_FAILED,
-                completion_error=completion_error,
+        if outcome.disposition == _RoundCompletionDisposition.FAILED:
+            logger.error(
+                "❌ benchmark result wait timed out: "
+                f"timeout_s={timeout_s} expected_nodes={self.expected_nodes} "
+                f"reported_nodes={list(outcome.reported_node_ids)} "
+                f"missing_nodes={list(outcome.missing_node_ids)}"
             )
-        return False
+            return False
+
+        # Signal only after the result snapshot and terminal gate were committed.
+        self.all_results_received.set()
+        if (
+            outcome.disposition
+            == _RoundCompletionDisposition.FORCED_MISSING_CONSUMERS
+        ):
+            logger.error(
+                "⚠️ force-completed MPMC run by inserting placeholder results "
+                "for missing consumer nodes: "
+                f"test_id={test_id} "
+                f"missing_consumers={list(outcome.forced_consumer_node_ids)} "
+                f"reported_nodes={list(outcome.reported_node_ids)} "
+                f"timeout_s={timeout_s}"
+            )
+        return True
 
     def build_incomplete_run_summary(
         self,
@@ -2817,6 +3315,16 @@ class CoordinatorServer:
                 "get_hit_operations": 0,
                 "get_miss_operations": 0,
                 "get_error_operations": 0,
+                "get_source_summary": {
+                    "observation_kinds": [],
+                    "get_memory_hit_operations": 0,
+                    "get_ssd_hit_operations": 0,
+                    "get_unknown_source_operations": 0,
+                    "get_observed_hit_operations": 0,
+                    "complete": False,
+                    "node_count": 0,
+                    "complete_node_count": 0,
+                },
                 "total_duration_seconds": 0.0,
                 "total_bytes": 0,
                 "overall_success_rate": 0.0,
@@ -2854,6 +3362,7 @@ class CoordinatorServer:
                 "get_hit_operations": int(overall["get_hit_operations"]),
                 "get_miss_operations": int(overall["get_miss_operations"]),
                 "get_error_operations": int(overall["get_error_operations"]),
+                "get_source_summary": copy.deepcopy(overall["get_source_summary"]),
                 "total_duration_seconds": float(overall["total_duration_seconds"]),
                 "throughput_ops_per_sec": float(overall["overall_tps"]),
                 "total_throughput_ops_per_sec": float(overall["overall_total_tps"]),
@@ -3391,6 +3900,7 @@ class CoordinatorServer:
             "get_hit_operations": int(bench_points["get_hit_operations"]),
             "get_miss_operations": int(bench_points["get_miss_operations"]),
             "get_error_operations": int(bench_points["get_error_operations"]),
+            "get_source_summary": copy.deepcopy(bench_points["get_source_summary"]),
             "total_duration_seconds": total_duration,
             "total_bytes": total_bytes,
             "overall_success_rate": overall_success_rate,
@@ -3439,6 +3949,7 @@ class CoordinatorServer:
                     "get_hit_operations": node.get_hit_operations,
                     "get_miss_operations": node.get_miss_operations,
                     "get_error_operations": node.get_error_operations,
+                    "get_source_summary": copy.deepcopy(node.get_source_summary),
                     "avg_latency_us": node.avg_latency_us,
                     "p50_latency_us": node.p50_latency_us,
                     "p95_latency_us": node.p95_latency_us,
@@ -3620,6 +4131,43 @@ def main():
                 f"💥 协调者启动失败或配置不满足: {coordinator.server_start_error}"
             )
             return 2
+
+        if cfg.test_mode == TestMode.MPMC.value:
+            runtime_ready_start_time = time.time()
+            logger.info(
+                "⏳ 等待 MPMC runtime_ready 屏障 "
+                f"(timeout_s={cfg.cluster_ready_timeout_seconds} "
+                f"expected_nodes={coordinator.expected_nodes})..."
+            )
+            runtime_ready_ok = coordinator.wait_for_runtime_ready(
+                timeout_s=float(cfg.cluster_ready_timeout_seconds)
+            )
+            runtime_ready_elapsed = time.time() - runtime_ready_start_time
+            if not runtime_ready_ok:
+                logger.error(
+                    "❌ MPMC runtime_ready did not complete before deadline: "
+                    f"timeout_s={cfg.cluster_ready_timeout_seconds} "
+                    f"expected_nodes={coordinator.expected_nodes}"
+                )
+                timed_out_summary = coordinator.build_incomplete_run_summary(
+                    elapsed_seconds=runtime_ready_elapsed,
+                    completion_error=(
+                        "MPMC runtime_ready wait timed out after "
+                        f"{float(cfg.cluster_ready_timeout_seconds):.1f}s"
+                    ),
+                )
+                all_summaries.append(timed_out_summary)
+                _write_benchmark_result_file(all_summaries)
+                logger.error(
+                    "❌ wrote incomplete benchmark_result.json due to MPMC runtime_ready timeout; "
+                    "runner will fail the case deterministically"
+                )
+                _hold_forever_after_result_written(reason="mpmc_runtime_ready_timeout")
+            logger.info(
+                "✅ MPMC runtime_ready 屏障完成: elapsed_s=%.1f expected_nodes=%s",
+                runtime_ready_elapsed,
+                coordinator.expected_nodes,
+            )
 
         start_time = time.time()
         logger.info(

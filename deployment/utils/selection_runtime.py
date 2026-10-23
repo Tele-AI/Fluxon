@@ -52,14 +52,6 @@ def atomic_group_member_selection_workload_name(
     )
 
 
-def plain_selection_authority_name(*, selection_name: str) -> str:
-    return _require_str(selection_name, "selection_name")
-
-
-def atomic_group_member_authority_name(*, selection_name: str, service_name: str) -> str:
-    return atomic_group_member_workload_name(selection_name=selection_name, service_name=service_name)
-
-
 def daemonset_selection_supervisor_label(*, workload_name: str) -> str:
     return (
         f"{SELECTION_WORKLOAD_KIND_DAEMONSET}/"

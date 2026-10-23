@@ -66,12 +66,14 @@ from fluxon_py.tests.test_lib import (  # noqa: E402
     KV_SVC_TYPE,
     MOONCAKE_MASTER_SERVER_ADDRESS,
     MOONCAKE_METADATA_SERVER,
-    load_test_fluxon_cluster_name,
-    load_test_fluxon_share_mem_path,
     new_test_consumer,
     new_test_producer,
     pre_kill_existing_test_processes_by_script_name,
     setup_test_environment,
+)
+from setup_and_pack.utils.repo_config_utils import (  # noqa: E402
+    load_test_fluxon_cluster_name_from_test_config,
+    load_test_fluxon_share_mem_path_from_test_config,
 )
 
 
@@ -896,8 +898,8 @@ def _new_store_config(*, instance_key: str, backend_type: str) -> FluxonKvClient
 
     if backend_type == KvClientType.FLUXON.value:
         fluxon_spec: dict[str, Any] = {
-            "cluster_name": load_test_fluxon_cluster_name(),
-            "share_mem_path": load_test_fluxon_share_mem_path(),
+            "cluster_name": load_test_fluxon_cluster_name_from_test_config(),
+            "share_mem_path": load_test_fluxon_share_mem_path_from_test_config(),
         }
         return FluxonKvClientConfig(
             {

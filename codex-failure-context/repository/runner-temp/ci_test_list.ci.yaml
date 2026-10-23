@@ -1,0 +1,464 @@
+schema_version: 9
+run:
+  mode: full_once
+  selectors:
+    case_ids: ALL
+    profile_ids:
+    - fluxon_tcp
+    command_ids: ALL
+    test_ids: ALL
+scenes:
+  ci_top_attention_doc_page_build:
+    ci:
+      subject: doc_page
+      runtime_contract: rust_self_managed
+      prepare:
+      - kind: online_docker_image
+        image_ref: hanbaoaaa/fluxon-doc-site-builder:quartz-v5.0.0-node-v24.16.0
+        env: FLUXON_DOC_SITE_DOCKER_IMAGE_REF
+      commands:
+      - id: top_attention_doc_page_build
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_doc_page_build.py
+          --case-config __RUN_DIR__/configs/ci_scene_config.yaml
+        timeout_seconds: 10800
+    select:
+      scales:
+      - n1_kvowner_dram_3gib
+      profiles:
+      - fluxon_tcp
+  ci_top_attention_bin_kvtest:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+      commands:
+      - id: top_attention_bin_kvtest
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_bin_kvtest.py
+          --case-config __RUN_DIR__/configs/ci_scene_config.yaml
+        timeout_seconds: 21600
+    select:
+      scales:
+      - n1_kvowner_dram_20gib
+      profiles:
+      - fluxon_tcp
+  ci_top_attention_log_mgmt:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+      commands:
+      - id: top_attention_log_mgmt
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_log_mgmt.py
+          --case-config __RUN_DIR__/configs/ci_scene_config.yaml
+        timeout_seconds: 21600
+    select:
+      scales:
+      - n1_kvowner_dram_20gib
+      profiles:
+      - fluxon_tcp
+  ci_top_attention_mq_core:
+    ci:
+      subject: mq
+      runtime_contract: cluster_kv_owner
+      commands:
+      - id: top_attention_mq_core
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_core.py
+          --case-config __RUN_DIR__/configs/ci_scene_config.yaml
+        timeout_seconds: 21600
+    select:
+      scales:
+      - n1_kvowner_dram_20gib
+      profiles:
+      - fluxon_tcp
+  ci_top_attention_ctrl_c_kv:
+    ci:
+      subject: rust
+      runtime_contract: rust_self_managed
+      commands:
+      - id: top_attention_ctrl_c_kv
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_ctrl_c_kv.py
+        timeout_seconds: 21600
+    select:
+      scales:
+      - n1_kvowner_dram_3gib
+      profiles:
+      - fluxon_tcp
+  ci_top_attention_ctrl_c_mq:
+    ci:
+      subject: mq
+      runtime_contract: rust_self_managed
+      commands:
+      - id: top_attention_ctrl_c_mq
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_ctrl_c_mq.py
+        timeout_seconds: 21600
+    select:
+      scales:
+      - n1_kvowner_dram_20gib
+      profiles:
+      - fluxon_tcp
+  ci_top_attention_mq_mpsc:
+    ci:
+      subject: mq
+      runtime_contract: cluster_kv_owner
+      commands:
+      - id: top_attention_mq_mpsc
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_mpsc.py
+          --case-config __RUN_DIR__/configs/ci_scene_config.yaml
+        timeout_seconds: 21600
+    select:
+      scales:
+      - n1_kvowner_dram_20gib
+      profiles:
+      - fluxon_tcp
+  ci_top_attention_mq_mpmc:
+    ci:
+      subject: mq
+      runtime_contract: cluster_kv_owner
+      commands:
+      - id: top_attention_mq_mpmc
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_mpmc.py
+          --case-config __RUN_DIR__/configs/ci_scene_config.yaml
+        timeout_seconds: 21600
+    select:
+      scales:
+      - n1_kvowner_dram_20gib
+      profiles:
+      - fluxon_tcp
+  ci_top_attention_mq_mpmc_bench:
+    ci:
+      subject: mq
+      runtime_contract: cluster_kv_owner
+      commands:
+      - id: top_attention_mq_mpmc_bench
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_mq_mpmc_bench.py
+          --case-config __RUN_DIR__/configs/ci_scene_config.yaml
+        timeout_seconds: 21600
+    select:
+      scales:
+      - n1_kvowner_dram_20gib
+      profiles:
+      - fluxon_tcp
+  ci_top_attention_largescale_mq:
+    ci:
+      subject: mq
+      runtime_contract: rust_self_managed
+      commands:
+      - id: top_attention_largescale_mq
+        command: __RUN_DIR__/venv/bin/python3 -u __RUN_DIR__/src/fluxon_test_stack/top_attention_test_index/_largescale_mq.py
+          --single-host-logical-targets --testbed-bundle-source __TEST_BED_BUNDLE_ROOT__
+          --workdir __WORKDIR_ROOT__/largescale_mq_ci_single_host/p160_c8 --owner-count
+          4 --owner-dram-gib 1 --producer-count 160 --consumer-count 8 --threads-per-process
+          1 --duration-seconds 90 --metric-warmup-seconds 60 --value-size 256 --op-timeout-seconds
+          5 --cluster-ready-timeout-seconds 1800 --consumer-sim-min-ms 1 --consumer-sim-max-ms
+          1
+        timeout_seconds: 21600
+    select:
+      scales:
+      - n1_kvowner_dram_3gib
+      profiles:
+      - fluxon_tcp
+scales:
+  n1_kvowner_dram_3gib:
+    duration_seconds: 60
+    topology: 1
+    targets:
+      hosts:
+      - infra44-ThinkStation-PX
+    owner:
+      owner_count: 1
+      owner_dram_bytes: 3221225472
+    benchmark: &id001
+      processes_per_target: 1
+      threads_per_process: 4
+      value_size: 16384
+      metric_warmup_seconds: 0
+      op_timeout_seconds: 30
+      cluster_ready_timeout_seconds: 660
+      value_size_list: []
+      consumer_sim_handle_ms_range:
+      - 700
+      - 1500
+  n1_kvowner_dram_20gib:
+    duration_seconds: 60
+    topology: 1
+    targets:
+      hosts:
+      - infra44-ThinkStation-PX
+    owner:
+      owner_count: 1
+      owner_dram_bytes: 21474836480
+    benchmark: *id001
+  n2_kvowner_dram_3gib:
+    duration_seconds: 60
+    topology: 2
+    targets:
+      hosts:
+      - infra44-ThinkStation-PX
+      - infra46-ThinkStation-PX
+    owner:
+      owner_count: 2
+      owner_dram_bytes: 3221225472
+    benchmark: *id001
+  n2_kvowner_dram_20gib:
+    duration_seconds: 60
+    topology: 2
+    targets:
+      hosts:
+      - infra44-ThinkStation-PX
+      - infra46-ThinkStation-PX
+    owner:
+      owner_count: 2
+      owner_dram_bytes: 21474836480
+    benchmark: *id001
+artifact_sets:
+  fluxon_fastws:
+    release_source:
+      kind: FLUXON_OPS_FS_S3
+      bucket: fluxon-release
+      access_key: admin
+      secret_key: admin
+      region: us-east-1
+      key_prefix: profiles/fluxon_fastws
+    release_artifacts:
+      wheel: fluxon-0.2.1-py3-none-any.whl
+    test_rsc_source:
+      kind: FLUXON_OPS_FS_S3
+      bucket: fluxon-release
+      access_key: admin
+      secret_key: admin
+      region: us-east-1
+      key_prefix: test_rsc/fluxon_fastws
+    test_rsc_artifacts:
+      ci_src_archive: src_ci.tar.gz
+      ci_ext_rsc_archive: fluxon_ci_ext_rsc.tar.gz
+  fluxon_tquic:
+    release_source:
+      kind: FLUXON_OPS_FS_S3
+      bucket: fluxon-release
+      access_key: admin
+      secret_key: admin
+      region: us-east-1
+      key_prefix: profiles/fluxon_tquic
+    release_artifacts:
+      wheel: fluxon-0.2.1-py3-none-any.whl
+    test_rsc_source:
+      kind: FLUXON_OPS_FS_S3
+      bucket: fluxon-release
+      access_key: admin
+      secret_key: admin
+      region: us-east-1
+      key_prefix: test_rsc/fluxon_tquic
+    test_rsc_artifacts:
+      ci_src_archive: src_ci.tar.gz
+      ci_ext_rsc_archive: fluxon_ci_ext_rsc.tar.gz
+  fluxon_sockudo_ws:
+    release_source:
+      kind: FLUXON_OPS_FS_S3
+      bucket: fluxon-release
+      access_key: admin
+      secret_key: admin
+      region: us-east-1
+      key_prefix: profiles/fluxon_sockudo_ws
+    release_artifacts:
+      wheel: fluxon-0.2.1-py3-none-any.whl
+    test_rsc_source:
+      kind: FLUXON_OPS_FS_S3
+      bucket: fluxon-release
+      access_key: admin
+      secret_key: admin
+      region: us-east-1
+      key_prefix: test_rsc/fluxon_sockudo_ws
+    test_rsc_artifacts:
+      ci_src_archive: src_ci.tar.gz
+      ci_ext_rsc_archive: fluxon_ci_ext_rsc.tar.gz
+  fluxon_tcp:
+    release_source:
+      kind: FLUXON_OPS_FS_S3
+      bucket: fluxon-release
+      access_key: admin
+      secret_key: admin
+      region: us-east-1
+      key_prefix: profiles/fluxon_tcp
+    release_artifacts:
+      wheel: fluxon-0.2.1-py3-none-any.whl
+    test_rsc_source:
+      kind: FLUXON_OPS_FS_S3
+      bucket: fluxon-release
+      access_key: admin
+      secret_key: admin
+      region: us-east-1
+      key_prefix: test_rsc/fluxon_tcp
+    test_rsc_artifacts:
+      ci_src_archive: src_ci.tar.gz
+      ci_ext_rsc_archive: fluxon_ci_ext_rsc.tar.gz
+profiles:
+  fluxon_tcp:
+    artifact_set: fluxon_tcp
+    runtime:
+      ci:
+        deploy:
+          adapter_cmd:
+          - test_profile_adapter.py
+          controller_url: __STACK_CONTROLLER_URL__
+          target_ip_map:
+            infra44-ThinkStation-PX: 192.168.151.44
+            infra46-ThinkStation-PX: 192.168.151.46
+          bootstrap_ready_timeout_seconds: 300
+        scene_configs:
+          ci_top_attention_doc_page_build:
+            doc_site_base_url: Tele-AI.github.io/Fluxon
+          ci_top_attention_bin_kvtest:
+            kv_test_rounds: p2p_only
+          ci_top_attention_cargo_fs_core: {}
+          ci_top_attention_cargo_util: {}
+          ci_top_attention_cargo_kv_unit:
+            kv_transport_feature: tcp_thread_transport
+          ci_top_attention_log_mgmt:
+            enabled: true
+          ci_top_attention_mq_core: {}
+          ci_top_attention_ctrl_c_kv: {}
+          ci_top_attention_ctrl_c_mq: {}
+          ci_top_attention_mq_mpsc: {}
+          ci_top_attention_mq_mpmc: {}
+          ci_top_attention_mq_mpmc_bench: {}
+          ci_top_attention_largescale_mq: {}
+        runtime_contracts:
+          cluster_kv_owner:
+            base_runtime:
+              etcd:
+                target: infra44-ThinkStation-PX
+                endpoint:
+                  scheme: HTTP
+                  host_port: 32579
+              greptime:
+                target: infra44-ThinkStation-PX
+                endpoint:
+                  scheme: HTTP
+                  host_port: 34030
+            case_runtime:
+              master:
+                lifecycle: service
+                k8s_ref: deployment/master
+                deployer:
+                  target: infra44-ThinkStation-PX
+                  command:
+                  - /bin/bash
+                  - -lc
+                  args:
+                  - "set -euo pipefail\ncd __RUN_DIR__/src\nexec __RUN_DIR__/venv/bin/python3\
+                    \ -m fluxon_py.runtime.start_master \\\n  -c __RUN_DIR__/configs/ci_master.yaml\
+                    \ \\\n  -w __RUN_DIR__/services/master\n"
+              owner_0:
+                lifecycle: service
+                k8s_ref: deployment/owner_0
+                deployer:
+                  target: __TARGET__
+                  command:
+                  - /bin/bash
+                  - -lc
+                  args:
+                  - "set -euo pipefail\ncd __RUN_DIR__/src\nexec __RUN_DIR__/venv/bin/python3\
+                    \ -m fluxon_py.runtime.start_owner_kvclient \\\n  -c __RUN_DIR__/configs/ci_owner_0.yaml\
+                    \ \\\n  -w __RUN_DIR__/services/owner_0\n"
+              ci_runner:
+                lifecycle: job
+                k8s_ref: deployment/ci_runner
+                deployer: &id002
+                  target: __TARGET__
+                  command:
+                  - /bin/bash
+                  - -lc
+                  args:
+                  - 'set -uo pipefail
+
+                    exec bash __RUN_DIR__/ci_runner.sh
+
+                    '
+          rust_self_managed:
+            base_runtime:
+              etcd:
+                target: infra44-ThinkStation-PX
+                endpoint:
+                  scheme: HTTP
+                  host_port: 32579
+              greptime:
+                target: infra44-ThinkStation-PX
+                endpoint:
+                  scheme: HTTP
+                  host_port: 34030
+            case_runtime:
+              ci_runner:
+                lifecycle: job
+                k8s_ref: deployment/ci_runner
+                deployer: *id002
+      test_stack:
+        kind: FLUXON
+        coordinator_ready_timeout_seconds: 300
+        port_alloc:
+          by_topology:
+            1:
+              coordinator_port_base: 17779
+              coordinator_port_stride: 10
+              kv_master_port_base: 50061
+              kv_master_port_stride: 10
+              kv_p2p_port_base: 11666
+              kv_p2p_port_stride: 66
+            2:
+              coordinator_port_base: 18779
+              coordinator_port_stride: 10
+              kv_master_port_base: 50161
+              kv_master_port_stride: 10
+              kv_p2p_port_base: 11666
+              kv_p2p_port_stride: 66
+        deploy:
+          adapter_cmd:
+          - test_profile_adapter.py
+          controller_url: __STACK_CONTROLLER_URL__
+          target_ip_map:
+            infra44-ThinkStation-PX: 192.168.151.44
+            infra46-ThinkStation-PX: 192.168.151.46
+          bootstrap_ready_timeout_seconds: 300
+        runtime_config:
+          kv_base:
+            instance_key: bench_base
+            contribute_to_cluster_pool_size:
+              dram: 0
+              vram: {}
+            fluxonkv_spec:
+              cluster_name: __STACK_CLUSTER_NAME__
+              share_mem_path: __STACK_SHARE_MEM_PATH__
+          mq_base:
+            capacity: 40
+            ttl_seconds: 90
+          kv_node_patch_template: {}
+        deploy_templates:
+          coordinator:
+            lifecycle: service
+            k8s_ref: deployment/test_stack_coord
+            deployer:
+              target: infra44-ThinkStation-PX
+              command:
+              - /bin/bash
+              - -lc
+              args:
+              - '# Placeholder only. test_runner.py rewrites the actual TEST_STACK
+
+                # launch command and resolves the interpreter from target hostworkdir.
+
+                :
+
+                '
+          node:
+            lifecycle: job
+            k8s_ref: deployment/test_stack_node___INSTANCE_KEY__
+            deployer:
+              target: __TARGET__
+              command:
+              - /bin/bash
+              - -lc
+              args:
+              - '# Placeholder only. test_runner.py rewrites the actual TEST_STACK
+
+                # launch command and resolves the interpreter from target hostworkdir.
+
+                : "__INSTANCE_KEY__ __COORDINATOR__"
+
+                '

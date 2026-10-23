@@ -2,7 +2,6 @@ use pyo3::PyErr;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use fluxon_mq::MpscError as CoreMpscError;
 // Re-export the core MPSC error type for callers who want to depend on a single error hub.
 pub use fluxon_mq::MpscError as CoreMpscErrorReExport;
 
@@ -274,10 +273,6 @@ pub(crate) fn new_file_write_error(
     error_class.call((), Some(&kwargs)).unwrap().into()
 }
 
-pub(crate) fn new_store_closed_error(py: Python<'_>, message: &str) -> PyObject {
-    new_api_error_base(py, "StoreClosedError", message)
-}
-
 pub(crate) fn new_result_success(py: Python<'_>, value: PyObject) -> PyObject {
     let api_error_module = py.import_bound("fluxon_py.api_error").unwrap();
     let result_class = api_error_module.getattr("Result").unwrap();
@@ -371,6 +366,7 @@ pub(crate) fn new_payload_lease_not_found_error(
 /// - Api::KeyNotFound -> KeyNotFoundError（携带 key）
 /// - Api::KeyAlreadyExists -> KeyAlreadyExistsError（携带 key）
 /// - Api::KeyBeingWritten -> KeyBeingWrittenError（携带 key）
+/// - Api::KeyAlreadyExists -> KeyAlreadyExistsError（携带 key）
 /// - Api::NoSpace -> StorageFullError（available_space=free_capacity）
 /// - 其他 -> NetworkError（携带格式化消息）
 pub(crate) fn py_error_from_kv_error(
@@ -408,6 +404,11 @@ pub(crate) fn py_error_from_kv_error(
         KvError::Api(CoreApiError::KeyBeingWritten { key }) => new_key_being_written_error(
             py,
             &format!("{}: Key is currently being written: {}", prefix, key),
+            Some(key),
+        ),
+        KvError::Api(CoreApiError::KeyAlreadyExists { key }) => new_key_already_exists_error(
+            py,
+            &format!("{}: Key already exists: {}", prefix, key),
             Some(key),
         ),
         KvError::Api(CoreApiError::InvalidArgument { detail }) => {

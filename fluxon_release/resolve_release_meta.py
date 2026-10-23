@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -15,7 +16,9 @@ QUICKSTART_IMAGE_FILE = REPO_ROOT / "examples" / "fluxon_quick_start" / "build_i
 RUST_SETUP_FILE = REPO_ROOT / "fluxon_rs" / "setup.py"
 RUST_ROOT = REPO_ROOT / "fluxon_rs"
 WORKSPACE_CARGO_FILE = RUST_ROOT / "Cargo.toml"
+COMMU_CONTRACT_FILE = RUST_ROOT / "fluxon_commu_contract" / "src" / "lib.rs"
 RELEASE_NOTES_DIR = REPO_ROOT / "fluxon_release" / "release_notes"
+CLOSED_SDK_MANIFEST_FILE = REPO_ROOT / "fluxon_release" / "closed_sdk" / "manifest.json"
 
 
 def _read_python_string_constant(path: Path, name: str) -> str:
@@ -25,6 +28,25 @@ def _read_python_string_constant(path: Path, name: str) -> str:
         if match:
             return match.group(1)
     raise ValueError(f"missing {name} in {path}")
+
+
+def _read_json_string(path: Path, name: str) -> str:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected a JSON object in {path}")
+    value = payload.get(name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"missing string {name} in {path}")
+    return value
+
+
+def _read_rust_string_constant(path: Path, name: str) -> str:
+    pattern = re.compile(rf'^pub const {re.escape(name)}\s*:\s*&str\s*=\s*"([^"]+)"\s*;\s*$')
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        match = pattern.match(raw_line.strip())
+        if match:
+            return match.group(1)
+    raise ValueError(f"missing Rust string constant {name} in {path}")
 
 
 def _read_workspace_members(path: Path) -> list[Path]:
@@ -115,6 +137,14 @@ def main() -> int:
     package_version = _read_python_string_constant(PY_VERSION_FILE, "__version__")
     quickstart_version = _read_python_string_constant(QUICKSTART_IMAGE_FILE, "IMAGE_TAG")
     rust_setup_version = _read_python_string_constant(RUST_SETUP_FILE, "version")
+    commu_open_surface_version = _read_rust_string_constant(
+        COMMU_CONTRACT_FILE,
+        "FLUXON_COMMU_OPEN_SURFACE_VERSION",
+    )
+    closed_sdk_required_version = _read_json_string(
+        CLOSED_SDK_MANIFEST_FILE,
+        "required_open_surface_version",
+    )
     workspace_version, cargo_manifests = _iter_release_cargo_manifests()
     cargo_versions: dict[Path, str] = {}
     for path in cargo_manifests:
@@ -131,6 +161,12 @@ def main() -> int:
     if rust_setup_version != package_version:
         mismatches.append(
             f"{RUST_SETUP_FILE.relative_to(REPO_ROOT)} declares {rust_setup_version}, expected {package_version}"
+        )
+    if closed_sdk_required_version != commu_open_surface_version:
+        mismatches.append(
+            f"{CLOSED_SDK_MANIFEST_FILE.relative_to(REPO_ROOT)} requires "
+            f"open surface {closed_sdk_required_version}, but "
+            f"{COMMU_CONTRACT_FILE.relative_to(REPO_ROOT)} declares {commu_open_surface_version}"
         )
     for path, version in cargo_versions.items():
         if version != package_version:
@@ -157,7 +193,7 @@ def main() -> int:
         "release_title": release_tag,
         "quickstart_image": f"fluxon_quick_start:{quickstart_version}",
         "quickstart_archive": f"fluxon_quick_start_{quickstart_version}_docker_image.tar.gz",
-        "release_notes_file": str(RELEASE_NOTES_DIR / f"{release_tag}.md"),
+        "release_notes_file": str(RELEASE_NOTES_DIR.relative_to(REPO_ROOT) / f"{release_tag}.md"),
         "prerelease": "true" if _is_prerelease(release_tag) else "false",
     }
 

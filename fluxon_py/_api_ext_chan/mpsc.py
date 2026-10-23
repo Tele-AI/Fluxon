@@ -1,12 +1,11 @@
 """MPSC channel shim backed by Rust implementation.
 
 This module preserves the original public API surface
-(`MPSCChanProducer`, `MPSCChanConsumer`, `ChanType`, `ChanRole`,
-`MqShutdownCtl`, etc.) but delegates the underlying channel
+(`MPSCChanProducer`, `MPSCChanConsumer`, `ChanType`, `ChanRole`, etc.)
+but delegates the underlying channel
 management to the Rust library exposed via `fluxon_pyo3`.
 
-Old Python implementations (ChanManager, etcd watchers, prefetch
-queues) have been removed.
+Legacy Python watcher and prefetch implementations have been removed.
 
 Currently this shim focuses on wiring up leases and identities. Data
 path operations (`put_data`/`get_data`) are intentionally left as
@@ -20,10 +19,11 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 import ctypes
+import etcd3
 
-from ..kvclient.kvclient_interface import KvClient
+from ..kvclient.kvclient_interface import KvClient, KvCloseRegistration
 from ..kvclient.kvclient_interface import DLPacked
 from ..kvclient import fluxon as _fluxon_kv
 from ..api_error import (
@@ -48,9 +48,11 @@ from ..api_error import (
     PayloadLeaseNotFoundError,
     InvalidArgumentError,
     InternalError,
+    ResourceCleanupError,
 )
 from fluxon_py.logging import init_logger
 from .mq_config_check import validate_mpsc_config
+from .mq_lifecycle import MqShutdownCtl, publish_mq_construction
 from . import ChannelProducer, ChannelConsumer
 
 
@@ -66,6 +68,9 @@ logging = init_logger(__name__)
 # negligible and helps converge behavior across tests.
 _TEST_CLOSE_MARKERS: Dict[str, bool] = {}
 _CLOSE_DURING_PUT_DETAIL = "producer closed during put_with_payload"
+_DISTRIBUTED_CLEANUP_ATTEMPTS = 3
+_DISTRIBUTED_CLEANUP_RPC_TIMEOUT_SECONDS = 5
+_BEST_EFFORT_LEASED_CLEANUP_RPC_TIMEOUT_SECONDS = 1
 
 def _record_test_close_marker(tag: str, by_gc: bool) -> None:
     _TEST_CLOSE_MARKERS[tag] = by_gc
@@ -98,6 +103,23 @@ class _NoopCloseable:
     def close(self) -> None:  # pragma: no cover - trivial utility
         return
 
+
+def _close_owned_mpsc_context(
+    context: Any, *, channel_id: Optional[str]
+) -> Result[OkNone, ApiError]:
+    """Close one endpoint-owned MQ context before its KV client closes."""
+    try:
+        context.close()
+    except Exception as e:
+        return Result.new_error(
+            ResourceCleanupError(
+                message=f"failed to close MPSC context: {e}",
+                resource_type="mpsc_context",
+                resource_id=channel_id or "unknown",
+            )
+        )
+    return Result.new_ok(OkNone())
+
 # ---------------------------------------------------------------------------
 # fluxon_pyo3 bridging
 # ---------------------------------------------------------------------------
@@ -129,45 +151,13 @@ _RustMpscContext = fluxon_pyo3.MpscContext  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
-# Shared shutdown controller (used by MPSC and MPMC)
+# Key helpers and the MPMC subchannel payload contract
 # ---------------------------------------------------------------------------
-
-
-class MqShutdownCtl:
-    """Shared shutdown controller for MQ components.
-
-    Holds a close flag and an operation lock that can be used by
-    producers/consumers and any internal helpers (e.g. watcher
-    threads) to coordinate shutdown in a single place.
-    """
-
-    def __init__(self) -> None:
-        self.closed: bool = False
-        self._op_lock = threading.Lock()
-
-
-# ---------------------------------------------------------------------------
-# Key helpers and small data structures kept for compatibility
-# ---------------------------------------------------------------------------
-
-
-PRODUCE_OFFSET_BEGIN = -1
-CONSUME_OFFSET_BEGIN = 0
-
-
-def _new_message_key(chan_id: str, producer_idx: str, msg_id: int) -> str:
-    """Key of message stored in key-value backend (not etcd)."""
-
-    return f"/mpscchan_{chan_id}_producer_{producer_idx}_msg_{msg_id}"
 
 
 @dataclass
 class ConsumedMessage:
-    """Consumed message with producer and channel information.
-
-    Kept for compatibility with MPMC which wraps payloads with this
-    type when acting as submodule.
-    """
+    """Payload plus producer/channel identity for the MPMC subchannel boundary."""
 
     data: Dict[str, Union[int, float, bool, str, bytes, DLPacked]]
     producer_id: str
@@ -190,26 +180,8 @@ def _new_etcd_consumer_key(chan_id: str, consumer_idx: str) -> str:
     return f"/channels/{chan_id}/consumer/consumer_{consumer_idx}"
 
 
-def _new_etcd_producer_key_prefix(chan_id: str) -> str:
-    return f"/channels/{chan_id}/producer/producer_"
-
-
-def _new_etcd_consumer_key_prefix(chan_id: str) -> str:
-    return f"/channels/{chan_id}/consumer/consumer_"
-
-
-def _new_next_producer_id_key(chan_id: str) -> str:
-    return f"/channels/{chan_id}/next_producer_id"
-
-# removed id_reserve_key; ID allocation now uses a shared cluster lease
-
-
-def _new_register_consumer_idx(chan_id: str, i: int) -> str:
-    return f"/channels/{chan_id}/consumer_{i}"
-
-
-def _new_consume_offset_of_all_producer_key(chan_id: str) -> str:
-    return f"/channels/{chan_id}/consumer_offset_of_all_producer/"
+def _new_etcd_producer_weight_key(chan_id: str, producer_idx: str) -> str:
+    return f"/channels/{chan_id}/producer_weight/{producer_idx}"
 
 
 def _new_consume_offset_of_one_producer_key(chan_id: str, producer_idx: str) -> str:
@@ -220,8 +192,170 @@ def _new_produce_offset_of_all_producer_key(chan_id: str) -> str:
     return f"/channels/{chan_id}/producer_offset_of_all_producer/"
 
 
-def _new_produce_offset_of_one_producer_key(chan_id: str, producer_idx: str) -> str:
-    return f"/channels/{chan_id}/producer_offset_of_all_producer/{producer_idx}"
+def _delete_and_verify_owned_etcd_state(
+    api: KvClient,
+    *,
+    keys: List[str],
+    prefixes: List[str],
+    dbg: str,
+) -> Result[OkNone, ApiError]:
+    """Delete and verify etcd state for a strict construction rollback."""
+
+    if not keys and not prefixes:
+        return Result.new_ok(OkNone())
+    try:
+        endpoints = api.get_etcd_config()
+    except Exception as e:  # noqa: BLE001
+        return Result.new_error(
+            ResourceCleanupError(
+                message=f"cannot read etcd endpoints for strict cleanup: {e}",
+                resource_type="mq_etcd_state",
+                resource_id=dbg,
+            )
+        )
+    if not endpoints:
+        return Result.new_error(
+            ResourceCleanupError(
+                message="cannot delete owned etcd state: empty etcd endpoint list",
+                resource_type="mq_etcd_state",
+                resource_id=dbg,
+            )
+        )
+    first_address = endpoints[0]
+    errors: List[str] = []
+    for attempt in range(1, _DISTRIBUTED_CLEANUP_ATTEMPTS + 1):
+        client: Optional[etcd3.Etcd3Client] = None
+        try:
+            host, port_str = first_address.split(":")
+            client = etcd3.client(
+                host=host,
+                port=int(port_str),
+                timeout=_DISTRIBUTED_CLEANUP_RPC_TIMEOUT_SECONDS,
+            )
+            for key in keys:
+                client.delete(key)
+            for prefix in prefixes:
+                client.delete_prefix(prefix)
+
+            remaining_keys = [key for key in keys if client.get(key)[0] is not None]
+            remaining_prefixes = [
+                prefix
+                for prefix in prefixes
+                if next(iter(client.get_prefix(prefix)), None) is not None
+            ]
+            if not remaining_keys and not remaining_prefixes:
+                return Result.new_ok(OkNone())
+            errors.append(
+                f"attempt={attempt} remaining_keys={remaining_keys!r} "
+                f"remaining_prefixes={remaining_prefixes!r}"
+            )
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"attempt={attempt} {type(e).__name__}: {e}")
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception as e:  # noqa: BLE001
+                    logging.debug("%s failed to close cleanup etcd client: %s", dbg, e)
+
+    return Result.new_error(
+        ResourceCleanupError(
+            message=(
+                f"failed to delete owned etcd state via {first_address}: "
+                + "; ".join(errors)
+            ),
+            resource_type="mq_etcd_state",
+            resource_id=dbg,
+        )
+    )
+
+
+def _best_effort_delete_leased_etcd_state(
+    api: KvClient,
+    *,
+    keys: List[str],
+    prefixes: List[str],
+    dbg: str,
+) -> bool:
+    """Attempt one eager delete pass and defer failures to lease TTL."""
+
+    if not keys and not prefixes:
+        return True
+    try:
+        endpoints = api.get_etcd_config()
+    except Exception as e:  # noqa: BLE001
+        logging.warning(
+            "%s leased etcd cleanup deferred to lease TTL: cannot read endpoints: %s",
+            dbg,
+            e,
+        )
+        return False
+    if not endpoints:
+        logging.warning(
+            "%s leased etcd cleanup deferred to lease TTL: empty endpoint list",
+            dbg,
+        )
+        return False
+
+    endpoint = endpoints[0]
+    client: Optional[etcd3.Etcd3Client] = None
+    try:
+        host, port_str = endpoint.split(":")
+        client = etcd3.client(
+            host=host,
+            port=int(port_str),
+            timeout=_BEST_EFFORT_LEASED_CLEANUP_RPC_TIMEOUT_SECONDS,
+        )
+        for key in keys:
+            client.delete(key)
+        for prefix in prefixes:
+            client.delete_prefix(prefix)
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning(
+            "%s leased etcd cleanup deferred to lease TTL: endpoint=%s err=%s: %s",
+            dbg,
+            endpoint,
+            type(e).__name__,
+            e,
+        )
+        return False
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception as e:  # noqa: BLE001
+                logging.debug("%s failed to close cleanup etcd client: %s", dbg, e)
+
+
+def _rollback_unpublished_channel_state(
+    api: KvClient,
+    chan_id: str,
+    dbg: str,
+) -> Result[OkNone, ApiError]:
+    """Remove every channel-scoped key for a channel that was never published."""
+
+    if not isinstance(chan_id, str) or not chan_id.isdigit():
+        return Result.new_error(
+            ResourceCleanupError(
+                message=f"invalid unpublished MPSC channel id: {chan_id!r}",
+                resource_type="mpsc_channel",
+                resource_id=str(chan_id),
+            )
+        )
+    return _delete_and_verify_owned_etcd_state(
+        api,
+        keys=[
+            _new_etcd_meta_key(chan_id),
+            f"cluster_lease/channels/{chan_id}",
+            f"cluster_lease/id_allocator/channels/{chan_id}",
+        ],
+        prefixes=[
+            f"/channels/{chan_id}/",
+            f"dist_id_allocator/channels/{chan_id}/",
+        ],
+        dbg=dbg,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -239,115 +373,28 @@ class ChanRole(Enum):
     CONSUMER = "consumer"
 
 
-class _LocalCloseMode(Enum):
-    FULL_CLEANUP = "full_cleanup"
-    RELEASE_LOCAL_HANDLE = "release_local_handle"
+def _require_fluxon_raw_client(api: KvClient) -> Any:
+    """Return the live native client required by the Rust MQ implementation."""
 
-
-# Dummy ChanManager kept only for type compatibility with MPMC
-class ChanManager:  # pragma: no cover - compatibility stub
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        raise RuntimeError(
-            "ChanManager has been moved to Rust; Python stub should not be instantiated"
-        )
-
-
-
-
-def _ensure_kvclient_lease_backend(api: KvClient, cluster: str) -> Any:
-    """Ensure kvclient lease allocator/keepalive callbacks are registered and return backend uid.
-
-    The MQ layer injects kvclient allocate/keepalive capability into the unified
-    LeaseBackendUid abstraction. The underlying fluxon_util::lease_manager builds
-    a KvClient backend uid keyed by the cluster name.
-    """
-    from ..kvclient.kvclient_interface import KvLeaseApi
-    from fluxon_pyo3 import LeaseBackendUid as _PyLeaseBackendUid  # type: ignore[attr-defined]
-
-    if not isinstance(api, KvLeaseApi):
-        raise InvalidConfigurationError(
-            message="KvClient must implement KvLeaseApi for MPSC payload lease",
-        )
-
-    def allocate_cb(ttl_seconds: int) -> int:
-        """Bridge to KvLeaseApi.allocate_lease for the given TTL.
-
-        Rust expects this callback to either:
-          - return a valid positive lease id (int), or
-          - raise a Python Exception (derives from BaseException) to signal error.
-
-        Do NOT raise ApiError dataclasses here (they are not Exceptions) to
-        avoid PyErr(TypeError: exceptions must derive from BaseException).
-        """
-        res = api.allocate_lease(int(ttl_seconds))
-        if not res.is_ok():
-            # Raise a real Python Exception so PyO3 converts it to Err(...)
-            raise RuntimeError(
-                f"kvclient allocate_lease failed for cluster={cluster}: {res.unwrap_error()}"
-            )
-        lease_id = res.unwrap()
-        assert isinstance(lease_id, int) and lease_id > 0
-        return lease_id
-
-    def keepalive_cb(lease_id: int) -> None:
-        """Bridge to KvLeaseApi.keepalive_lease for the given lease id.
-
-        Rust expects a successful keepalive to return None (unit) and failures
-        to raise a Python Exception. Returning a custom Result object here will
-        cause type conversion errors in PyO3. See logs: "exceptions must derive
-        from BaseException" when raising non-Exception ApiError values.
-        """
-        # Keepalive must not alter TTL; do not pass custom_ttl
-        res = api.keepalive_lease(int(lease_id))
-        if not res.is_ok():
-            err = res.unwrap_error()
-            # When the client is shutting down, background keepalive calls can race with the
-            # P2P/framework shutdown and surface as a transient "SystemShutdown" network error.
-            # Treat it as a no-op so the lease manager can stop cleanly without poisoning the
-            # process exit code after successful workload completion.
-            if isinstance(err, NetworkError) and ("SystemShutdown" in str(err)):
-                return None
-            # Raise a real Python Exception so PyO3 converts it to Err(...)
-            raise RuntimeError(
-                f"kvclient keepalive_lease failed for cluster={cluster}: {err}"
-            )
-        # Success: consume Ok(None) to satisfy strict Result policy
-        _ = res.unwrap()
-        # Success path: return None explicitly to map to Rust ()
-        return None
-
-    # Inject kvclient allocate/keepalive callbacks while constructing LeaseBackendUid.
-    return _PyLeaseBackendUid.kv_client_with_callbacks(
-        cluster,
-        allocate_cb,
-        keepalive_cb,
-    )
-
-
+    if not isinstance(api, _fluxon_kv.FluxonKVCacheStore):
+        raise InvalidConfigurationError(message="MQ requires FluxonKVCacheStore")
+    raw = api._client
+    if raw is None:
+        raise InvalidConfigurationError(message="MQ requires an open FluxonKVCacheStore")
+    return raw
 
 
 class MpscContext:
-    """Python wrapper around Rust MpscContext with shared kv backend state."""
+    """Python wrapper around the Rust-owned MQ and KV lease context."""
 
     def __init__(self, api: KvClient) -> None:
-        cluster = api.get_cluster_name()
         etcd_endpoints: List[str] = api.get_etcd_config()
 
         self.api = api
-        self.cluster = cluster
         self.etcd_endpoints = etcd_endpoints
 
-        # Inject kvclient lease capability via LeaseBackendUid during construction.
-        self.kv_backend_uid = _ensure_kvclient_lease_backend(api, cluster)
-
-        # Underlying Rust context receives endpoints plus the kv backend uid
-        # that already carries kvclient allocate/keepalive callbacks.
-        raw = getattr(api, "_client", None)
-        if raw is None:
-            raise InvalidConfigurationError(
-                message="MPSC requires a fluxon-backed KvClient exposing `_client` (fluxon_pyo3.KvClient)",
-            )
-        self._inner = _RustMpscContext(etcd_endpoints, self.kv_backend_uid, raw)
+        raw = _require_fluxon_raw_client(api)
+        self._inner = _RustMpscContext(etcd_endpoints, raw)
 
     def new_producer(
         self,
@@ -360,6 +407,7 @@ class MpscContext:
         override_payload_lease_id: Optional[int],
         parent_mpmc_id_opt: Optional[str] = None,
         parent_mpmc_member_id_opt: Optional[int] = None,
+        bind_shutdown_ctl: Optional[Any] = None,
     ):
         chan_id_int_opt: Optional[int] = None if chan_id is None else int(chan_id)
         parent_mpmc_id_int_opt: Optional[int] = (
@@ -375,6 +423,7 @@ class MpscContext:
             override_payload_lease_id,
             parent_mpmc_id_int_opt,
             parent_mpmc_member_id_opt,
+            bind_shutdown_ctl,
         )
 
     def new_consumer(
@@ -424,6 +473,9 @@ class MPSCChanProducer(ChannelProducer):
     should be implemented on the Rust side and wired through here.
     """
 
+    _kv_close_registration = KvCloseRegistration.noop()
+
+    @publish_mq_construction
     def __init__(
         self,
         api: KvClient,
@@ -436,24 +488,36 @@ class MPSCChanProducer(ChannelProducer):
         override_payload_lease_id: Optional[int] = None,
         parent_mpmc_id_opt: Optional[str] = None,
         parent_mpmc_member_id_opt: Optional[int] = None,
+        _parent_shutdown_ctl: Optional[MqShutdownCtl] = None,
     ) -> None:
         # Lifecycle safety: initialize critical fields first so close() can be
         # invoked without hasattr/getattr checks even if construction fails.
+        self._close_lock = threading.Lock()
+        self._close_done = False
+        self._kv_close_registration = KvCloseRegistration.noop()
         self._handle_shutdown_ctl = _NoopCloseable()
+        self._created_new_channel = chan_id is None
+        self._parent_mpmc_id = parent_mpmc_id_opt
         self._ctx = _NoopCloseable()
         self._handle = None  # type: ignore[assignment]
+        # PyO3 handle methods borrow `&mut self`, so calls on one handle are
+        # single-flight. Lifecycle shutdown must never wait on this lock.
+        self._data_path_lock = threading.Lock()
         self._chan_id = "-1"
         self._producer_id = "unknown"
         self._closed_local = False
-        # Keep fields for compatibility, but the internal logic is fully handled by Rust.
+        self._membership_cleanup_done = False
+        self._unpublished_rollback_done = False
+        self.shutdown_ctl = MqShutdownCtl()
+        self._handle_shutdown_ctl = _RustMpscContext.new_shutdown_ctl()
         # Validate config strictly (no implicit defaults/fallbacks).
         chan_config = validate_mpsc_config(chan_config, role=ChanRole.PRODUCER)
         self.api = api
         self.chan_config = chan_config
-        self.override_member_lease = override_member_lease
-        self.override_chan_lease = override_chan_lease
-        self.shutdown_ctl = MqShutdownCtl()
-
+        if parent_mpmc_id_opt is None:
+            self._kv_close_registration = api.register_child_close(
+                self._close_from_kv
+            )
         # Use MpscContext to manage etcd/cluster and the unified KV backend.
         ctx = MpscContext(api)
         self._ctx = ctx
@@ -476,17 +540,28 @@ class MPSCChanProducer(ChannelProducer):
         else:
             override_member_lease_id = override_global_lease_id
 
-        handle = ctx.new_producer(
-            chan_id,
-            chan_config["ttl_seconds"],
-            chan_config.get("weight"),
-            chan_config.get("capacity"),
-            override_global_lease_id,
-            override_member_lease_id,
-            override_payload_lease_id,
-            parent_mpmc_id_opt,
-            parent_mpmc_member_id_opt,
-        )
+        unregister_parent_close: Callable[[], None] = lambda: None
+        if _parent_shutdown_ctl is not None:
+            if not isinstance(_parent_shutdown_ctl, MqShutdownCtl):
+                raise TypeError("_parent_shutdown_ctl must be MqShutdownCtl")
+            unregister_parent_close = _parent_shutdown_ctl.register_construction_shutdown(
+                self._handle_shutdown_ctl.close
+            )
+        try:
+            handle = ctx.new_producer(
+                chan_id,
+                chan_config["ttl_seconds"],
+                chan_config.get("weight"),
+                chan_config.get("capacity"),
+                override_global_lease_id,
+                override_member_lease_id,
+                override_payload_lease_id,
+                parent_mpmc_id_opt,
+                parent_mpmc_member_id_opt,
+                self._handle_shutdown_ctl,
+            )
+        finally:
+            unregister_parent_close()
         self._handle = handle
         self._handle_shutdown_ctl = handle.shutdown_clone()
         # Guard to make close idempotent without relying on None checks.
@@ -513,6 +588,20 @@ class MPSCChanProducer(ChannelProducer):
             self.get_producer_id(),
         )
 
+        if _parent_shutdown_ctl is not None and _parent_shutdown_ctl.closed:
+            cleanup_result = (
+                self._rollback_unpublished_channel()
+                if self._created_new_channel
+                else self.close()
+            )
+            if not cleanup_result.is_ok():
+                raise RuntimeError(
+                    "MPMC parent closed during MPSC producer construction; "
+                    f"cleanup failed: {cleanup_result.unwrap_error()}"
+                )
+            cleanup_result.unwrap()
+            raise RuntimeError("MPMC parent closed during MPSC producer construction")
+
     def dbg_tag(self) -> str:
         return (
             f"[MPSCChanProducer chan_id={self._chan_id} "
@@ -530,11 +619,30 @@ class MPSCChanProducer(ChannelProducer):
     def is_closed(self) -> bool:
         return self.shutdown_ctl.closed
 
+    def _close_from_kv(self) -> Result[OkNone, ApiError]:
+        self._kv_child_construction_done.wait()
+        return self.close()
+
+    def _signal_shutdown(self) -> None:
+        self.shutdown_ctl.close()
+        try:
+            self._handle_shutdown_ctl.close()
+        except Exception as e:  # noqa: BLE001
+            logging.debug("%s shutdown signal skipped: %s", self.dbg_tag(), e)
+
     def record_nonblocking_put_success(self, unix_ms: int) -> None:
-        self._handle.record_nonblocking_put_success(unix_ms)  # type: ignore[attr-defined]
+        with self._data_path_lock:
+            handle = self._handle
+            if self.shutdown_ctl.closed or handle is None:
+                return
+            handle.record_nonblocking_put_success(unix_ms)
 
     def record_blocking_put_observed(self, unix_ms: int) -> None:
-        self._handle.record_blocking_put_observed(unix_ms)  # type: ignore[attr-defined]
+        with self._data_path_lock:
+            handle = self._handle
+            if self.shutdown_ctl.closed or handle is None:
+                return
+            handle.record_blocking_put_observed(unix_ms)
 
     # Note: historically the payload lease id was injected after
     # construction via `set_payload_lease_id`. Now we always resolve it
@@ -576,10 +684,33 @@ class MPSCChanProducer(ChannelProducer):
         dlpack_capsules: List[object] = []
         try:
             ptrs = _fluxon_kv.build_flat_dict_ptrs(value, keepalive, dlpack_capsules)
-            self._handle.put_flat_dict_ptrs(ptrs)  # type: ignore[attr-defined]
         except Exception as e:  # pragma: no cover - thin shim
+            return Result[bool, ApiError].new_error(e)  # type: ignore[arg-type]
+
+        try:
+            with self._data_path_lock:
+                handle = self._handle
+                if self.shutdown_ctl.closed or handle is None:
+                    return Result[bool, ApiError].new_error(
+                        ProducerClosedError(
+                            message="producer is closed",
+                            channel_id=self.get_chan_id(),
+                            producer_idx=self.get_producer_id(),
+                        )
+                    )
+                handle.put_flat_dict_ptrs(ptrs)
+        except Exception as e:  # pragma: no cover - thin shim
+            if self.shutdown_ctl.closed:
+                logging.debug("%s put stopped by close: %s", self.dbg_tag(), e)
+                return Result[bool, ApiError].new_error(
+                    ProducerClosedError(
+                        message="producer is closed",
+                        channel_id=self.get_chan_id(),
+                        producer_idx=self.get_producer_id(),
+                    )
+                )
             if _is_close_during_put_error(e):
-                self.shutdown_ctl.closed = True
+                self._signal_shutdown()
                 logging.info("%s put aborted by close: %s", self.dbg_tag(), e)
                 return Result[bool, ApiError].new_error(
                     ProducerClosedError(
@@ -610,12 +741,7 @@ class MPSCChanProducer(ChannelProducer):
             #   2) The check here and its corresponding tests.
             logging.error("%s put_flat_dict_ptrs failed: %s", self.dbg_tag(), e)
             if isinstance(e, PayloadLeaseNotFoundError):
-                # Mark closed and best-effort notify Rust side to stop callbacks/holds.
-                self.shutdown_ctl.closed = True
-                try:
-                    self._handle_shutdown_ctl.close()
-                except Exception as ie:  # noqa: BLE001
-                    logging.warning("%s notify rust shutdown after LeaseNotFound failed: %s", self.dbg_tag(), ie)
+                self._signal_shutdown()
 
                 return Result[bool, ApiError].new_error(
                     ProducerClosedError(
@@ -631,63 +757,99 @@ class MPSCChanProducer(ChannelProducer):
         # Success path: explicitly construct ok variant for consistency with MPMC
         return Result[bool, ApiError].new_ok(True)
 
-    def close(self) -> Result[OkNone, ApiError]:  # pragma: no cover - minimal shim
-        return self._close_with_mode(_LocalCloseMode.FULL_CLEANUP)
+    def close(self) -> Result[OkNone, ApiError]:
+        with self._close_lock:
+            if self._close_done:
+                return Result.new_ok(OkNone())
 
-    def release_local_handle(self) -> Result[OkNone, ApiError]:
-        return self._close_with_mode(_LocalCloseMode.RELEASE_LOCAL_HANDLE)
+            # Use safe attribute access to tolerate partially-initialized objects
+            chan_id = getattr(self, "_chan_id", None)
+            by_gc = bool(getattr(self, "_closing_by_gc", False))
+            producer_id = getattr(self, "_producer_id", None)
+            dbg = (
+                f"[MPSCChanProducer chan_id={chan_id or 'unknown'} "
+                f"producer_idx={producer_id or 'unknown'}]"
+            )
+            if not getattr(self, "_closed_local", False):
+                logging.debug(
+                    "%s close begin chan_id=%s parent_mpmc_id=%s",
+                    dbg,
+                    chan_id,
+                    self._parent_mpmc_id,
+                )
+                self._closed_local = True
+                self._signal_shutdown()
+                self._handle_shutdown_ctl = None  # type: ignore[assignment]
+                # In-flight calls retain their own strong reference and unwind
+                # after the independent Rust shutdown signal above.
+                self._handle = None  # type: ignore[assignment]
+                if hasattr(self, "_chan_id") and hasattr(self, "_producer_id"):
+                    tag = f"mpsc:producer:{self._chan_id}:{self._producer_id}"
+                    _record_test_close_marker(tag, by_gc)
 
-    def _close_with_mode(self, mode: _LocalCloseMode) -> Result[OkNone, ApiError]:
-        # Use safe attribute access to tolerate partially-initialized objects
-        chan_id = getattr(self, "_chan_id", None)
-        dbg = getattr(self, "_dbg_tag", "[MPSCChanProducer]")
-        # Make close idempotent to avoid double shutdown when both explicit close
-        # and GC-driven finalizer run.
-        if getattr(self, "_closed_local", False):
+            context_close_result = _close_owned_mpsc_context(
+                self._ctx,
+                channel_id=chan_id,
+            )
+            if not context_close_result.is_ok():
+                return context_close_result
+            context_close_result.unwrap()
+            self._ctx = _NoopCloseable()
+
+            if (
+                not by_gc
+                and not getattr(self, "_membership_cleanup_done", False)
+                and isinstance(chan_id, str)
+                and isinstance(producer_id, str)
+                and chan_id != "-1"
+                and producer_id != "unknown"
+            ):
+                self._membership_cleanup_done = _best_effort_delete_leased_etcd_state(
+                    self.api,
+                    keys=[
+                        _new_etcd_producer_key(chan_id, producer_id),
+                        _new_etcd_producer_weight_key(chan_id, producer_id),
+                    ],
+                    prefixes=[],
+                    dbg=dbg,
+                )
+
             logging.debug(
-                "%s close skipped (already closed) chan_id=%s mode=%s",
+                "%s close end chan_id=%s",
                 dbg,
                 chan_id,
-                mode.value,
             )
-            return Result(OkNone())
-        logging.debug("%s close begin chan_id=%s mode=%s", dbg, chan_id, mode.value)
-        self._closed_local = True
-        self.shutdown_ctl.closed = True
-        try:
-            # 1) tell Rust side to stop local tasks and retry loops
-            self._handle_shutdown_ctl.close()
-        except Exception as e:
-            # If the underlying handle is already dropped or None, do not warn noisily.
-            logging.debug("%s shutdown_ctl.close skipped: %s", dbg, e)
-        # Drop shutdown handle ref so no strong ref is kept in Python
-        self._handle_shutdown_ctl = None  # type: ignore[assignment]
-        # 2) drop PyO3 handle to release strong refs into Rust
-        try:
-            self._handle = None  # type: ignore[assignment]
-        except Exception as e:
-            logging.warning("%s failed to drop rust handle: %s", dbg, e)
-        # RELEASE_LOCAL_HANDLE is used by outer MPMC teardown after the
-        # shared distributed state has already been handed off to other
-        # participants. In that path we must stop the local handle tasks,
-        # but we must not block on a full MQ framework shutdown here.
-        if mode == _LocalCloseMode.FULL_CLEANUP:
-            try:
-                self._ctx.close()
-            except Exception as e:
-                logging.warning("%s failed to close mpsc context: %s", dbg, e)
-        self._ctx = _NoopCloseable()
-        # Record test marker to indicate whether this close was GC-triggered
-        by_gc = bool(getattr(self, "_closing_by_gc", False))
-        if hasattr(self, "_chan_id") and hasattr(self, "_producer_id"):
-            tag = f"mpsc:producer:{self._chan_id}:{self._producer_id}"
-            _record_test_close_marker(tag, by_gc)
-        logging.debug("%s close end chan_id=%s mode=%s", dbg, chan_id, mode.value)
-        return Result(OkNone())
+            self._close_done = True
+            self._kv_close_registration.unregister()
+            return Result.new_ok(OkNone())
 
-    def before_close(self) -> None:
-        if hasattr(self, "shutdown_ctl"):
-            self.shutdown_ctl.closed = True
+    def _rollback_unpublished_channel(self) -> Result[OkNone, ApiError]:
+        """Close and remove a newly created channel that was never published."""
+
+        if not getattr(self, "_created_new_channel", False):
+            return Result.new_error(
+                ResourceCleanupError(
+                    message="cannot roll back a bound existing MPSC channel",
+                    resource_type="mpsc_channel",
+                    resource_id=self.get_chan_id(),
+                )
+            )
+        if getattr(self, "_unpublished_rollback_done", False):
+            return Result.new_ok(OkNone())
+        close_result = self.close()
+        if not close_result.is_ok():
+            return close_result
+        close_result.unwrap()
+        rollback_result = _rollback_unpublished_channel_state(
+            self.api,
+            self.get_chan_id(),
+            self.dbg_tag(),
+        )
+        if not rollback_result.is_ok():
+            return rollback_result
+        rollback_result.unwrap()
+        self._unpublished_rollback_done = True
+        return Result.new_ok(OkNone())
 
     def __del__(self) -> None:  # pragma: no cover - best-effort GC hook
         """Best-effort shutdown when GC drops the producer.
@@ -699,7 +861,6 @@ class MPSCChanProducer(ChannelProducer):
         - drop the PyO3 handle eagerly to stop keepalive tasks
         """
         
-        self.before_close()
         # Mark that this close is driven by GC (__del__) for test verification
         self._closing_by_gc = True  # type: ignore[attr-defined]
         try:
@@ -723,6 +884,9 @@ class MPSCChanConsumer(ChannelConsumer):
     and be exposed via fluxon_pyo3.
     """
 
+    _kv_close_registration = KvCloseRegistration.noop()
+
+    @publish_mq_construction
     def __init__(
         self,
         api: KvClient,
@@ -737,9 +901,17 @@ class MPSCChanConsumer(ChannelConsumer):
         parent_mpmc_member_id_opt: Optional[int] = None,
     ) -> None:
         # Lifecycle safety defaults; see producer for rationale
+        self._close_lock = threading.Lock()
+        self._close_done = False
+        self._kv_close_registration = KvCloseRegistration.noop()
         self._handle_shutdown_ctl = _NoopCloseable()
+        self._created_new_channel = chan_id is None
+        self._parent_mpmc_id = parent_mpmc_id_opt
         self._ctx = _NoopCloseable()
         self._handle = None  # type: ignore[assignment]
+        # Consumer ordering is single-flight at the PyO3 `&mut self` boundary.
+        # close() signals shutdown independently and never waits on this lock.
+        self._data_path_lock = threading.Lock()
         self._chan_id = "-1"
         self._consumer_id = "unknown"
         # MPMC may claim the sub-channel ready key before returning this
@@ -747,15 +919,19 @@ class MPSCChanConsumer(ChannelConsumer):
         self._mpmc_ready_claimed = False
         self._dbg_tag = "[MPSCChanConsumer]"
         self._closed_local = False
-        from ..api_ext_chan import new_etcd_client  # kept for compatibility, unused here
-
+        self._membership_cleanup_done = False
+        self._unpublished_rollback_done = False
+        self.shutdown_ctl = MqShutdownCtl()
         # Validate config strictly (no implicit defaults/fallbacks).
         chan_config = validate_mpsc_config(chan_config, role=ChanRole.CONSUMER)
         self.api = api
         self.chan_config = chan_config
         self.override_member_lease = override_member_lease
         self.override_chan_lease = override_chan_lease
-        self.shutdown_ctl = MqShutdownCtl()
+        if parent_mpmc_id_opt is None:
+            self._kv_close_registration = api.register_child_close(
+                self._close_from_kv
+            )
 
 
         # Same as producer: manage etcd/cluster and kv backend via MpscContext.
@@ -827,7 +1003,6 @@ class MPSCChanConsumer(ChannelConsumer):
             self._consumer_id,
             payload_backend,
         )
-
     def dbg_tag(self) -> str:
         return self._dbg_tag
 
@@ -847,68 +1022,111 @@ class MPSCChanConsumer(ChannelConsumer):
     def is_closed(self) -> bool:
         return self.shutdown_ctl.closed
 
-    def request_shutdown(self) -> None:
-        if self.shutdown_ctl.closed:
-            return
-        self.shutdown_ctl.closed = True
+    def _close_from_kv(self) -> Result[OkNone, ApiError]:
+        self._kv_child_construction_done.wait()
+        return self.close()
+
+    def _signal_shutdown(self) -> None:
+        self.shutdown_ctl.close()
         try:
             self._handle_shutdown_ctl.close()
         except Exception as e:
-            logging.debug("%s request_shutdown close skipped: %s", self.dbg_tag(), e)
+            logging.debug("%s shutdown signal skipped: %s", self.dbg_tag(), e)
 
-    def close(self) -> Result[OkNone, ApiError]:  # pragma: no cover - minimal shim
-        return self._close_with_mode(_LocalCloseMode.FULL_CLEANUP)
+    def close(self) -> Result[OkNone, ApiError]:
+        with self._close_lock:
+            if self._close_done:
+                return Result.new_ok(OkNone())
 
-    def release_local_handle(self) -> Result[OkNone, ApiError]:
-        return self._close_with_mode(_LocalCloseMode.RELEASE_LOCAL_HANDLE)
+            chan_id = getattr(self, "_chan_id", None)
+            by_gc = bool(getattr(self, "_closing_by_gc", False))
+            consumer_id = getattr(self, "_consumer_id", None)
+            dbg = (
+                f"[MPSCChanConsumer chan_id={chan_id or 'unknown'} "
+                f"consumer_idx={consumer_id or 'unknown'}]"
+            )
+            if not getattr(self, "_closed_local", False):
+                logging.debug(
+                    "%s close begin chan_id=%s parent_mpmc_id=%s",
+                    dbg,
+                    chan_id,
+                    self._parent_mpmc_id,
+                )
+                self._closed_local = True
+                self._signal_shutdown()
+                self._handle_shutdown_ctl = None  # type: ignore[assignment]
+                # The active get keeps the PyO3 object alive until it observes
+                # shutdown and returns; detaching here does not invalidate it.
+                self._handle = None  # type: ignore[assignment]
+                if hasattr(self, "_chan_id") and hasattr(self, "_consumer_id"):
+                    tag = f"mpsc:consumer:{self._chan_id}:{self._consumer_id}"
+                    _record_test_close_marker(tag, by_gc)
 
-    def _close_with_mode(self, mode: _LocalCloseMode) -> Result[OkNone, ApiError]:
-        chan_id = getattr(self, "_chan_id", None)
-        dbg = getattr(self, "_dbg_tag", "[MPSCChanConsumer]")
-        if getattr(self, "_closed_local", False):
+            context_close_result = _close_owned_mpsc_context(
+                self._ctx,
+                channel_id=chan_id,
+            )
+            if not context_close_result.is_ok():
+                return context_close_result
+            context_close_result.unwrap()
+            self._ctx = _NoopCloseable()
+
+            if (
+                not by_gc
+                and not getattr(self, "_membership_cleanup_done", False)
+                and isinstance(chan_id, str)
+                and isinstance(consumer_id, str)
+                and chan_id != "-1"
+                and consumer_id != "unknown"
+            ):
+                self._membership_cleanup_done = _best_effort_delete_leased_etcd_state(
+                    self.api,
+                    keys=[_new_etcd_consumer_key(chan_id, consumer_id)],
+                    prefixes=[],
+                    dbg=dbg,
+                )
+
             logging.debug(
-                "%s close skipped (already closed) chan_id=%s mode=%s",
+                "%s close end chan_id=%s",
                 dbg,
                 chan_id,
-                mode.value,
             )
-            return Result(OkNone())
-        logging.debug("%s close begin chan_id=%s mode=%s", dbg, chan_id, mode.value)
-        self._closed_local = True
-        self.shutdown_ctl.closed = True
-        try:
-            # 1) signal Rust shutdown to stop local prefetch/retry work
-            self._handle_shutdown_ctl.close()
-        except Exception as e:
-            logging.debug("%s shutdown_ctl.close skipped: %s", dbg, e)
-        self._handle_shutdown_ctl = None  # type: ignore[assignment]
-        try:
-            self._handle = None  # type: ignore[assignment]
-        except Exception as e:
-            logging.warning("%s failed to drop rust handle: %s", dbg, e)
-        # RELEASE_LOCAL_HANDLE must only tear down this process-local
-        # consumer handle. The shared MPMC state keeps running elsewhere,
-        # so avoid a blocking full MQ framework shutdown in this mode.
-        if mode == _LocalCloseMode.FULL_CLEANUP:
-            try:
-                self._ctx.close()
-            except Exception as e:
-                logging.warning("%s failed to close mpsc context: %s", dbg, e)
-        self._ctx = _NoopCloseable()
-        # Do not touch etcd directly here. Channel key lifecycle must be handled
-        # by leases at the backend (Rust) layer. Tests will validate TTL-based
-        # cleanup; Python shim only ensures handles/keepalives are dropped.
-        # Record test marker to indicate whether this close was GC-triggered
-        by_gc = bool(getattr(self, "_closing_by_gc", False))
-        if hasattr(self, "_chan_id") and hasattr(self, "_consumer_id"):
-            tag = f"mpsc:consumer:{self._chan_id}:{self._consumer_id}"
-            _record_test_close_marker(tag, by_gc)
-        logging.debug("%s close end chan_id=%s mode=%s", dbg, chan_id, mode.value)
-        return Result(OkNone())
+            self._close_done = True
+            self._kv_close_registration.unregister()
+            return Result.new_ok(OkNone())
 
-    def before_close(self) -> None:
-        if hasattr(self, "shutdown_ctl"):
-            self.shutdown_ctl.closed = True
+    def membership_cleanup_completed(self) -> bool:
+        """Return whether the eager membership delete pass completed."""
+
+        return self._membership_cleanup_done
+
+    def _rollback_unpublished_channel(self) -> Result[OkNone, ApiError]:
+        """Close and remove a newly created channel that was never published."""
+
+        if not getattr(self, "_created_new_channel", False):
+            return Result.new_error(
+                ResourceCleanupError(
+                    message="cannot roll back a bound existing MPSC channel",
+                    resource_type="mpsc_channel",
+                    resource_id=self.get_chan_id(),
+                )
+            )
+        if getattr(self, "_unpublished_rollback_done", False):
+            return Result.new_ok(OkNone())
+        close_result = self.close()
+        if not close_result.is_ok():
+            return close_result
+        close_result.unwrap()
+        rollback_result = _rollback_unpublished_channel_state(
+            self.api,
+            self.get_chan_id(),
+            self.dbg_tag(),
+        )
+        if not rollback_result.is_ok():
+            return rollback_result
+        rollback_result.unwrap()
+        self._unpublished_rollback_done = True
+        return Result.new_ok(OkNone())
 
     def __del__(self) -> None:  # pragma: no cover - best-effort GC hook
         """Best-effort shutdown when GC drops the consumer.
@@ -917,7 +1135,6 @@ class MPSCChanConsumer(ChannelConsumer):
         and let TTL-based cleanup reclaim keys in etcd.
         """
         
-        self.before_close()
         # Mark that this close is driven by GC (__del__) for test verification
         self._closing_by_gc = True  # type: ignore[attr-defined]
         try:
@@ -1090,6 +1307,14 @@ class MPSCChanConsumer(ChannelConsumer):
         The window size is mapped to `batch_size + prefetch_num`, so the underlying
         Rust actor maintains a local prefetch queue of that size.
         """
+        if self.shutdown_ctl.closed:
+            return Result.new_error(
+                ChannelClosedError(
+                    message="Consumer is closed.",
+                    channel_id=self._chan_id,
+                )
+            )
+
         prefetch_target = batch_size + max(prefetch_num, 0)
 
         # Inline minimal fetch loop with explicit prefetch_target to keep
@@ -1105,24 +1330,35 @@ class MPSCChanConsumer(ChannelConsumer):
             t_sec = try_time if try_time > 0 else 1
             timeout_ms = int(t_sec * 1000)
             assert timeout_ms > 0
-	    
+
         for _ in range(batch_size):
             try:
                 # Pass timeout_ms (converted from try_time seconds) to Rust.
-                obj = self._handle.get_one(prefetch_target, timeout_ms)  # type: ignore[attr-defined]
+                with self._data_path_lock:
+                    handle = self._handle
+                    if self.shutdown_ctl.closed or handle is None:
+                        return Result.new_error(
+                            ChannelClosedError(
+                                message="Consumer is closed.",
+                                channel_id=self._chan_id,
+                            )
+                        )
+                    obj = handle.get_one(prefetch_target, timeout_ms)
             except Exception as e:
-                logging.error("%s get_one failed: %s", self.dbg_tag(), e)
                 # Rust is expected to raise an extension-layer ApiError. To avoid carrying
                 # arbitrary Exception types in Result, wrap non-ApiError into
                 # MqGetDataUnknownError to keep the error taxonomy narrow.
                 if self.shutdown_ctl.closed:
+                    logging.debug("%s get_one stopped by close: %s", self.dbg_tag(), e)
                     api_err = ChannelClosedError(
                         message="Consumer is closed.",
                         channel_id=self._chan_id,
                     )
                 elif isinstance(e, ApiError):
+                    logging.error("%s get_one failed: %s", self.dbg_tag(), e)
                     api_err = e
                 else:
+                    logging.error("%s get_one failed: %s", self.dbg_tag(), e)
                     api_err = MqGetDataUnknownError.from_exception(
                         e, channel_id=self._chan_id, consumer_id=self._consumer_id
                     )
@@ -1154,18 +1390,10 @@ __all__ = [
     "ChanType",
     "ChanRole",
     "ConsumedMessage",
-    "MqShutdownCtl",
-    "ChanManager",
     "_new_etcd_meta_key",
     "_new_etcd_producer_key",
     "_new_etcd_consumer_key",
-    "_new_etcd_producer_key_prefix",
-    "_new_etcd_consumer_key_prefix",
-    "_new_next_producer_id_key",
-    "_new_register_consumer_idx",
-    "_new_consume_offset_of_all_producer_key",
     "_new_consume_offset_of_one_producer_key",
-    "_new_message_key",
     # test helpers
     "test_get_close_marker",
     "test_clear_close_marker",
