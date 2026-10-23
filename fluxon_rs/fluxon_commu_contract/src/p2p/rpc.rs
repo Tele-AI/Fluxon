@@ -17,13 +17,65 @@ use prost::bytes::Bytes as ProstBytes;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 pub const MIN_EXPLICIT_RPC_TIMEOUT_SECS: u64 = 10;
+pub const MIN_EXPLICIT_RPC_TIMEOUT_MS: u64 = MIN_EXPLICIT_RPC_TIMEOUT_SECS * 1_000;
 pub const USER_RPC_REQ_MSG_ID: u32 = 7001;
 pub const USER_RPC_RESP_MSG_ID: u32 = 7002;
 pub const USER_RPC_REQUEST_OWNER1_OBSERVE_TRACE_RAW_BYTES_INDEX: usize = 1;
 pub const USER_RPC_OBSERVE_TRACE_RAW_BYTES_INDEX: usize = 1;
 pub const USER_RPC_OWNER1_OBSERVE_TRACE_RAW_BYTES_INDEX: usize = 2;
+
+pub fn validate_explicit_rpc_timeout(timeout: Option<Duration>) -> P2PResult<()> {
+    let Some(timeout) = timeout else {
+        return Ok(());
+    };
+    if timeout < Duration::from_millis(MIN_EXPLICIT_RPC_TIMEOUT_MS) {
+        return Err(P2pError::InvalidRpcTimeout {
+            timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            min_timeout_ms: MIN_EXPLICIT_RPC_TIMEOUT_MS,
+            reason: format!(
+                "Explicit RPC timeout below {}s is forbidden.",
+                MIN_EXPLICIT_RPC_TIMEOUT_SECS
+            ),
+        });
+    }
+    Ok(())
+}
+
+pub fn validate_explicit_rpc_timeout_ms(timeout_ms: u64) -> P2PResult<()> {
+    validate_explicit_rpc_timeout(Some(Duration::from_millis(timeout_ms)))
+}
+
+#[cfg(test)]
+mod explicit_rpc_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_default_and_minimum_explicit_timeout() {
+        assert!(validate_explicit_rpc_timeout(None).is_ok());
+        assert!(validate_explicit_rpc_timeout_ms(MIN_EXPLICIT_RPC_TIMEOUT_MS).is_ok());
+    }
+
+    #[test]
+    fn rejects_subminimum_timeout_with_typed_error() {
+        let timeout_ms = MIN_EXPLICIT_RPC_TIMEOUT_MS - 1;
+        let err = validate_explicit_rpc_timeout_ms(timeout_ms).unwrap_err();
+        assert_eq!(err.code(), 617);
+        match err {
+            P2pError::InvalidRpcTimeout {
+                timeout_ms: actual_timeout_ms,
+                min_timeout_ms,
+                ..
+            } => {
+                assert_eq!(actual_timeout_ms, timeout_ms);
+                assert_eq!(min_timeout_ms, MIN_EXPLICIT_RPC_TIMEOUT_MS);
+            }
+            other => panic!("expected InvalidRpcTimeout, got {other:?}"),
+        }
+    }
+}
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 pub enum UserRpcTransportPathKind {

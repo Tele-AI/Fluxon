@@ -1,10 +1,9 @@
-use crate::master_kv_router::msg_pack::GetDoneResp;
+use crate::master_kv_router::msg_pack::RadixKvMetadata;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::p2p::msg_pack::{MsgPackSerializePart, RPCReq};
-use crate::rpcresp_kvresult_convert::msg_and_error::ErrorCode;
+use crate::rpcresp_kvresult_convert::msg_and_error::{ErrorCode, OK};
 use bitcode::{Decode, Encode};
 
-use crate::cluster_manager::NodeIDString;
 use crate::memholder::ExternalMemHolderInfo;
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -61,6 +60,38 @@ impl TestPutPhaseTrace {
         merge_i64_field!(owner_master_put_end_server_us);
     }
 }
+
+#[derive(Default, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct SsdStageReadReq {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+    pub get_id: u64,
+    pub stage_addr: u64,
+    pub stage_capacity: u64,
+    pub len: u64,
+}
+
+impl MsgPackSerializePart for SsdStageReadReq {
+    fn msg_id(&self) -> u32 {
+        4044
+    }
+}
+
+impl RPCReq for SsdStageReadReq {
+    type Resp = SsdStageReadResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct SsdStageReadResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for SsdStageReadResp {
+    fn msg_id(&self) -> u32 {
+        4045
+    }
+}
 // --- RPC for Physical Node Shared Memory ---
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
@@ -92,68 +123,629 @@ impl MsgPackSerializePart for ExternalGetResp {
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct SsdStageReadReq {
-    pub key: String,
-    pub put_id: PutIDForAKey,
-    pub get_id: u64,
-    pub stage_addr: u64,
-    pub stage_len: u64,
-    pub target_node_id: NodeIDString,
-    pub target_addr: u64,
-    pub len: u64,
+pub struct ExternalBatchGetReq {
+    pub keys: Vec<String>,
+    pub req_node_id: String,
+    /// Owner node_start_time observed by external when request starts
+    pub started_time: i64,
+    pub transfer_concurrency: usize,
 }
-
-impl MsgPackSerializePart for SsdStageReadReq {
+impl MsgPackSerializePart for ExternalBatchGetReq {
     fn msg_id(&self) -> u32 {
         4020
     }
 }
-
-impl RPCReq for SsdStageReadReq {
-    type Resp = SsdStageReadResp;
+impl RPCReq for ExternalBatchGetReq {
+    type Resp = ExternalBatchGetResp;
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct SsdStageReadResp {
-    pub done: GetDoneResp,
+pub struct ExternalBatchGetItemResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub external_memholder_info: Option<ExternalMemHolderInfo>,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchGetResp {
+    pub items: Vec<ExternalBatchGetItemResp>,
     pub error_code: ErrorCode,
     pub error_json: String,
 }
 
-impl MsgPackSerializePart for SsdStageReadResp {
+/// Probe only the requester's share-group owner. A `Some` item is pinned
+/// owner-local data; `None` must be resolved through the remote directory.
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchGetLocalProbeReq {
+    pub plan_handle: u64,
+    pub keys: Vec<String>,
+    pub req_node_id: String,
+    pub started_time: i64,
+}
+impl MsgPackSerializePart for ExternalBatchGetLocalProbeReq {
+    fn msg_id(&self) -> u32 {
+        4040
+    }
+}
+impl RPCReq for ExternalBatchGetLocalProbeReq {
+    type Resp = ExternalBatchGetLocalProbeResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchGetLocalProbeResp {
+    pub items: Vec<Option<ExternalMemHolderInfo>>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for ExternalBatchGetLocalProbeResp {
+    fn msg_id(&self) -> u32 {
+        4041
+    }
+}
+
+#[cfg(test)]
+mod external_batch_get_local_probe_wire_tests {
+    use super::{ExternalBatchGetLocalProbeReq, ExternalBatchGetLocalProbeResp};
+    use crate::memholder::ExternalMemHolderInfo;
+    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+
+    #[test]
+    fn mixed_local_remote_probe_round_trip() {
+        let request = ExternalBatchGetLocalProbeReq {
+            plan_handle: 41,
+            keys: vec!["local".to_string(), "remote".to_string()],
+            req_node_id: "external-a".to_string(),
+            started_time: 17,
+        };
+        let decoded: ExternalBatchGetLocalProbeReq =
+            bitcode::decode(&bitcode::encode(&request)).expect("decode local probe request");
+        assert_eq!(decoded.plan_handle, 41);
+        assert_eq!(decoded.keys, request.keys);
+
+        let response = ExternalBatchGetLocalProbeResp {
+            items: vec![
+                Some(ExternalMemHolderInfo {
+                    offset: 4096,
+                    len: 8192,
+                    holder_id: 23,
+                }),
+                None,
+            ],
+            error_code: OK,
+            error_json: String::new(),
+        };
+        let decoded: ExternalBatchGetLocalProbeResp =
+            bitcode::decode(&bitcode::encode(&response)).expect("decode local probe response");
+        assert_eq!(decoded.items.len(), 2);
+        assert_eq!(
+            decoded.items[0].as_ref().map(|info| info.holder_id),
+            Some(23)
+        );
+        assert!(decoded.items[1].is_none());
+    }
+}
+impl MsgPackSerializePart for ExternalBatchGetResp {
     fn msg_id(&self) -> u32 {
         4021
     }
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct SsdReplicaPersistReq {
-    pub key: String,
-    pub put_id: PutIDForAKey,
-    pub target_addr: u64,
-    pub len: u64,
+pub struct ExternalBatchGetStartReq {
+    pub keys: Vec<String>,
+    pub req_node_id: String,
+    /// Owner node_start_time observed by external when request starts
+    pub started_time: i64,
+    pub prefix_best_effort: bool,
+    pub atomic_group_lens: Option<Vec<usize>>,
+    pub transfer_concurrency: usize,
 }
-
-impl MsgPackSerializePart for SsdReplicaPersistReq {
+impl MsgPackSerializePart for ExternalBatchGetStartReq {
     fn msg_id(&self) -> u32 {
-        4022
+        4030
     }
 }
-
-impl RPCReq for SsdReplicaPersistReq {
-    type Resp = SsdReplicaPersistResp;
+impl RPCReq for ExternalBatchGetStartReq {
+    type Resp = ExternalBatchGetStartResp;
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
-pub struct SsdReplicaPersistResp {
-    pub persisted: bool,
+pub struct ExternalBatchGetStartResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub handle: u64,
+    pub raw_prefix_hit_len: usize,
+    pub transfer_plan: ExternalBatchGetStartTransferPlan,
+}
+impl MsgPackSerializePart for ExternalBatchGetStartResp {
+    fn msg_id(&self) -> u32 {
+        4031
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub enum ExternalBatchGetStartTransferPlan {
+    #[default]
+    OwnerRpc,
+    InlineLocal {
+        items: Vec<ExternalBatchGetItemResp>,
+    },
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchGetTransferReq {
+    pub handle: u64,
+    pub req_node_id: String,
+    /// Owner node_start_time observed by external when request starts
+    pub started_time: i64,
+    /// Complete atomic-group prefix selected by the consumer from the live
+    /// get-start handle.
+    pub consume_prefix_len: usize,
+}
+impl MsgPackSerializePart for ExternalBatchGetTransferReq {
+    fn msg_id(&self) -> u32 {
+        4032
+    }
+}
+impl RPCReq for ExternalBatchGetTransferReq {
+    type Resp = ExternalBatchGetTransferResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchGetTransferResp {
+    pub items: Vec<ExternalBatchGetItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for ExternalBatchGetTransferResp {
+    fn msg_id(&self) -> u32 {
+        4033
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchGetCancelReq {
+    pub handle: u64,
+    pub req_node_id: String,
+    /// Owner node_start_time observed by external when request starts
+    pub started_time: i64,
+    pub transfer_plan: ExternalBatchGetCancelPlan,
+}
+impl MsgPackSerializePart for ExternalBatchGetCancelReq {
+    fn msg_id(&self) -> u32 {
+        4034
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub enum ExternalBatchGetCancelPlan {
+    #[default]
+    OwnerRpc,
+    InlineLocal {
+        holder_ids: Vec<u64>,
+    },
+}
+impl RPCReq for ExternalBatchGetCancelReq {
+    type Resp = ExternalBatchGetCancelResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchGetCancelResp {
     pub error_code: ErrorCode,
     pub error_json: String,
 }
 
-impl MsgPackSerializePart for SsdReplicaPersistResp {
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalPlannedGetItem {
+    pub key: String,
+    /// Reuse the canonical master Plan wire type instead of copying a second
+    /// set of source identity fields into the owner execution protocol.
+    pub plan: crate::master_kv_router::msg_pack::BatchGetPlanItemResp,
+}
+
+/// Execute a target-free master plan into the requester's owner-local CPU
+/// pool. The stable `(requester generation, plan_handle)` identity makes a
+/// lost response replayable without another lookup or transfer.
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalExecutePlannedGetReq {
+    pub plan_handle: u64,
+    pub items: Vec<ExternalPlannedGetItem>,
+    pub req_node_id: String,
+    pub started_time: i64,
+    pub transfer_concurrency: usize,
+}
+impl MsgPackSerializePart for ExternalExecutePlannedGetReq {
+    fn msg_id(&self) -> u32 {
+        4038
+    }
+}
+impl RPCReq for ExternalExecutePlannedGetReq {
+    type Resp = ExternalExecutePlannedGetResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalExecutePlannedGetResp {
+    pub items: Vec<ExternalBatchGetItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[cfg(test)]
+mod external_execute_planned_get_wire_tests {
+    use super::{
+        ExternalBatchGetItemResp, ExternalExecutePlannedGetReq, ExternalExecutePlannedGetResp,
+        ExternalPlannedGetItem,
+    };
+    use crate::memholder::ExternalMemHolderInfo;
+    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+
+    #[test]
+    fn operation_identity_and_holder_terminal_round_trip() {
+        let request = ExternalExecutePlannedGetReq {
+            plan_handle: 19,
+            items: vec![ExternalPlannedGetItem {
+                key: "page-a".to_string(),
+                plan: crate::master_kv_router::msg_pack::BatchGetPlanItemResp {
+                    get_id: 0,
+                    requester_local_borrow_eligible: true,
+                    ..Default::default()
+                },
+            }],
+            req_node_id: "external-a".to_string(),
+            started_time: 23,
+            transfer_concurrency: 32,
+        };
+        let decoded: ExternalExecutePlannedGetReq =
+            bitcode::decode(&bitcode::encode(&request)).expect("decode planned execute request");
+        assert_eq!(decoded.plan_handle, 19);
+        assert_eq!(decoded.items[0].plan.get_id, 0);
+        assert!(decoded.items[0].plan.requester_local_borrow_eligible);
+        assert_eq!(decoded.started_time, 23);
+
+        let terminal = ExternalExecutePlannedGetResp {
+            items: vec![ExternalBatchGetItemResp {
+                error_code: OK,
+                error_json: String::new(),
+                external_memholder_info: Some(ExternalMemHolderInfo {
+                    offset: 4096,
+                    len: 8192,
+                    holder_id: 29,
+                }),
+            }],
+            error_code: OK,
+            error_json: String::new(),
+        };
+        let decoded: ExternalExecutePlannedGetResp =
+            bitcode::decode(&bitcode::encode(&terminal)).expect("decode planned execute terminal");
+        assert_eq!(
+            decoded.items[0]
+                .external_memholder_info
+                .as_ref()
+                .map(|info| info.holder_id),
+            Some(29)
+        );
+    }
+}
+impl MsgPackSerializePart for ExternalExecutePlannedGetResp {
+    fn msg_id(&self) -> u32 {
+        4039
+    }
+}
+impl MsgPackSerializePart for ExternalBatchGetCancelResp {
+    fn msg_id(&self) -> u32 {
+        4035
+    }
+}
+
+#[cfg(test)]
+mod external_batch_get_plan_wire_tests {
+    use super::{
+        ExternalBatchGetCancelPlan, ExternalBatchGetCancelReq, ExternalBatchGetItemResp,
+        ExternalBatchGetStartResp, ExternalBatchGetStartTransferPlan, ExternalBatchGetTransferReq,
+    };
+    use crate::memholder::ExternalMemHolderInfo;
+    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+
+    #[test]
+    fn inline_start_and_cancel_plans_round_trip() {
+        let start = ExternalBatchGetStartResp {
+            error_code: OK,
+            error_json: String::new(),
+            handle: 19,
+            raw_prefix_hit_len: 2,
+            transfer_plan: ExternalBatchGetStartTransferPlan::InlineLocal {
+                items: vec![ExternalBatchGetItemResp {
+                    error_code: OK,
+                    error_json: String::new(),
+                    external_memholder_info: Some(ExternalMemHolderInfo {
+                        offset: 4096,
+                        len: 8192,
+                        holder_id: 23,
+                    }),
+                }],
+            },
+        };
+        let decoded_start: ExternalBatchGetStartResp =
+            bitcode::decode(&bitcode::encode(&start)).expect("decode inline start plan");
+        assert_eq!(decoded_start.handle, 19);
+        assert!(matches!(
+            decoded_start.transfer_plan,
+            ExternalBatchGetStartTransferPlan::InlineLocal { items }
+                if items.len() == 1
+                    && items[0]
+                        .external_memholder_info
+                        .as_ref()
+                        .is_some_and(|info| info.holder_id == 23)
+        ));
+
+        let transfer = ExternalBatchGetTransferReq {
+            handle: 19,
+            req_node_id: "external-a".to_string(),
+            started_time: 29,
+            consume_prefix_len: 1,
+        };
+        let decoded_transfer: ExternalBatchGetTransferReq =
+            bitcode::decode(&bitcode::encode(&transfer)).expect("decode transfer request");
+        assert_eq!(decoded_transfer.consume_prefix_len, 1);
+
+        let cancel = ExternalBatchGetCancelReq {
+            handle: 19,
+            req_node_id: "external-a".to_string(),
+            started_time: 29,
+            transfer_plan: ExternalBatchGetCancelPlan::InlineLocal {
+                holder_ids: vec![23, 24],
+            },
+        };
+        let decoded_cancel: ExternalBatchGetCancelReq =
+            bitcode::decode(&bitcode::encode(&cancel)).expect("decode inline cancel plan");
+        assert!(matches!(
+            decoded_cancel.transfer_plan,
+            ExternalBatchGetCancelPlan::InlineLocal { holder_ids }
+                if holder_ids == vec![23, 24]
+        ));
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutStartItemReq {
+    pub key: String,
+    pub len: u64,
+    pub reject_if_inflight_same_key: bool,
+    pub reject_if_exist_same_key: bool,
+    pub make_replica_task: bool,
+    pub preferred_sub_cluster: Option<String>,
+    pub radix: Option<RadixKvMetadata>,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutStartReq {
+    pub items: Vec<ExternalBatchPutStartItemReq>,
+    /// Positive lengths partitioning `items`; omitted means one group per item.
+    pub atomic_group_lens: Option<Vec<usize>>,
+    /// Owner node_start_time observed by external when request starts
+    pub started_time: i64,
+}
+impl MsgPackSerializePart for ExternalBatchPutStartReq {
+    fn msg_id(&self) -> u32 {
+        4022
+    }
+}
+impl RPCReq for ExternalBatchPutStartReq {
+    type Resp = ExternalBatchPutStartResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutStartItemResp {
+    pub error_code: ErrorCode,
+    pub src_offset: u64,
+    pub target_offset: u64,
+    pub transfer_target_offset: Option<u64>,
+    pub peer_id: Option<String>,
+    pub src_base_addr: u64,
+    pub target_base_addr: u64,
+    pub error_json: String,
+    pub put_id: Option<PutIDForAKey>,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutStartResp {
+    pub items: Vec<ExternalBatchPutStartItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for ExternalBatchPutStartResp {
     fn msg_id(&self) -> u32 {
         4023
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutTransferEndItemReq {
+    pub key: String,
+    pub len: u64,
+    pub src_offset: u64,
+    pub target_offset: u64,
+    pub peer_id: Option<String>,
+    pub target_base_addr: Option<u64>,
+    pub put_id: Option<PutIDForAKey>,
+    pub lease_id: Option<u64>,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutTransferEndReq {
+    pub items: Vec<ExternalBatchPutTransferEndItemReq>,
+    /// Owner node_start_time observed by external when request starts
+    pub started_time: i64,
+    pub transfer_concurrency: usize,
+}
+impl MsgPackSerializePart for ExternalBatchPutTransferEndReq {
+    fn msg_id(&self) -> u32 {
+        4024
+    }
+}
+impl RPCReq for ExternalBatchPutTransferEndReq {
+    type Resp = ExternalBatchPutTransferEndResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutTransferEndItemResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutTransferEndResp {
+    pub items: Vec<ExternalBatchPutTransferEndItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for ExternalBatchPutTransferEndResp {
+    fn msg_id(&self) -> u32 {
+        4025
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutCommitItemReq {
+    pub key: String,
+    pub len: u64,
+    pub src_offset: u64,
+    pub remote_target: bool,
+    pub put_id: Option<PutIDForAKey>,
+    pub lease_id: Option<u64>,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutCommitReq {
+    pub items: Vec<ExternalBatchPutCommitItemReq>,
+    /// Owner node_start_time observed by the caller when request starts
+    pub started_time: i64,
+}
+impl MsgPackSerializePart for ExternalBatchPutCommitReq {
+    fn msg_id(&self) -> u32 {
+        4026
+    }
+}
+impl RPCReq for ExternalBatchPutCommitReq {
+    type Resp = ExternalBatchPutCommitResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutCommitItemResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchPutCommitResp {
+    pub items: Vec<ExternalBatchPutCommitItemResp>,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for ExternalBatchPutCommitResp {
+    fn msg_id(&self) -> u32 {
+        4027
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalIoLocalitySnapshot {
+    pub op_count: u64,
+    pub bytes: u64,
+    pub transfer_us: u64,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalObservabilitySnapshotReq {
+    /// Owner node_start_time observed by external when request starts.
+    pub started_time: i64,
+}
+impl MsgPackSerializePart for ExternalObservabilitySnapshotReq {
+    fn msg_id(&self) -> u32 {
+        4028
+    }
+}
+impl RPCReq for ExternalObservabilitySnapshotReq {
+    type Resp = ExternalObservabilitySnapshotResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalObservabilitySnapshotResp {
+    pub error_code: ErrorCode,
+    pub error_json: String,
+    pub l2_local_hit_pages: u64,
+    pub l2_local_hit_bytes: u64,
+    pub l2_remote_hit_pages: u64,
+    pub l2_remote_hit_bytes: u64,
+    pub put_local: ExternalIoLocalitySnapshot,
+    pub put_remote: ExternalIoLocalitySnapshot,
+    pub get_local: ExternalIoLocalitySnapshot,
+    pub get_remote: ExternalIoLocalitySnapshot,
+}
+impl ExternalObservabilitySnapshotResp {
+    pub fn success(snapshot: crate::metrics::KvLocalitySnapshot) -> Self {
+        Self {
+            error_code: OK,
+            error_json: String::new(),
+            l2_local_hit_pages: snapshot.l2_local_hit_pages,
+            l2_local_hit_bytes: snapshot.l2_local_hit_bytes,
+            l2_remote_hit_pages: snapshot.l2_remote_hit_pages,
+            l2_remote_hit_bytes: snapshot.l2_remote_hit_bytes,
+            put_local: ExternalIoLocalitySnapshot {
+                op_count: snapshot.put_local.op_count,
+                bytes: snapshot.put_local.bytes,
+                transfer_us: snapshot.put_local.transfer_us,
+            },
+            put_remote: ExternalIoLocalitySnapshot {
+                op_count: snapshot.put_remote.op_count,
+                bytes: snapshot.put_remote.bytes,
+                transfer_us: snapshot.put_remote.transfer_us,
+            },
+            get_local: ExternalIoLocalitySnapshot {
+                op_count: snapshot.get_local.op_count,
+                bytes: snapshot.get_local.bytes,
+                transfer_us: snapshot.get_local.transfer_us,
+            },
+            get_remote: ExternalIoLocalitySnapshot {
+                op_count: snapshot.get_remote.op_count,
+                bytes: snapshot.get_remote.bytes,
+                transfer_us: snapshot.get_remote.transfer_us,
+            },
+        }
+    }
+
+    pub fn into_snapshot(self) -> crate::metrics::KvLocalitySnapshot {
+        crate::metrics::KvLocalitySnapshot {
+            l2_local_hit_pages: self.l2_local_hit_pages,
+            l2_local_hit_bytes: self.l2_local_hit_bytes,
+            l2_remote_hit_pages: self.l2_remote_hit_pages,
+            l2_remote_hit_bytes: self.l2_remote_hit_bytes,
+            put_local: crate::metrics::KvIoLocalitySnapshot {
+                op_count: self.put_local.op_count,
+                bytes: self.put_local.bytes,
+                transfer_us: self.put_local.transfer_us,
+            },
+            put_remote: crate::metrics::KvIoLocalitySnapshot {
+                op_count: self.put_remote.op_count,
+                bytes: self.put_remote.bytes,
+                transfer_us: self.put_remote.transfer_us,
+            },
+            get_local: crate::metrics::KvIoLocalitySnapshot {
+                op_count: self.get_local.op_count,
+                bytes: self.get_local.bytes,
+                transfer_us: self.get_local.transfer_us,
+            },
+            get_remote: crate::metrics::KvIoLocalitySnapshot {
+                op_count: self.get_remote.op_count,
+                bytes: self.get_remote.bytes,
+                transfer_us: self.get_remote.transfer_us,
+            },
+        }
+    }
+}
+impl MsgPackSerializePart for ExternalObservabilitySnapshotResp {
+    fn msg_id(&self) -> u32 {
+        4029
     }
 }
 
@@ -182,7 +774,8 @@ pub struct ExternalPutStartReq {
     pub key: String,
     pub len: u64,
     pub reject_if_inflight_same_key: bool,
-    pub reject_if_exists: bool,
+    pub reject_if_exist_same_key: bool,
+    pub make_replica_task: bool,
     /// Prefer placing the target allocation on any kvclient within this sub_cluster.
     pub preferred_sub_cluster: Option<String>,
     /// Owner node_start_time observed by external when request starts
@@ -259,6 +852,9 @@ impl MsgPackSerializePart for ExternalPutTransferEndResp {
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct ExternalPutCommitReq {
     pub key: String,
+    pub len: u64,
+    pub src_offset: u64,
+    pub remote_target: bool,
     pub put_id: Option<PutIDForAKey>,
     pub lease_id: Option<u64>,
     /// Owner node_start_time observed by the caller when request starts
@@ -367,6 +963,34 @@ impl MsgPackSerializePart for ExternalIsExistResp {
 }
 
 #[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchIsExistReq {
+    pub keys: Vec<String>,
+    pub allow_local_snapshot: bool,
+    /// Owner node_start_time observed by external when request starts
+    pub started_time: i64,
+}
+impl MsgPackSerializePart for ExternalBatchIsExistReq {
+    fn msg_id(&self) -> u32 {
+        crate::rpcresp_kvresult_convert::msg_and_error::MsgId::ExternalBatchIsExistReq as u32
+    }
+}
+impl RPCReq for ExternalBatchIsExistReq {
+    type Resp = ExternalBatchIsExistResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchIsExistResp {
+    pub error_code: ErrorCode,
+    pub exists_list: Vec<bool>,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for ExternalBatchIsExistResp {
+    fn msg_id(&self) -> u32 {
+        crate::rpcresp_kvresult_convert::msg_and_error::MsgId::ExternalBatchIsExistResp as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct ExternalDeleteAckReq {
     pub key: String,
     pub external_client_id: String,
@@ -394,11 +1018,66 @@ impl MsgPackSerializePart for ExternalDeleteAckResp {
     }
 }
 
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchDeleteAckReq {
+    pub external_client_id: String,
+    pub holder_ids: Vec<u64>,
+    /// Owner node_start_time observed when these holders were created.
+    pub started_time: i64,
+}
+impl MsgPackSerializePart for ExternalBatchDeleteAckReq {
+    fn msg_id(&self) -> u32 {
+        4036
+    }
+}
+impl RPCReq for ExternalBatchDeleteAckReq {
+    type Resp = ExternalBatchDeleteAckResp;
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalBatchDeleteAckResp {
+    pub released_count: u32,
+    pub missing_count: u32,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+impl MsgPackSerializePart for ExternalBatchDeleteAckResp {
+    fn msg_id(&self) -> u32 {
+        4037
+    }
+}
+
+#[cfg(test)]
+mod external_batch_delete_ack_wire_tests {
+    use super::ExternalBatchDeleteAckReq;
+
+    #[test]
+    fn compact_holder_id_batch_round_trips() {
+        let request = ExternalBatchDeleteAckReq {
+            external_client_id: "external-a".to_string(),
+            holder_ids: vec![3, 5, 8],
+            started_time: 17,
+        };
+        let decoded: ExternalBatchDeleteAckReq =
+            bitcode::decode(&bitcode::encode(&request)).expect("decode holder ACK batch");
+        assert_eq!(decoded.external_client_id, "external-a");
+        assert_eq!(decoded.holder_ids, vec![3, 5, 8]);
+        assert_eq!(decoded.started_time, 17);
+    }
+}
+
 // --- RPC: Owner -> External to invalidate weak-index cache for keys ---
 #[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct ExternalInvalidateWeakIndexItem {
+    pub key: String,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct ExternalInvalidateWeakIndexReq {
-    /// Keys whose weak cache entries should be invalidated on external client
+    /// Keys whose weak cache entries should be invalidated on external client.
+    /// Kept for compatibility with older senders; new senders should use `items`.
     pub keys: Vec<String>,
+    pub items: Vec<ExternalInvalidateWeakIndexItem>,
 }
 impl MsgPackSerializePart for ExternalInvalidateWeakIndexReq {
     fn msg_id(&self) -> u32 {

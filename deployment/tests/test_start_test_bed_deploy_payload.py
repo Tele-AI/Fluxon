@@ -71,7 +71,7 @@ def _manifest(
                     "containers": [
                         {
                             "name": service_name,
-                            "image": "fluxon_quick_start:0.2.1",
+                            "image": "fluxon_quick_start:0.2.2",
                             "command": ["/bin/bash", "-lc"],
                             "args": ["echo ok\n"],
                         }

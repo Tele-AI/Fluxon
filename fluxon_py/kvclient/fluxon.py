@@ -3,6 +3,7 @@
 This module provides a concrete implementation using the PyO3 Rust bindings.
 """
 
+from dataclasses import dataclass
 from typing import Union, Optional, Callable, Any, Dict, List, Tuple
 import ctypes
 import os
@@ -25,7 +26,7 @@ except ImportError as e:
 from .kvclient_interface import KvClient
 from .kvclient_interface import KvLeaseApi, KvRpcApi, PutOptionalArgs, FlatDict
 from .backend_fallback_close import unregister_store_from_cleanup
-from .kvclient_interface import KvFuture, MemHolder
+from .kvclient_interface import GetStartHandle, GetStartResult, KvFuture, MemHolder
 from .nonzerocopy_encode import (
     DLPacked,
     INTERNAL_DLPACK_META_KEY,
@@ -54,6 +55,131 @@ _PyBytes_AsString.restype = ctypes.c_void_p
 
 _SIDE_TRANSFER_WORKER_PYTHON_ENV = "FLUXON_KV_SIDE_WORKER_PYTHON"
 _BLOCKING_PUT_OUTER_TOTAL_LOG_INTERVAL_NS = 10 * 1_000_000_000
+_MIN_EXPLICIT_RPC_TIMEOUT_MS = int(fluxon_pyo3.MIN_EXPLICIT_RPC_TIMEOUT_MS)
+
+
+def _validate_explicit_rpc_timeout_ms(timeout_ms: int) -> None:
+    if not isinstance(timeout_ms, int):
+        raise InvalidArgumentError(message=f"timeout_ms must be int; got {type(timeout_ms)}")
+    if timeout_ms < _MIN_EXPLICIT_RPC_TIMEOUT_MS:
+        raise InvalidArgumentError(
+            message=(
+                f"timeout_ms must be >= {_MIN_EXPLICIT_RPC_TIMEOUT_MS}; "
+                f"got {timeout_ms}"
+            )
+        )
+
+
+def _validate_put_atomic_groups(
+    keys: List[str],
+    atomic_group_lens: Optional[List[int]],
+    make_replica_task_mask: Optional[List[bool]],
+) -> Optional[List[int]]:
+    if atomic_group_lens is None:
+        return None
+    if not isinstance(atomic_group_lens, list):
+        raise ValueError(
+            "atomic_group_lens must be list[int] when provided; "
+            f"got {type(atomic_group_lens)}"
+        )
+    normalized_group_lens: List[int] = []
+    for index, length in enumerate(atomic_group_lens):
+        if type(length) is not int:
+            raise ValueError(
+                "atomic_group_lens items must be int; "
+                f"index={index} got={type(length)}"
+            )
+        if length <= 0:
+            raise ValueError(
+                "atomic_group_lens entries must be > 0; "
+                f"index={index} got={length}"
+            )
+        normalized_group_lens.append(length)
+    group_sum = sum(normalized_group_lens)
+    if group_sum != len(keys):
+        raise ValueError(
+            "atomic_group_lens must sum to keys length; "
+            f"sum={group_sum} keys={len(keys)}"
+        )
+    if make_replica_task_mask is not None:
+        offset = 0
+        for group_index, group_len in enumerate(normalized_group_lens):
+            group_mask = make_replica_task_mask[offset : offset + group_len]
+            if any(item != group_mask[0] for item in group_mask[1:]):
+                raise ValueError(
+                    "make_replica_task_mask must be uniform within each atomic group; "
+                    f"group_index={group_index} offset={offset} len={group_len}"
+                )
+            offset += group_len
+    return normalized_group_lens
+
+
+def _validate_put_radix_metadata(
+    keys: List[str],
+    radix_parent_keys: Optional[List[Optional[str]]],
+    content_depths: Optional[List[int]],
+) -> Tuple[Optional[List[Optional[str]]], Optional[List[int]]]:
+    if radix_parent_keys is None and content_depths is None:
+        return None, None
+    if radix_parent_keys is None or content_depths is None:
+        raise ValueError(
+            "radix_parent_keys and content_depths must be provided together"
+        )
+    if not isinstance(radix_parent_keys, list):
+        raise ValueError(
+            "radix_parent_keys must be list[Optional[str]] when provided; "
+            f"got {type(radix_parent_keys)}"
+        )
+    if not isinstance(content_depths, list):
+        raise ValueError(
+            "content_depths must be list[int] when provided; "
+            f"got {type(content_depths)}"
+        )
+    if len(radix_parent_keys) != len(keys) or len(content_depths) != len(keys):
+        raise ValueError(
+            "radix metadata lengths must match keys length; "
+            f"keys={len(keys)} parents={len(radix_parent_keys)} "
+            f"depths={len(content_depths)}"
+        )
+
+    normalized_parents: List[Optional[str]] = []
+    normalized_depths: List[int] = []
+    for index, (key, parent, depth) in enumerate(
+        zip(keys, radix_parent_keys, content_depths)
+    ):
+        if type(depth) is not int:
+            raise ValueError(
+                "content_depths items must be int; "
+                f"index={index} got={type(depth)}"
+            )
+        if depth < 0 or depth > 0xFFFFFFFF:
+            raise ValueError(
+                "content_depths items must fit u32; "
+                f"index={index} got={depth}"
+            )
+        if parent is not None and (not isinstance(parent, str) or not parent):
+            raise ValueError(
+                "radix_parent_keys items must be non-empty str or None; "
+                f"index={index} got={parent!r}"
+            )
+        if depth == 0 and parent is not None:
+            raise ValueError(
+                "a depth-zero radix key must not have a parent; "
+                f"index={index} key={key!r} parent={parent!r}"
+            )
+        if depth > 0 and parent is None:
+            raise ValueError(
+                "a non-root radix key must have a parent; "
+                f"index={index} key={key!r} depth={depth}"
+            )
+        if parent == key:
+            raise ValueError(
+                "a radix key cannot be its own parent; "
+                f"index={index} key={key!r}"
+            )
+        normalized_parents.append(parent)
+        normalized_depths.append(depth)
+    return normalized_parents, normalized_depths
 
 
 def _percentile_nearest_rank_ns(sorted_values: List[int], percentile: int) -> int:
@@ -138,9 +264,231 @@ def _resolve_side_transfer_worker_python() -> str:
     return sys.executable
 
 
+@dataclass(frozen=True)
+class _RegisteredBufferDescriptor:
+    ptr: int
+    size: int
+    device_kind: str = "host"
+    device_id: str = ""
+    layout: str = "raw"
+    metadata: Optional[Dict[str, Any]] = None
+
+    @property
+    def end(self) -> int:
+        return self.ptr + self.size
+
+    def contains(self, ptr: int, size: int) -> bool:
+        req_end = ptr + size
+        return ptr >= self.ptr and req_end <= self.end
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "ptr": self.ptr,
+            "size": self.size,
+            "device_kind": self.device_kind,
+            "device_id": self.device_id,
+            "layout": self.layout,
+            "metadata": dict(self.metadata or {}),
+        }
+
+
+@dataclass(frozen=True)
+class GpuBufferRegistration:
+    registration_id: int
+    ptr: int
+    size: int
+    device_id: int
+
+    def __post_init__(self) -> None:
+        if type(self.registration_id) is not int or self.registration_id <= 0:
+            raise ValueError("registration_id must be a positive int")
+        if type(self.ptr) is not int or self.ptr <= 0:
+            raise ValueError("GPU registration ptr must be a positive int")
+        if type(self.size) is not int or self.size <= 0:
+            raise ValueError("GPU registration size must be a positive int")
+        if type(self.device_id) is not int or self.device_id < 0:
+            raise ValueError("GPU device_id must be a non-negative int")
+        if self.end > (1 << 64):
+            raise ValueError("GPU registration range overflows u64")
+
+    @property
+    def end(self) -> int:
+        return self.ptr + self.size
+
+    def destination(self, ptr: int, capacity: int) -> "GpuDestination":
+        destination = GpuDestination(
+            registration_id=self.registration_id,
+            ptr=ptr,
+            capacity=capacity,
+        )
+        if destination.ptr < self.ptr or destination.end > self.end:
+            raise ValueError(
+                "GPU destination is outside its registration: "
+                f"registration=[{self.ptr:#x},{self.end:#x}) "
+                f"destination=[{destination.ptr:#x},{destination.end:#x})"
+            )
+        return destination
+
+
+@dataclass(frozen=True)
+class GpuDestination:
+    registration_id: int
+    ptr: int
+    capacity: int
+
+    def __post_init__(self) -> None:
+        if type(self.registration_id) is not int or self.registration_id <= 0:
+            raise ValueError("registration_id must be a positive int")
+        if type(self.ptr) is not int or self.ptr <= 0:
+            raise ValueError("GPU destination ptr must be a positive int")
+        if type(self.capacity) is not int or self.capacity <= 0:
+            raise ValueError("GPU destination capacity must be a positive int")
+        if self.end > (1 << 64):
+            raise ValueError("GPU destination range overflows u64")
+
+    @property
+    def end(self) -> int:
+        return self.ptr + self.capacity
+
+
+@dataclass
+class GpuGetStartHandle:
+    """One-shot handle for a background RDMA pull into GPU staging."""
+
+    keys: Tuple[str, ...]
+    destinations: Tuple[GpuDestination, ...]
+    result: GetStartResult
+    created_at_ns: int
+    backend_token: int
+    backend_handle: int
+    remote_indices: Tuple[int, ...]
+    closed: bool = False
+    transfer_wall_us: Optional[int] = None
+    finish_wait_us: Optional[int] = None
+    terminal_before_consume: Optional[bool] = None
+    terminal_to_consume_us: Optional[int] = None
+
+
+@dataclass
+class GetPlanHandle:
+    """Target-free Get plan that must be executed once or cancelled."""
+
+    keys: Tuple[str, ...]
+    result: GetStartResult
+    gpu_result: GetStartResult
+    created_at_ns: int
+    backend_token: int
+    backend_handle: int
+    gpu_remote_indices: Tuple[int, ...]
+    closed: bool = False
+
+
 def _map_nospace_to_storagefull(err: ApiError) -> ApiError:
     """Normalize storage-capacity errors without depending on backend internals."""
     return err
+
+
+def _get_start_prefix_hit_groups(
+    raw_prefix_hit_len: int,
+    group_lens: Tuple[int, ...],
+) -> int:
+    prefix_hit_groups = 0
+    transferable_len = 0
+    for group_len in group_lens:
+        next_transferable_len = transferable_len + group_len
+        if next_transferable_len > raw_prefix_hit_len:
+            break
+        transferable_len = next_transferable_len
+        prefix_hit_groups += 1
+    return prefix_hit_groups
+
+
+def _get_start_group_index_for_key_index(
+    group_lens: Tuple[int, ...],
+    key_index: int,
+) -> Optional[int]:
+    cursor = 0
+    for group_index, group_len in enumerate(group_lens):
+        cursor += group_len
+        if key_index < cursor:
+            return group_index
+    return None
+
+
+def _build_get_start_result_from_backend_payload(
+    payload: Dict[str, Any],
+    keys: List[str],
+    prefix_best_effort: bool,
+    normalized_group_lens: Optional[List[int]],
+) -> GetStartResult:
+    result_keys = tuple(keys)
+    group_lens = (
+        (len(result_keys),)
+        if normalized_group_lens is None
+        else tuple(normalized_group_lens)
+    )
+    raw_prefix_hit_len = int(payload["raw_prefix_hit_len"])
+    if raw_prefix_hit_len < 0 or raw_prefix_hit_len > len(result_keys):
+        raise RuntimeError(
+            "get_start returned invalid raw_prefix_hit_len: "
+            f"raw_prefix_hit_len={raw_prefix_hit_len} keys={len(result_keys)}"
+        )
+    prefix_hit_groups = _get_start_prefix_hit_groups(
+        raw_prefix_hit_len,
+        group_lens,
+    )
+    if not prefix_best_effort and prefix_hit_groups != len(group_lens):
+        transferable_len = 0
+        prefix_hit_groups = 0
+    else:
+        transferable_len = sum(group_lens[:prefix_hit_groups])
+    first_miss_index = (
+        None if raw_prefix_hit_len == len(result_keys) else raw_prefix_hit_len
+    )
+    first_miss_group_index = (
+        None
+        if first_miss_index is None
+        else _get_start_group_index_for_key_index(group_lens, first_miss_index)
+    )
+    return GetStartResult(
+        keys=result_keys,
+        raw_prefix_hit_len=raw_prefix_hit_len,
+        transferable_len=transferable_len,
+        prefix_hit_groups=prefix_hit_groups,
+        atomic_group_lens=tuple(normalized_group_lens) if normalized_group_lens is not None else None,
+        prefix_best_effort=prefix_best_effort,
+        first_miss_index=first_miss_index,
+        first_miss_group_index=first_miss_group_index,
+        all_hit=transferable_len == len(result_keys),
+    )
+
+
+def _narrow_get_start_result(result: GetStartResult, consume_prefix_len: int) -> GetStartResult:
+    group_lens = result.atomic_group_lens or (len(result.keys),)
+    selected_groups: List[int] = []
+    cursor = 0
+    for group_len in group_lens:
+        if cursor + group_len > consume_prefix_len:
+            break
+        selected_groups.append(int(group_len))
+        cursor += int(group_len)
+    if cursor != consume_prefix_len:
+        raise ValueError(
+            "consume_prefix_len must end at an atomic-group boundary: "
+            f"consume={consume_prefix_len} groups={group_lens}"
+        )
+    keys = result.keys[:consume_prefix_len]
+    return GetStartResult(
+        keys=keys,
+        raw_prefix_hit_len=consume_prefix_len,
+        transferable_len=consume_prefix_len,
+        prefix_hit_groups=len(selected_groups),
+        atomic_group_lens=tuple(selected_groups),
+        prefix_best_effort=result.prefix_best_effort,
+        first_miss_index=None,
+        first_miss_group_index=None,
+        all_hit=True,
+    )
 
 
 def _error_to_ret_code(err: ApiError) -> int:
@@ -305,7 +653,12 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         self._close_lock = threading.Lock()
         self._config = config
         self._init_error: Optional[ApiError] = None
+        self._registered_buffer_descriptors: List[_RegisteredBufferDescriptor] = []
+        self._gpu_buffer_registration: Optional[GpuBufferRegistration] = None
         cluster_name = config.fluxonkv_spec_cluster_name
+        self._batch_concurrency = 128
+        if self._batch_concurrency <= 0:
+            raise ValueError("batch_concurrency must be > 0")
         self._blocking_put_outer_total_log_window = _BlockingPutOuterTotalLogWindow(
             f"FluxonKVCacheStore[{cluster_name}]"
         )
@@ -374,12 +727,22 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             reject_if_inflight_same_key = (
                 bool(opts.reject_if_inflight_same_key) if opts is not None else False
             )
+            reject_if_exist_same_key = (
+                bool(opts.reject_if_exist_same_key) if opts is not None else False
+            )
+            write_through = bool(opts.write_through) if opts is not None else True
+            make_replica_task = (
+                bool(opts.make_replica_task) if opts is not None else True
+            )
             reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
             inner_res = self._client.put(
                 key,
                 ptrs,
                 lease_id=lease_id,
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
+                reject_if_exist_same_key=reject_if_exist_same_key,
+                write_through=write_through,
+                make_replica_task=make_replica_task,
                 reject_if_exists=reject_if_exists,
             )
             if not inner_res.is_ok():
@@ -424,12 +787,22 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             reject_if_inflight_same_key = (
                 bool(opts.reject_if_inflight_same_key) if opts is not None else False
             )
+            reject_if_exist_same_key = (
+                bool(opts.reject_if_exist_same_key) if opts is not None else False
+            )
             reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
+            write_through = bool(opts.write_through) if opts is not None else True
+            make_replica_task = (
+                bool(opts.make_replica_task) if opts is not None else True
+            )
             inner_res = self._client.put_blocking(
                 key,
                 ptrs,
                 lease_id=lease_id,
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
+                reject_if_exist_same_key=reject_if_exist_same_key,
+                write_through=write_through,
+                make_replica_task=make_replica_task,
                 reject_if_exists=reject_if_exists,
             )
             if not inner_res.is_ok():
@@ -458,6 +831,207 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         except ApiError as e:
             return Result.new_error(e)
 
+    @staticmethod
+    def _normalize_batch_result_list(batch_result: Any, expected_len: int, op_name: str) -> List[Any]:
+        if isinstance(batch_result, Result):
+            if not batch_result.is_ok():
+                raise RuntimeError(f"{op_name} backend error: {batch_result.unwrap_error()}")
+            batch_result = batch_result.unwrap()
+        if not isinstance(batch_result, list):
+            raise RuntimeError(f"{op_name} returned non-list: {type(batch_result)}")
+        if len(batch_result) != expected_len:
+            raise RuntimeError(
+                f"{op_name} returned unexpected length: expected={expected_len} got={len(batch_result)}"
+            )
+        return list(batch_result)
+
+    def batch_put_blocking(
+        self,
+        keys: List[str],
+        values: List[FlatDict],
+        opts: Optional[PutOptionalArgs] = None,
+        concurrency: Optional[int] = None,
+    ) -> List[Result[OkNone, ApiError]]:
+        if len(keys) != len(values):
+            raise ValueError("batch_put_blocking requires keys and values to have the same length")
+        if len(keys) == 0:
+            return []
+        if self._client is None:
+            err = GeneralError(message="Store not initialized when batch_put_blocking(). Call setup() first.")
+            return [Result.new_error(err) for _ in keys]
+
+        lease_id: Optional[int] = opts.lease_id if opts is not None else None
+        reject_if_inflight_same_key = (
+            bool(opts.reject_if_inflight_same_key) if opts is not None else False
+        )
+        reject_if_exist_same_key = (
+            bool(opts.reject_if_exist_same_key) if opts is not None else False
+        )
+        write_through = bool(opts.write_through) if opts is not None else True
+        make_replica_task = bool(opts.make_replica_task) if opts is not None else True
+
+        keepalive_groups: List[List[bytes]] = []
+        dlpack_groups: List[List[object]] = []
+        ptr_groups: List[List[tuple[int, int, int, int, int, Optional[int]]]] = []
+        try:
+            for value in values:
+                keepalive: List[bytes] = []
+                dlpack_capsules: List[object] = []
+                ptr_groups.append(build_flat_dict_ptrs(value, keepalive, dlpack_capsules))
+                keepalive_groups.append(keepalive)
+                dlpack_groups.append(dlpack_capsules)
+
+            inner_res = self._client.batch_put_blocking(
+                keys,
+                ptr_groups,
+                lease_id=lease_id,
+                reject_if_inflight_same_key=reject_if_inflight_same_key,
+                reject_if_exist_same_key=reject_if_exist_same_key,
+                write_through=write_through,
+                make_replica_task=make_replica_task,
+                concurrency=concurrency if concurrency is not None else self._batch_concurrency,
+            )
+            if not inner_res.is_ok():
+                err = inner_res.unwrap_error()
+                return [Result.new_error(err) for _ in keys]
+
+            batch_results = self._normalize_batch_result_list(
+                inner_res.unwrap(), len(keys), "batch_put_blocking"
+            )
+            submit_out: List[Result[OkNone, ApiError]] = []
+            for idx, item in enumerate(batch_results):
+                if isinstance(item, Result):
+                    submit_out.append(item)
+                    continue
+                if item is None:
+                    submit_out.append(Result.new_ok(OkNone()))
+                    continue
+                if isinstance(item, int) and item == 0:
+                    submit_out.append(Result.new_ok(OkNone()))
+                    continue
+                if isinstance(item, int):
+                    submit_out.append(
+                        Result.new_error(
+                            GeneralError(
+                                message=(
+                                    "batch_put_blocking returned backend code "
+                                    f"{item} for key {keys[idx]!r}"
+                                )
+                            )
+                        )
+                    )
+                    continue
+                submit_out.append(
+                    Result.new_error(
+                        GeneralError(
+                            message=f"unexpected batch_put result type: {type(item)}"
+                        )
+                    )
+                )
+            return submit_out
+        except ApiError as e:
+            return [Result.new_error(e) for _ in keys]
+        except Exception as e:
+            return [Result.new_error(GeneralError(f"batch_put_blocking failed: {e}")) for _ in keys]
+        finally:
+            for keepalive in keepalive_groups:
+                keepalive.clear()
+            for dlpack_capsules in dlpack_groups:
+                dlpack_capsules.clear()
+
+    def batch_get_blocking(
+        self,
+        keys: List[str],
+        concurrency: Optional[int] = None,
+    ) -> List[Result[Union[Any, MemHolder], ApiError]]:
+        if len(keys) == 0:
+            return []
+        if self._client is None:
+            err = GeneralError(message="Store not initialized when batch_get_blocking(). Call setup() first.")
+            return [Result.new_error(err) for _ in keys]
+
+        try:
+            inner_res = self._client.batch_get_blocking(
+                keys,
+                concurrency=concurrency if concurrency is not None else self._batch_concurrency,
+            )
+            if not inner_res.is_ok():
+                err = inner_res.unwrap_error()
+                return [Result.new_error(err) for _ in keys]
+
+            batch_results = self._normalize_batch_result_list(
+                inner_res.unwrap(), len(keys), "batch_get_blocking"
+            )
+            out: List[Result[Union[Any, MemHolder], ApiError]] = []
+            for idx, item in enumerate(batch_results):
+                if isinstance(item, Result):
+                    out.append(item)
+                    continue
+                if item is None:
+                    out.append(
+                        Result.new_error(
+                            GeneralError(message=f"batch_get_blocking returned None for key {keys[idx]!r}")
+                        )
+                    )
+                    continue
+                out.append(Result.new_ok(item))
+            return out
+        except ApiError as e:
+            return [Result.new_error(e) for _ in keys]
+        except Exception as e:
+            return [Result.new_error(GeneralError(f"batch_get_blocking failed: {e}")) for _ in keys]
+
+    def put_payload_from_ptr(
+        self,
+        key: str,
+        payload_ptr: int,
+        payload_size: int,
+        opts: Optional[PutOptionalArgs] = None,
+    ) -> Result[KvFuture, ApiError]:
+        if self._client is None:
+            return Result.new_error(
+                GeneralError(
+                    message="Store not initialized when put_payload_from_ptr(). Call setup() first."
+                )
+            )
+
+        keepalive: List[bytes] = []
+        try:
+            ptrs = _build_payload_field_ptrs(payload_ptr, payload_size, keepalive)
+            lease_id: Optional[int] = opts.lease_id if opts is not None else None
+            reject_if_inflight_same_key = (
+                bool(opts.reject_if_inflight_same_key) if opts is not None else False
+            )
+            reject_if_exist_same_key = (
+                bool(opts.reject_if_exist_same_key) if opts is not None else False
+            )
+            reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
+            write_through = bool(opts.write_through) if opts is not None else True
+            make_replica_task = (
+                bool(opts.make_replica_task) if opts is not None else True
+            )
+            inner_res = self._client.put(
+                key,
+                ptrs,
+                lease_id=lease_id,
+                reject_if_inflight_same_key=reject_if_inflight_same_key,
+                reject_if_exist_same_key=reject_if_exist_same_key,
+                write_through=write_through,
+                make_replica_task=make_replica_task,
+                reject_if_exists=reject_if_exists,
+            )
+            if not inner_res.is_ok():
+                return Result.new_error(_map_nospace_to_storagefull(inner_res.unwrap_error()))
+            inner_future = inner_res.unwrap()
+            assert inner_future is not None
+            outer_future = _FluxonPutFuture(inner_future, keepalive, [])
+            keepalive = []
+            return Result.new_ok(outer_future)
+        except ApiError as e:
+            return Result.new_error(e)
+        finally:
+            keepalive.clear()
+
     def put_payload_from_ptr_blocking(
         self,
         key: str,
@@ -479,12 +1053,22 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
             reject_if_inflight_same_key = (
                 bool(opts.reject_if_inflight_same_key) if opts is not None else False
             )
+            reject_if_exist_same_key = (
+                bool(opts.reject_if_exist_same_key) if opts is not None else False
+            )
+            write_through = bool(opts.write_through) if opts is not None else True
+            make_replica_task = (
+                bool(opts.make_replica_task) if opts is not None else True
+            )
             reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
             inner_res = self._client.put_blocking(
                 key,
                 ptrs,
                 lease_id=lease_id,
                 reject_if_inflight_same_key=reject_if_inflight_same_key,
+                reject_if_exist_same_key=reject_if_exist_same_key,
+                write_through=write_through,
+                make_replica_task=make_replica_task,
                 reject_if_exists=reject_if_exists,
             )
             if not inner_res.is_ok():
@@ -578,16 +1162,465 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         del holder
         return Result.new_ok(payload_size)
 
+    def register_buffer(
+        self,
+        ptr: int,
+        size: int,
+        device_kind: str = "host",
+        device_id: str = "",
+        layout: str = "raw",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Result[OkNone, ApiError]:
+        if self._client is None:
+            return Result.new_error(
+                GeneralError(
+                    message="Store not initialized when register_buffer(). Call setup() first."
+                )
+            )
+        if not isinstance(ptr, int):
+            return Result.new_error(
+                InvalidArgumentError(message=f"ptr must be int; got {type(ptr)}")
+            )
+        if not isinstance(size, int):
+            return Result.new_error(
+                InvalidArgumentError(message=f"size must be int; got {type(size)}")
+            )
+        if ptr < 0:
+            return Result.new_error(
+                InvalidArgumentError(message=f"ptr must be >= 0; got {ptr}")
+            )
+        if size < 0:
+            return Result.new_error(
+                InvalidArgumentError(message=f"size must be >= 0; got {size}")
+            )
+        if not isinstance(device_kind, str):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"device_kind must be str; got {type(device_kind)}"
+                )
+            )
+        if device_kind.strip().lower() != "host":
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "register_buffer supports host memory only; "
+                        "use register_gpu_buffer for a CUDA staging range"
+                    )
+                )
+            )
+        if not isinstance(device_id, str):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"device_id must be str; got {type(device_id)}"
+                )
+            )
+        if not isinstance(layout, str):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"layout must be str; got {type(layout)}"
+                )
+            )
+        if metadata is not None and not isinstance(metadata, dict):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"metadata must be dict or None; got {type(metadata)}"
+                )
+            )
+        try:
+            inner_res = self._client.register_buffer(ptr, size)
+            if not inner_res.is_ok():
+                return Result.new_error(inner_res.unwrap_error())
+            _ = inner_res.unwrap()
+            self._registered_buffer_descriptors.append(
+                _RegisteredBufferDescriptor(
+                    ptr=int(ptr),
+                    size=int(size),
+                    device_kind=device_kind,
+                    device_id=device_id,
+                    layout=layout,
+                    metadata=dict(metadata or {}),
+                )
+            )
+            return Result.new_ok(OkNone())
+        except ApiError as e:
+            return Result.new_error(e)
+
+    def register_gpu_buffer(
+        self,
+        ptr: int,
+        size: int,
+        device_id: int,
+    ) -> Result[GpuBufferRegistration, ApiError]:
+        if self._client is None:
+            return Result.new_error(
+                GeneralError(
+                    message="Store not initialized when register_gpu_buffer(). Call setup() first."
+                )
+            )
+        if isinstance(ptr, bool) or not isinstance(ptr, int) or ptr <= 0:
+            return Result.new_error(
+                InvalidArgumentError(message=f"GPU ptr must be a positive int; got {ptr!r}")
+            )
+        if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+            return Result.new_error(
+                InvalidArgumentError(message=f"GPU size must be a positive int; got {size!r}")
+            )
+        if (
+            isinstance(device_id, bool)
+            or not isinstance(device_id, int)
+            or device_id < 0
+        ):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"GPU device_id must be a non-negative int; got {device_id!r}"
+                )
+            )
+        if ptr + size > (1 << 64):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"GPU registration range overflows u64: ptr={ptr:#x} size={size}"
+                )
+            )
+        if self._gpu_buffer_registration is not None:
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "one GPU buffer is already registered: "
+                        f"registration_id={self._gpu_buffer_registration.registration_id}"
+                    )
+                )
+            )
+        try:
+            inner_res = self._client.register_gpu_buffer(ptr, size, device_id)
+            if not inner_res.is_ok():
+                return Result.new_error(inner_res.unwrap_error())
+            payload = inner_res.unwrap()
+            if not isinstance(payload, dict):
+                return Result.new_error(
+                    GeneralError(
+                        message=f"register_gpu_buffer returned non-dict payload: {type(payload)}"
+                    )
+                )
+            registration = GpuBufferRegistration(
+                registration_id=int(payload["registration_id"]),
+                ptr=int(payload["ptr"]),
+                size=int(payload["len"]),
+                device_id=int(payload["device_id"]),
+            )
+            if (
+                registration.registration_id <= 0
+                or registration.ptr != ptr
+                or registration.size != size
+                or registration.device_id != device_id
+            ):
+                return Result.new_error(
+                    GeneralError(
+                        message=(
+                            "register_gpu_buffer returned a mismatched registration: "
+                            f"{registration!r}"
+                        )
+                    )
+                )
+            self._gpu_buffer_registration = registration
+            return Result.new_ok(registration)
+        except ApiError as e:
+            return Result.new_error(e)
+
+    def validate_gpu_destination(
+        self,
+        destination: GpuDestination,
+    ) -> Result[OkNone, ApiError]:
+        if self._client is None:
+            return Result.new_error(
+                GeneralError(
+                    message="Store not initialized when validate_gpu_destination()."
+                )
+            )
+        if not isinstance(destination, GpuDestination):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "validate_gpu_destination requires GpuDestination; "
+                        f"got {type(destination)}"
+                    )
+                )
+            )
+        if destination.capacity <= 0 or destination.ptr <= 0:
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=f"invalid GPU destination: {destination!r}"
+                )
+            )
+        try:
+            inner_res = self._client.validate_gpu_destination(
+                destination.registration_id,
+                destination.ptr,
+                destination.capacity,
+            )
+            if not inner_res.is_ok():
+                return Result.new_error(inner_res.unwrap_error())
+            _ = inner_res.unwrap()
+            return Result.new_ok(OkNone())
+        except ApiError as e:
+            return Result.new_error(e)
+
+    def unregister_gpu_buffer(
+        self,
+        registration: GpuBufferRegistration,
+    ) -> Result[OkNone, ApiError]:
+        if self._client is None:
+            return Result.new_error(
+                GeneralError(
+                    message="Store not initialized when unregister_gpu_buffer()."
+                )
+            )
+        if not isinstance(registration, GpuBufferRegistration):
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "unregister_gpu_buffer requires GpuBufferRegistration; "
+                        f"got {type(registration)}"
+                    )
+                )
+            )
+        active = self._gpu_buffer_registration
+        if active != registration:
+            return Result.new_error(
+                InvalidArgumentError(
+                    message=(
+                        "GPU registration is not active on this store: "
+                        f"requested={registration!r} active={active!r}"
+                    )
+                )
+            )
+        try:
+            inner_res = self._client.unregister_gpu_buffer(registration.registration_id)
+            if not inner_res.is_ok():
+                return Result.new_error(inner_res.unwrap_error())
+            _ = inner_res.unwrap()
+            self._gpu_buffer_registration = None
+            return Result.new_ok(OkNone())
+        except ApiError as e:
+            return Result.new_error(e)
+
+    def batch_put_from(
+        self,
+        keys: List[str],
+        payload_ptrs: List[int],
+        payload_sizes: List[int],
+        opts: Optional[PutOptionalArgs] = None,
+    ) -> List[int]:
+        if len(keys) != len(payload_ptrs) or len(keys) != len(payload_sizes):
+            raise ValueError(
+                "batch_put_from requires keys, payload_ptrs, and payload_sizes to have the same length"
+            )
+        if len(keys) == 0:
+            return []
+
+        if self._client is None:
+            code = _error_to_ret_code(
+                GeneralError(
+                    message="Store not initialized when batch_put_from(). Call setup() first."
+                )
+            )
+            return [code] * len(keys)
+
+        lease_id: Optional[int] = opts.lease_id if opts is not None else None
+        reject_if_inflight_same_key = (
+            bool(opts.reject_if_inflight_same_key) if opts is not None else False
+        )
+        reject_if_exist_same_key = (
+            bool(opts.reject_if_exist_same_key) if opts is not None else False
+        )
+        write_through = bool(opts.write_through) if opts is not None else True
+        make_replica_task = bool(opts.make_replica_task) if opts is not None else True
+
+        try:
+            inner_res = self._client.batch_put_from(
+                keys,
+                payload_ptrs,
+                payload_sizes,
+                lease_id=lease_id,
+                reject_if_inflight_same_key=reject_if_inflight_same_key,
+                reject_if_exist_same_key=reject_if_exist_same_key,
+                write_through=write_through,
+                make_replica_task=make_replica_task,
+            )
+            if inner_res.is_ok():
+                submit_results = list(inner_res.unwrap())
+                if len(submit_results) != len(keys):
+                    raise RuntimeError(
+                        "batch_put_from returned unexpected result length: "
+                        f"expected={len(keys)} got={len(submit_results)}"
+                    )
+                return [int(item) for item in submit_results]
+            err = inner_res.unwrap_error()
+            code = _error_to_ret_code(err)
+            return [code] * len(keys)
+        except ApiError as e:
+            code = _error_to_ret_code(e)
+            return [code] * len(keys)
+        except Exception as e:
+            code = _error_to_ret_code(GeneralError(f"batch_put_from failed: {e}"))
+            return [code] * len(keys)
+
     def get_size(self, key: str) -> Result[int, ApiError]:
         """Get the size of a stored value (non-blocking)."""
         return self._client.get_size(key)
 
-    def is_exist(self, key: str) -> Result[bool, ApiError]:
+    def is_exist(self, key: str, allow_local_snapshot: bool = False) -> Result[bool, ApiError]:
         """Check if a key exists in the store (non-blocking)."""
         try:
-            return self._client.is_exist(key)
+            if self._client is None:
+                return Result.new_error(
+                    GeneralError(
+                        message="Store not initialized when is_exist(). Call setup() first."
+                    )
+                )
+            return self._client.is_exist(key, allow_local_snapshot=allow_local_snapshot)
         except Exception as e:
             return Result.new_error(GeneralError(f"Existence check failed: {str(e)}"))
+
+    def batch_get_into(
+        self,
+        keys: List[str],
+        payload_ptrs: List[int],
+        payload_capacities: List[int],
+    ) -> List[int]:
+        if len(keys) != len(payload_ptrs) or len(keys) != len(payload_capacities):
+            raise ValueError(
+                "batch_get_into requires keys, payload_ptrs, and payload_capacities to have the same length"
+            )
+        if len(keys) == 0:
+            return []
+
+        if self._client is not None:
+            inner_res = self._client.batch_get_into(keys, payload_ptrs, payload_capacities)
+            if inner_res.is_ok():
+                return list(inner_res.unwrap())
+            err = inner_res.unwrap_error()
+            return [_error_to_ret_code(err)] * len(keys)
+
+        results: List[int] = []
+        for key, ptr, size in zip(keys, payload_ptrs, payload_capacities):
+            get_result = self.get_payload_into_ptr_blocking(key, ptr, size)
+            if get_result.is_ok():
+                results.append(int(get_result.unwrap()))
+            else:
+                results.append(_error_to_ret_code(get_result.unwrap_error()))
+        return results
+
+    def batch_is_exist(
+        self,
+        keys: List[str],
+        allow_local_snapshot: bool = False,
+    ) -> List[int]:
+        if len(keys) == 0:
+            return []
+
+        if self._client is None:
+            code = _error_to_ret_code(
+                GeneralError(
+                    message="Store not initialized when batch_is_exist(). Call setup() first."
+                )
+            )
+            return [code] * len(keys)
+
+        try:
+            inner_res = self._client.batch_is_exist(
+                keys,
+                allow_local_snapshot=allow_local_snapshot,
+            )
+            if not inner_res.is_ok():
+                code = _error_to_ret_code(inner_res.unwrap_error())
+                return [code] * len(keys)
+            batch_results = self._normalize_batch_result_list(
+                inner_res.unwrap(), len(keys), "batch_is_exist"
+            )
+            out: List[int] = []
+            for idx, item in enumerate(batch_results):
+                if not isinstance(item, int):
+                    raise GeneralError(
+                        message=(
+                            f"batch_is_exist returned non-int item for key {keys[idx]!r}: "
+                            f"{type(item)}"
+                        )
+                    )
+                out.append(int(item))
+            return out
+        except ApiError as e:
+            code = _error_to_ret_code(e)
+            return [code] * len(keys)
+        except Exception as e:
+            code = _error_to_ret_code(GeneralError(f"batch_is_exist failed: {e}"))
+            return [code] * len(keys)
+
+    def get_meta(self, key: str) -> Result[Dict[str, Any], ApiError]:
+        """Query key metadata and one live placement without fetching payload bytes."""
+        try:
+            inner = self._client.get_meta(key)
+            if not inner.is_ok():
+                return Result.new_error(inner.unwrap_error())
+            meta = inner.unwrap()
+            assert isinstance(meta, dict), f"get_meta returned non-dict: {type(meta)}"
+            return Result.new_ok(meta)
+        except Exception as e:
+            return Result.new_error(GeneralError(f"GetMeta failed for key '{key}': {str(e)}"))
+
+    def batch_get_meta(self, keys: List[str]) -> List[Dict[str, Any]]:
+        if len(keys) == 0:
+            return []
+
+        if self._client is not None and hasattr(self._client, "batch_get_meta"):
+            inner_res = self._client.batch_get_meta(keys)
+            if inner_res.is_ok():
+                rows = inner_res.unwrap()
+                assert isinstance(rows, list), (
+                    f"batch_get_meta returned non-list: {type(rows)}"
+                )
+                return list(rows)
+            err = inner_res.unwrap_error()
+            code = _error_to_ret_code(err)
+            return [
+                {
+                    "exists": False,
+                    "len": 0,
+                    "node_id": "",
+                    "src_addr": 0,
+                    "src_base_addr": 0,
+                    "segment_device_id": "",
+                    "segment_device_desc": "",
+                    "replica_count": 0,
+                    "transport_error": True,
+                    "error_code": -code,
+                    "error_json": str(err),
+                }
+                for _ in keys
+            ]
+
+        rows: List[Dict[str, Any]] = []
+        for key in keys:
+            meta_res = self.get_meta(key)
+            if meta_res.is_ok():
+                rows.append(meta_res.unwrap())
+            else:
+                err = meta_res.unwrap_error()
+                rows.append(
+                    {
+                        "exists": False,
+                        "len": 0,
+                        "node_id": "",
+                        "src_addr": 0,
+                        "src_base_addr": 0,
+                        "segment_device_id": "",
+                        "segment_device_desc": "",
+                        "replica_count": 0,
+                        "transport_error": True,
+                        "error_code": -_error_to_ret_code(err),
+                        "error_json": str(err),
+                    }
+                )
+        return rows
 
     def count_prefix(self, prefix: str) -> Result[int, ApiError]:
         """Count number of keys with the given prefix.
@@ -616,10 +1649,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         try:
             if self._client is None:
                 raise GeneralError(message="Store not initialized when rpc_call(). Call setup() first.")
-            if not isinstance(timeout_ms, int):
-                raise InvalidArgumentError(message=f"timeout_ms must be int; got {type(timeout_ms)}")
-            if timeout_ms < 10_000:
-                raise InvalidArgumentError(message=f"timeout_ms must be >= 10000; got {timeout_ms}")
+            _validate_explicit_rpc_timeout_ms(timeout_ms)
 
             encoded = encode_flat_kv_dict(payload)
             if not encoded.is_ok():
@@ -646,10 +1676,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 raise GeneralError(message="Store not initialized when rpc_call_bytes(). Call setup() first.")
             if not isinstance(payload, (bytes, bytearray)):
                 raise InvalidArgumentError(message=f"payload must be bytes; got {type(payload)}")
-            if not isinstance(timeout_ms, int):
-                raise InvalidArgumentError(message=f"timeout_ms must be int; got {type(timeout_ms)}")
-            if timeout_ms < 10_000:
-                raise InvalidArgumentError(message=f"timeout_ms must be >= 10000; got {timeout_ms}")
+            _validate_explicit_rpc_timeout_ms(timeout_ms)
 
             inner = self._client.rpc_call(node_id, path, bytes(payload), timeout_ms)
             if not inner.is_ok():
@@ -741,10 +1768,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 raise InvalidArgumentError(message=f"file_offset must be int; got {type(file_offset)}")
             if file_offset < 0:
                 raise InvalidArgumentError(message=f"file_offset must be >= 0; got {file_offset}")
-            if not isinstance(timeout_ms, int):
-                raise InvalidArgumentError(message=f"timeout_ms must be int; got {type(timeout_ms)}")
-            if timeout_ms < 10_000:
-                raise InvalidArgumentError(message=f"timeout_ms must be >= 10000; got {timeout_ms}")
+            _validate_explicit_rpc_timeout_ms(timeout_ms)
 
             return self._client.sync_kv_to_file(
                 target_instance_key,
@@ -799,6 +1823,14 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                     return Result.new_error(child_close_result.unwrap_error())
                 child_close_result.unwrap()
 
+                if self._gpu_buffer_registration is not None:
+                    unregister_result = self.unregister_gpu_buffer(
+                        self._gpu_buffer_registration
+                    )
+                    if not unregister_result.is_ok():
+                        return Result.new_error(unregister_result.unwrap_error())
+                    unregister_result.unwrap()
+
                 # Keep the mutable PyO3 borrow behind one lock until shutdown
                 # completes. Concurrent close callers wait and then observe None.
                 res = self._client.close()
@@ -824,6 +1856,764 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         if self._client is None:
             raise RuntimeError("Store not initialized")
         return str(self._client.cluster_name())
+
+    def wait_local_segments_ready(self) -> List[dict[str, Any]]:
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when wait_local_segments_ready(). Call setup() first."
+            )
+        inner_res = self._client.wait_local_segments_ready()
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"wait_local_segments_ready backend error: {inner_res.unwrap_error()}"
+            )
+        inner_res = inner_res.unwrap()
+        if not isinstance(inner_res, list):
+            raise RuntimeError(
+                "wait_local_segments_ready must return a list of segment mappings"
+            )
+        out: List[dict[str, Any]] = []
+        for item in inner_res:
+            if not isinstance(item, dict):
+                raise RuntimeError(
+                    "wait_local_segments_ready segment item must be a dict"
+                )
+            out.append(dict(item))
+        return out
+
+    def local_fast_put_start(
+        self,
+        keys: List[str],
+        value_len: int,
+        opts: Optional[PutOptionalArgs] = None,
+    ) -> int:
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when local_fast_put_start(). Call setup() first."
+            )
+        if len(keys) == 0:
+            raise ValueError("local_fast_put_start requires at least one key")
+        if not isinstance(value_len, int):
+            raise ValueError(f"value_len must be int; got {type(value_len)}")
+        if value_len <= 0:
+            raise ValueError(f"value_len must be > 0; got {value_len}")
+        reject_if_inflight_same_key = (
+            bool(opts.reject_if_inflight_same_key) if opts is not None else False
+        )
+        reject_if_exist_same_key = (
+            bool(opts.reject_if_exist_same_key) if opts is not None else False
+        )
+        write_through = bool(opts.write_through) if opts is not None else True
+        make_replica_task = bool(opts.make_replica_task) if opts is not None else True
+        make_replica_task_mask: Optional[List[bool]] = None
+        if opts is not None and opts.make_replica_task_mask is not None:
+            requested_mask = opts.make_replica_task_mask
+            if not isinstance(requested_mask, list):
+                raise ValueError(
+                    "make_replica_task_mask must be list[bool] when provided; "
+                    f"got {type(requested_mask)}"
+                )
+            if len(requested_mask) != len(keys):
+                raise ValueError(
+                    "make_replica_task_mask length must match keys length; "
+                    f"keys={len(keys)} mask={len(requested_mask)}"
+                )
+            for index, item in enumerate(requested_mask):
+                if type(item) is not bool:
+                    raise ValueError(
+                        "make_replica_task_mask items must be bool; "
+                        f"index={index} got={type(item)}"
+                    )
+            make_replica_task_mask = list(requested_mask)
+        atomic_group_lens = _validate_put_atomic_groups(
+            keys,
+            opts.atomic_group_lens if opts is not None else None,
+            make_replica_task_mask,
+        )
+        radix_parent_keys, content_depths = _validate_put_radix_metadata(
+            keys,
+            opts.radix_parent_keys if opts is not None else None,
+            opts.content_depths if opts is not None else None,
+        )
+        inner_res = self._client.local_fast_put_start(
+            keys,
+            value_len,
+            reject_if_inflight_same_key=reject_if_inflight_same_key,
+            reject_if_exist_same_key=reject_if_exist_same_key,
+            write_through=write_through,
+            make_replica_task=make_replica_task,
+            make_replica_task_mask=make_replica_task_mask,
+            radix_parent_keys=radix_parent_keys,
+            content_depths=content_depths,
+            atomic_group_lens=atomic_group_lens,
+        )
+        if not inner_res.is_ok():
+            err = inner_res.unwrap_error()
+            if isinstance(err, Exception):
+                raise err
+            raise RuntimeError(f"local_fast_put_start backend error: {err}")
+        plan_ptr = inner_res.unwrap()
+        if not isinstance(plan_ptr, int) or plan_ptr <= 0:
+            raise RuntimeError(f"local_fast_put_start returned invalid plan_ptr: {plan_ptr!r}")
+        return int(plan_ptr)
+
+    def local_fast_put_commit(self, plan_ptr: int) -> KvFuture:
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when local_fast_put_commit(). Call setup() first."
+            )
+        inner_res = self._client.local_fast_put_commit(plan_ptr)
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"local_fast_put_commit backend error: {inner_res.unwrap_error()}"
+            )
+        inner_future = inner_res.unwrap()
+        if inner_future is None:
+            raise RuntimeError("local_fast_put_commit returned empty future")
+        return _FluxonBatchRetCodeFuture(inner_future, [plan_ptr])
+
+    def put_abort(self, plan_ptr: int) -> None:
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when put_abort(). Call setup() first."
+            )
+        inner_res = self._client.put_abort(plan_ptr)
+        if not inner_res.is_ok():
+            raise RuntimeError(f"put_abort backend error: {inner_res.unwrap_error()}")
+        _ = inner_res.unwrap()
+
+    def get_views(
+        self,
+        keys: List[str],
+        concurrency: Optional[int] = None,
+    ) -> int:
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when get_views(). Call setup() first."
+            )
+        if len(keys) == 0:
+            raise ValueError("get_views requires at least one key")
+        inner_res = self._client.get_views(
+            keys,
+            concurrency=concurrency if concurrency is not None else self._batch_concurrency,
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(f"get_views backend error: {inner_res.unwrap_error()}")
+        plan_ptr = inner_res.unwrap()
+        if not isinstance(plan_ptr, int) or plan_ptr <= 0:
+            raise RuntimeError(f"get_views returned invalid plan_ptr: {plan_ptr!r}")
+        return int(plan_ptr)
+
+    def release_views(self, plan_ptr: int) -> None:
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when release_views(). Call setup() first."
+            )
+        inner_res = self._client.release_views(plan_ptr)
+        if not inner_res.is_ok():
+            raise RuntimeError(f"release_views backend error: {inner_res.unwrap_error()}")
+        _ = inner_res.unwrap()
+
+    def get_start(
+        self,
+        keys: List[str],
+        prefix_best_effort: bool = True,
+        atomic_group_lens: Optional[List[int]] = None,
+    ) -> GetStartHandle:
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when get_start(). Call setup() first."
+            )
+        if len(keys) == 0:
+            raise ValueError("get_start requires at least one key")
+        normalized_group_lens: Optional[List[int]] = None
+        if atomic_group_lens is not None:
+            normalized_group_lens = [int(length) for length in atomic_group_lens]
+            if any(length <= 0 for length in normalized_group_lens):
+                raise ValueError("get_start atomic_group_lens entries must be > 0")
+            if sum(normalized_group_lens) != len(keys):
+                raise ValueError(
+                    "get_start atomic_group_lens must sum to keys length: "
+                    f"sum={sum(normalized_group_lens)} keys={len(keys)}"
+                )
+
+        started_at_ns = time.monotonic_ns()
+        inner_res = self._client.get_start(
+            list(keys),
+            bool(prefix_best_effort),
+            normalized_group_lens,
+            self._batch_concurrency,
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(f"get_start backend error: {inner_res.unwrap_error()}")
+        payload = inner_res.unwrap()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"get_start returned non-dict payload: {type(payload)}")
+        backend_handle = int(payload["handle"])
+        result = _build_get_start_result_from_backend_payload(
+            payload,
+            list(keys),
+            bool(prefix_best_effort),
+            normalized_group_lens,
+        )
+        logging.info(
+            "FluxonKVCacheStore get_start result: keys=%d raw_prefix_hit_len=%d "
+            "transferable_len=%d prefix_hit_groups=%d all_hit=%s "
+            "first_miss_index=%s first_miss_group_index=%s "
+            "prefix_best_effort=%s duration_ms=%.3f",
+            len(keys),
+            result.raw_prefix_hit_len,
+            result.transferable_len,
+            result.prefix_hit_groups,
+            result.all_hit,
+            result.first_miss_index,
+            result.first_miss_group_index,
+            result.prefix_best_effort,
+            (time.monotonic_ns() - started_at_ns) / 1_000_000.0,
+        )
+        return GetStartHandle(
+            keys=tuple(keys),
+            result=result,
+            created_at_ns=started_at_ns,
+            backend_token=id(self),
+            backend_handle=backend_handle,
+        )
+
+    def get_plan(
+        self,
+        keys: List[str],
+        prefix_best_effort: bool = True,
+        atomic_group_lens: Optional[List[int]] = None,
+    ) -> GetPlanHandle:
+        if self._client is None:
+            raise RuntimeError("Store not initialized when get_plan(). Call setup() first.")
+        if not keys:
+            raise ValueError("get_plan requires at least one key")
+        normalized_group_lens: Optional[List[int]] = None
+        if atomic_group_lens is not None:
+            normalized_group_lens = [int(length) for length in atomic_group_lens]
+            if any(length <= 0 for length in normalized_group_lens):
+                raise ValueError("get_plan atomic_group_lens entries must be > 0")
+            if sum(normalized_group_lens) != len(keys):
+                raise ValueError(
+                    "get_plan atomic_group_lens must sum to keys length: "
+                    f"sum={sum(normalized_group_lens)} keys={len(keys)}"
+                )
+        started_at_ns = time.monotonic_ns()
+        inner_res = self._client.get_plan(
+            list(keys),
+            bool(prefix_best_effort),
+            normalized_group_lens,
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(f"get_plan backend error: {inner_res.unwrap_error()}")
+        payload = inner_res.unwrap()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"get_plan returned non-dict payload: {type(payload)}")
+        backend_handle = int(payload["handle"])
+        try:
+            result = _build_get_start_result_from_backend_payload(
+                payload,
+                list(keys),
+                bool(prefix_best_effort),
+                normalized_group_lens,
+            )
+            gpu_payload = dict(payload)
+            gpu_payload["raw_prefix_hit_len"] = payload["gpu_raw_prefix_hit_len"]
+            gpu_result = _build_get_start_result_from_backend_payload(
+                gpu_payload,
+                list(keys),
+                bool(prefix_best_effort),
+                normalized_group_lens,
+            )
+            gpu_remote_indices = tuple(int(index) for index in payload["gpu_remote_indices"])
+            if (
+                tuple(sorted(set(gpu_remote_indices))) != gpu_remote_indices
+                or any(
+                    index < 0 or index >= gpu_result.transferable_len
+                    for index in gpu_remote_indices
+                )
+            ):
+                raise RuntimeError(
+                    "get_plan returned invalid gpu_remote_indices: "
+                    f"indices={gpu_remote_indices} "
+                    f"transferable={gpu_result.transferable_len}"
+                )
+        except Exception:
+            cancel_res = self._client.cancel_get_plan(backend_handle)
+            if not cancel_res.is_ok():
+                logging.exception(
+                    "get_plan payload validation failed and cleanup also failed: %s",
+                    cancel_res.unwrap_error(),
+                )
+            else:
+                _ = cancel_res.unwrap()
+            raise
+        return GetPlanHandle(
+            keys=tuple(keys),
+            result=result,
+            gpu_result=gpu_result,
+            created_at_ns=started_at_ns,
+            backend_token=id(self),
+            backend_handle=backend_handle,
+            gpu_remote_indices=gpu_remote_indices,
+        )
+
+    def cancel_get_plan(self, handle: GetPlanHandle) -> None:
+        if not isinstance(handle, GetPlanHandle):
+            raise TypeError(f"cancel_get_plan requires GetPlanHandle, got {type(handle)}")
+        if handle.backend_token != id(self):
+            raise RuntimeError("cancel_get_plan handle belongs to a different store")
+        if handle.closed:
+            return
+        if self._client is None:
+            raise RuntimeError("Store not initialized when cancel_get_plan().")
+        inner_res = self._client.cancel_get_plan(handle.backend_handle)
+        if not inner_res.is_ok():
+            raise RuntimeError(f"cancel_get_plan backend error: {inner_res.unwrap_error()}")
+        _ = inner_res.unwrap()
+        handle.closed = True
+
+    def execute_get_plan_cpu(
+        self,
+        handle: GetPlanHandle,
+        *,
+        consume_prefix_len: int,
+        concurrency: Optional[int] = None,
+    ) -> GetStartHandle:
+        if not isinstance(handle, GetPlanHandle):
+            raise TypeError(
+                f"execute_get_plan_cpu requires GetPlanHandle, got {type(handle)}"
+            )
+        if handle.backend_token != id(self) or handle.closed:
+            raise RuntimeError("execute_get_plan_cpu requires a live plan from this store")
+        narrowed = _narrow_get_start_result(handle.result, int(consume_prefix_len))
+        if consume_prefix_len <= 0 or consume_prefix_len > handle.result.transferable_len:
+            raise ValueError(
+                "execute_get_plan_cpu consume prefix is outside the CPU plan: "
+                f"consume={consume_prefix_len} transferable={handle.result.transferable_len}"
+            )
+        if self._client is None:
+            raise RuntimeError("Store not initialized when execute_get_plan_cpu().")
+        inner_res = self._client.execute_get_plan_cpu(
+            handle.backend_handle,
+            int(consume_prefix_len),
+            self._batch_concurrency if concurrency is None else int(concurrency),
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"execute_get_plan_cpu backend error: {inner_res.unwrap_error()}"
+            )
+        _ = inner_res.unwrap()
+        handle.closed = True
+        return GetStartHandle(
+            keys=narrowed.keys,
+            result=narrowed,
+            created_at_ns=handle.created_at_ns,
+            backend_token=id(self),
+            backend_handle=handle.backend_handle,
+        )
+
+    def execute_get_plan_gpu(
+        self,
+        handle: GetPlanHandle,
+        destinations: List[GpuDestination],
+        *,
+        consume_prefix_len: int,
+        concurrency: Optional[int] = None,
+    ) -> GpuGetStartHandle:
+        if not isinstance(handle, GetPlanHandle):
+            raise TypeError(
+                f"execute_get_plan_gpu requires GetPlanHandle, got {type(handle)}"
+            )
+        if handle.backend_token != id(self) or handle.closed:
+            raise RuntimeError("execute_get_plan_gpu requires a live plan from this store")
+        remote_indices = tuple(
+            index for index in handle.gpu_remote_indices if index < consume_prefix_len
+        )
+        if not remote_indices:
+            raise ValueError("execute_get_plan_gpu requires at least one remote source")
+        if len(destinations) != len(remote_indices):
+            raise ValueError(
+                "execute_get_plan_gpu requires one exact destination per remote source: "
+                f"destinations={len(destinations)} remote={len(remote_indices)} "
+                f"consume={consume_prefix_len}"
+            )
+        narrowed = _narrow_get_start_result(handle.gpu_result, int(consume_prefix_len))
+        if consume_prefix_len <= 0 or consume_prefix_len > handle.gpu_result.transferable_len:
+            raise ValueError(
+                "execute_get_plan_gpu consume prefix is outside the GPU plan: "
+                f"consume={consume_prefix_len} transferable={handle.gpu_result.transferable_len}"
+            )
+        active_registration = self._gpu_buffer_registration
+        if active_registration is None:
+            raise RuntimeError("execute_get_plan_gpu requires an active GPU registration")
+        for index, destination in enumerate(destinations):
+            if not isinstance(destination, GpuDestination):
+                raise TypeError(
+                    "execute_get_plan_gpu destinations must be GpuDestination: "
+                    f"index={index} got={type(destination)}"
+                )
+            if destination.registration_id != active_registration.registration_id:
+                raise ValueError(
+                    "execute_get_plan_gpu destination uses a stale registration: "
+                    f"index={index}"
+                )
+            if destination.ptr < active_registration.ptr or destination.end > active_registration.end:
+                raise ValueError(
+                    "execute_get_plan_gpu destination is outside the active registration: "
+                    f"index={index}"
+                )
+        if self._client is None:
+            raise RuntimeError("Store not initialized when execute_get_plan_gpu().")
+        inner_res = self._client.execute_get_plan_gpu(
+            handle.backend_handle,
+            [
+                (destination.registration_id, destination.ptr, destination.capacity)
+                for destination in destinations
+            ],
+            int(consume_prefix_len),
+            self._batch_concurrency if concurrency is None else int(concurrency),
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"execute_get_plan_gpu backend error: {inner_res.unwrap_error()}"
+            )
+        _ = inner_res.unwrap()
+        handle.closed = True
+        return GpuGetStartHandle(
+            keys=narrowed.keys,
+            destinations=tuple(destinations),
+            result=narrowed,
+            created_at_ns=handle.created_at_ns,
+            backend_token=id(self),
+            backend_handle=handle.backend_handle,
+            remote_indices=remote_indices,
+        )
+
+    def cancel_get_transfer(self, handle: GetStartHandle) -> None:
+        if not isinstance(handle, GetStartHandle):
+            raise TypeError(f"cancel_get_transfer requires GetStartHandle, got {type(handle)}")
+        if handle.backend_token is not None and handle.backend_token != id(self):
+            raise RuntimeError(
+                "cancel_get_transfer handle belongs to a different FluxonKVCacheStore"
+            )
+        if handle.closed:
+            return
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when cancel_get_transfer(). Call setup() first."
+            )
+        inner_res = self._client.cancel_get_transfer(int(handle.backend_handle))
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"cancel_get_transfer backend error: {inner_res.unwrap_error()}"
+            )
+        _ = inner_res.unwrap()
+        handle.closed = True
+
+    def get_transfer(
+        self,
+        handle: GetStartHandle,
+        concurrency: Optional[int] = None,
+        *,
+        consume_prefix_len: Optional[int] = None,
+    ) -> int:
+        if not isinstance(handle, GetStartHandle):
+            raise TypeError(f"get_transfer requires GetStartHandle, got {type(handle)}")
+        if handle.backend_token is not None and handle.backend_token != id(self):
+            raise RuntimeError("get_transfer handle belongs to a different FluxonKVCacheStore")
+        if handle.closed:
+            raise RuntimeError("get_transfer handle has been closed")
+        result = handle.result
+        if result.transferable_len == 0:
+            raise RuntimeError(
+                "get_transfer requires a non-empty transferable prefix: "
+                f"transferable_len={result.transferable_len} total={len(result.keys)} "
+                f"raw_prefix_hit_len={result.raw_prefix_hit_len} "
+                f"first_miss_index={result.first_miss_index} "
+                f"first_miss_group_index={result.first_miss_group_index}"
+            )
+        if consume_prefix_len is None:
+            normalized_consume_prefix_len = result.transferable_len
+        else:
+            if isinstance(consume_prefix_len, bool) or not isinstance(
+                consume_prefix_len, int
+            ):
+                raise TypeError(
+                    "get_transfer consume_prefix_len must be an int or None, got "
+                    f"{type(consume_prefix_len)}"
+                )
+            normalized_consume_prefix_len = int(consume_prefix_len)
+        if (
+            normalized_consume_prefix_len <= 0
+            or normalized_consume_prefix_len > result.transferable_len
+        ):
+            raise ValueError(
+                "get_transfer consume_prefix_len must be within the live "
+                "transferable prefix: "
+                f"consume={normalized_consume_prefix_len} "
+                f"transferable={result.transferable_len}"
+            )
+        group_lens = result.atomic_group_lens or (len(result.keys),)
+        group_end = 0
+        for group_len in group_lens:
+            group_end += int(group_len)
+            if group_end >= normalized_consume_prefix_len:
+                break
+        if group_end != normalized_consume_prefix_len:
+            raise ValueError(
+                "get_transfer consume_prefix_len must end at an atomic-group "
+                "boundary: "
+                f"consume={normalized_consume_prefix_len} "
+                f"atomic_group_lens={group_lens}"
+            )
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when get_transfer(). Call setup() first."
+            )
+        _ = concurrency
+        inner_res = self._client.get_transfer(
+            handle.backend_handle, normalized_consume_prefix_len
+        )
+        if not inner_res.is_ok():
+            handle.closed = True
+            raise RuntimeError(f"get_transfer backend error: {inner_res.unwrap_error()}")
+        plan_ptr = inner_res.unwrap()
+        handle.closed = True
+        if not isinstance(plan_ptr, int) or plan_ptr <= 0:
+            raise RuntimeError(f"get_transfer returned invalid plan_ptr: {plan_ptr!r}")
+        return int(plan_ptr)
+
+    def get_start_gpu(
+        self,
+        keys: List[str],
+        destinations: List[GpuDestination],
+        prefix_best_effort: bool = True,
+        atomic_group_lens: Optional[List[int]] = None,
+    ) -> GpuGetStartHandle:
+        """Start background remote reads directly into caller-owned GPU staging."""
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when get_start_gpu(). Call setup() first."
+            )
+        if len(keys) == 0:
+            raise ValueError("get_start_gpu requires at least one key")
+        if len(keys) != len(destinations):
+            raise ValueError(
+                "get_start_gpu requires one destination per key: "
+                f"keys={len(keys)} destinations={len(destinations)}"
+            )
+        active_registration = self._gpu_buffer_registration
+        if active_registration is None:
+            raise RuntimeError("get_start_gpu requires an active GPU registration")
+        for index, destination in enumerate(destinations):
+            if not isinstance(destination, GpuDestination):
+                raise TypeError(
+                    "get_start_gpu destinations must be GpuDestination: "
+                    f"index={index} got={type(destination)}"
+                )
+            if destination.registration_id != active_registration.registration_id:
+                raise ValueError(
+                    "get_start_gpu destination uses a stale registration: "
+                    f"index={index} destination_id={destination.registration_id} "
+                    f"active_id={active_registration.registration_id}"
+                )
+            if (
+                destination.ptr < active_registration.ptr
+                or destination.end > active_registration.end
+            ):
+                raise ValueError(
+                    "get_start_gpu destination is outside the active registration: "
+                    f"index={index} destination={destination!r} "
+                    f"registration={active_registration!r}"
+                )
+
+        normalized_group_lens: Optional[List[int]] = None
+        if atomic_group_lens is not None:
+            normalized_group_lens = [int(length) for length in atomic_group_lens]
+            if any(length <= 0 for length in normalized_group_lens):
+                raise ValueError("get_start_gpu atomic_group_lens entries must be > 0")
+            if sum(normalized_group_lens) != len(keys):
+                raise ValueError(
+                    "get_start_gpu atomic_group_lens must sum to keys length: "
+                    f"sum={sum(normalized_group_lens)} keys={len(keys)}"
+                )
+
+        started_at_ns = time.monotonic_ns()
+        inner_res = self._client.get_start_gpu(
+            list(keys),
+            [
+                (
+                    destination.registration_id,
+                    destination.ptr,
+                    destination.capacity,
+                )
+                for destination in destinations
+            ],
+            bool(prefix_best_effort),
+            normalized_group_lens,
+            self._batch_concurrency,
+        )
+        if not inner_res.is_ok():
+            raise RuntimeError(f"get_start_gpu backend error: {inner_res.unwrap_error()}")
+        payload = inner_res.unwrap()
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"get_start_gpu returned non-dict payload: {type(payload)}"
+            )
+        backend_handle = int(payload["handle"])
+        try:
+            result = _build_get_start_result_from_backend_payload(
+                payload,
+                list(keys),
+                bool(prefix_best_effort),
+                normalized_group_lens,
+            )
+        except Exception:
+            cancel_res = self._client.cancel_get_transfer_gpu(backend_handle)
+            if not cancel_res.is_ok():
+                logging.exception(
+                    "get_start_gpu payload validation failed and cleanup also failed: %s",
+                    cancel_res.unwrap_error(),
+                )
+            else:
+                _ = cancel_res.unwrap()
+            raise
+        return GpuGetStartHandle(
+            keys=tuple(keys),
+            destinations=tuple(destinations),
+            result=result,
+            created_at_ns=started_at_ns,
+            backend_token=id(self),
+            backend_handle=backend_handle,
+            remote_indices=tuple(range(result.transferable_len)),
+        )
+
+    def cancel_get_transfer_gpu(self, handle: GpuGetStartHandle) -> None:
+        if not isinstance(handle, GpuGetStartHandle):
+            raise TypeError(
+                f"cancel_get_transfer_gpu requires GpuGetStartHandle, got {type(handle)}"
+            )
+        if handle.backend_token != id(self):
+            raise RuntimeError(
+                "cancel_get_transfer_gpu handle belongs to a different FluxonKVCacheStore"
+            )
+        if handle.closed:
+            return
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when cancel_get_transfer_gpu(). Call setup() first."
+            )
+        inner_res = self._client.cancel_get_transfer_gpu(handle.backend_handle)
+        handle.closed = True
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"cancel_get_transfer_gpu backend error: {inner_res.unwrap_error()}"
+            )
+        _ = inner_res.unwrap()
+
+    def get_transfer_gpu(
+        self,
+        handle: GpuGetStartHandle,
+        *,
+        consume_prefix_len: Optional[int] = None,
+    ) -> int:
+        """Wait for GPU transfer and return one ordered CPU/GPU source plan."""
+        if not isinstance(handle, GpuGetStartHandle):
+            raise TypeError(
+                f"get_transfer_gpu requires GpuGetStartHandle, got {type(handle)}"
+            )
+        if handle.backend_token != id(self):
+            raise RuntimeError(
+                "get_transfer_gpu handle belongs to a different FluxonKVCacheStore"
+            )
+        if handle.closed:
+            raise RuntimeError("get_transfer_gpu handle has been closed")
+        result = handle.result
+        normalized_consume_prefix_len = (
+            result.transferable_len
+            if consume_prefix_len is None
+            else consume_prefix_len
+        )
+        if (
+            isinstance(normalized_consume_prefix_len, bool)
+            or not isinstance(normalized_consume_prefix_len, int)
+            or normalized_consume_prefix_len <= 0
+            or normalized_consume_prefix_len > result.transferable_len
+        ):
+            raise ValueError(
+                "get_transfer_gpu consume_prefix_len must be within the live prefix: "
+                f"consume={normalized_consume_prefix_len!r} "
+                f"transferable={result.transferable_len}"
+            )
+        group_lens = result.atomic_group_lens or (len(result.keys),)
+        group_end = 0
+        for group_len in group_lens:
+            group_end += int(group_len)
+            if group_end >= normalized_consume_prefix_len:
+                break
+        if group_end != normalized_consume_prefix_len:
+            raise ValueError(
+                "get_transfer_gpu consume_prefix_len must end at an atomic-group boundary: "
+                f"consume={normalized_consume_prefix_len} groups={group_lens}"
+            )
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when get_transfer_gpu(). Call setup() first."
+            )
+        inner_res = self._client.get_transfer_gpu(
+            handle.backend_handle,
+            normalized_consume_prefix_len,
+        )
+        handle.closed = True
+        if not inner_res.is_ok():
+            raise RuntimeError(
+                f"get_transfer_gpu backend error: {inner_res.unwrap_error()}"
+            )
+        payload = inner_res.unwrap()
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"get_transfer_gpu returned non-dict payload: {type(payload)}"
+            )
+        transferred_prefix_len = int(payload["transferred_prefix_len"])
+        consumed_prefix_len = int(payload["consumed_prefix_len"])
+        if (
+            transferred_prefix_len != result.transferable_len
+            or consumed_prefix_len != normalized_consume_prefix_len
+        ):
+            raise RuntimeError(
+                "get_transfer_gpu returned inconsistent terminal lengths: "
+                f"transferred={transferred_prefix_len}/{result.transferable_len} "
+                f"consumed={consumed_prefix_len}/{normalized_consume_prefix_len}"
+            )
+        transfer_wall_us = payload["transfer_wall_us"]
+        finish_wait_us = payload["finish_wait_us"]
+        terminal_before_consume = payload["terminal_before_consume"]
+        terminal_to_consume_us = payload["terminal_to_consume_us"]
+        for field_name, value in (
+            ("transfer_wall_us", transfer_wall_us),
+            ("finish_wait_us", finish_wait_us),
+            ("terminal_to_consume_us", terminal_to_consume_us),
+        ):
+            if type(value) is not int or value < 0:
+                raise RuntimeError(
+                    "get_transfer_gpu returned invalid timing: "
+                    f"{field_name}={value!r}"
+                )
+        if type(terminal_before_consume) is not bool:
+            raise RuntimeError(
+                "get_transfer_gpu returned invalid terminal_before_consume: "
+                f"{terminal_before_consume!r}"
+            )
+        handle.transfer_wall_us = transfer_wall_us
+        handle.finish_wait_us = finish_wait_us
+        handle.terminal_before_consume = terminal_before_consume
+        handle.terminal_to_consume_us = terminal_to_consume_us
+        plan_ptr = int(payload["plan_ptr"])
+        if plan_ptr <= 0:
+            raise RuntimeError(f"get_transfer_gpu returned invalid plan_ptr: {plan_ptr}")
+        return plan_ptr
 
     def get_etcd_config(self) -> List[str]:
         if self._client is None:
@@ -908,6 +2698,19 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
 
         return MetricSnapshot(per_segment=normalized)
 
+    def observability_snapshot_async(self) -> KvFuture:
+        """Return a future for Fluxon locality and IO counters."""
+        if self._client is None:
+            raise RuntimeError(
+                "Store not initialized when observability_snapshot_async(). Call setup() first."
+            )
+        res = self._client.observability_snapshot_async()
+        if not res.is_ok():
+            raise RuntimeError(
+                f"observability_snapshot_async backend error: {res.unwrap_error()}"
+            )
+        return res.unwrap()
+
     # --- Fluxon-kv lease helpers (synchronous) ---
     def allocate_lease(self, ttl_seconds: int) -> Result[int, ApiError]:
         try:
@@ -967,7 +2770,7 @@ class _FluxonRpcFuture(KvFuture):
         self._inner = inner_future
 
     def is_waiting(self) -> bool:
-        return bool(getattr(self._inner, "is_waiting")())
+        return bool(self._inner.is_waiting())
 
     def _decode_wait_success(
         self,
@@ -1004,7 +2807,7 @@ class _FluxonRpcBytesFuture(KvFuture):
         self._inner = inner_future
 
     def is_waiting(self) -> bool:
-        return bool(getattr(self._inner, "is_waiting")())
+        return bool(self._inner.is_waiting())
 
     def wait(self) -> Result[bytes, ApiError]:
         res = self._inner.wait()
@@ -1041,7 +2844,7 @@ class _FluxonPutFuture(KvFuture):
         self._dlpack_capsules = []
 
     def is_waiting(self) -> bool:
-        return bool(getattr(self._inner, "is_waiting")())
+        return bool(self._inner.is_waiting())
 
     def wait(self) -> Result[Union[Any, MemHolder], ApiError]:
         from ..api_error import OkNone, Result as PyResult  # type: ignore
@@ -1054,3 +2857,36 @@ class _FluxonPutFuture(KvFuture):
 
         _ = res.unwrap()
         return PyResult.new_ok(OkNone())  # type: ignore
+
+
+class _FluxonBatchRetCodeFuture(KvFuture):
+    """Future wrapper for batch APIs that resolve to one integer ret-code per key."""
+
+    def __init__(self, inner_future: Any, keepalive: List[object]) -> None:
+        self._inner = inner_future
+        self._keepalive = keepalive
+
+    def __del__(self) -> None:
+        self._keepalive = []
+
+    def is_waiting(self) -> bool:
+        return bool(self._inner.is_waiting())
+
+    def wait(self) -> Result[List[int], ApiError]:
+        res = self._inner.wait()
+        self._keepalive = []
+        if not res.is_ok():
+            return Result.new_error(res.unwrap_error())
+        raw = res.unwrap()
+        if not isinstance(raw, list):
+            return Result.new_error(
+                GeneralError(message=f"batch future returned non-list payload: {type(raw)}")
+            )
+        out: List[int] = []
+        for item in raw:
+            if not isinstance(item, int):
+                return Result.new_error(
+                    GeneralError(message=f"batch future returned non-int item: {type(item)}")
+                )
+            out.append(int(item))
+        return Result.new_ok(out)

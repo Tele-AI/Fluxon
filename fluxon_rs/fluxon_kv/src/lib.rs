@@ -8,9 +8,6 @@ pub mod panel_proxy;
 // #[cfg(test)]
 pub mod key_prefix;
 pub mod kv_ssd_storage;
-#[cfg(test)]
-mod kv_ssd_storage2;
-mod kv_ssd_storage_foyer;
 #[cfg(feature = "test_bins")]
 pub mod kv_test;
 pub mod kvlease;
@@ -22,6 +19,7 @@ pub mod memholder;
 pub mod metric_reporter;
 pub mod metrics;
 pub mod observe_kvope;
+pub(crate) mod owner_segment;
 pub mod p2p;
 pub mod profile;
 pub mod rpcresp_kvresult_convert;
@@ -33,6 +31,23 @@ pub mod user_rpc;
 pub use crate::client_seg_pool::SharedJsonMeta;
 pub use crate::cluster_manager::{ClusterEvent, ClusterMember};
 pub use fluxon_observability::types::FsMountKind;
+
+pub(crate) const OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES: u64 = 4 * 1024;
+
+pub(crate) fn owner_segment_offset_bytes(offset_units: u32) -> Option<u64> {
+    u64::from(offset_units).checked_mul(OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES)
+}
+
+pub(crate) fn owner_segment_allocation_capacity_bytes(value_len: u64) -> Option<u64> {
+    let normalized = value_len.max(OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES);
+    let alignment_mask = OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES - 1;
+    let slot_size = normalized
+        .checked_add(alignment_mask)
+        .map(|rounded| rounded & !alignment_mask)?;
+    u32::try_from(slot_size / OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES)
+        .ok()
+        .map(|_| slot_size)
+}
 
 pub type MembershipEventReceiver =
     limit_thirdparty::tokio::sync::abroadcast::Receiver<ClusterEvent>;
@@ -57,10 +72,10 @@ use crate::cluster_manager::ClusterManagerViewTrait;
 use crate::external_client_api::ExternalClientApiAccessTrait;
 use crate::external_client_api::ExternalClientApiView;
 use crate::external_client_api::ExternalClientApiViewTrait;
+use crate::kv_ssd_storage::{KvSsdStorageInit, KvSsdStorageRootLimit};
 use crate::master_kv_router::MasterKvRouterAccessTrait;
 use crate::master_kv_router::MasterKvRouterView;
 use crate::master_kv_router::MasterKvRouterViewTrait;
-use crate::master_kv_router::msg_pack::GetSourceKind;
 use crate::master_lease_manager::MasterLeaseManager;
 use crate::master_lease_manager::master_lease_manager::MasterLeaseManagerNewArg;
 use crate::master_lease_manager::{
@@ -81,17 +96,15 @@ use clap::{Parser, Subcommand};
 use client_kv_api::ClientKvApiNewArg;
 use client_seg_pool::{ClientSegPool, ClientSegPoolNewArg};
 use client_transfer_engine::ClientTransferEngine;
-use cluster_manager::{
-    ClusterManager, ClusterManagerNewArg, ClusterManagerRdmaControlInit, META_KEY_KV_SSD_STORAGE,
-};
+use cluster_manager::{ClusterManager, ClusterManagerNewArg, ClusterManagerRdmaControlInit};
 use config::{
     ClientConfig, ClientConfigYaml, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig,
-    MasterConfigYaml, NetworkConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole,
-    TcpThreadReactorWaitMode, TestSpecConfig, TestSpecTransportMode, TransferEngineType,
-    normalize_etcd_addresses,
+    MasterConfigYaml, ProtocolConfig, ProtocolType, SideTransferRole, TcpThreadReactorWaitMode,
+    TestSpecConfig, TestSpecTransportMode, TransferEngineType, normalize_etcd_addresses,
 };
 use external_client_api::{ExternalClientApi, ExternalClientApiNewArg};
 use fluxon_commu::TransferBackendActivationMode;
+use fluxon_commu::closed_sdk::ClosedRuntimeProcessLoggingConfig;
 use fluxon_framework::LogicalModule;
 use fluxon_framework::{AnyResult, define_framework};
 use master_kv_router::{MasterKvRouter, MasterKvRouterNewArg};
@@ -108,12 +121,201 @@ use p2p::p2p_module::{
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+const CLOSED_SDK_LOG_FILE_NAME: &str = "events.jsonl";
+
+#[derive(Clone)]
+struct ClosedSdkProcessLoggingAuthority {
+    absolute_path: PathBuf,
+    config: ClosedRuntimeProcessLoggingConfig,
+    pid: u32,
+    process_start_time_ticks: u64,
+}
+
+impl ClosedSdkProcessLoggingAuthority {
+    fn matches_process_generation(&self, pid: u32, process_start_time_ticks: u64) -> bool {
+        self.pid == pid && self.process_start_time_ticks == process_start_time_ticks
+    }
+}
+
+static CLOSED_SDK_PROCESS_LOGGING_AUTHORITY: OnceLock<
+    limit_thirdparty::tokio::sync::AMutex<Option<ClosedSdkProcessLoggingAuthority>>,
+> = OnceLock::new();
+
+fn closed_sdk_process_logging_authority()
+-> &'static limit_thirdparty::tokio::sync::AMutex<Option<ClosedSdkProcessLoggingAuthority>> {
+    CLOSED_SDK_PROCESS_LOGGING_AUTHORITY
+        .get_or_init(|| limit_thirdparty::tokio::sync::AMutex::new(None))
+}
+
+fn parse_process_start_time_ticks(proc_stat: &str) -> Result<u64> {
+    let right_parenthesis = proc_stat
+        .rfind(')')
+        .ok_or_else(|| anyhow::anyhow!("unexpected /proc/self/stat format: missing ')'"))?;
+    let tail = proc_stat
+        .get(right_parenthesis + 2..)
+        .ok_or_else(|| anyhow::anyhow!("unexpected /proc/self/stat format: truncated"))?;
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    if fields.len() < 20 {
+        anyhow::bail!("unexpected /proc/self/stat format: too few fields");
+    }
+    fields[19]
+        .parse::<u64>()
+        .map_err(|error| anyhow::anyhow!("parse /proc/self/stat start_time_ticks: {error}"))
+}
+
+fn self_process_start_time_ticks() -> Result<u64> {
+    let proc_stat = fs::read_to_string("/proc/self/stat")
+        .map_err(|error| anyhow::anyhow!("read /proc/self/stat failed: {error}"))?;
+    parse_process_start_time_ticks(proc_stat.as_str())
+}
+
+fn derive_closed_sdk_process_log_path(
+    kv_logs_dir: &Path,
+    instance_key: &str,
+    pid: u32,
+    process_start_time_ticks: u64,
+) -> PathBuf {
+    kv_logs_dir
+        .join("closed")
+        .join(hex::encode(Sha256::digest(instance_key.as_bytes())))
+        .join(format!("pid-{pid}-start-{process_start_time_ticks}"))
+        .join(CLOSED_SDK_LOG_FILE_NAME)
+}
+
+async fn initialize_closed_sdk_process_logging(
+    kv_logs_dir: &Path,
+    instance_key: &str,
+) -> Result<PathBuf> {
+    let pid = std::process::id();
+    let process_start_time_ticks = self_process_start_time_ticks()?;
+    let mut process_authority = closed_sdk_process_logging_authority().lock().await;
+    if let Some(existing) = process_authority.as_ref() {
+        if !existing.matches_process_generation(pid, process_start_time_ticks) {
+            anyhow::bail!(
+                "closed SDK process logging authority belongs to a different process generation: existing_pid={} existing_start_ticks={} current_pid={} current_start_ticks={}",
+                existing.pid,
+                existing.process_start_time_ticks,
+                pid,
+                process_start_time_ticks
+            );
+        }
+        let initialized_path =
+            fluxon_commu::closed_sdk::initialize_process_logging(existing.config.clone())
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("reconfirm closed SDK process logging failed: {error}")
+                })?;
+        if initialized_path != existing.config.absolute_path {
+            anyhow::bail!(
+                "closed SDK process logging path mismatch while reusing process authority: expected={} initialized={}",
+                existing.absolute_path.display(),
+                initialized_path
+            );
+        }
+        return Ok(existing.absolute_path.clone());
+    }
+
+    let canonical_logs_dir = kv_logs_dir.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize owner log directory failed: path={} error={error}",
+            kv_logs_dir.display()
+        )
+    })?;
+    let requested_path = derive_closed_sdk_process_log_path(
+        canonical_logs_dir.as_path(),
+        instance_key,
+        pid,
+        process_start_time_ticks,
+    );
+    let generation_dir = requested_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("derived closed SDK log path has no parent"))?;
+    fs::create_dir_all(generation_dir).map_err(|error| {
+        anyhow::anyhow!(
+            "create closed SDK log directory failed: path={} error={error}",
+            generation_dir.display()
+        )
+    })?;
+    for directory in [
+        canonical_logs_dir.join("closed"),
+        generation_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("closed SDK instance log directory is missing"))?
+            .to_path_buf(),
+        generation_dir.to_path_buf(),
+    ] {
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            anyhow::anyhow!(
+                "set closed SDK log directory permissions failed: path={} error={error}",
+                directory.display()
+            )
+        })?;
+    }
+    let canonical_generation_dir = generation_dir.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize closed SDK log directory failed: path={} error={error}",
+            generation_dir.display()
+        )
+    })?;
+    let absolute_path = canonical_generation_dir.join(CLOSED_SDK_LOG_FILE_NAME);
+    if absolute_path != requested_path {
+        anyhow::bail!(
+            "derived closed SDK log path changed after canonicalization: requested={} canonical={}",
+            requested_path.display(),
+            absolute_path.display()
+        );
+    }
+    let absolute_path_text = absolute_path
+        .to_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "closed SDK process log path is not valid UTF-8: {}",
+                absolute_path.display()
+            )
+        })?
+        .to_string();
+    let config = ClosedRuntimeProcessLoggingConfig {
+        absolute_path: absolute_path_text.clone(),
+        filter: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+    };
+    let initialized_path = fluxon_commu::closed_sdk::initialize_process_logging(config.clone())
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("initialize closed SDK process logging failed: {error}")
+        })?;
+    if initialized_path != absolute_path_text {
+        anyhow::bail!(
+            "closed SDK process logging path mismatch: requested={} initialized={}",
+            absolute_path.display(),
+            initialized_path
+        );
+    }
+    *process_authority = Some(ClosedSdkProcessLoggingAuthority {
+        absolute_path: absolute_path.clone(),
+        config,
+        pid,
+        process_start_time_ticks,
+    });
+    println!(
+        "[fluxon] Closed SDK logging initialized. path={}",
+        absolute_path.display()
+    );
+    info!(
+        closed_sdk_log_path = %absolute_path.display(),
+        pid,
+        process_start_time_ticks,
+        "closed SDK log authority installed"
+    );
+    Ok(absolute_path)
+}
 
 struct ExternalBootstrapBundle {
     meta: SharedJsonMeta,
@@ -132,6 +334,15 @@ fn cluster_manager_rdma_control_init_from_transfer_config(
     // File-config startup always probes all devices but starts with no enabled RDMA devices.
     // The embedded ops page remains the single control plane for enabling/disabling devices at runtime.
     ClusterManagerRdmaControlInit::Disabled
+}
+
+fn cluster_manager_rdma_control_init_from_config(
+    config: &ClientConfig,
+) -> ClusterManagerRdmaControlInit {
+    cluster_manager_rdma_control_init_from_transfer_config(
+        config.fluxonkv_spec.transfer_engine,
+        &config.protocol,
+    )
 }
 
 fn test_spec_config_rdma_control_init(
@@ -156,6 +367,16 @@ fn test_spec_config_rdma_control_init(
         }
         None => None,
     }
+}
+
+fn transfer_engine_rdma_device_names_from_config(
+    protocol: &ProtocolConfig,
+    test_spec_config: Option<&TestSpecConfig>,
+) -> Option<String> {
+    if let Some(devices) = test_spec_config.and_then(|cfg| cfg.rdma_device_names.as_ref()) {
+        return Some(devices.join(","));
+    }
+    protocol.rdma_device_names.clone()
 }
 
 fn test_spec_config_transfer_backend_activation_mode(
@@ -192,24 +413,6 @@ pub enum KvGetResult {
     Owner(Option<Arc<UserMemHolder>>),
     /// External mode: optional external mem holder (shared-mem view)
     External(Option<Arc<ExtMemHolder>>),
-}
-
-/// Internal GET result that preserves the source selected for this operation.
-#[derive(Clone)]
-pub enum KvGetResultWithSource {
-    Owner(Option<(Arc<UserMemHolder>, GetSourceKind)>),
-    External(Option<(Arc<ExtMemHolder>, GetSourceKind)>),
-}
-
-impl KvGetResultWithSource {
-    fn without_source(self) -> KvGetResult {
-        match self {
-            Self::Owner(result) => KvGetResult::Owner(result.map(|(holder, _source_kind)| holder)),
-            Self::External(result) => {
-                KvGetResult::External(result.map(|(holder, _source_kind)| holder))
-            }
-        }
-    }
 }
 
 /// A thin trait on `Framework` to route KV ops by role.
@@ -254,20 +457,24 @@ pub trait KvClientTrait {
         opts: crate::client_kv_api::PutOptionalArgs,
     ) -> KvResult<()>;
 
-    /// Get by role; returns role-tagged holder.
-    async fn kv_get(&self, key: &str) -> KvResult<KvGetResult> {
-        Ok(self.kv_get_with_source(key).await?.without_source())
-    }
-
-    /// Benchmark instrumentation path that also returns the selected storage source.
-    #[doc(hidden)]
-    async fn kv_get_with_source(&self, key: &str) -> KvResult<KvGetResultWithSource>;
+    /// Get by role; returns role-tagged holder
+    async fn kv_get(&self, key: &str) -> KvResult<KvGetResult>;
 
     /// Delete by role
     async fn kv_delete(&self, key: &str) -> KvResult<()>;
 
     /// Existence check by role
     async fn kv_is_exist(&self, key: &str) -> KvResult<bool>;
+
+    /// Batch existence check by role.
+    ///
+    /// `allow_local_snapshot` only enables positive local-cache hits; misses
+    /// still fall through to the authority path.
+    async fn kv_batch_is_exist(
+        &self,
+        keys: Vec<String>,
+        allow_local_snapshot: bool,
+    ) -> KvResult<Vec<bool>>;
 
     /// Count keys by prefix via master-side radix index.
     async fn kv_count_prefix(&self, prefix: &str) -> KvResult<u64>;
@@ -366,15 +573,15 @@ impl KvClientTrait for Framework {
         }
     }
 
-    async fn kv_get_with_source(&self, key: &str) -> KvResult<KvGetResultWithSource> {
+    async fn kv_get(&self, key: &str) -> KvResult<KvGetResult> {
         if self.is_external_mode() {
             let r = self
                 .external_client_api_view()
                 .external_client_api()
                 .inner()
-                .get_with_source(key)
+                .get(key)
                 .await?;
-            Ok(KvGetResultWithSource::External(r))
+            Ok(KvGetResult::External(r))
         } else {
             let r = self
                 .client_kv_api_view()
@@ -382,12 +589,7 @@ impl KvClientTrait for Framework {
                 .inner()
                 .get(key)
                 .await?;
-            Ok(KvGetResultWithSource::Owner(r.map(|(holder, get_info)| {
-                let source_kind = get_info
-                    .map(|info| info.source_kind())
-                    .unwrap_or(GetSourceKind::Memory);
-                (holder, source_kind)
-            })))
+            Ok(KvGetResult::Owner(r.map(|(h, _)| h)))
         }
     }
 
@@ -419,6 +621,26 @@ impl KvClientTrait for Framework {
                 .client_kv_api()
                 .inner()
                 .is_exist(key)
+                .await
+        }
+    }
+
+    async fn kv_batch_is_exist(
+        &self,
+        keys: Vec<String>,
+        allow_local_snapshot: bool,
+    ) -> KvResult<Vec<bool>> {
+        if self.is_external_mode() {
+            self.external_client_api_view()
+                .external_client_api()
+                .inner()
+                .batch_is_exist(keys, allow_local_snapshot)
+                .await
+        } else {
+            self.client_kv_api_view()
+                .client_kv_api()
+                .inner()
+                .batch_is_exist(keys, allow_local_snapshot)
                 .await
         }
     }
@@ -795,9 +1017,9 @@ fn build_side_transfer_worker_config(
     test_spec_config.side_transfer_worker_count = 0;
     test_spec_config.side_transfer_worker_p2p_port_base = None;
     test_spec_config.side_transfer_role = Some(SideTransferRole::Worker);
-    test_spec_config.protocol_type = None;
     test_spec_config.transport_mode = None;
     test_spec_config.rdma_device_names = None;
+    test_spec_config.owner_local_reserve_expected_capacity = None;
 
     Ok(ClientConfig {
         cluster_name: owner_config.cluster_name.clone(),
@@ -813,6 +1035,8 @@ fn build_side_transfer_worker_config(
             tcp_thread_reactor: owner_config.protocol.tcp_thread_reactor,
         },
         pprof_duration_seconds: owner_config.pprof_duration_seconds,
+        replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),
@@ -861,20 +1085,20 @@ fn build_side_transfer_worker_config_yaml(
     let side_config = build_side_transfer_worker_config(owner_config, worker_idx)?;
     Ok(ClientConfigYaml {
         instance_key: side_config.instance_key,
-        network: Some(NetworkConfigYaml {
-            subnet_whitelist: None,
-            primary_ip_to_extended_ips: None,
-            rdma_device_names: side_config.protocol.rdma_device_names,
-            tcp_reactor_mode: Some(side_config.protocol.tcp_thread_reactor),
-        }),
+        protocol: Some(side_config.protocol),
         contribute_to_cluster_pool_size: None,
         pprof_duration_seconds: side_config.pprof_duration_seconds,
+        replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         fluxonkv_spec: crate::config::FluxonKvSpecYaml {
             etcd_addresses: None,
             cluster_name: side_config.cluster_name,
             share_mem_path: side_config.share_mem_path,
             large_file_paths: None,
             large_limit_size: None,
+            ssd_write_rate_limit_bytes_per_sec: None,
+            ssd_write_burst_bytes: None,
+            ssd_capacity_writeback_enabled: None,
             p2p_listen_port: side_config.fluxonkv_spec.p2p_listen_port,
             redis_compat: None,
             sub_cluster: None,
@@ -891,7 +1115,7 @@ fn side_transfer_runtime_dir(owner_config: &ClientConfig) -> PathBuf {
 }
 
 fn cluster_manager_local_ipc_root(
-    share_mem_path: &str,
+    ipc_identity_path: &str,
     test_spec_config: &TestSpecConfig,
 ) -> Option<String> {
     // Test-only override:
@@ -905,20 +1129,33 @@ fn cluster_manager_local_ipc_root(
         return None;
     }
 
-    // Local IPC and the mmap bundle must stay logically tied to the same share-group root, but
-    // they do not need to reuse the same literal filesystem path.
+    // Local IPC needs a stable, host-visible identity path, but iceoryx2 does not need to reuse
+    // that literal filesystem path as its runtime root. Owners/external clients use their mmap
+    // bundle root as the identity; the master uses its existing log root because it has no mmap
+    // bundle of its own.
     //
     // Causal chain:
-    // - `share_mem_path` is authoritative for mmap.file/shared.json coordination and can be long.
+    // - The identity path can be long (owner share_mem_path and master log_dir both commonly are).
     // - iceoryx2 event listeners materialize AF_UNIX socket files under `local_ipc_root`.
     // - AF_UNIX paths are short; reusing a long `share_mem_path` makes listener creation fail
     //   as `ResourceCreationFailed`, even on a clean start with no stale resources.
     // - Therefore we derive a short, stable alias from the canonical shared-memory root and publish
     //   only that alias as `local_ipc_root`.
     Some(
-        derive_short_local_ipc_root(share_mem_path)
+        derive_short_local_ipc_root(ipc_identity_path)
             .unwrap_or_else(|err| panic!("failed to derive local_ipc_root: {}", err)),
     )
+}
+
+fn master_cluster_manager_local_ipc_root(
+    log_dir: &str,
+    test_spec_config: &TestSpecConfig,
+) -> Option<String> {
+    // Master participates in the same local IPC transport as every other Fluxon member. Peers
+    // consume the exact root published in master membership, so this root does not need to equal
+    // an owner's share_mem_path-derived root. TCP remains the transport-control fallback when the
+    // local lane cannot be established.
+    cluster_manager_local_ipc_root(log_dir, test_spec_config)
 }
 
 fn derive_short_local_ipc_root(share_mem_path: &str) -> Result<String> {
@@ -1383,25 +1620,6 @@ pub async fn entry() -> Result<()> {
     Ok(())
 }
 
-async fn finish_framework_init(
-    framework: &Framework,
-    init_result: anyhow::Result<()>,
-) -> Result<()> {
-    let Err(init_error) = init_result else {
-        return Ok(());
-    };
-
-    if let Err(shutdown_error) = framework.shutdown().await {
-        return Err(anyhow::anyhow!(
-            "Failed to initialize framework: {init_error:#}; failed to shut down partially initialized framework: {shutdown_error}"
-        ));
-    }
-
-    Err(anyhow::anyhow!(
-        "Failed to initialize framework: {init_error:#}"
-    ))
-}
-
 async fn run_master_impl(
     config_arg: ConfigArg<MasterConfig>,
     test_overrides: Option<MasterRunTestOverrides>,
@@ -1463,6 +1681,7 @@ async fn run_master_impl(
             fluxon_util::init_log_with_extra_layer(&kv_logs_dir, &config.instance_key, layer)
         }
     }
+    initialize_closed_sdk_process_logging(&kv_logs_dir, &config.instance_key).await?;
     println!("Master config: {:?}", config);
     info!("Master config: {:?}", config);
     info!("Build version (git commit): {}", build_version);
@@ -1511,7 +1730,10 @@ async fn run_master_impl(
             instance_name: Some(config.instance_key.clone()),
             port: None,
             metadata,
-            local_ipc_root: None,
+            local_ipc_root: master_cluster_manager_local_ipc_root(
+                &config.log_dir,
+                &config.test_spec_config,
+            ),
             rdma_control_init,
             sub_cluster: None,
             network: config.network.clone(),
@@ -1532,13 +1754,19 @@ async fn run_master_impl(
             enable_transfer_rpc_fast_path: config.enable_transfer_rpc_fast_path,
             rpc_port: 12345,
             protocol_type: config.protocol.protocol_type,
-            rdma_device_names: config.protocol.rdma_device_names.clone(),
+            rdma_device_names: transfer_engine_rdma_device_names_from_config(
+                &config.protocol,
+                Some(&config.test_spec_config),
+            ),
             backend_activation_mode: transfer_backend_activation_mode,
             transfer_engine: config.transfer_engine,
         },
         master_seg_manager_arg: MasterSegManagerNewArg,
         master_kv_router_arg: MasterKvRouterNewArg {
             test_spec_config: config.test_spec_config.clone(),
+            replica_task_placement: config.replica_task_placement.clone(),
+            replica_cache_capacity_ratio: config.replica_cache_capacity_ratio,
+            replica_writeback_tier1_capacity_ratio: config.replica_writeback_tier1_capacity_ratio,
         },
         metric_reporter_arg: MetricReporterNewArg {
             test_spec_config: config.test_spec_config.clone(),
@@ -1556,11 +1784,9 @@ async fn run_master_impl(
     ));
     info!("Initializing master framework...");
 
-    finish_framework_init(
-        &framework,
-        init_framework_master(&framework, init_args).await,
-    )
-    .await?;
+    init_framework_master(&framework, init_args)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to initialize framework: {:#}", e))?;
 
     if !observability_disabled {
         start_greptime_otlp_tracing_exporter_kv(
@@ -1904,6 +2130,7 @@ async fn run_client_impl(
         );
         Some(greptime_tracing_rx)
     };
+    initialize_closed_sdk_process_logging(&kv_logs_dir, &config.instance_key).await?;
 
     println!("Build version (git commit): {}", build_version);
     println!("Build version (source-sha256): {}", source_sha256);
@@ -1935,6 +2162,34 @@ async fn run_client_impl(
             config.test_spec_config.side_transfer_role,
             Some(SideTransferRole::Worker)
         );
+    let owner_placement_class = if is_external {
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid
+    } else {
+        config.owner_placement_class.unwrap_or_else(|| {
+            if config.replica_writeback_hot_capacity_ratio.is_some() {
+                // Transitional compatibility for already-written inference
+                // configs. New deployments set owner_placement_class
+                // explicitly; RemoteCpu is never inferred from topology.
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference
+            } else {
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid
+            }
+        })
+    };
+    let owner_allocation_authority = if owner_placement_class.is_valid() {
+        crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Owner
+    } else {
+        crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master
+    };
+    let owner_local_target_bytes = match owner_placement_class {
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference => {
+            config.replica_writeback_hot_capacity_ratio.map(|ratio| {
+                (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
+            })
+        }
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::RemoteCpu => Some(0),
+        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid => None,
+    };
     let bootstrapped_shared_meta = if is_side_transfer_worker {
         Some(wait_for_external_bootstrap_bundle(&config).await?.meta)
     } else {
@@ -1967,9 +2222,6 @@ async fn run_client_impl(
     if is_side_transfer_worker {
         metadata.insert("side_transfer_worker".to_string(), "true".to_string());
     }
-    if !is_external && !is_side_transfer_worker && config.ssd_storage.is_some() {
-        metadata.insert(META_KEY_KV_SSD_STORAGE.to_string(), "true".to_string());
-    }
 
     // Local IPC routing requires both share-group owner id and the local IPC root.
     // The owner id is also published via a dedicated share-group key; we denormalize it into
@@ -1978,6 +2230,18 @@ async fn run_client_impl(
         // Owner nodes are the global relay set. Keeping a single metadata marker converges
         // route selection, observability proxy eligibility, and ops topology rendering.
         metadata.insert("p2p_relay".to_string(), "true".to_string());
+        if owner_placement_class.is_valid() {
+            metadata.insert(
+                "owner_placement_class".to_string(),
+                owner_placement_class.as_str().to_string(),
+            );
+        }
+        if config.ssd_storage.is_some() {
+            metadata.insert(
+                crate::cluster_manager::META_KEY_KV_SSD_STORAGE.to_string(),
+                "true".to_string(),
+            );
+        }
     }
     merge_startup_member_metadata(&mut metadata, startup_member_metadata)?;
 
@@ -1995,12 +2259,7 @@ async fn run_client_impl(
         .as_ref()
         .map(|overrides| overrides.rdma_control_init.clone())
         .or_else(|| test_spec_config_rdma_control_init(Some(&config.test_spec_config)))
-        .unwrap_or_else(|| {
-            cluster_manager_rdma_control_init_from_transfer_config(
-                config.fluxonkv_spec.transfer_engine,
-                &config.protocol,
-            )
-        });
+        .unwrap_or_else(|| cluster_manager_rdma_control_init_from_config(&config));
     let transfer_backend_activation_mode = test_overrides
         .as_ref()
         .and_then(|overrides| overrides.transfer_backend_activation_mode)
@@ -2016,6 +2275,25 @@ async fn run_client_impl(
         role, config.cluster_name, config.instance_key
     ));
     info!("Initializing client framework...");
+
+    let ssd_storage_init = config
+        .ssd_storage
+        .as_ref()
+        .map(|ssd| {
+            config
+                .large_file_paths
+                .kv_ssd_storage_root(&config.cluster_name, &config.instance_key)
+                .map(|root_dir| KvSsdStorageInit {
+                    roots: vec![KvSsdStorageRootLimit {
+                        root_dir,
+                        limit_bytes: ssd.limit_bytes,
+                    }],
+                    write_rate_limit_bytes_per_sec: ssd.write_rate_limit_bytes_per_sec,
+                    write_burst_bytes: ssd.write_burst_bytes,
+                    capacity_writeback_enabled: ssd.capacity_writeback_enabled,
+                })
+        })
+        .transpose()?;
 
     if is_external && !is_side_transfer_worker {
         let init_args = InitArgsExternal {
@@ -2048,9 +2326,38 @@ async fn run_client_impl(
             metric_reporter_arg: MetricReporterNewArg {
                 test_spec_config: config.test_spec_config.clone(),
             },
-            external_client_api_arg: ExternalClientApiNewArg {
+            client_seg_pool_arg: ClientSegPoolNewArg {
+                contribute_size: config.contribute_to_cluster_pool_size.clone(),
+                allocation_authority:
+                    crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+                owner_placement_class:
+                    crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
+                owner_local_target_bytes: None,
+                owner_segment_memfd: false,
                 share_mem_path: config.share_mem_path.clone(),
                 large_file_paths: config.large_file_paths.clone(),
+                cluster_name: config.cluster_name.clone(),
+                etcd_addresses: config.etcd_addresses_raw.clone(),
+                attach_existing_meta: None,
+                side_transfer_worker: false,
+                require_transfer_rpc_fast_path_ready_timeout: None,
+            },
+            client_transfer_engine_arg: ClientTransferEngineNewArg {
+                metadata_uri: config.fluxonkv_spec.etcd_addresses[0].clone(),
+                instance_name: config.instance_key.clone(),
+                enable_transfer_rpc_fast_path: config.fluxonkv_spec.enable_transfer_rpc_fast_path,
+                rpc_port: 12345,
+                protocol_type: config.protocol.protocol_type.clone(),
+                rdma_device_names: transfer_engine_rdma_device_names_from_config(
+                    &config.protocol,
+                    Some(&config.test_spec_config),
+                ),
+                backend_activation_mode: transfer_backend_activation_mode,
+                transfer_engine: config.fluxonkv_spec.transfer_engine.clone(),
+            },
+            external_client_api_arg: ExternalClientApiNewArg {
+                shared_memory_path: config.share_mem_path.clone(),
+                shared_file_path: config.share_mem_path.clone(),
                 expected_cluster_name: config.cluster_name.clone(),
                 expected_protocol_version: build_version.clone(),
                 enable_side_transfer: config.test_spec_config.enable_side_transfer,
@@ -2060,39 +2367,10 @@ async fn run_client_impl(
             },
         };
 
-        finish_framework_init(
-            &framework,
-            init_framework_external(&framework, init_args).await,
-        )
-        .await?;
+        init_framework_external(&framework, init_args)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize framework: {:#}", e))?;
     } else {
-        let ssd_storage = if is_side_transfer_worker {
-            None
-        } else if let Some(ssd_cfg) = config.ssd_storage.as_ref() {
-            let root_limits = config
-                .large_file_paths
-                .kv_ssd_storage_root_limits(
-                    &config.cluster_name,
-                    &config.instance_key,
-                    &ssd_cfg.large_limit_size,
-                )
-                .map_err(|err| anyhow::anyhow!("invalid kv ssd storage dirs: {}", err))?;
-            Some(crate::kv_ssd_storage::KvSsdStorageInit {
-                root_limits: root_limits
-                    .into_iter()
-                    .map(
-                        |(root_dir, limit_bytes)| crate::kv_ssd_storage::KvSsdStorageRootLimit {
-                            root_dir,
-                            limit_bytes,
-                        },
-                    )
-                    .collect(),
-                uring_mode: config.test_spec_config.kv_ssd_uring_mode,
-                backend: config.test_spec_config.kv_ssd_storage_backend,
-            })
-        } else {
-            None
-        };
         let init_args = InitArgsOwner {
             cluster_manager_arg: ClusterManagerNewArg {
                 etcd_endpoints: config.fluxonkv_spec.etcd_addresses.clone(),
@@ -2125,10 +2403,23 @@ async fn run_client_impl(
             },
             client_kv_api_arg: ClientKvApiNewArg {
                 test_spec_config: config.test_spec_config.clone(),
-                ssd_storage,
+                owner_hot_cache_capacity_bytes: owner_local_target_bytes.filter(|_| {
+                    owner_placement_class
+                        == crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference
+                }),
+                owner_local_reserve_physical_capacity_bytes: config
+                    .contribute_to_cluster_pool_size
+                    .dram,
+                allocation_authority: owner_allocation_authority,
+                owner_placement_class,
+                ssd_storage: ssd_storage_init,
             },
             client_seg_pool_arg: ClientSegPoolNewArg {
                 contribute_size: config.contribute_to_cluster_pool_size.clone(),
+                allocation_authority: owner_allocation_authority,
+                owner_placement_class,
+                owner_local_target_bytes,
+                owner_segment_memfd: config.test_spec_config.owner_segment_memfd,
                 // Read shared memory path from config (must not be empty).
                 share_mem_path: config.share_mem_path.clone(),
                 large_file_paths: config.large_file_paths.clone(),
@@ -2155,17 +2446,18 @@ async fn run_client_impl(
                 enable_transfer_rpc_fast_path: config.fluxonkv_spec.enable_transfer_rpc_fast_path,
                 rpc_port: 12345,
                 protocol_type: config.protocol.protocol_type.clone(),
-                rdma_device_names: config.protocol.rdma_device_names.clone(),
+                rdma_device_names: transfer_engine_rdma_device_names_from_config(
+                    &config.protocol,
+                    Some(&config.test_spec_config),
+                ),
                 backend_activation_mode: transfer_backend_activation_mode,
                 transfer_engine: config.fluxonkv_spec.transfer_engine.clone(),
             },
         };
 
-        finish_framework_init(
-            &framework,
-            init_framework_owner(&framework, init_args).await,
-        )
-        .await?;
+        init_framework_owner(&framework, init_args)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to initialize framework: {:#}", e))?;
     }
 
     let framework = Arc::new(framework);
@@ -2524,10 +2816,66 @@ mod tests {
     use std::path::Path;
     use uuid::Uuid;
 
+    #[test]
+    fn closed_sdk_log_path_is_process_scoped_and_instance_safe() {
+        let path = derive_closed_sdk_process_log_path(
+            Path::new("/authority/cluster_logs"),
+            "../owner/a",
+            17,
+            29,
+        );
+        assert_eq!(
+            path,
+            Path::new("/authority/cluster_logs")
+                .join("closed")
+                .join("bc3efb91a5f8cb2150176412901ece886e46bd1f0e9b7b8eb3121dbfc66ed974")
+                .join("pid-17-start-29")
+                .join("events.jsonl")
+        );
+        assert!(!path.to_string_lossy().contains("../owner/a"));
+    }
+
+    #[test]
+    fn process_start_time_parser_handles_spaces_and_parentheses_in_comm() {
+        let proc_stat =
+            "123 (owner worker (numa1)) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242";
+        assert_eq!(parse_process_start_time_ticks(proc_stat).unwrap(), 4242);
+        assert!(parse_process_start_time_ticks("truncated").is_err());
+    }
+
+    #[test]
+    fn closed_sdk_log_authority_is_process_generation_scoped() {
+        let authority = ClosedSdkProcessLoggingAuthority {
+            absolute_path: PathBuf::from("/authority/events.jsonl"),
+            config: ClosedRuntimeProcessLoggingConfig {
+                absolute_path: "/authority/events.jsonl".to_string(),
+                filter: "info".to_string(),
+            },
+            pid: 17,
+            process_start_time_ticks: 29,
+        };
+        assert!(authority.matches_process_generation(17, 29));
+        assert!(!authority.matches_process_generation(18, 29));
+        assert!(!authority.matches_process_generation(17, 30));
+    }
+
     fn new_test_dir(prefix: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("{}_{}", prefix, Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn owner_segment_alignment_supports_mixed_size_allocations() {
+        const SGLANG_KV_PAGE_BYTES: u64 = 4_718_592;
+        assert_eq!(
+            owner_segment_allocation_capacity_bytes(SGLANG_KV_PAGE_BYTES),
+            Some(SGLANG_KV_PAGE_BYTES)
+        );
+        assert_eq!(
+            owner_segment_allocation_capacity_bytes(3 * 1024 * 1024 + 1),
+            Some(3 * 1024 * 1024 + 4096)
+        );
     }
 
     fn owner_config_for_side_transfer_test() -> ClientConfig {
@@ -2545,6 +2893,8 @@ mod tests {
                 tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             },
             pprof_duration_seconds: None,
+            replica_writeback_hot_capacity_ratio: None,
+            owner_placement_class: None,
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: vec!["http://127.0.0.1:2379".to_string()],
@@ -2569,7 +2919,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spec_tcp_protocol_uses_tcp_bypass_activation() {
+    fn test_spec_transport_mode_uses_protocol_agnostic_force_enable_activation() {
         let cfg = TestSpecConfig {
             transport_mode: Some(TestSpecTransportMode::TransferOnly),
             ..Default::default()
@@ -2585,25 +2935,6 @@ mod tests {
             ),
             Some(TransferBackendActivationMode::TcpTestBypassRdmaControl)
         );
-    }
-
-    #[test]
-    fn file_config_startup_keeps_rdma_disabled_until_control_update() {
-        for protocol_type in [ProtocolType::Tcp, ProtocolType::Rdma] {
-            let protocol = ProtocolConfig {
-                protocol_type,
-                rdma_device_names: None,
-                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
-            };
-
-            assert_eq!(
-                cluster_manager_rdma_control_init_from_transfer_config(
-                    TransferEngineType::Closed,
-                    &protocol,
-                ),
-                ClusterManagerRdmaControlInit::Disabled
-            );
-        }
     }
 
     #[test]
@@ -2699,6 +3030,50 @@ mod tests {
         assert_eq!(disabled, None);
 
         std::fs::remove_dir_all(&tempdir).unwrap();
+    }
+
+    #[test]
+    fn master_cluster_manager_local_ipc_root_is_published_by_default() {
+        let tempdir = new_test_dir("fluxon_master_local_ipc_root");
+        let log_root = tempdir.join("master_logs");
+
+        let enabled = master_cluster_manager_local_ipc_root(
+            log_root.to_str().unwrap(),
+            &TestSpecConfig::default(),
+        );
+        assert!(enabled.is_some());
+        assert_eq!(
+            enabled,
+            cluster_manager_local_ipc_root(log_root.to_str().unwrap(), &TestSpecConfig::default(),)
+        );
+
+        let disabled = master_cluster_manager_local_ipc_root(
+            log_root.to_str().unwrap(),
+            &TestSpecConfig {
+                disable_local_ipc: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(disabled, None);
+
+        std::fs::remove_dir_all(&tempdir).unwrap();
+    }
+
+    #[test]
+    fn transfer_engine_rdma_device_names_prefers_test_spec_devices() {
+        let protocol = ProtocolConfig {
+            protocol_type: ProtocolType::Rdma,
+            rdma_device_names: Some("mlx5_9:1".to_string()),
+            tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
+        };
+        let cfg = TestSpecConfig {
+            rdma_device_names: Some(vec!["mlx5_1".to_string(), "mlx5_0".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            transfer_engine_rdma_device_names_from_config(&protocol, Some(&cfg)),
+            Some("mlx5_1,mlx5_0".to_string())
+        );
     }
 
     #[test]
@@ -2825,12 +3200,11 @@ mod tests {
 
         assert_eq!(side_cfg_yaml.instance_key, "owner-a__side_1");
         assert_eq!(
-            side_cfg_yaml.network,
-            Some(NetworkConfigYaml {
-                subnet_whitelist: None,
-                primary_ip_to_extended_ips: None,
+            side_cfg_yaml.protocol,
+            Some(ProtocolConfig {
+                protocol_type: ProtocolType::Tcp,
                 rdma_device_names: None,
-                tcp_reactor_mode: Some(TcpThreadReactorWaitMode::default()),
+                tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             })
         );
         assert!(side_cfg_yaml.contribute_to_cluster_pool_size.is_none());
@@ -2838,11 +3212,6 @@ mod tests {
         assert!(side_cfg_yaml.fluxonkv_spec.large_file_paths.is_none());
         assert!(side_cfg_yaml.fluxonkv_spec.sub_cluster.is_none());
         assert_eq!(side_cfg_yaml.fluxonkv_spec.p2p_listen_port, Some(42001));
-        assert!(
-            !serde_yaml::to_string(&side_cfg_yaml)
-                .unwrap()
-                .contains("protocol_type")
-        );
         assert_eq!(
             side_cfg_yaml.test_spec_config.side_transfer_role,
             Some(SideTransferRole::Worker)
@@ -2900,6 +3269,8 @@ mod tests {
                 tcp_thread_reactor: TcpThreadReactorWaitMode::default(),
             },
             pprof_duration_seconds: None,
+            replica_writeback_hot_capacity_ratio: None,
+            owner_placement_class: None,
             redis_compat_listen_addr: None,
             fluxonkv_spec: FluxonKvSpec {
                 etcd_addresses: Vec::new(),

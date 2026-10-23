@@ -44,16 +44,7 @@ pub trait UserRpcServer: Send + Sync {
 pub type UserRpcFlatDictFuture = Pin<Box<dyn Future<Output = KvResult<FlatDict>> + Send + 'static>>;
 
 pub(crate) fn validate_timeout_ms(timeout_ms: u64) -> KvResult<()> {
-    if timeout_ms < user_rpc::USER_RPC_MIN_TIMEOUT_MS {
-        return Err(KvError::Api(ApiError::InvalidArgument {
-            detail: format!(
-                "timeout_ms must be >= {} (got {})",
-                user_rpc::USER_RPC_MIN_TIMEOUT_MS,
-                timeout_ms
-            ),
-        }));
-    }
-    Ok(())
+    user_rpc::validate_timeout_ms(timeout_ms)
 }
 
 pub(crate) struct FluxonUserRpcImpl {

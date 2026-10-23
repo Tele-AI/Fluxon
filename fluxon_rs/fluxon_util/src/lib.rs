@@ -1,5 +1,6 @@
 pub mod dag_viz_html;
 pub mod dev_config;
+pub mod fixed_slab_allocator;
 pub mod fs_statvfs;
 pub mod fs_watch;
 pub mod git_version_build_record;
@@ -8,6 +9,7 @@ pub mod init_dag_compiler;
 pub mod map_lock;
 pub mod merge_recent_async_notifies;
 pub mod notify_state;
+pub mod pin_aware_moka;
 pub mod prefix_scan;
 pub mod prom_remote_write;
 pub mod scoped_future_set;

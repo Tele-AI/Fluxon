@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::NodeIDString;
-pub use fluxon_commu_contract::ClosedRuntimeLocalMemoryKind;
+pub use fluxon_commu_contract::{
+    CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER, ClosedRuntimeLocalMemoryKind,
+};
 use fluxon_commu_contract::{
     ClosedRuntimeHandle, ClosedRuntimePeerGen, ClosedRuntimeTransferEngineOpenRuntimeRequest,
     ClosedRuntimeTransferEngineOpenRuntimeResponse,

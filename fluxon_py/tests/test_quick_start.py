@@ -96,4 +96,3 @@ class QuickStartCompatTest(unittest.TestCase):
                 kv_owner_config={},
                 start_middleware=True,
             )
-

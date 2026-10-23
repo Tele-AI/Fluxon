@@ -33,6 +33,15 @@ def _load_module(module_path: Path, module_name: str):
 
 
 class VendorRuntimeLayoutTest(unittest.TestCase):
+    def test_cuda_driver_is_external_but_cuda_runtime_is_packaged(self) -> None:
+        for module_path in PACKER_MODULE_PATHS:
+            mod = _load_module(
+                module_path=module_path,
+                module_name=f"vendor_runtime_cuda_external_{module_path.stem}",
+            )
+            self.assertTrue(mod._is_external_driver_runtime_lib("libcuda.so.1"))
+            self.assertFalse(mod._is_external_driver_runtime_lib("libcudart.so.12"))
+
     def test_ensure_vendor_runtime_soname_aliases_materializes_missing_alias_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

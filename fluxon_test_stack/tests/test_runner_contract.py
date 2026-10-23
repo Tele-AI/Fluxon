@@ -52,6 +52,10 @@ def _build_checks(selected_test_id: Optional[str]) -> List[Tuple[str, Callable[[
             test_test_spec_protocol_type_contract,
         ),
         (
+            "post_read_remote_policy_is_forwarded_strictly",
+            test_post_read_remote_policy_is_forwarded_strictly,
+        ),
+        (
             "suite_requires_benchmark_bundle_only_for_bench_cases",
             test_suite_requires_benchmark_bundle_only_for_bench_cases,
         ),
@@ -243,6 +247,38 @@ def test_test_spec_protocol_type_contract() -> None:
         return
 
     print("PASS: test_test_spec_protocol_type_contract")
+
+
+def test_post_read_remote_policy_is_forwarded_strictly() -> None:
+    normalized = _TEST_RUNNER._normalize_test_spec_config(
+        {"post_read_remote_policy": "drop"},
+        "profile.test_spec_config",
+    )
+    if normalized.get("post_read_remote_policy") != "drop":
+        print(
+            "FAIL: test_post_read_remote_policy_is_forwarded_strictly - "
+            f"unexpected normalized config: {normalized!r}"
+        )
+        return
+    runtime = _TEST_RUNNER._test_spec_config_runtime_view(normalized)
+    if runtime.get("post_read_remote_policy") != "drop":
+        print(
+            "FAIL: test_post_read_remote_policy_is_forwarded_strictly - "
+            f"runtime config dropped the policy: {runtime!r}"
+        )
+        return
+    try:
+        _TEST_RUNNER._normalize_test_spec_config(
+            {"post_read_remote_policy": "ttl"},
+            "profile.test_spec_config",
+        )
+    except ValueError:
+        print("PASS: test_post_read_remote_policy_is_forwarded_strictly")
+        return
+    print(
+        "FAIL: test_post_read_remote_policy_is_forwarded_strictly - "
+        "unsupported policy was accepted"
+    )
 
 
 def test_suite_requires_benchmark_bundle_only_for_bench_cases() -> None:

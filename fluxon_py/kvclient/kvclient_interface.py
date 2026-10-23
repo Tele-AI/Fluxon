@@ -24,6 +24,46 @@ from .nonzerocopy_encode import DLPacked, decode_flat_kv_dict, encode_flat_kv_di
 FlatDict = Dict[str, Union[int, float, bool, str, bytes, DLPacked]]
 
 
+@dataclass(frozen=True)
+class GetStartResult:
+    """
+    Result of a group-prefix best-effort get_start().
+
+    Semantics:
+    - ``keys`` is the caller-provided ordered page-key sequence.
+    - ``raw_prefix_hit_len`` is the page-level continuous hit prefix.
+    - ``transferable_len`` is rounded down to complete atomic groups and is the
+      maximum prefix that can be consumed by get_transfer(). A caller may
+      consume a shorter prefix only at an atomic-group boundary.
+    """
+
+    keys: Tuple[str, ...]
+    raw_prefix_hit_len: int
+    transferable_len: int
+    prefix_hit_groups: int
+    atomic_group_lens: Optional[Tuple[int, ...]]
+    prefix_best_effort: bool
+    first_miss_index: Optional[int]
+    first_miss_group_index: Optional[int]
+    all_hit: bool
+
+
+@dataclass
+class GetStartHandle:
+    """
+    Opaque-ish handle returned by get_start() and consumed by get_transfer().
+
+    Callers must pass this handle to cancel_get_transfer() when abandoning it
+    without calling get_transfer(). Fluxon backends may keep strong holder
+    references alive while this handle is live.
+    """
+
+    keys: Tuple[str, ...]
+    result: GetStartResult
+    created_at_ns: int
+    backend_token: Optional[int] = None
+    backend_handle: int = 0
+    closed: bool = False
 class _KvCloseRegistryState(Enum):
     OPEN = "open"
     CLOSING = "closing"
@@ -138,11 +178,36 @@ class PutOptionalArgs:
     - lease_id: attach the written key to a lease on commit.
     - reject_if_inflight_same_key: ask Fluxon to fail-fast when the same key is already
       being written by another inflight put.
+    - reject_if_exist_same_key: ask Fluxon to fail-fast when the key already has a
+      committed live replica.
+    - write_through: keep synchronous remote-placement semantics when the backend
+      supports an async write-back path. Defaults to True to match SGLang
+      HiCache's default write policy.
+    - make_replica_task: enqueue an asynchronous replica after a local write-back
+      commit. Set False for a local-only write-back.
+    - make_replica_task_mask: optional per-key replica admission decisions for
+      local_fast_put_start(). Its length must match the key batch. The scalar
+      make_replica_task remains the batch-wide gate.
+    - radix_parent_keys/content_depths: optional exact Radix lineage for the
+      ordered local_fast_put_start() key batch. Both fields must be supplied
+      together. A depth-zero key has no parent; every deeper key names its
+      exact parent key. The metadata is observational until a Radix-aware
+      eviction policy is explicitly enabled.
+    - atomic_group_lens: optional positive lengths that partition the ordered
+      local_fast_put_start() key batch into atomic groups. Replica admission
+      must be uniform within every group.
     - reject_if_exists: create the key only when it does not already exist.
     """
     lease_id: Optional[int] = None
     reject_if_inflight_same_key: bool = False
+    reject_if_exist_same_key: bool = False
     reject_if_exists: bool = False
+    write_through: bool = True
+    make_replica_task: bool = True
+    make_replica_task_mask: Optional[List[bool]] = None
+    radix_parent_keys: Optional[List[Optional[str]]] = None
+    content_depths: Optional[List[int]] = None
+    atomic_group_lens: Optional[List[int]] = None
 
     def support_mooncake(self) -> Tuple[bool, List[str]]:
         """
@@ -159,6 +224,20 @@ class PutOptionalArgs:
             unsupported.append("lease_id")
         if self.reject_if_inflight_same_key:
             unsupported.append("reject_if_inflight_same_key")
+        if self.reject_if_exist_same_key:
+            unsupported.append("reject_if_exist_same_key")
+        if self.write_through:
+            unsupported.append("write_through")
+        if not self.make_replica_task:
+            unsupported.append("make_replica_task")
+        if self.make_replica_task_mask is not None:
+            unsupported.append("make_replica_task_mask")
+        if self.radix_parent_keys is not None:
+            unsupported.append("radix_parent_keys")
+        if self.content_depths is not None:
+            unsupported.append("content_depths")
+        if self.atomic_group_lens is not None:
+            unsupported.append("atomic_group_lens")
         return (len(unsupported) == 0, unsupported)
 
 
@@ -271,7 +350,7 @@ class KvClient(FactoryOnly):
         _ = wait_result.unwrap()
         return Result.new_ok(OkNone())
 
-    def get_blocking(self, key: str) -> Result["MemHolder", ApiError]:
+    def get_blocking(self, key: str) -> Result[Union[Any, "MemHolder"], ApiError]:
         """Synchronously retrieve a value by key.
 
         Default implementation delegates to ``get()`` followed by
@@ -282,6 +361,103 @@ class KvClient(FactoryOnly):
         if not get_result.is_ok():
             return Result.new_error(get_result.unwrap_error())
         return get_result.unwrap().wait()
+
+    def batch_put_blocking(
+        self,
+        keys: List[str],
+        values: List[FlatDict],
+        opts: Optional[PutOptionalArgs] = None,
+        concurrency: Optional[int] = None,
+    ) -> List[Result[OkNone, ApiError]]:
+        """Synchronously store a batch of key-value pairs."""
+        if len(keys) != len(values):
+            raise ValueError("batch_put_blocking requires keys and values to have the same length")
+        _ = concurrency
+        return [self.put_blocking(key, value, opts=opts) for key, value in zip(keys, values)]
+
+    def batch_get_blocking(
+        self,
+        keys: List[str],
+        concurrency: Optional[int] = None,
+    ) -> List[Result[Union[Any, "MemHolder"], ApiError]]:
+        """Synchronously retrieve a batch of keys."""
+        _ = concurrency
+        return [self.get_blocking(key) for key in keys]
+
+    def local_fast_put_start(
+        self,
+        keys: List[str],
+        value_len: int,
+        opts: Optional[PutOptionalArgs] = None,
+    ) -> int:
+        _ = keys
+        _ = value_len
+        _ = opts
+        raise NotImplementedError(
+            "local_fast_put_start is only implemented by backends with native plan_ptr support"
+        )
+
+    def local_fast_put_commit(self, plan_ptr: int) -> "KvFuture":
+        _ = plan_ptr
+        raise NotImplementedError(
+            "local_fast_put_commit is only implemented by backends with native plan_ptr support"
+        )
+
+    def put_abort(self, plan_ptr: int) -> None:
+        _ = plan_ptr
+        raise NotImplementedError(
+            "put_abort is only implemented by backends with native plan_ptr support"
+        )
+
+    def get_views(
+        self,
+        keys: List[str],
+        concurrency: Optional[int] = None,
+    ) -> int:
+        _ = keys
+        _ = concurrency
+        raise NotImplementedError(
+            "get_views is only implemented by backends with native plan_ptr support"
+        )
+
+    def release_views(self, plan_ptr: int) -> None:
+        _ = plan_ptr
+        raise NotImplementedError(
+            "release_views is only implemented by backends with native plan_ptr support"
+        )
+
+    def get_start(
+        self,
+        keys: List[str],
+        prefix_best_effort: bool = True,
+        atomic_group_lens: Optional[List[int]] = None,
+    ) -> GetStartHandle:
+        _ = keys
+        _ = prefix_best_effort
+        _ = atomic_group_lens
+        raise NotImplementedError(
+            "get_start is only implemented by backends with native prefix get support"
+        )
+
+    def get_transfer(
+        self,
+        handle: GetStartHandle,
+        concurrency: Optional[int] = None,
+        *,
+        consume_prefix_len: Optional[int] = None,
+    ) -> int:
+        _ = handle
+        _ = concurrency
+        _ = consume_prefix_len
+        raise NotImplementedError(
+            "get_transfer is only implemented by backends with native prefix get support"
+        )
+
+    def cancel_get_transfer(self, handle: GetStartHandle) -> None:
+        _ = handle
+        raise NotImplementedError(
+            "cancel_get_transfer is only implemented by backends with native prefix get support"
+        )
 
     @abstractmethod
     def get_size(self, key: str) -> Result[int, ApiError]:

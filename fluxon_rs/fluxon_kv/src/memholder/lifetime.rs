@@ -1,5 +1,7 @@
 use super::DeleteTargetMember;
-use crate::client_kv_api::msg_pack::ExternalInvalidateWeakIndexReq;
+use crate::client_kv_api::msg_pack::{
+    ExternalInvalidateWeakIndexItem, ExternalInvalidateWeakIndexReq,
+};
 use crate::client_kv_api::{ClientKvApiView, ClientKvApiViewTrait, ExternalHoldingGetInfo};
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::external_client_api::{ExternalClientApiView, ExternalClientApiViewTrait};
@@ -8,18 +10,16 @@ use crate::master_kv_router::msg_pack::{
     BatchDeleteAckReq, BatchDeleteClientKvMetaCacheReq, DeleteAckItem, DeleteClientKvMetaCacheItem,
 };
 use crate::master_kv_router::{MasterKvRouterView, OwnerHoldingGetInfo};
+use crate::p2p::control_plane_rpc::call_control_plane_rpc;
 use crate::p2p::msg_pack::{MsgPack, RPCCaller};
 use crate::rpcresp_kvresult_convert::msg_and_error;
 use async_trait::async_trait;
-use dashmap::{DashMap, mapref::entry::Entry};
+use dashmap::DashMap;
 use fluxon_framework_compiled::shutdown::{ShutdownPoller, ShutdownWaiter};
 use fluxon_framework_compiled::upgrade_view_guard::UpgradeViewGuard;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-
-const EXTERNAL_DELETE_ACK_TIMEOUT_SECS: u64 = 5;
 
 pub type OwnerDeleteAckItem = DeleteAckItem;
 
@@ -116,15 +116,6 @@ impl MemholderDropAck for OwnerDeleteAckCtx {
             self.on_view_dropped();
             return;
         };
-        let node_id = v.cluster_manager().get_self_info().id;
-        v.client_kv_api()
-            .inner()
-            .owner_delete_ack_mgr
-            .track(OwnerDeleteAckItem {
-                key: self.key.clone(),
-                client_id: node_id,
-                holder_id: self.holder_id,
-            });
         if !<Self as MemholderDropAck>::is_running(&v) {
             self.on_skip_shutdown();
             return;
@@ -136,7 +127,6 @@ impl MemholderDropAck for OwnerDeleteAckCtx {
 
 pub struct ExternalDeleteAckCtx {
     pub view: ExternalClientApiView,
-    pub key: String,
     pub external_client_id: String,
     pub holder_id: u64,
     pub started_time: i64,
@@ -156,75 +146,25 @@ impl MemholderDropAck for ExternalDeleteAckCtx {
     }
     fn ack_future(
         &self,
-        guard: Self::Guard,
+        _guard: Self::Guard,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        let v = self.view.clone();
-        let key = self.key.clone();
-        let external_client_id = self.external_client_id.clone();
-        let holder_id = self.holder_id;
-        let started_time = self.started_time;
-        Box::pin(async move {
-            let _keep = guard;
-            // Best-effort drop ACK must not outlive framework shutdown.
-            // During step8 teardown, the owner/external peers can already be concurrently exiting,
-            // and the ACK RPC can otherwise stall long enough to block task_registry shutdown.
-            match tokio::time::timeout(
-                Duration::from_secs(EXTERNAL_DELETE_ACK_TIMEOUT_SECS),
-                v.external_client_api().inner().send_external_delete_ack(
-                    &key,
-                    &external_client_id,
-                    holder_id,
-                    started_time,
-                ),
-            )
-            .await
-            {
-                Err(_) => {
-                    tracing::warn!(
-                        "Timed out sending external_delete_ack for key={}, holder_id={}, external_client_id={} after {}s",
-                        key,
-                        holder_id,
-                        external_client_id,
-                        EXTERNAL_DELETE_ACK_TIMEOUT_SECS
-                    );
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        "Failed to send external_delete_ack for key={}, holder_id={}, external_client_id={}: {}",
-                        key,
-                        holder_id,
-                        external_client_id,
-                        e
-                    );
-                }
-                Ok(Ok(())) => {
-                    tracing::debug!(
-                        "Successfully sent external_delete_ack for key={}, holder_id={}, external_client_id={}",
-                        key,
-                        holder_id,
-                        external_client_id
-                    );
-                }
-            }
-        })
+        Box::pin(async { unreachable!("external holder ACKs are enqueued synchronously") })
     }
     fn on_view_dropped(&self) {
         tracing::warn!(
-            "ExternalClientApiView has been dropped, cannot send external_delete_ack for key='{}', holder_id {}.",
-            self.key,
+            "ExternalClientApiView has been dropped, cannot enqueue external_delete_ack for holder_id {}.",
             self.holder_id
         );
     }
     fn on_skip_shutdown(&self) {
         tracing::info!(
-            "Skipping external_delete_ack for key={}, holder_id={} due to shutdown",
-            self.key,
+            "Skipping external_delete_ack for holder_id={} due to shutdown",
             self.holder_id
         );
     }
     fn run_drop_ack(&self) {
         let v = self.view().clone();
-        let Some(g) = <Self as MemholderDropAck>::try_upgrade(&v) else {
+        let Some(_guard) = <Self as MemholderDropAck>::try_upgrade(&v) else {
             self.on_view_dropped();
             return;
         };
@@ -232,8 +172,18 @@ impl MemholderDropAck for ExternalDeleteAckCtx {
             self.on_skip_shutdown();
             return;
         }
-        let fut = self.ack_future(g);
-        let _ = v.spawn("memholder_drop_ack_external", async move { fut.await });
+        if let Err(err) = v.external_client_api().inner().enqueue_external_delete_ack(
+            self.external_client_id.clone(),
+            self.holder_id,
+            self.started_time,
+        ) {
+            tracing::warn!(
+                holder_id = self.holder_id,
+                external_client_id = %self.external_client_id,
+                error = %err,
+                "failed to enqueue external holder ACK"
+            );
+        }
     }
 }
 
@@ -260,6 +210,18 @@ impl NodeHolderKey {
     #[inline]
     pub fn hold_by_node(&self, node_id: &str) -> bool {
         self.node_id == node_id
+    }
+}
+
+/// Crate-local helper trait used by the default node-scope cleanup path.
+pub(crate) trait HoldByNodeKey {
+    fn hold_by_node(&self, node_id: &str) -> bool;
+}
+
+impl HoldByNodeKey for NodeHolderKey {
+    #[inline]
+    fn hold_by_node(&self, node_id: &str) -> bool {
+        self.hold_by_node(node_id)
     }
 }
 
@@ -310,7 +272,7 @@ where
     }
 }
 
-/// Delete-delivery contract independent of each manager's authority storage shape.
+/// Unified manager trait for memholder authority plus delete delivery control.
 pub(crate) trait DeleteShutdownCtx: Clone + Send + Sync + 'static {
     fn delete_shutdown_waiter(&self) -> ShutdownWaiter;
     fn delete_shutdown_poller(&self) -> ShutdownPoller;
@@ -338,6 +300,8 @@ impl DeleteShutdownCtx for ClientKvApiView {
 
 #[async_trait]
 pub(crate) trait MemholderManagerTrait: Sync {
+    type Key: Eq + Hash + Send + Sync + Clone + 'static;
+    type Value: Send + Sync + 'static;
     type DeleteCtx: DeleteShutdownCtx;
     type DeleteTask: Clone + Send + Sync + 'static;
     type DeleteTarget: Eq + Hash + Clone + std::fmt::Display + Send + Sync + 'static;
@@ -346,6 +310,9 @@ pub(crate) trait MemholderManagerTrait: Sync {
     const DELETE_TARGET_QUEUE_CAPACITY: usize;
     const DELETE_MERGE_WINDOW_MILLIS: u64;
     const DELETE_RETRY_INTERVAL_MILLIS: u64;
+
+    /// Return the authority map of current memholder holdings.
+    fn inner_map(&self) -> &DashMap<Self::Key, Self::Value>;
 
     /// Resolve the concrete manager instance from the running delete context.
     fn delete_manager(ctx: &Self::DeleteCtx) -> &Self;
@@ -380,134 +347,61 @@ pub(crate) trait MemholderManagerTrait: Sync {
     fn is_delete_shutdown_task(_task: &Self::DeleteTask) -> bool {
         false
     }
-}
 
-/// Master-owned holdings grouped by their natural member/holder hierarchy.
-pub struct MasterOwnerMemMgr {
-    by_member: DashMap<String, MemberHoldingState>,
-    total: AtomicUsize,
-}
-
-struct MemberHoldingState {
-    generation: i64,
-    departed: bool,
-    by_holder_id: HashMap<u64, OwnerHoldingGetInfo>,
-}
-
-impl MemberHoldingState {
-    fn active(generation: i64) -> Self {
-        Self {
-            generation,
-            departed: false,
-            by_holder_id: HashMap::new(),
-        }
+    #[inline]
+    fn insert(&self, key: Self::Key, value: Self::Value) {
+        self.inner_map().insert(key, value);
     }
 
-    fn departed(generation: i64) -> Self {
-        Self {
-            generation,
-            departed: true,
-            by_holder_id: HashMap::new(),
-        }
-    }
-}
-
-impl MasterOwnerMemMgr {
-    pub(crate) fn insert_if_member_active(
-        &self,
-        key: NodeHolderKey,
-        value: OwnerHoldingGetInfo,
-        generation: i64,
-    ) -> bool {
-        let mut state = match self.by_member.entry(key.node_id.clone()) {
-            Entry::Occupied(state) => state.into_ref(),
-            Entry::Vacant(state) => state.insert(MemberHoldingState::active(generation)),
-        };
-        if state.departed || state.generation != generation {
-            return false;
-        }
-        assert!(
-            state.by_holder_id.insert(key.holder_id, value).is_none(),
-            "duplicate master holding for member={} holder_id={}",
-            key.node_id,
-            key.holder_id
-        );
-        self.total.fetch_add(1, Ordering::Relaxed);
-        true
+    #[inline]
+    fn remove(&self, key: &Self::Key) -> Option<Self::Value> {
+        self.inner_map().remove(key).map(|(_k, v)| v)
     }
 
-    pub(crate) fn mark_member_active(&self, node_id: &str, generation: i64) -> usize {
-        match self.by_member.entry(node_id.to_string()) {
-            Entry::Occupied(mut state) => {
-                let mut removed = 0;
-                if state.get().generation != generation {
-                    removed = state.get().by_holder_id.len();
-                    state.get_mut().by_holder_id.clear();
-                    state.get_mut().generation = generation;
-                    self.decrement_total(removed);
-                }
-                state.get_mut().departed = false;
-                removed
-            }
-            Entry::Vacant(state) => {
-                state.insert(MemberHoldingState::active(generation));
-                0
+    fn cleanup_node(&self, node_id: &str) -> usize
+    where
+        Self::Key: HoldByNodeKey,
+    {
+        // 收集后删除，避免持有引用期间修改
+        let mut keys = Vec::new();
+        for e in self.inner_map().iter() {
+            if HoldByNodeKey::hold_by_node(e.key(), node_id) {
+                keys.push(e.key().clone());
             }
         }
-    }
-
-    pub(crate) fn mark_member_left_and_cleanup(&self, node_id: &str, generation: i64) -> usize {
-        let mut state = match self.by_member.entry(node_id.to_string()) {
-            Entry::Occupied(state) => state.into_ref(),
-            Entry::Vacant(state) => {
-                state.insert(MemberHoldingState::departed(generation));
-                return 0;
+        let mut removed = 0usize;
+        for k in keys {
+            if self
+                .inner_map()
+                .remove_if(&k, |kk, _| HoldByNodeKey::hold_by_node(kk, node_id))
+                .is_some()
+            {
+                removed += 1;
             }
-        };
-        if state.generation != generation {
-            return 0;
         }
-        state.departed = true;
-        let removed = state.by_holder_id.len();
-        state.by_holder_id.clear();
-        self.decrement_total(removed);
         removed
     }
 
-    pub(crate) fn remove(&self, key: &NodeHolderKey) -> Option<OwnerHoldingGetInfo> {
-        let Entry::Occupied(mut state) = self.by_member.entry(key.node_id.clone()) else {
-            return None;
-        };
-        let value = state.get_mut().by_holder_id.remove(&key.holder_id)?;
-        self.decrement_total(1);
-        Some(value)
+    #[inline]
+    fn total(&self) -> usize {
+        self.inner_map().len()
     }
 
-    #[cfg(any(test, feature = "test_bins"))]
-    pub(crate) fn get(&self, key: &NodeHolderKey) -> Option<OwnerHoldingGetInfo> {
-        let state = self.by_member.get(&key.node_id)?;
-        state.by_holder_id.get(&key.holder_id).cloned()
+    #[inline]
+    fn inner(&self) -> &DashMap<Self::Key, Self::Value> {
+        self.inner_map()
     }
+}
 
-    #[cfg(any(test, feature = "test_bins"))]
-    pub(crate) fn total(&self) -> usize {
-        self.total.load(Ordering::Relaxed)
-    }
-
-    fn decrement_total(&self, count: usize) {
-        if count == 0 {
-            return;
-        }
-        self.total
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_sub(count)
-            })
-            .unwrap_or_else(|_| panic!("master holding total underflow indicates a logic bug"));
-    }
+/// 具体 mgr：绑定 inner + trait，对外固定能力；无需 new，使用 Default。
+pub struct MasterOwnerMemMgr {
+    inner: MemholderManagerInner<NodeHolderKey, OwnerHoldingGetInfo>,
 }
 
 #[async_trait]
 impl MemholderManagerTrait for MasterOwnerMemMgr {
+    type Key = NodeHolderKey;
+    type Value = OwnerHoldingGetInfo;
     type DeleteCtx = MasterKvRouterView;
     type DeleteTask = DeleteKeyInfo;
     type DeleteTarget = DeleteTargetMember;
@@ -516,6 +410,11 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
     const DELETE_TARGET_QUEUE_CAPACITY: usize = 1000;
     const DELETE_MERGE_WINDOW_MILLIS: u64 = 1000;
     const DELETE_RETRY_INTERVAL_MILLIS: u64 = 1000;
+
+    #[inline]
+    fn inner_map(&self) -> &DashMap<Self::Key, Self::Value> {
+        self.inner.as_map()
+    }
 
     fn delete_manager(ctx: &Self::DeleteCtx) -> &Self {
         &ctx.master_kv_router().inner().get_holding
@@ -536,8 +435,8 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
 
         let mut targets = Vec::new();
         let node_replicas = nodes_kv_route_info.node_replicas.read();
-        for (node_id, replicas) in node_replicas.iter() {
-            if replicas.tomb_tag.is_tomb() || replicas.memory.is_none() {
+        for (node_id, kv_route_info) in node_replicas.iter() {
+            if kv_route_info.tomb_tag.is_tomb() {
                 continue;
             }
             let Some(member) = ctx
@@ -579,10 +478,10 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
             };
 
             let node_replicas = nodes_kv_route_info.node_replicas.read();
-            let Some(replicas) = node_replicas.get(target.node_id.as_str()) else {
+            let Some(kv_route_info) = node_replicas.get(target.node_id.as_str()) else {
                 continue;
             };
-            if replicas.tomb_tag.is_tomb() || replicas.memory.is_none() {
+            if kv_route_info.tomb_tag.is_tomb() {
                 continue;
             }
 
@@ -613,16 +512,16 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
             raw_bytes: Vec::new(),
         };
 
-        let resp = rpc_caller
-            .call(
-                ctx.p2p_module(),
-                target.node_id.clone().into(),
-                req,
-                Some(std::time::Duration::from_secs(60)),
-                0,
-            )
-            .await
-            .map_err(|err| format!("{err:?}"))?;
+        let resp = call_control_plane_rpc(
+            &rpc_caller,
+            ctx.p2p_module(),
+            target.node_id.clone().into(),
+            req,
+            Some(std::time::Duration::from_secs(60)),
+            0,
+        )
+        .await
+        .map_err(|err| format!("{err:?}"))?;
 
         if resp.serialize_part.error_code != msg_and_error::OK {
             return Err(format!(
@@ -656,14 +555,13 @@ impl MemholderManagerTrait for MasterOwnerMemMgr {
 impl Default for MasterOwnerMemMgr {
     fn default() -> Self {
         Self {
-            by_member: Default::default(),
-            total: AtomicUsize::new(0),
+            inner: Default::default(),
         }
     }
 }
 
 pub struct OwnerDeleteAckMemMgr {
-    inner: MemholderManagerInner<NodeHolderKey, OwnerDeleteAckItem>,
+    inner: MemholderManagerInner<NodeHolderKey, ()>,
 }
 
 impl Default for OwnerDeleteAckMemMgr {
@@ -674,34 +572,10 @@ impl Default for OwnerDeleteAckMemMgr {
     }
 }
 
-impl OwnerDeleteAckMemMgr {
-    pub(crate) fn track(&self, item: OwnerDeleteAckItem) {
-        self.inner.as_map().insert(
-            NodeHolderKey::new(item.client_id.clone(), item.holder_id),
-            item,
-        );
-    }
-
-    pub(crate) fn pending_items(&self) -> Vec<OwnerDeleteAckItem> {
-        self.inner
-            .as_map()
-            .iter()
-            .map(|entry| entry.value().clone())
-            .collect()
-    }
-
-    pub(crate) async fn send_shutdown_batch(
-        &self,
-        ctx: &ClientKvApiView,
-        tasks: Vec<OwnerDeleteAckItem>,
-    ) -> Result<(), String> {
-        <Self as MemholderManagerTrait>::send_delete_tasks(self, ctx, OwnerDeleteAckTarget, tasks)
-            .await
-    }
-}
-
 #[async_trait]
 impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
+    type Key = NodeHolderKey;
+    type Value = ();
     type DeleteCtx = ClientKvApiView;
     type DeleteTask = OwnerDeleteAckItem;
     type DeleteTarget = OwnerDeleteAckTarget;
@@ -710,6 +584,11 @@ impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
     const DELETE_TARGET_QUEUE_CAPACITY: usize = 1000;
     const DELETE_MERGE_WINDOW_MILLIS: u64 = 10;
     const DELETE_RETRY_INTERVAL_MILLIS: u64 = 200;
+
+    #[inline]
+    fn inner_map(&self) -> &DashMap<Self::Key, Self::Value> {
+        self.inner.as_map()
+    }
 
     fn delete_manager(ctx: &Self::DeleteCtx) -> &Self {
         &ctx.client_kv_api().inner().owner_delete_ack_mgr
@@ -747,11 +626,6 @@ impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
             return Ok(());
         }
 
-        let completed_keys = delete_acks
-            .iter()
-            .map(|item| NodeHolderKey::new(item.client_id.clone(), item.holder_id))
-            .collect::<Vec<_>>();
-
         let master_node_id = ctx
             .cluster_manager()
             .find_or_wait_master_node()
@@ -765,26 +639,22 @@ impl MemholderManagerTrait for OwnerDeleteAckMemMgr {
             raw_bytes: Vec::new(),
         };
 
-        let resp = rpc_caller
-            .call(
-                ctx.p2p_module(),
-                master_node_id.into(),
-                req,
-                Some(Duration::from_secs(60)),
-                0,
-            )
-            .await
-            .map_err(|err| format!("{err:?}"))?;
+        let resp = call_control_plane_rpc(
+            &rpc_caller,
+            ctx.p2p_module(),
+            master_node_id.into(),
+            req,
+            Some(Duration::from_secs(60)),
+            0,
+        )
+        .await
+        .map_err(|err| format!("{err:?}"))?;
 
         if resp.serialize_part.error_code != msg_and_error::OK {
             return Err(format!(
                 "code={} error={}",
                 resp.serialize_part.error_code, resp.serialize_part.error_json
             ));
-        }
-
-        for key in completed_keys {
-            self.inner.as_map().remove(&key);
         }
 
         Ok(())
@@ -809,6 +679,86 @@ pub struct OwnerExternalMemMgr {
     inner: MemholderManagerInner<NodeHolderKey, ExternalHoldingGetInfo>,
 }
 
+impl OwnerExternalMemMgr {
+    /// Remove only holdings owned by the departed membership generation.
+    /// Node ids are reusable, so node-only cleanup can release memory still in
+    /// use by a reconnected external requester.
+    pub fn cleanup_node_generation(&self, node_id: &str, node_start_time: i64) -> usize {
+        let keys = self
+            .inner
+            .as_map()
+            .iter()
+            .filter_map(|entry| {
+                owner_external_holding_matches_generation(
+                    entry.value().req_node_id.as_ref(),
+                    entry.value().requester_node_start_time,
+                    node_id,
+                    node_start_time,
+                )
+                .then(|| entry.key().clone())
+            })
+            .collect::<Vec<_>>();
+
+        keys.into_iter()
+            .filter(|key| {
+                self.inner
+                    .as_map()
+                    .remove_if(key, |_, holding| {
+                        owner_external_holding_matches_generation(
+                            holding.req_node_id.as_ref(),
+                            holding.requester_node_start_time,
+                            node_id,
+                            node_start_time,
+                        )
+                    })
+                    .is_some()
+            })
+            .count()
+    }
+}
+
+fn owner_external_holding_matches_generation(
+    holding_node_id: &str,
+    holding_node_start_time: Option<i64>,
+    departed_node_id: &str,
+    departed_node_start_time: i64,
+) -> bool {
+    holding_node_id == departed_node_id && holding_node_start_time == Some(departed_node_start_time)
+}
+
+#[cfg(test)]
+mod owner_external_generation_tests {
+    use super::owner_external_holding_matches_generation;
+
+    #[test]
+    fn holding_cleanup_never_matches_reconnected_or_unknown_generation() {
+        assert!(owner_external_holding_matches_generation(
+            "external-a",
+            Some(11),
+            "external-a",
+            11,
+        ));
+        assert!(!owner_external_holding_matches_generation(
+            "external-a",
+            Some(12),
+            "external-a",
+            11,
+        ));
+        assert!(!owner_external_holding_matches_generation(
+            "external-a",
+            None,
+            "external-a",
+            11,
+        ));
+        assert!(!owner_external_holding_matches_generation(
+            "external-b",
+            Some(11),
+            "external-a",
+            11,
+        ));
+    }
+}
+
 impl Default for OwnerExternalMemMgr {
     fn default() -> Self {
         Self {
@@ -817,30 +767,10 @@ impl Default for OwnerExternalMemMgr {
     }
 }
 
-impl OwnerExternalMemMgr {
-    pub(crate) fn insert(&self, key: NodeHolderKey, value: ExternalHoldingGetInfo) {
-        self.inner.as_map().insert(key, value);
-    }
-
-    pub(crate) fn remove(&self, key: &NodeHolderKey) -> Option<ExternalHoldingGetInfo> {
-        self.inner.as_map().remove(key).map(|(_, value)| value)
-    }
-
-    pub(crate) fn cleanup_node(&self, node_id: &str) -> usize {
-        self.inner.cleanup_with(|key| key.hold_by_node(node_id))
-    }
-
-    pub(crate) fn total(&self) -> usize {
-        self.inner.as_map().len()
-    }
-
-    pub(crate) fn inner(&self) -> &DashMap<NodeHolderKey, ExternalHoldingGetInfo> {
-        self.inner.as_map()
-    }
-}
-
 #[async_trait]
 impl MemholderManagerTrait for OwnerExternalMemMgr {
+    type Key = NodeHolderKey;
+    type Value = ExternalHoldingGetInfo;
     type DeleteCtx = ClientKvApiView;
     type DeleteTask = DeleteClientKvMetaCacheItem;
     type DeleteTarget = DeleteTargetMember;
@@ -849,6 +779,11 @@ impl MemholderManagerTrait for OwnerExternalMemMgr {
     const DELETE_TARGET_QUEUE_CAPACITY: usize = 1000;
     const DELETE_MERGE_WINDOW_MILLIS: u64 = 1000;
     const DELETE_RETRY_INTERVAL_MILLIS: u64 = 1000;
+
+    #[inline]
+    fn inner_map(&self) -> &DashMap<Self::Key, Self::Value> {
+        self.inner.as_map()
+    }
 
     fn delete_manager(ctx: &Self::DeleteCtx) -> &Self {
         &ctx.client_kv_api().inner().external_get_holding
@@ -865,15 +800,21 @@ impl MemholderManagerTrait for OwnerExternalMemMgr {
             if holding.key != task.key {
                 continue;
             }
+            let Some(holding_epoch) = holding.requester_node_start_time else {
+                continue;
+            };
             let Some(member) = ctx
                 .cluster_manager()
-                .get_member_info_cached(&holding.req_node_id)
+                .get_member_info_cached(holding.req_node_id.as_ref())
             else {
                 continue;
             };
+            if member.node_start_time != holding_epoch {
+                continue;
+            }
             targets.insert(DeleteTargetMember::new(
-                holding.req_node_id.clone(),
-                member.node_start_time,
+                holding.req_node_id.to_string(),
+                holding_epoch,
             ));
         }
         targets.into_iter().collect()
@@ -891,18 +832,24 @@ impl MemholderManagerTrait for OwnerExternalMemMgr {
         target: Self::DeleteTarget,
         tasks: Vec<Self::DeleteTask>,
     ) -> Result<(), String> {
-        let mut keys: Vec<String> = tasks.into_iter().map(|task| task.key).collect();
-        keys.sort();
-        keys.dedup();
+        let mut items: Vec<ExternalInvalidateWeakIndexItem> = tasks
+            .into_iter()
+            .map(|task| ExternalInvalidateWeakIndexItem { key: task.key })
+            .collect();
+        items.sort_by(|a, b| a.key.cmp(&b.key));
+        items.dedup_by(|a, b| a.key == b.key);
 
-        if keys.is_empty() {
+        if items.is_empty() {
             return Ok(());
         }
 
         let rpc_caller = RPCCaller::<ExternalInvalidateWeakIndexReq>::new();
         rpc_caller.regist(ctx.p2p_module());
         let req = MsgPack {
-            serialize_part: ExternalInvalidateWeakIndexReq { keys },
+            serialize_part: ExternalInvalidateWeakIndexReq {
+                keys: Vec::new(),
+                items,
+            },
             raw_bytes: Vec::new(),
         };
 

@@ -245,6 +245,7 @@ pub fn obe_put_done_success(
         transfer_poll_wait_us,
         transfer_poll_iters,
         transfer_used_fast_path,
+        transfer_used_nixl: false,
         transfer_local_noop,
         transfer_remote_transfer,
     });

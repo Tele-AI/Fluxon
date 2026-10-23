@@ -750,6 +750,9 @@ pub enum ClosedRuntimeLocalMemoryKind {
     Gpu { device_id: u32 },
 }
 
+pub const CLOSED_RUNTIME_DIRECT_FAST_PATH_NOT_READY_MARKER: &str =
+    "fluxon_direct_fast_path_not_ready";
+
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum ClosedRuntimeTransferEngineCall {
     Init2ForInitDag {
@@ -803,8 +806,17 @@ pub enum ClosedRuntimeTransferEngineResponse {
     InboundFastPathMessagesValue(Vec<TransferRpcFastPathInbound>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct ClosedRuntimeProcessLoggingConfig {
+    pub absolute_path: String,
+    pub filter: String,
+}
+
 #[derive(Debug, Clone, Encode, Decode)]
 pub enum ClosedRuntimeRequest {
+    InitializeProcessLogging {
+        config: ClosedRuntimeProcessLoggingConfig,
+    },
     ConstructClusterManager {
         arg: ClusterManagerNewArg,
     },
@@ -842,6 +854,9 @@ pub enum ClosedRuntimeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum ClosedRuntimeResponse {
+    ProcessLoggingInitialized {
+        absolute_path: String,
+    },
     Constructed {
         handle: ClosedRuntimeHandle,
     },

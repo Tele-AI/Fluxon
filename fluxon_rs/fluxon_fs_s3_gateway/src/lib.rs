@@ -178,6 +178,7 @@ pub struct TransferHistoryQueryConfig {
 pub struct GatewayAccessConfig {
     pub access_db_path: String,
     pub bootstrap_access_model: FluxonFsAccessModel,
+    pub require_bootstrap_credentials_change: bool,
     pub transfer_state_store: Option<FluxonFsTransferStateStoreConfig>,
 }
 
@@ -481,6 +482,7 @@ pub struct GatewayState {
     transfer_state_store: Option<Arc<dyn TransferStateStore>>,
     transfer_reconcile_handle: Option<Arc<TiKvTransferReconcileHandle>>,
     permission_list: Arc<RwLock<Vec<FluxonFsS3PermissionAccount>>>,
+    pending_credentials_change_usernames: Arc<RwLock<BTreeSet<String>>>,
     initial_credentials_change_required: Arc<AtomicBool>,
     fs_cache: Arc<FluxonFsGlobalConfig>,
     s3_cfg: FluxonFsS3GatewayConfig,
@@ -737,13 +739,32 @@ impl GatewayState {
         transfer_history_query: Option<TransferHistoryQueryConfig>,
     ) -> Result<Self, String> {
         let access_db = Arc::new(Mutex::new(open_access_db(&access.access_db_path)?));
-        let (permission_list, initial_credentials_change_required) = {
+        let (
+            permission_list,
+            pending_credentials_change_usernames,
+            initial_credentials_change_required,
+        ) = {
             let mut conn = access_db.lock();
-            load_or_bootstrap_permission_list_from_db(
+            let permission_list = load_or_bootstrap_permission_list_from_db(
                 &mut conn,
                 &access.bootstrap_access_model,
+                access.require_bootstrap_credentials_change,
                 fs_cache.as_ref(),
-            )?
+            )?;
+            let pending_credentials_change_usernames =
+                load_pending_credentials_change_usernames_from_db(&conn)?;
+            let initial_credentials_change_required = if access.require_bootstrap_credentials_change
+            {
+                persist_initial_credentials_change_required_to_db(&conn, true)?;
+                true
+            } else {
+                load_initial_credentials_change_required_from_db(&conn)?
+            };
+            (
+                permission_list,
+                pending_credentials_change_usernames,
+                initial_credentials_change_required,
+            )
         };
         let external_base_path = normalize_external_base_path(&external_base_path);
         let transfer_worker_scheduler = TransferWorkerSchedulerHandle::new();
@@ -777,6 +798,9 @@ impl GatewayState {
             transfer_state_store,
             transfer_reconcile_handle,
             permission_list: Arc::new(RwLock::new(permission_list)),
+            pending_credentials_change_usernames: Arc::new(RwLock::new(
+                pending_credentials_change_usernames,
+            )),
             initial_credentials_change_required: Arc::new(AtomicBool::new(
                 initial_credentials_change_required,
             )),
@@ -1054,6 +1078,31 @@ impl GatewayState {
 
     pub fn access_db_path(&self) -> &str {
         self.access_db_path.as_str()
+    }
+
+    fn account_requires_credentials_change(&self, username: &str) -> bool {
+        self.pending_credentials_change_usernames
+            .read()
+            .contains(username)
+    }
+
+    fn complete_required_credentials_change(&self, username: &str) -> Result<(), String> {
+        self.access_db
+            .lock()
+            .execute(
+                "DELETE FROM access_pending_credentials_change WHERE username = ?1",
+                params![username],
+            )
+            .map_err(|e| {
+                format!(
+                    "clear pending credentials change failed: username={} err={}",
+                    username, e
+                )
+            })?;
+        self.pending_credentials_change_usernames
+            .write()
+            .remove(username);
+        Ok(())
     }
 
     fn initial_credentials_change_required(&self) -> bool {
@@ -1924,6 +1973,9 @@ CREATE TABLE IF NOT EXISTS access_scope_binding (
     FOREIGN KEY (scope_id) REFERENCES access_scope(scope_id) ON DELETE CASCADE,
     FOREIGN KEY (username) REFERENCES access_users(username) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS access_pending_credentials_change (
+    username TEXT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS fs_mount_registry (
     external_instance_key TEXT NOT NULL,
     local_mount_dir_abs TEXT NOT NULL,
@@ -2003,6 +2055,35 @@ fn access_db_user_count(conn: &Connection) -> Result<i64, String> {
         row.get::<_, i64>(0)
     })
     .map_err(|e| format!("query access user count failed: {}", e))
+}
+
+fn load_pending_credentials_change_usernames_from_db(
+    conn: &Connection,
+) -> Result<BTreeSet<String>, String> {
+    conn.execute(
+        "DELETE FROM access_pending_credentials_change
+         WHERE username NOT IN (SELECT username FROM access_users)",
+        [],
+    )
+    .map_err(|e| format!("prune stale pending credentials change rows failed: {}", e))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.username
+             FROM access_pending_credentials_change p
+             INNER JOIN access_users u ON u.username = p.username
+             ORDER BY p.username",
+        )
+        .map_err(|e| format!("prepare pending credentials change query failed: {}", e))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| format!("query pending credentials change usernames failed: {}", e))?;
+    let mut usernames = BTreeSet::new();
+    for row in rows {
+        usernames.insert(
+            row.map_err(|e| format!("decode pending credentials change username failed: {}", e))?,
+        );
+    }
+    Ok(usernames)
 }
 
 fn persist_initial_credentials_change_required_to_db(
@@ -2146,35 +2227,37 @@ fn load_permission_list_from_db(
 fn load_or_bootstrap_permission_list_from_db(
     conn: &mut Connection,
     bootstrap_access_model: &AccessModel,
+    require_bootstrap_credentials_change: bool,
     _fs_cache: &FluxonFsGlobalConfig,
-) -> Result<(Vec<FluxonFsS3PermissionAccount>, bool), String> {
+) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
     if access_db_user_count(conn)? != 0 {
-        let permission_list = load_permission_list_from_db(conn)?;
-        let initial_credentials_change_required =
-            load_initial_credentials_change_required_from_db(conn)?;
-        return Ok((permission_list, initial_credentials_change_required));
+        return load_permission_list_from_db(conn);
     }
-    let initial_credentials_change_required =
-        is_default_bootstrap_credentials(bootstrap_access_model);
-    let permission_list = persist_access_model_to_db_with_initial_credentials_state(
+    persist_access_model_to_db(
         conn,
         bootstrap_access_model,
-        Some(initial_credentials_change_required),
-    )?;
-    Ok((permission_list, initial_credentials_change_required))
+        require_bootstrap_credentials_change,
+    )
 }
 
 fn persist_access_model_to_db(
     conn: &mut Connection,
     model: &AccessModel,
+    mark_credentials_change_pending: bool,
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
-    persist_access_model_to_db_with_initial_credentials_state(conn, model, None)
+    persist_access_model_to_db_with_initial_credentials_state(
+        conn,
+        model,
+        None,
+        mark_credentials_change_pending,
+    )
 }
 
 fn persist_access_model_to_db_with_initial_credentials_state(
     conn: &mut Connection,
     model: &AccessModel,
     initial_credentials_change_required: Option<bool>,
+    mark_credentials_change_pending: bool,
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
     let permission_list = s3_permission_list_from_access_model(model)?;
     let normalized_model = access_model_from_s3_permission_list(&permission_list)?;
@@ -2237,6 +2320,24 @@ fn persist_access_model_to_db_with_initial_credentials_state(
         }
     }
 
+    if mark_credentials_change_pending {
+        for user in &normalized_model.users {
+            tx.execute(
+                "INSERT INTO access_pending_credentials_change(username) VALUES (?1)",
+                params![user.username],
+            )
+            .map_err(|e| {
+                format!(
+                    "mark bootstrap account pending credentials change failed: username={} err={}",
+                    user.username, e
+                )
+            })?;
+        }
+    } else {
+        tx.execute("DELETE FROM access_pending_credentials_change", [])
+            .map_err(|e| format!("clear completed credentials-change markers failed: {}", e))?;
+    }
+
     if let Some(required) = initial_credentials_change_required {
         persist_initial_credentials_change_required_to_db(&tx, required)?;
     }
@@ -2249,8 +2350,8 @@ fn persist_permission_list_to_db(
     conn: &mut Connection,
     permission_list: &[FluxonFsS3PermissionAccount],
 ) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
-    let model = access_model_from_s3_permission_list(permission_list)?;
-    persist_access_model_to_db(conn, &model)
+    let model = access_model_from_permission_list(permission_list)?;
+    persist_access_model_to_db(conn, &model, false)
 }
 
 fn persist_permission_list_to_db_with_initial_credentials_state(
@@ -2263,6 +2364,7 @@ fn persist_permission_list_to_db_with_initial_credentials_state(
         conn,
         &model,
         Some(initial_credentials_change_required),
+        false,
     )
 }
 
@@ -2967,6 +3069,20 @@ fn account_can_manage_permissions(account: &AuthAccount) -> bool {
     account.can_manage_users
 }
 
+// Keep the legacy local names as private adapters while the core contract uses
+// the explicit S3 permission conversion names.
+fn access_model_from_permission_list(
+    permission_list: &[FluxonFsS3PermissionAccount],
+) -> Result<AccessModel, String> {
+    access_model_from_s3_permission_list(permission_list)
+}
+
+fn permission_list_from_access_model(
+    model: &AccessModel,
+) -> Result<Vec<FluxonFsS3PermissionAccount>, String> {
+    s3_permission_list_from_access_model(model)
+}
+
 fn account_has_bucket_access(account: &AuthAccount, bucket: &str) -> bool {
     if account.can_manage_users {
         return true;
@@ -3402,6 +3518,12 @@ async fn handle_any_impl(
         &orig_path,
         orig_query.as_deref(),
     )?;
+    if st.account_requires_credentials_change(auth_ctx.username.as_str()) {
+        return Err(S3Error::AccessDenied {
+            detail: "initial credentials must be changed in the FluxonFS Web UI before S3 access is enabled"
+                .to_string(),
+        });
+    }
 
     handle_any_authed_impl(st, auth_ctx, method, path, uri, headers, body).await
 }
@@ -5098,12 +5220,57 @@ fn extract_xml_tag_text(xml: &str, tag: &str) -> Result<String, S3Error> {
             detail: format!("missing closing tag: {}", tag),
         });
     };
-    let raw = rest[..b].trim();
-    xml_unescape(raw)
-        .map(|value| value.into_owned())
-        .map_err(|err| S3Error::InvalidRequest {
-            detail: format!("invalid XML entity in {}: {}", tag, err),
-        })
+    decode_xml_text(rest[..b].trim())
+}
+
+fn decode_xml_text(text: &str) -> Result<String, S3Error> {
+    let mut decoded = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(entity_start) = rest.find('&') {
+        decoded.push_str(&rest[..entity_start]);
+        let entity_and_rest = &rest[entity_start + 1..];
+        let Some(entity_end) = entity_and_rest.find(';') else {
+            return Err(S3Error::InvalidRequest {
+                detail: "unterminated XML entity".to_string(),
+            });
+        };
+        let entity = &entity_and_rest[..entity_end];
+        match entity {
+            "amp" => decoded.push('&'),
+            "lt" => decoded.push('<'),
+            "gt" => decoded.push('>'),
+            "quot" => decoded.push('"'),
+            "apos" => decoded.push('\''),
+            _ => {
+                let code_point = if let Some(hex) = entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                {
+                    u32::from_str_radix(hex, 16).ok()
+                } else if let Some(decimal) = entity.strip_prefix('#') {
+                    decimal.parse::<u32>().ok()
+                } else {
+                    None
+                };
+                let Some(code_point) = code_point else {
+                    return Err(S3Error::InvalidRequest {
+                        detail: format!("invalid XML entity: &{};", entity),
+                    });
+                };
+                let is_valid_xml_char = matches!(code_point, 0x9 | 0xA | 0xD)
+                    || matches!(code_point, 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF);
+                let Some(ch) = char::from_u32(code_point).filter(|_| is_valid_xml_char) else {
+                    return Err(S3Error::InvalidRequest {
+                        detail: format!("invalid XML character reference: &{};", entity),
+                    });
+                };
+                decoded.push(ch);
+            }
+        }
+        rest = &entity_and_rest[entity_end + 1..];
+    }
+    decoded.push_str(rest);
+    Ok(decoded)
 }
 
 async fn multipart_complete(
@@ -5346,7 +5513,9 @@ fn auth_verify_sigv4(st: &GatewayState, headers: &HeaderMap) -> Result<AuthCtx, 
             detail: format!("invalid access key: {}", access_key),
         });
     };
-    if st.initial_credentials_change_required() {
+    if st.initial_credentials_change_required()
+        || st.account_requires_credentials_change(account.username.as_str())
+    {
         return Err(S3Error::AccessDenied {
             detail: "change the initial admin credentials in the Web UI before using S3"
                 .to_string(),
@@ -6957,6 +7126,15 @@ mod tests {
             "access db should exist after open: {}",
             db_path.display()
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            assert_eq!(
+                fs::metadata(&db_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         std::fs::remove_file(&db_path).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -7050,6 +7228,7 @@ mod tests {
         GatewayAccessConfig {
             access_db_path,
             bootstrap_access_model: test_bootstrap_access_model(),
+            require_bootstrap_credentials_change: false,
             transfer_state_store: Some(FluxonFsTransferStateStoreConfig {
                 kind: FluxonFsTransferStateStoreKind::TiKv(FluxonFsTransferStateStoreTiKvConfig {
                     pd_endpoints,
@@ -7065,6 +7244,7 @@ mod tests {
         GatewayAccessConfig {
             access_db_path,
             bootstrap_access_model: test_bootstrap_access_model(),
+            require_bootstrap_credentials_change: false,
             transfer_state_store: None,
         }
     }
@@ -7078,6 +7258,46 @@ mod tests {
             }],
             scope_access: Vec::new(),
         }
+    }
+
+    fn bootstrap_credentials_change_test_state(access_db_path: String) -> Arc<GatewayState> {
+        let mut exports = BTreeMap::new();
+        exports.insert("demo".to_string(), test_export("demo"));
+        Arc::new(
+            GatewayState::new(
+                "test_cluster".to_string(),
+                String::new(),
+                GatewayAccessConfig {
+                    access_db_path,
+                    bootstrap_access_model: FluxonFsAccessModel {
+                        users: vec![FluxonFsAccessUser {
+                            username: "admin".to_string(),
+                            password: "admin".to_string(),
+                            can_manage_users: true,
+                        }],
+                        scope_access: Vec::new(),
+                    },
+                    require_bootstrap_credentials_change: true,
+                    transfer_state_store: None,
+                },
+                Arc::new(FluxonFsGlobalConfig {
+                    stale_window_ms: 0,
+                    write_session_target_inflight_bytes:
+                        FS_CACHE_DEFAULT_WRITE_SESSION_TARGET_INFLIGHT_BYTES_V1,
+                    rules: Vec::new(),
+                    exports,
+                }),
+                FluxonFsS3GatewayConfig {
+                    get_object_inflight_pieces: 4,
+                    kv_miss_policy: FluxonFsS3KvMissPolicy::RemoteRead,
+                },
+                Arc::new(ObjectBackend::default()),
+                Arc::new(TestFsMasterAdminBackend),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
     }
 
     fn repo_root() -> PathBuf {
@@ -10887,6 +11107,250 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         headers
     }
 
+    fn signed_s3_headers(
+        username: &str,
+        password: &str,
+        method: &Method,
+        canonical_uri: &str,
+        query: &str,
+    ) -> HeaderMap {
+        let amz_date = "20260316T000000Z";
+        let scope_date = "20260316";
+        let region = "us-east-1";
+        let signed_headers = vec![
+            "host".to_string(),
+            "x-amz-content-sha256".to_string(),
+            "x-amz-date".to_string(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("127.0.0.1"));
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_static(super::UNSIGNED_PAYLOAD),
+        );
+        headers.insert("x-amz-date", HeaderValue::from_static(amz_date));
+        let canonical_headers = super::canonical_headers_string(&headers, &signed_headers).unwrap();
+        let signed_headers_text = signed_headers.join(";");
+        let canonical_request = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            method.as_str(),
+            canonical_uri,
+            super::canonical_query_string(query),
+            canonical_headers,
+            signed_headers_text,
+            super::UNSIGNED_PAYLOAD,
+        );
+        let scope = format!("{}/{}/s3/aws4_request", scope_date, region);
+        let string_to_sign = format!(
+            "{}\n{}\n{}\n{}",
+            super::SIGV4_ALG,
+            amz_date,
+            scope,
+            super::sha256_hex(canonical_request.as_bytes()),
+        );
+        let signing_key = super::derive_signing_key(password, scope_date, region, "s3");
+        let signature = super::hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!(
+                "{} Credential={}/{}, SignedHeaders={}, Signature={}",
+                super::SIGV4_ALG,
+                username,
+                scope,
+                signed_headers_text,
+                signature,
+            ))
+            .unwrap(),
+        );
+        headers
+    }
+
+    async fn post_credentials_change(
+        st: Arc<GatewayState>,
+        username: &str,
+        password: &str,
+        form: &str,
+    ) -> axum::response::Response {
+        let auth = basic_auth_headers(username, password)
+            .get(axum::http::header::AUTHORIZATION)
+            .unwrap()
+            .clone();
+        super::build_router(st)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/ui/account/password/")
+                    .header(axum::http::header::AUTHORIZATION, auth)
+                    .header(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(Body::from(form.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_required_bootstrap_credentials_change_blocks_ui_and_s3_until_both_change() {
+        let runtime_dir = TestTempDir::new("fluxon_fs_gateway_initial_credentials");
+        let db_path = runtime_dir.path().join("access.db");
+        let db_path_text = db_path.to_string_lossy().into_owned();
+        let st = bootstrap_credentials_change_test_state(db_path_text.clone());
+
+        let initial_auth = basic_auth_headers("admin", "admin")
+            .get(axum::http::header::AUTHORIZATION)
+            .unwrap()
+            .clone();
+        let redirect = super::build_router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/")
+                    .header(axum::http::header::AUTHORIZATION, initial_auth.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(redirect.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            redirect
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .unwrap(),
+            "/ui/account/password/"
+        );
+
+        let change_page = super::build_router(st.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/account/password/")
+                    .header(axum::http::header::AUTHORIZATION, initial_auth)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(change_page.status(), StatusCode::OK);
+        let change_page_body = hyper::body::to_bytes(change_page.into_body())
+            .await
+            .unwrap();
+        let change_page_html = String::from_utf8(change_page_body.to_vec()).unwrap();
+        assert!(change_page_html.contains("class=\"account_credentials_body\""));
+        assert!(change_page_html.contains("class=\"account_credentials_form\""));
+        assert!(change_page_html.contains(".account_credentials_body{"));
+
+        let s3_uri: Uri = "/demo?list-type=2".parse().unwrap();
+        let err = super::handle_any_impl(
+            st.clone(),
+            Method::GET,
+            "demo".to_string(),
+            s3_uri.clone(),
+            signed_s3_headers("admin", "admin", &Method::GET, "/demo", "list-type=2"),
+            Body::empty(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            S3Error::AccessDenied { ref detail }
+                if detail.contains("initial credentials must be changed")
+        ));
+
+        drop(st);
+        let st = bootstrap_credentials_change_test_state(db_path_text.clone());
+        assert!(st.account_requires_credentials_change("admin"));
+
+        let password_only = post_credentials_change(
+            st.clone(),
+            "admin",
+            "admin",
+            "new_username=admin&current_password=admin&new_password=owner-secret&confirm_new_password=owner-secret",
+        )
+        .await;
+        assert_eq!(password_only.status(), StatusCode::BAD_REQUEST);
+        assert!(st.account_requires_credentials_change("admin"));
+
+        let username_only = post_credentials_change(
+            st.clone(),
+            "admin",
+            "admin",
+            "new_username=owner&current_password=admin&new_password=admin&confirm_new_password=admin",
+        )
+        .await;
+        assert_eq!(username_only.status(), StatusCode::BAD_REQUEST);
+        assert!(st.account_requires_credentials_change("admin"));
+
+        let changed = post_credentials_change(
+            st.clone(),
+            "admin",
+            "admin",
+            "new_username=owner&current_password=admin&new_password=owner-secret&confirm_new_password=owner-secret",
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            changed.headers().get(axum::http::header::LOCATION).unwrap(),
+            "../../"
+        );
+        assert!(super::find_account_by_username(&st, "admin").is_none());
+        assert!(super::find_account_by_username(&st, "owner").is_some());
+        assert!(!st.account_requires_credentials_change("owner"));
+
+        let old_s3_err = super::handle_any_impl(
+            st.clone(),
+            Method::GET,
+            "demo".to_string(),
+            s3_uri.clone(),
+            signed_s3_headers("admin", "admin", &Method::GET, "/demo", "list-type=2"),
+            Body::empty(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(old_s3_err, S3Error::AccessDenied { .. }));
+
+        let new_s3_response = super::handle_any_impl(
+            st.clone(),
+            Method::GET,
+            "demo".to_string(),
+            s3_uri.clone(),
+            signed_s3_headers(
+                "owner",
+                "owner-secret",
+                &Method::GET,
+                "/demo",
+                "list-type=2",
+            ),
+            Body::empty(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(new_s3_response.status(), StatusCode::OK);
+
+        drop(st);
+        let restarted = bootstrap_credentials_change_test_state(db_path_text);
+        assert!(!restarted.account_requires_credentials_change("owner"));
+        assert!(super::find_account_by_username(&restarted, "admin").is_none());
+        let restarted_s3_response = super::handle_any_impl(
+            restarted,
+            Method::GET,
+            "demo".to_string(),
+            s3_uri,
+            signed_s3_headers(
+                "owner",
+                "owner-secret",
+                &Method::GET,
+                "/demo",
+                "list-type=2",
+            ),
+            Body::empty(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restarted_s3_response.status(), StatusCode::OK);
+    }
+
     fn sigv4_auth_headers(access_key: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -11604,6 +12068,34 @@ max-background-jobs = {TEST_TIKV_RAFTDB_MAX_BACKGROUND_JOBS}\n"
         .await
         .unwrap_err();
         assert!(matches!(err, super::S3Error::AccessDenied { .. }));
+    }
+
+    #[test]
+    fn test_parse_complete_multipart_body_decodes_rclone_etag_entities() {
+        let body = br#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Part><PartNumber>1</PartNumber><ETag>&#34;c036ad6a777a9dba189aef04fc7b6b9c&#34;</ETag></Part>
+  <Part><PartNumber>2</PartNumber><ETag>&quot;86a1cf86b21c0e748c9c6ee1dd390e47&quot;</ETag></Part>
+</CompleteMultipartUpload>"#;
+
+        let parts = super::parse_complete_multipart_body(body).unwrap();
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].etag, "c036ad6a777a9dba189aef04fc7b6b9c");
+        assert_eq!(parts[1].part_number, 2);
+        assert_eq!(parts[1].etag, "86a1cf86b21c0e748c9c6ee1dd390e47");
+    }
+
+    #[test]
+    fn test_decode_xml_text_decodes_once_and_rejects_invalid_entities() {
+        assert_eq!(
+            super::decode_xml_text("&amp;quot;&lt;&gt;&apos;&#x41;&#65;").unwrap(),
+            "&quot;<>'AA"
+        );
+        assert!(super::decode_xml_text("&unknown;").is_err());
+        assert!(super::decode_xml_text("&#0;").is_err());
+        assert!(super::decode_xml_text("&quot").is_err());
     }
 
     #[tokio::test]

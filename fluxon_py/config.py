@@ -143,10 +143,16 @@ def _to_plain_yaml_obj(value: Any, path: str) -> Any:
 def _yaml_template():
     return """
 instance_key: xxx                      # Unique distributed instance id (str)
+protocol:                              # Transport protocol override (dict(optional))
+  protocol_type:                       # Protocol type (('tcp'|'rdma'))
+  rdma_device_names:                   # Explicit RDMA devices for protocol config (['{str}'](optional))
+  tcp_thread_reactor:                  # busy_poll|event_driven; defaults to busy_poll (str(optional))
 network:                               # Network and transport tuning (dict(optional))
   rdma_device_names:                   # Comma-separated RDMA device names (str(optional))
   tcp_reactor_mode:                    # busy_poll|event_driven; external defaults to event_driven, owner/master to busy_poll (str(optional))
 pprof_duration_seconds:                # Dump pprof flamegraph after N seconds (int(optional))
+owner_placement_class:                 # inference|remote_cpu; explicit owner capacity role (str(optional))
+replica_writeback_hot_capacity_ratio: 0.75 # Owner-local hot working-set ratio greater than zero and at most one (float(optional))
 contribute_to_cluster_pool_size:       # Capacity contributed to cluster pool (dict(optional))
   dram: 1677721600                     # - DRAM contribution (size_bytes(multiple of 16777216))
   vram:                                # - VRAM contribution per GPU (dict(dynamic_key))
@@ -163,12 +169,24 @@ test_spec_config:                      # Test-only config overrides (dict(option
   prefer_local_placement: false        # Prefer placing new KV writes on the requester-local owner when possible (bool(optional))
   short_circuit_put_payload_path: false # Keep large put_start allocation but skip payload memcpy + transfer (bool(optional))
   skip_put_end_commit: false           # Return success after payload transfer without put_done commit; inflight_put TTL cleanup only (bool(optional))
+  owner_segment_memfd: false           # Owner DRAM segment uses memfd + procfs pathname attach (bool(optional))
+  legacy_a19_global_demotion_one_phase: false # Explicit a19 one-RPC demotion recovery mode; default keeps exact owner reservation (bool(optional))
+  ssd_read_source_policy: legacy_remote_first # legacy_remote_first|local_ssd_only_first (str(optional))
+  post_read_remote_policy: retain      # retain|drop exact remote DRAM source after a local Get backing commits (str(optional))
+  owner_local_reserve_soft_wait_timeout_ms: # Local-reserve polling interval, >0 (int(optional))
+  owner_local_reserve_hard_timeout_ms: # Local-reserve end-to-end claim timeout, > soft wait (int(optional))
+  owner_local_reserve_expected_capacity: # Owner-only local-reserve prewarm target (dict(optional))
+    value_len:                         # Canonical value payload bytes, >0 and <=512 MiB (int)
+    payload_capacity_bytes:            # Expected payload capacity to keep resident, >0 (int)
   protocol_type:                       # Test-only transfer protocol: tcp|rdma (str(optional))
   transport_mode:                      # transfer_only|transfer_with_rpc (str(optional))
   tcp_thread_reactor_shard_count:      # tcp_thread reactor shard count, 1..16 (int(optional))
   tcp_thread_bulk_lane_count:          # tcp_thread bulk lane count, 1..8 (int(optional))
   tcp_thread_control_lane_count:       # tcp_thread control lane count, 1..8 (int(optional))
   user_rpc_sync_handler_thread_count:  # Owner-dedicated sync user-RPC worker thread count, >0 (int(optional))
+  replica_task_max_inflight:           # Deprecated compatibility field, still validated as 1..64; direct remote-Put singleflight does not use a global actor queue (int(optional))
+  owner_remote_put_max_inflight_bytes: # Exact-byte, no-queue admission budget for direct remote-Put leaders, >0 (int(optional))
+  owner_remote_put_max_inflight_items: # Optional leader-count safety ceiling; requires the byte budget, >0 (int(optional))
   require_transfer_rpc_fast_path_ready_timeout_seconds: # Require owner-owner transfer-rpc fast path before owner ready/shared.json publication (int(optional))
   rdma_device_names:                   # Explicit RDMA devices for benchmark/test fast-path fanout (['{str}'](optional))
   enable_side_transfer: false          # Enable TCP side-transfer fast-path (bool(optional))
@@ -198,12 +216,53 @@ fluxonkv_spec:                        # fluxon kv specific config (dict(optional
   cluster_name:                       # Cluster name (str)
   share_mem_path:                     # Shared bundle path for mmap.file/shared.json/peer metadata (str)
   large_file_paths:                   # Owner-mode ordered large-file roots (['{str}'](optional))
-  large_limit_size:                   # Owner-mode KV SSD byte limits aligned with large_file_paths (['{size_bytes}'](optional))
+  large_limit_size:                   # Optional per-root SSD capacity in bytes (list(optional))
+  ssd_write_rate_limit_bytes_per_sec: # Optional non-queueing SSD write rate (int(optional))
+  ssd_write_burst_bytes:              # Paired immediate SSD write burst (int(optional))
+  ssd_capacity_writeback_enabled:     # Preserve last backing during capacity eviction; omitted means true (bool(optional))
   p2p_listen_port:                    # P2P QUIC listen port override (int(optional))
   redis_compat:                       # Enable Redis protocol shim (dict(optional))
     listen_addr:                      # TCP listen addr, e.g. "127.0.0.1:16379" (str)
   sub_cluster:                        # KV node sub-cluster label (None|str)
 """
+
+
+def _normalize_protocol_config(raw: Any, ctx: str) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{ctx} must be a mapping")
+
+    allowed_keys = {"protocol_type", "rdma_device_names", "tcp_thread_reactor"}
+    unknown = sorted(set(raw.keys()) - allowed_keys)
+    if unknown:
+        raise ValueError(f"{ctx} contains unknown keys: {unknown}")
+
+    out = dict(raw)
+    wait_mode = raw.get("tcp_thread_reactor")
+    if wait_mode is not None:
+        if not isinstance(wait_mode, str):
+            raise ValueError(f"{ctx}.tcp_thread_reactor must be a string")
+        allowed_wait_modes = {"busy_poll", "event_driven"}
+        if wait_mode not in allowed_wait_modes:
+            raise ValueError(
+                f"{ctx}.tcp_thread_reactor must be one of "
+                f"{sorted(allowed_wait_modes)}, got {wait_mode!r}"
+            )
+        out["tcp_thread_reactor"] = wait_mode
+    protocol_type = raw.get("protocol_type")
+    if protocol_type is not None:
+        if not isinstance(protocol_type, str):
+            raise ValueError(f"{ctx}.protocol_type must be a string")
+        if protocol_type not in {"tcp", "rdma"}:
+            raise ValueError(f"{ctx}.protocol_type must be one of ['rdma', 'tcp'], got {protocol_type!r}")
+        out["protocol_type"] = protocol_type
+    rdma_device_names = raw.get("rdma_device_names")
+    if rdma_device_names is not None:
+        if not isinstance(rdma_device_names, str) or not rdma_device_names.strip():
+            raise ValueError(f"{ctx}.rdma_device_names must be a non-empty string")
+        out["rdma_device_names"] = rdma_device_names.strip()
+    return out
 
 
 def _normalize_network_config(raw: Any, ctx: str) -> Optional[Dict[str, Any]]:
@@ -255,12 +314,22 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "prefer_local_placement",
         "short_circuit_put_payload_path",
         "skip_put_end_commit",
+        "owner_segment_memfd",
+        "legacy_a19_global_demotion_one_phase",
+        "ssd_read_source_policy",
+        "post_read_remote_policy",
+        "owner_local_reserve_soft_wait_timeout_ms",
+        "owner_local_reserve_hard_timeout_ms",
+        "owner_local_reserve_expected_capacity",
         "protocol_type",
         "transport_mode",
         "tcp_thread_reactor_shard_count",
         "tcp_thread_bulk_lane_count",
         "tcp_thread_control_lane_count",
         "user_rpc_sync_handler_thread_count",
+        "replica_task_max_inflight",
+        "owner_remote_put_max_inflight_bytes",
+        "owner_remote_put_max_inflight_items",
         "require_transfer_rpc_fast_path_ready_timeout_seconds",
         "rdma_device_names",
         "enable_side_transfer",
@@ -287,6 +356,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "prefer_local_placement",
         "short_circuit_put_payload_path",
         "skip_put_end_commit",
+        "owner_segment_memfd",
+        "legacy_a19_global_demotion_one_phase",
         "enable_side_transfer",
     ):
         value = raw.get(key)
@@ -295,6 +366,32 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
                 raise ValueError(f"{ctx}.{key} must be a bool")
             out[key] = value
 
+    ssd_read_source_policy = raw.get("ssd_read_source_policy")
+    if ssd_read_source_policy is not None:
+        if not isinstance(ssd_read_source_policy, str):
+            raise ValueError(f"{ctx}.ssd_read_source_policy must be a string")
+        allowed_ssd_read_source_policies = {
+            "legacy_remote_first",
+            "local_ssd_only_first",
+        }
+        if ssd_read_source_policy not in allowed_ssd_read_source_policies:
+            raise ValueError(
+                f"{ctx}.ssd_read_source_policy must be one of "
+                f"{sorted(allowed_ssd_read_source_policies)}, got {ssd_read_source_policy!r}"
+            )
+        out["ssd_read_source_policy"] = ssd_read_source_policy
+
+    post_read_remote_policy = raw.get("post_read_remote_policy")
+    if post_read_remote_policy is not None:
+        if not isinstance(post_read_remote_policy, str):
+            raise ValueError(f"{ctx}.post_read_remote_policy must be a string")
+        allowed_post_read_remote_policies = {"retain", "drop"}
+        if post_read_remote_policy not in allowed_post_read_remote_policies:
+            raise ValueError(
+                f"{ctx}.post_read_remote_policy must be one of "
+                f"{sorted(allowed_post_read_remote_policies)}, got {post_read_remote_policy!r}"
+            )
+        out["post_read_remote_policy"] = post_read_remote_policy
     kv_ssd_storage_backend = raw.get("kv_ssd_storage_backend")
     if kv_ssd_storage_backend is not None:
         if not isinstance(kv_ssd_storage_backend, str):
@@ -399,6 +496,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         ("tcp_thread_reactor_shard_count", 1, 16),
         ("tcp_thread_bulk_lane_count", 1, 8),
         ("tcp_thread_control_lane_count", 1, 8),
+        ("replica_task_max_inflight", 1, 64),
     ):
         value = raw.get(key)
         if value is None:
@@ -418,6 +516,71 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         if user_rpc_sync_handler_thread_count <= 0:
             raise ValueError(f"{ctx}.user_rpc_sync_handler_thread_count must be > 0")
         out["user_rpc_sync_handler_thread_count"] = user_rpc_sync_handler_thread_count
+
+    for key in (
+        "owner_remote_put_max_inflight_bytes",
+        "owner_remote_put_max_inflight_items",
+    ):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{ctx}.{key} must be an int")
+        if value <= 0:
+            raise ValueError(f"{ctx}.{key} must be > 0")
+        out[key] = value
+    if (
+        "owner_remote_put_max_inflight_items" in out
+        and "owner_remote_put_max_inflight_bytes" not in out
+    ):
+        raise ValueError(
+            f"{ctx}.owner_remote_put_max_inflight_items requires "
+            f"{ctx}.owner_remote_put_max_inflight_bytes"
+        )
+
+    reserve_timeouts: Dict[str, int] = {}
+    for key in (
+        "owner_local_reserve_soft_wait_timeout_ms",
+        "owner_local_reserve_hard_timeout_ms",
+    ):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{ctx}.{key} must be an int")
+        if value <= 0:
+            raise ValueError(f"{ctx}.{key} must be > 0")
+        reserve_timeouts[key] = value
+        out[key] = value
+    soft_timeout_ms = reserve_timeouts.get("owner_local_reserve_soft_wait_timeout_ms", 10)
+    hard_timeout_ms = reserve_timeouts.get("owner_local_reserve_hard_timeout_ms", 10_000)
+    if hard_timeout_ms <= soft_timeout_ms:
+        raise ValueError(
+            f"{ctx}.owner_local_reserve_hard_timeout_ms must be greater than "
+            f"{ctx}.owner_local_reserve_soft_wait_timeout_ms"
+        )
+
+    expected_capacity = raw.get("owner_local_reserve_expected_capacity")
+    if expected_capacity is not None:
+        expected_ctx = f"{ctx}.owner_local_reserve_expected_capacity"
+        if not isinstance(expected_capacity, dict):
+            raise ValueError(f"{expected_ctx} must be a mapping")
+        unknown_expected = sorted(
+            set(expected_capacity.keys()) - {"value_len", "payload_capacity_bytes"}
+        )
+        if unknown_expected:
+            raise ValueError(f"{expected_ctx} contains unknown keys: {unknown_expected}")
+        normalized_expected: Dict[str, int] = {}
+        for key in ("value_len", "payload_capacity_bytes"):
+            value = expected_capacity.get(key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{expected_ctx}.{key} must be an int")
+            if value <= 0:
+                raise ValueError(f"{expected_ctx}.{key} must be > 0")
+            normalized_expected[key] = value
+        if normalized_expected["value_len"] > 512 * 1024 * 1024:
+            raise ValueError(f"{expected_ctx}.value_len must be <= 536870912")
+        out["owner_local_reserve_expected_capacity"] = normalized_expected
 
     side_transfer_worker_count = raw.get("side_transfer_worker_count")
     if side_transfer_worker_count is not None:
@@ -521,6 +684,33 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
         raise ValueError("fluxonkv_spec must be a mapping")
 
     is_zero_contribution = _is_zero_contribution_fluxonkv_config(cfg)
+    test_spec_config = cfg.get("test_spec_config") or {}
+    expected_capacity = test_spec_config.get("owner_local_reserve_expected_capacity")
+    owner_segment_memfd = test_spec_config.get("owner_segment_memfd", False)
+    owner_placement_class = cfg.get("owner_placement_class")
+    hot_capacity_ratio = cfg.get("replica_writeback_hot_capacity_ratio")
+
+    if owner_placement_class is not None:
+        if not isinstance(owner_placement_class, str):
+            raise ValueError("owner_placement_class must be a string")
+        if owner_placement_class not in {"inference", "remote_cpu"}:
+            raise ValueError(
+                "owner_placement_class must be one of ['inference', 'remote_cpu']"
+            )
+
+    if hot_capacity_ratio is not None:
+        if isinstance(hot_capacity_ratio, bool) or not isinstance(
+            hot_capacity_ratio, (int, float)
+        ):
+            raise ValueError(
+                "replica_writeback_hot_capacity_ratio must be a number in (0, 1]"
+            )
+        hot_capacity_ratio = float(hot_capacity_ratio)
+        if not 0.0 < hot_capacity_ratio <= 1.0:
+            raise ValueError(
+                "replica_writeback_hot_capacity_ratio must be finite and in (0, 1]"
+            )
+        cfg["replica_writeback_hot_capacity_ratio"] = hot_capacity_ratio
 
     share_mem_path = spec.get("share_mem_path")
     if not isinstance(share_mem_path, str) or not share_mem_path.strip():
@@ -533,12 +723,29 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
         raise ValueError("fluxonkv_spec.transfer_engine has been removed from Fluxon KV config")
 
     if is_zero_contribution:
+        if owner_placement_class is not None:
+            raise ValueError("owner_placement_class is only valid on owner configs")
+        if hot_capacity_ratio is not None:
+            raise ValueError(
+                "replica_writeback_hot_capacity_ratio is only valid on owner configs"
+            )
+        if expected_capacity is not None:
+            raise ValueError(
+                "test_spec_config.owner_local_reserve_expected_capacity is only valid on owner configs"
+            )
+        if owner_segment_memfd:
+            raise ValueError(
+                "test_spec_config.owner_segment_memfd is only valid on owner configs"
+            )
         forbidden_spec_keys = [
             "etcd_addresses",
             "redis_compat",
             "sub_cluster",
             "large_file_paths",
             "large_limit_size",
+            "ssd_write_rate_limit_bytes_per_sec",
+            "ssd_write_burst_bytes",
+            "ssd_capacity_writeback_enabled",
         ]
         for key in forbidden_spec_keys:
             if key in spec:
@@ -552,6 +759,24 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
         )
     if _parse_size_bytes(contrib["dram"], "contribute_to_cluster_pool_size.dram") == 0:
         raise ValueError("owner mode requires non-zero contribute_to_cluster_pool_size.dram")
+
+    if owner_placement_class == "inference" and hot_capacity_ratio is None:
+        raise ValueError(
+            "owner_placement_class=inference requires replica_writeback_hot_capacity_ratio"
+        )
+    if owner_placement_class == "remote_cpu" and hot_capacity_ratio is not None:
+        raise ValueError(
+            "owner_placement_class=remote_cpu requires replica_writeback_hot_capacity_ratio to be omitted"
+        )
+
+    if expected_capacity is not None:
+        payload_capacity_bytes = int(expected_capacity["payload_capacity_bytes"])
+        owner_dram_bytes = int(contrib["dram"])
+        if payload_capacity_bytes > owner_dram_bytes:
+            raise ValueError(
+                "test_spec_config.owner_local_reserve_expected_capacity.payload_capacity_bytes "
+                f"{payload_capacity_bytes} exceeds owner segment {owner_dram_bytes}"
+            )
 
     if "etcd_addresses" not in spec:
         raise ValueError("fluxonkv_spec.etcd_addresses is required for owner mode")
@@ -578,6 +803,33 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
                 f"fluxonkv_spec.large_file_paths[{idx}] must be a non-empty string in owner mode"
             )
 
+    write_rate = spec.get("ssd_write_rate_limit_bytes_per_sec")
+    write_burst = spec.get("ssd_write_burst_bytes")
+    capacity_writeback = spec.get("ssd_capacity_writeback_enabled")
+    if (write_rate is None) != (write_burst is None):
+        raise ValueError(
+            "fluxonkv_spec.ssd_write_rate_limit_bytes_per_sec and "
+            "ssd_write_burst_bytes must be configured together"
+        )
+    if write_rate is not None:
+        if (
+            isinstance(write_rate, bool)
+            or not isinstance(write_rate, int)
+            or write_rate <= 0
+            or isinstance(write_burst, bool)
+            or not isinstance(write_burst, int)
+            or write_burst <= 0
+        ):
+            raise ValueError("SSD write rate and burst must both be positive integers")
+        if "large_limit_size" not in spec:
+            raise ValueError("SSD write admission requires fluxonkv_spec.large_limit_size")
+    if capacity_writeback is not None:
+        if not isinstance(capacity_writeback, bool):
+            raise ValueError("ssd_capacity_writeback_enabled must be a bool")
+        if "large_limit_size" not in spec:
+            raise ValueError(
+                "SSD capacity write-back policy requires fluxonkv_spec.large_limit_size"
+            )
     if "large_limit_size" in spec and spec["large_limit_size"] is not None:
         large_limit_size = spec["large_limit_size"]
         if not isinstance(large_limit_size, list):
@@ -608,6 +860,10 @@ class FluxonKvClientConfig():
 
         _verify_config_by_template(plain)
 
+        if "protocol" in plain:
+            plain["protocol"] = _normalize_protocol_config(
+                plain.get("protocol"), "protocol"
+            )
         if "network" in plain:
             plain["network"] = _normalize_network_config(plain.get("network"), "network")
         plain["test_spec_config"] = _normalize_test_spec_config(
@@ -624,6 +880,12 @@ class FluxonKvClientConfig():
             raise ValueError(
                 "exactly one of [mooncake_spec, fluxonkv_spec] is required (and the chosen spec must not be null)"
             )
+        if "replica_writeback_hot_capacity_ratio" in plain and not has_fluxon:
+            raise ValueError(
+                "replica_writeback_hot_capacity_ratio requires fluxonkv_spec"
+            )
+        if "owner_placement_class" in plain and not has_fluxon:
+            raise ValueError("owner_placement_class requires fluxonkv_spec")
 
         pprof_duration_seconds = plain.get("pprof_duration_seconds")
         if pprof_duration_seconds is None:
@@ -649,6 +911,13 @@ class FluxonKvClientConfig():
         if v is None:
             return None
         return int(v)
+
+    @property
+    def owner_placement_class(self) -> Optional[str]:
+        value = self.config_dict.get("owner_placement_class")
+        if value is None:
+            return None
+        return str(value)
     
     @property
     def contribute_to_cluster_pool_size(self):
@@ -964,8 +1233,8 @@ def _parse_type_annotation(comment: str) -> Optional[Tuple[str, Dict[str, Any]]]
                         return parsed_type_name, merged_params
                     return type_name, {"constraint": constraint}
         
-        # 6) Primitive types: str, int, bool, size_bytes, None
-        if type_str in ["str", "int", "bool", "size_bytes", "None"]:
+        # 6) Primitive types: str, int, float, bool, list, size_bytes, None
+        if type_str in ["str", "int", "float", "bool", "list", "size_bytes", "None"]:
             return type_str, {}
         
         debug_print("type_str ", type_str, "not matched to any type")
@@ -1086,6 +1355,15 @@ def _validate_value_by_type(value: Any, type_info: Tuple[str, Dict[str, Any]], p
                         else:
                             return None
 
+    elif type_name == "float":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if raise_err:
+                raise_validation_error(
+                    f"Expected float-compatible number, got {type(value).__name__}"
+                )
+            else:
+                return None
+
     elif type_name == "size_bytes":
         try:
             bytes_value = _parse_size_bytes(value, path)
@@ -1094,11 +1372,17 @@ def _validate_value_by_type(value: Any, type_info: Tuple[str, Dict[str, Any]], p
                 raise_validation_error(str(exc))
             return None
         return bytes_value
-    
     elif type_name == "bool":
         if not isinstance(value, bool):
             if raise_err:
                 raise_validation_error(f"Expected bool, got {type(value).__name__}")
+            else:
+                return None
+
+    elif type_name == "list":
+        if not isinstance(value, list):
+            if raise_err:
+                raise_validation_error(f"Expected list, got {type(value).__name__}")
             else:
                 return None
     

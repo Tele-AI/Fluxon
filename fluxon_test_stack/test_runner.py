@@ -4275,6 +4275,7 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
             "prefer_local_placement",
             "short_circuit_put_payload_path",
             "skip_put_end_commit",
+            "post_read_remote_policy",
             "p2p_transport_impl",
             "protocol_type",
             "transport_mode",
@@ -4310,6 +4311,17 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
     ):
         if key in cfg:
             out[key] = _require_bool(cfg.get(key), f"{ctx}.{key}")
+    if "post_read_remote_policy" in cfg:
+        post_read_remote_policy = _require_str(
+            cfg.get("post_read_remote_policy"), f"{ctx}.post_read_remote_policy"
+        )
+        allowed_post_read_remote_policies = {"retain", "drop"}
+        if post_read_remote_policy not in allowed_post_read_remote_policies:
+            raise ValueError(
+                f"{ctx}.post_read_remote_policy must be one of "
+                f"{sorted(allowed_post_read_remote_policies)}, got {post_read_remote_policy!r}"
+            )
+        out["post_read_remote_policy"] = post_read_remote_policy
     if "p2p_transport_impl" in cfg:
         p2p_transport_impl = _require_str(cfg.get("p2p_transport_impl"), f"{ctx}.p2p_transport_impl")
         allowed_p2p_transport_impls = {"tcp", "tcp_thread"}

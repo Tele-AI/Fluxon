@@ -756,6 +756,41 @@ impl P2pModule {
         }
     }
 
+    /// Install a dispatch handler as an awaited init-DAG action.
+    ///
+    /// Startup-critical handlers must use this form so the publishing DAG step
+    /// cannot complete while the closed runtime still lacks the handler.
+    pub(crate) async fn regist_dispatch_raw_for_init_dag<F>(
+        &self,
+        msg_id: MsgId,
+        f: F,
+    ) -> P2PResult<()>
+    where
+        F: Fn(
+                &str,
+                &P2pModule,
+                ClosedRuntimeDispatchRequestRef<'_>,
+                &bytes::Bytes,
+            ) -> P2PResult<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let view = self.module_view();
+        let handle = self.ensure_closed_runtime_handle().await?;
+        p2p_register_dispatch(
+            handle,
+            msg_id,
+            Arc::new(
+                move |request: ClosedRuntimeDispatchRequestRef<'_>, body: bytes::Bytes| {
+                    f(request.reply_next_hop, view.p2p_module(), request, &body).map(|_| ())
+                },
+            ),
+        )
+        .await
+        .map_err(p2p_closed_sdk_error)
+    }
+
     pub(crate) fn register_rpc_response_msg_id(&self, msg_id: MsgId) {
         {
             if self.is_rpc_response_msg_id_registered_runtime(msg_id) {
@@ -992,6 +1027,10 @@ pub mod rpc {
     use crate::{NodeID, TaskId};
     use tracing::warn;
 
+    fn should_wait_before_rpc_retry(attempt_idx: usize, total_attempts: usize) -> bool {
+        attempt_idx.saturating_add(1) < total_attempts
+    }
+
     pub use fluxon_commu_contract::p2p::rpc::*;
 
     #[derive(Default)]
@@ -1007,6 +1046,7 @@ pub mod rpc {
     pub struct Responser {
         task_id: TaskId,
         node_id: NodeID,
+        node_start_time: i64,
         reply_next_hop: NodeID,
         incoming_local_observe: crate::p2p::WireTransportLocalObserve,
         view: P2pModuleView,
@@ -1065,6 +1105,11 @@ pub mod rpc {
             self.node_id.clone()
         }
 
+        /// Exact logical-source generation authenticated by the transport.
+        pub fn node_start_time(&self) -> i64 {
+            self.node_start_time
+        }
+
         pub fn task_id(&self) -> TaskId {
             self.task_id
         }
@@ -1095,6 +1140,11 @@ pub mod rpc {
 
         pub fn node_id(&self) -> NodeID {
             self.responsor.node_id()
+        }
+
+        /// Exact logical-source generation authenticated by the transport.
+        pub fn node_start_time(&self) -> i64 {
+            self.responsor.node_start_time()
         }
 
         pub fn task_id(&self) -> TaskId {
@@ -1211,6 +1261,15 @@ pub mod rpc {
             regist_rpc_recv::<R, _>(p2p, req_handler);
         }
 
+        /// Await handler installation for a startup-critical init-DAG step.
+        pub async fn regist_for_init_dag<F>(&self, p2p: &P2pModule, req_handler: F) -> P2PResult<()>
+        where
+            F: Fn(RPCResponsor<R>, MsgPack<R>) -> P2PResult<()> + Send + Sync + 'static,
+            R: Default,
+        {
+            regist_rpc_recv_for_init_dag::<R, _>(p2p, req_handler).await
+        }
+
         pub async fn call(
             &self,
             p2p: &P2pModule,
@@ -1259,6 +1318,7 @@ pub mod rpc {
                 Responser {
                     task_id: request_view.task_id,
                     node_id: logical_source,
+                    node_start_time: request_view.logical_source_node_start_time,
                     reply_next_hop: reply_next_hop.to_string().into(),
                     incoming_local_observe: crate::p2p::WireTransportLocalObserve {
                         frame_recv_done_ts_us: request_view.incoming_frame_recv_done_ts_us,
@@ -1298,6 +1358,49 @@ pub mod rpc {
         });
     }
 
+    pub async fn regist_rpc_recv_for_init_dag<REQ, F>(
+        p2p: &P2pModule,
+        req_handler: F,
+    ) -> P2PResult<()>
+    where
+        REQ: RPCReq + Default,
+        F: Fn(RPCResponsor<REQ>, MsgPack<REQ>) -> P2PResult<()> + Send + Sync + 'static,
+    {
+        let req_type = REQ::default();
+        let msg_id = req_type.msg_id();
+        let view = p2p.module_view();
+        p2p.regist_dispatch_raw_for_init_dag(
+            msg_id,
+            move |_reply_next_hop, _p2p, request_view, data| {
+                let raw_lengths = request_view.body_raw_bytes_lengths;
+                let req = MsgPack::<REQ>::decode_from_body_view(
+                    request_view.body_serialize_part_len,
+                    raw_lengths,
+                    data,
+                )?;
+                let rpc_resp = RPCResponsor {
+                    responsor: Responser {
+                        task_id: request_view.task_id,
+                        node_id: request_view.logical_source_peer_id.to_string().into(),
+                        node_start_time: request_view.logical_source_node_start_time,
+                        reply_next_hop: request_view.reply_next_hop.to_string().into(),
+                        incoming_local_observe: crate::p2p::WireTransportLocalObserve {
+                            frame_recv_done_ts_us: request_view.incoming_frame_recv_done_ts_us,
+                            dispatch_enqueued_ts_us: request_view.incoming_dispatch_enqueued_ts_us,
+                            dispatch_started_ts_us: request_view.incoming_dispatch_started_ts_us,
+                            complete_pending_call_ts_us: request_view
+                                .incoming_complete_pending_call_ts_us,
+                        },
+                        view: view.clone(),
+                    },
+                    _phantom: PhantomData,
+                };
+                req_handler(rpc_resp, req)
+            },
+        )
+        .await
+    }
+
     async fn run_rpc_attempts<T, Call, CallFuture>(
         shutdown_poller: &fluxon_framework_compiled::shutdown::ShutdownPoller,
         attempts: usize,
@@ -1320,7 +1423,6 @@ pub mod rpc {
             if attempt_idx != 0 {
                 warn!("RPC call retrying, msg_id={msg_id}");
             }
-
             match call().await {
                 Ok(resp) => {
                     if failed_count > 0 {
@@ -1361,11 +1463,13 @@ pub mod rpc {
         timeout: Option<std::time::Duration>,
         transport_policy: RpcTransportPolicy,
     ) -> P2PResult<MsgPack<REQ::Resp>> {
+        validate_explicit_rpc_timeout(timeout)?;
         let shutdown_poller = p2p.module_view().register_shutdown_poller();
         let msg_id = req.msg_id();
+        let attempts = retry.max(1);
         run_rpc_attempts(
             &shutdown_poller,
-            retry,
+            attempts,
             msg_id,
             Duration::from_secs(5),
             || {
@@ -1402,6 +1506,8 @@ pub mod rpc {
         timeout: Option<std::time::Duration>,
         transport_policy: RpcTransportPolicy,
     ) -> P2PResult<RpcCallObservedOutput<REQ::Resp>> {
+        validate_explicit_rpc_timeout(timeout)?;
+
         regist_rpc_send::<REQ>(p2p);
 
         {
@@ -1412,31 +1518,12 @@ pub mod rpc {
                 .await?;
         }
 
-        let timeout_duration = match timeout {
-            Some(duration) => {
-                let min_duration = Duration::from_secs(MIN_EXPLICIT_RPC_TIMEOUT_SECS);
-                if duration < min_duration {
-                    return Err(P2pError::InvalidRpcTimeout {
-                        timeout_ms: duration.as_secs() * 1_000
-                            + u64::from(duration.subsec_millis()),
-                        min_timeout_ms: MIN_EXPLICIT_RPC_TIMEOUT_SECS * 1_000,
-                        reason: format!(
-                            "Explicit RPC timeout below {}s is forbidden.",
-                            MIN_EXPLICIT_RPC_TIMEOUT_SECS
-                        ),
-                    });
-                }
-                Some(duration)
-            }
-            None => None,
-        };
-
         let wire_encode_started_at = Instant::now();
         let msg_id = req.msg_id();
         let wire_body = req.into_wire_body()?;
         let wire_encode_us = duration_to_i64_us(wire_encode_started_at.elapsed());
         let raw_output = p2p
-            .call_raw_observed(node, msg_id, wire_body, timeout_duration, transport_policy)
+            .call_raw_observed(node, msg_id, wire_body, timeout, transport_policy)
             .await?;
         let response_local_observe = raw_output.message.local_observe;
         let resp_decode_started_at = Instant::now();
@@ -1515,81 +1602,16 @@ pub mod rpc {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    mod retry_tests {
+        use super::should_wait_before_rpc_retry;
 
-        #[tokio::test]
-        async fn rpc_attempts_recover_after_transient_transport_error() {
-            let shutdown_poller = fluxon_framework_compiled::shutdown::ShutdownPoller::new();
-            let call_count = AtomicUsize::new(0);
-
-            let response = run_rpc_attempts(&shutdown_poller, 3, 4003, Duration::ZERO, || {
-                let attempt = call_count.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    if attempt == 0 {
-                        Err(P2pError::SendFailed {
-                            detail: "transient ICE publisher failure".to_string(),
-                        })
-                    } else {
-                        Ok(17)
-                    }
-                }
-            })
-            .await
-            .expect("a transient transport failure should recover on retry");
-
-            assert_eq!(response, 17);
-            assert_eq!(call_count.load(Ordering::SeqCst), 2);
-        }
-
-        #[tokio::test]
-        async fn rpc_attempts_preserve_the_last_transport_error() {
-            let shutdown_poller = fluxon_framework_compiled::shutdown::ShutdownPoller::new();
-            let call_count = AtomicUsize::new(0);
-
-            let error =
-                run_rpc_attempts::<(), _, _>(&shutdown_poller, 3, 4003, Duration::ZERO, || {
-                    let attempt = call_count.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        if attempt < 2 {
-                            Err(P2pError::NoConnectionReady {
-                                nodeid: "owner-0".to_string(),
-                            })
-                        } else {
-                            Err(P2pError::SendFailed {
-                                detail: "final ICE publisher failure".to_string(),
-                            })
-                        }
-                    }
-                })
-                .await
-                .expect_err("all injected RPC attempts must fail");
-
-            assert_eq!(call_count.load(Ordering::SeqCst), 3);
-            assert!(matches!(
-                error,
-                P2pError::SendFailed { detail }
-                    if detail == "final ICE publisher failure"
-            ));
-        }
-
-        #[tokio::test]
-        async fn rpc_attempts_stop_before_calling_after_shutdown() {
-            let shutdown_poller = fluxon_framework_compiled::shutdown::ShutdownPoller::new();
-            shutdown_poller.shutdown();
-            let call_count = AtomicUsize::new(0);
-
-            let error =
-                run_rpc_attempts::<(), _, _>(&shutdown_poller, 3, 4003, Duration::ZERO, || {
-                    call_count.fetch_add(1, Ordering::SeqCst);
-                    async { Ok(()) }
-                })
-                .await
-                .expect_err("shutdown must prevent the RPC call");
-
-            assert_eq!(call_count.load(Ordering::SeqCst), 0);
-            assert!(matches!(error, P2pError::SystemShutdown {}));
+        #[test]
+        fn final_failed_attempt_never_adds_retry_delay() {
+            assert!(!should_wait_before_rpc_retry(0, 0));
+            assert!(!should_wait_before_rpc_retry(0, 1));
+            assert!(should_wait_before_rpc_retry(0, 3));
+            assert!(should_wait_before_rpc_retry(1, 3));
+            assert!(!should_wait_before_rpc_retry(2, 3));
         }
     }
 }

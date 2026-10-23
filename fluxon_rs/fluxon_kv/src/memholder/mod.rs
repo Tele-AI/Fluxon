@@ -18,14 +18,26 @@ pub mod kvclient_encode;
 pub mod memholder_test;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::client_kv_api::ClientKvApiView;
 use crate::{cluster_manager::NodeID, external_client_api::ExternalClientApiView};
 
 use bitcode::{Decode, Encode};
+use fluxon_util::pin_aware_moka::PinGuard;
+
+#[derive(Clone, Debug)]
+pub enum MemoryInfoDropAction {
+    None,
+    OwnerDeleteAck,
+    ReleaseLocalReserveResidentSlot {
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
+    },
+}
 
 /// Memory metadata for owner/client user holders
+#[derive(Clone)]
 pub struct MemoryInfo {
     pub offset: u64,
     /// Computed absolute address (base + offset) at creation
@@ -35,7 +47,7 @@ pub struct MemoryInfo {
     pub key: String,
     pub master_node_id: NodeID,
     pub view: ClientKvApiView,
-    delete_ack_claimed: AtomicBool,
+    pub drop_action: MemoryInfoDropAction,
 }
 
 impl std::fmt::Debug for MemoryInfo {
@@ -47,6 +59,7 @@ impl std::fmt::Debug for MemoryInfo {
             .field("holder_id", &self.holder_id)
             .field("key", &self.key)
             .field("master_node_id", &self.master_node_id)
+            .field("drop_action", &self.drop_action)
             .finish()
     }
 }
@@ -79,6 +92,7 @@ pub struct UserMemHolder {
     pub memory_info: Arc<MemoryInfo>,
     pub refcount: Arc<AllMemholderRefCount>,
     expose_kind: UserMemHolderExposeKind,
+    _owner_hot_pin: Option<PinGuard>,
 }
 impl UserMemHolder {
     pub fn holder_id(&self) -> u64 {
@@ -105,6 +119,14 @@ impl UserMemHolder {
         refcount: Arc<AllMemholderRefCount>,
         expose_kind: UserMemHolderExposeKind,
     ) -> Self {
+        let owner_hot_pin = match expose_kind {
+            UserMemHolderExposeKind::SegPtr => refcount
+                .view
+                .client_kv_api()
+                .inner()
+                .owner_hot_pin_memory_info(&memory_info),
+            UserMemHolderExposeKind::OwnedCopy => None,
+        };
         tracing::debug!(
             "Creating UserMemHolder for key '{}', _holder_id_ {}, expose_kind={:?}.",
             memory_info.key,
@@ -115,6 +137,7 @@ impl UserMemHolder {
             memory_info,
             refcount,
             expose_kind,
+            _owner_hot_pin: owner_hot_pin,
         }
     }
     pub fn memory_info(&self) -> Arc<MemoryInfo> {
@@ -160,14 +183,72 @@ impl MemoryInfo {
             key,
             master_node_id,
             view,
-            delete_ack_claimed: AtomicBool::new(false),
+            drop_action: MemoryInfoDropAction::OwnerDeleteAck,
         }
     }
 
-    pub(crate) fn try_claim_delete_ack(&self) -> bool {
-        self.delete_ack_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    pub async fn new_local_reserve_resident(
+        addr: u64,
+        len: u32,
+        key: String,
+        master_node_id: NodeID,
+        view: ClientKvApiView,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
+    ) -> Self {
+        let base_addr = {
+            let base_guard = view
+                .client_seg_pool()
+                .cpu_mem_read_guard()
+                .await
+                .expect("segment cpu mem must be available when creating resident MemoryInfo");
+            base_guard.allocated_addr
+        };
+        Self::new_local_reserve_resident_with_base(
+            addr,
+            base_addr,
+            len,
+            key,
+            master_node_id,
+            view,
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        )
+    }
+
+    pub fn new_local_reserve_resident_with_base(
+        addr: u64,
+        base_addr: u64,
+        len: u32,
+        key: String,
+        master_node_id: NodeID,
+        view: ClientKvApiView,
+        allocation_id: u64,
+        segment_offset: u64,
+        capacity_bytes: u64,
+    ) -> Self {
+        assert!(
+            addr >= base_addr,
+            "resident local reserve addr must be within client segment: addr={:#x} base_addr={:#x}",
+            addr,
+            base_addr
+        );
+        Self {
+            offset: addr - base_addr,
+            addr,
+            len,
+            holder_id: 0,
+            key,
+            master_node_id,
+            view,
+            drop_action: MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
+                allocation_id,
+                segment_offset,
+                capacity_bytes,
+            },
+        }
     }
 
     pub fn bytes(&self) -> &[u8] {
@@ -178,19 +259,87 @@ impl MemoryInfo {
         );
         unsafe { std::slice::from_raw_parts(self.addr as *const u8, self.len as usize) }
     }
+
+    pub fn local_reserve_resident_slot_ref(&self) -> Option<(u64, u64, u64)> {
+        match self.drop_action {
+            MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
+                allocation_id,
+                segment_offset,
+                capacity_bytes,
+            } => Some((allocation_id, segment_offset, capacity_bytes)),
+            MemoryInfoDropAction::None | MemoryInfoDropAction::OwnerDeleteAck => None,
+        }
+    }
+
+    pub(crate) fn take_local_reserve_resident_slot_ref(&mut self) -> Option<(u64, u64, u64)> {
+        let action = std::mem::replace(&mut self.drop_action, MemoryInfoDropAction::None);
+        match action {
+            MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
+                allocation_id,
+                segment_offset,
+                capacity_bytes,
+            } => Some((allocation_id, segment_offset, capacity_bytes)),
+            other => {
+                self.drop_action = other;
+                None
+            }
+        }
+    }
 }
+
 /// Represents a memory holder that keeps a reference to transferred data
 impl Drop for MemoryInfo {
     fn drop(&mut self) {
-        if !self.try_claim_delete_ack() {
-            return;
+        match &self.drop_action {
+            MemoryInfoDropAction::None => {}
+            MemoryInfoDropAction::OwnerDeleteAck => {
+                let ctx = OwnerDeleteAckCtx {
+                    view: self.view.clone(),
+                    key: self.key.clone(),
+                    holder_id: self.holder_id,
+                };
+                ctx.run_drop_ack();
+            }
+            MemoryInfoDropAction::ReleaseLocalReserveResidentSlot {
+                allocation_id,
+                segment_offset,
+                capacity_bytes,
+            } => {
+                let Some(_view_guard) = self.view.try_upgrade() else {
+                    tracing::debug!(
+                        key = self.key,
+                        "skipping resident local reserve slot release after view drop"
+                    );
+                    return;
+                };
+                if !self.view.register_shutdown_poller().is_running() {
+                    tracing::debug!(
+                        key = self.key,
+                        "skipping resident local reserve slot release during shutdown"
+                    );
+                    return;
+                }
+                if let Err(err) = self
+                    .view
+                    .client_kv_api()
+                    .inner()
+                    .owner_release_local_reserve_resident_slot_holder(
+                        *allocation_id,
+                        *segment_offset,
+                        *capacity_bytes,
+                    )
+                {
+                    tracing::warn!(
+                        "failed to release resident owner slot holder on MemoryInfo drop: key={} allocation_id={} segment_offset={} capacity_bytes={} err={}",
+                        self.key,
+                        allocation_id,
+                        segment_offset,
+                        capacity_bytes,
+                        err
+                    );
+                }
+            }
         }
-        let ctx = OwnerDeleteAckCtx {
-            view: self.view.clone(),
-            key: self.key.clone(),
-            holder_id: self.holder_id,
-        };
-        ctx.run_drop_ack();
     }
 }
 
@@ -213,7 +362,6 @@ pub struct ExternalMemHolderInfo {
     pub offset: u64,
     pub len: u32,
     pub holder_id: u64,
-    pub source_kind: crate::master_kv_router::msg_pack::GetSourceKind,
 }
 impl ExternalMemHolder {
     /// Get the memory offset
@@ -266,7 +414,6 @@ impl Drop for ExternalMemHolder {
 
         let ctx = ExternalDeleteAckCtx {
             view: self.view.clone(),
-            key: self.key.clone(),
             external_client_id: self.external_client_id.clone(),
             holder_id: self.holder_id,
             started_time: self.owner_start_time,

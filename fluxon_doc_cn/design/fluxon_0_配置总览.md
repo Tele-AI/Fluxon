@@ -94,7 +94,7 @@ manylinux_version: "2_28"
 ```yaml
 namespace: fluxon-example
 name_prefix: fluxon-example
-image: fluxon_quick_start:0.2.1
+image: fluxon_quick_start:0.2.2
 
 cluster_nodes:
   - hostname: example-node-a
@@ -350,6 +350,7 @@ fluxon_fs:
     prometheus_base_url: http://127.0.0.1:4000/v1/prometheus
     auto_refresh_interval_secs: 10
     access_db_path: /var/lib/fluxon/fs_master_access.db
+    require_bootstrap_credentials_change: true
     bootstrap_access_model:
       users:
         - username: admin
@@ -389,6 +390,7 @@ fluxon_fs:
 
 - `fluxon_fs.master` 很小，当前稳定字段只有 `instance_key` 和可选的 `pull_interval_ms`；旧的 `fluxon_fs.rpc` 和 `rpc_timeout_ms` 已移除。
 - `fluxon_fs.master_panel` 负责 UI/S3 授权和 transfer 状态；`listen_addr`、`public_base_url`、`prometheus_base_url`、`access_db_path`、`bootstrap_access_model`、`s3_gateway` 都是启动基线。
+- `require_bootstrap_credentials_change: true` 会要求空数据库首次写入的 bootstrap 账号先在 Web UI 中同时修改用户名和密码；完成前 S3 访问会被拒绝。
 - `fluxon_fs.cache` 负责目录级 cache / export 规则；`rules[*].dir_abs` 和 `exports[*].remote_root_dir_abs` 都必须是绝对路径。
 
 还要记住两个分支规则：

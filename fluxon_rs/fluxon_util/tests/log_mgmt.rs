@@ -63,8 +63,11 @@ fn kv_log_shards_roll_and_cleanup_with_test_window() {
         TEST_LOG_SHARD_ANCHOR_UNIX_SECONDS_ENV,
         (now - 2).to_string(),
     );
+    let _rust_log_guard = EnvVarGuard::set("RUST_LOG", "info");
+    let _fluxon_log_guard = EnvVarGuard::set("FLUXON_LOG", "info");
 
     fluxon_util::init_log(log_path, instance_key);
+    tracing::debug!(target: "fluxon_util", "[kv-log-mgmt][debug-must-be-filtered]");
     tracing::info!(target: "fluxon_util", "[kv-log-mgmt][phase=before] ts={}", now);
     std::thread::sleep(Duration::from_millis(300));
     std::thread::sleep(Duration::from_secs(11));
@@ -106,6 +109,11 @@ fn kv_log_shards_roll_and_cleanup_with_test_window() {
     assert!(
         !shard_2_text.contains("[kv-log-mgmt][phase=before]"),
         "second shard should not contain the before marker"
+    );
+    assert!(
+        !shard_1_text.contains("[kv-log-mgmt][debug-must-be-filtered]")
+            && !shard_2_text.contains("[kv-log-mgmt][debug-must-be-filtered]"),
+        "file output must honor the canonical info filter"
     );
     assert_eq!(DEFAULT_DAILY_LOG_RETENTION_DAYS, 31);
 }

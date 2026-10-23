@@ -8,6 +8,13 @@
 
 ## Release Notes
 
+### 0.2.2
+
+- [FS] 增加单机目录 S3 服务，支持本地文件与 S3 对象双向映射
+- [FS] 首次登录必须修改凭据，完成前禁止 S3 访问
+- [PYPI] Python 分发包更名为 `fluxon-py`，并通过 GitHub OIDC trusted publishing 发布
+- [RELEASE] Python、Rust、Quick Start、wheel 与 release 元数据统一升级到 `0.2.2`
+
 ### 0.2.1
 
 - [PERF] 优化 `RPC`、`KV`、`FS` 性能

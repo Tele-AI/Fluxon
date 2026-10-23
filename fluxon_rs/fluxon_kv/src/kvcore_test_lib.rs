@@ -10,7 +10,7 @@ use crate::client_kv_api::ClientKvApiView;
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::config::{
     ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig, MonitoringConfig,
-    ProtocolConfig, ProtocolType, TestSpecConfig, TransferEngineType,
+    ProtocolConfig, ProtocolType, ReplicaTaskPlacementConfig, TestSpecConfig, TransferEngineType,
 };
 use crate::{ConfigArg, Framework, run_client, run_master};
 
@@ -94,6 +94,9 @@ fn new_master_config_with_cluster(
         log_dir,
         pprof_duration_seconds: None,
         master_ui: None,
+        replica_task_placement: ReplicaTaskPlacementConfig::default(),
+        replica_cache_capacity_ratio: crate::config::DEFAULT_REPLICA_CACHE_CAPACITY_RATIO,
+        replica_writeback_tier1_capacity_ratio: None,
         test_spec_config: TestSpecConfig::default(),
     };
     println!("fluxonkv core created master config for test: {:?}", conf);
@@ -137,6 +140,8 @@ fn new_client_config_with_cluster_and_dram(
             tcp_thread_reactor: Default::default(),
         },
         pprof_duration_seconds: None,
+        replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: vec![etcd],
@@ -222,6 +227,54 @@ pub async fn start_master_and_client_with_client_dram(
     // Give a short grace for modules to finish init and connect
     sleep(Duration::from_secs(3)).await;
     (master_fw, client_fw)
+}
+
+/// Start a test owner after applying one focused configuration mutation. This
+/// keeps integration tests on the same canonical startup path while allowing
+/// storage-tier tests to enable their local SSD root explicitly.
+pub async fn start_master_and_client_with_client_config(
+    master_key: &str,
+    client_key: &str,
+    configure: impl FnOnce(&mut ClientConfig),
+) -> (Arc<Framework>, Arc<Framework>) {
+    let cluster_name = test_cluster_name(master_key);
+    clean_etcd_members(&cluster_name).await;
+
+    let (master_fw, _) = run_master(ConfigArg::Config(new_master_config_with_cluster(
+        master_key,
+        None,
+        &cluster_name,
+    )))
+    .await
+    .expect("start master");
+    let mut client_config =
+        new_client_config_with_cluster_and_dram(client_key, &cluster_name, 1024 * 1024 * 160);
+    configure(&mut client_config);
+    let (client_fw, _) = run_client(ConfigArg::Config(client_config))
+        .await
+        .expect("start client");
+
+    sleep(Duration::from_secs(3)).await;
+    (master_fw, client_fw)
+}
+
+/// Join one additional owner to an already-running test cluster without
+/// cleaning membership or restarting the master.  The caller remains
+/// responsible for shutting this framework down before the original pair.
+pub async fn start_additional_client_with_config(
+    master_key: &str,
+    client_key: &str,
+    configure: impl FnOnce(&mut ClientConfig),
+) -> Arc<Framework> {
+    let cluster_name = test_cluster_name(master_key);
+    let mut client_config =
+        new_client_config_with_cluster_and_dram(client_key, &cluster_name, 1024 * 1024 * 160);
+    configure(&mut client_config);
+    let (client_fw, _) = run_client(ConfigArg::Config(client_config))
+        .await
+        .expect("start additional test client");
+    sleep(Duration::from_secs(3)).await;
+    client_fw
 }
 
 pub async fn stop_master_and_client(master_fw: Arc<Framework>, client_fw: Arc<Framework>) {

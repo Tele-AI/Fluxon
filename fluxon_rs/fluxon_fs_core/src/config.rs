@@ -2269,6 +2269,7 @@ pub struct FluxonFsMasterPanelConfig {
     pub auto_refresh_interval_secs: u64,
     pub access_db_path: String,
     pub bootstrap_access_model: FluxonFsAccessModel,
+    pub require_bootstrap_credentials_change: bool,
     pub transfer_state_store: Option<FluxonFsTransferStateStoreConfig>,
     pub s3_gateway: FluxonFsS3GatewayConfig,
 }
@@ -2569,6 +2570,19 @@ pub fn parse_master_panel_config_from_yaml_text(
             panel_invalid("fluxon_fs.master_panel.access_db_path must be non-empty string")
         })?;
     let bootstrap_access_model = parse_bootstrap_access_model_config(panel_map)?;
+    let require_bootstrap_credentials_change = panel_map
+        .get(&serde_yaml::Value::String(
+            "require_bootstrap_credentials_change".to_string(),
+        ))
+        .map(|v| {
+            v.as_bool().ok_or_else(|| {
+                panel_invalid(
+                    "fluxon_fs.master_panel.require_bootstrap_credentials_change must be bool",
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
     let transfer_state_store = parse_optional_transfer_state_store_config(panel_map)?;
 
     let s3_v = panel_map
@@ -2623,6 +2637,7 @@ pub fn parse_master_panel_config_from_yaml_text(
         auto_refresh_interval_secs: auto_refresh_interval_secs as u64,
         access_db_path,
         bootstrap_access_model,
+        require_bootstrap_credentials_change,
         transfer_state_store,
         s3_gateway: FluxonFsS3GatewayConfig {
             get_object_inflight_pieces: inflight_pieces as u64,
@@ -3140,6 +3155,7 @@ fluxon_fs:
         );
         let cfg = parse_master_panel_config_from_yaml_text(&text).unwrap();
         assert_eq!(cfg.access_db_path, "./fluxon_fs_master_access.db");
+        assert!(!cfg.require_bootstrap_credentials_change);
         assert_eq!(
             cfg.prometheus_base_url,
             "http://127.0.0.1:4000/v1/prometheus"
@@ -3150,6 +3166,38 @@ fluxon_fs:
                 assert_eq!(tikv.key_prefix, "/fluxon_fs_transfer/");
             }
         }
+    }
+
+    #[test]
+    fn test_master_panel_parses_required_bootstrap_credentials_change() {
+        let text = minimal_master_panel_yaml(
+            r#"
+    require_bootstrap_credentials_change: true
+    s3_gateway:
+      get_object_inflight_pieces: 4
+      kv_miss_policy: "remote_read"
+"#,
+        );
+        let cfg = parse_master_panel_config_from_yaml_text(&text).unwrap();
+        assert!(cfg.require_bootstrap_credentials_change);
+    }
+
+    #[test]
+    fn test_master_panel_rejects_non_bool_bootstrap_credentials_change() {
+        let text = minimal_master_panel_yaml(
+            r#"
+    require_bootstrap_credentials_change: "true"
+    s3_gateway:
+      get_object_inflight_pieces: 4
+      kv_miss_policy: "remote_read"
+"#,
+        );
+        let err = parse_master_panel_config_from_yaml_text(&text).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "fluxon_fs.master_panel.require_bootstrap_credentials_change must be bool"
+            )
+        );
     }
 
     #[test]

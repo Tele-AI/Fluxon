@@ -10,8 +10,8 @@ pub use fluxon_commu_closed_sdk_consumer::{
     assert_abi_compatible, boundary_mode, cluster_manager_call, construct_cluster_manager_handle,
     construct_p2p_module_handle, construct_transfer_engine_handle,
     current_cluster_manager_self_rdma_resolved_config, drop_runtime_handle,
-    p2p_attach_transfer_engine, p2p_call_raw_observed, p2p_register_dispatch,
-    p2p_register_rpc_response_msg_id, p2p_register_user_rpc_bytes_handler,
+    initialize_process_logging, p2p_attach_transfer_engine, p2p_call_raw_observed,
+    p2p_register_dispatch, p2p_register_rpc_response_msg_id, p2p_register_user_rpc_bytes_handler,
     p2p_register_user_rpc_bytes_handler_async, p2p_send_response_raw, query_version,
     recv_cluster_event_stream, recv_cluster_rdma_resolved_config_stream,
     register_transfer_engine_open_runtime_callback, required_open_surface_version, runtime_anchor,
@@ -24,6 +24,7 @@ pub use fluxon_commu_closed_sdk_consumer::{
     transfer_engine_update_enabled_rdma_devices, transfer_engine_update_runtime_config,
     watch_cluster_manager_self_rdma_resolved_config,
 };
+pub use fluxon_commu_contract::ClosedRuntimeProcessLoggingConfig;
 use fluxon_commu_contract::{ClosedRuntimeError, FLUXON_COMMU_OPEN_SURFACE_VERSION};
 pub use fluxon_commu_contract::{ClosedRuntimeHandle, RdmaProbeSnapshot, RdmaRuntimeSnapshot};
 

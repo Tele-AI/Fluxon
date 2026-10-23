@@ -285,14 +285,33 @@ fn read_log_tail(path: &Path) -> String {
     lines.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
-/// Return per-run test workdir base under repo log folder.
-/// Format: <repo>/log/test_workdir_YYYY_MM_DD_HH_MM_SS
+/// Optional parent directory for per-run test workdirs.
+pub const TEST_WORKDIR_ROOT_ENV: &str = "FLUXON_TEST_WORKDIR_ROOT";
+
+/// Return the per-process test workdir base.
+///
+/// When `FLUXON_TEST_WORKDIR_ROOT` is set, the timestamped directory is placed
+/// below that absolute root. Otherwise the historical repo-local log directory
+/// remains the compatibility default.
 pub fn test_workdir_base() -> &'static str {
     static TEST_WORKDIR: OnceLock<String> = OnceLock::new();
     TEST_WORKDIR.get_or_init(|| {
-        // Keep consistent with prior behavior of writing under ../../log from each crate
-        let mut base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        base.push("../../log");
+        let mut base = match std::env::var_os(TEST_WORKDIR_ROOT_ENV) {
+            Some(root) => {
+                let root = PathBuf::from(root);
+                assert!(
+                    root.is_absolute(),
+                    "{TEST_WORKDIR_ROOT_ENV} must be an absolute path"
+                );
+                root
+            }
+            None => {
+                // Keep the historical behavior for callers that do not opt in.
+                let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                root.push("../../log");
+                root
+            }
+        };
 
         // Human-friendly timestamp to the second (UTC)
         let ts = chrono::Utc::now().format("%Y_%m_%d_%H_%M_%S");

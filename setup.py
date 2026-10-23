@@ -36,6 +36,7 @@ def get_install_requires():
         'etcd3==0.12.0', 
         'protobuf<=3.20.4', 
         'msgpack',
+        'Flask',
         # Required by Mooncake backend (used for RW locks)
         'readerwriterlock',
         ]

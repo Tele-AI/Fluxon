@@ -198,6 +198,11 @@ MANYLINUX_CXX_RUNTIME_LIBRARY_NAMES = (
     "libstdc++.so.6",
     "libgomp.so.1",
 )
+EXTERNAL_DRIVER_RUNTIME_LIBRARY_NAMES = (
+    # libcuda is supplied by the NVIDIA kernel-driver installation on the target GPU node.
+    # Packaging the build-time stub would make the wheel non-functional at runtime.
+    "libcuda.so.1",
+)
 
 def _dedupe_relative_paths(relative_paths: tuple[str, ...]) -> tuple[str, ...]:
     ordered_relative_paths: list[str] = []
@@ -1919,7 +1924,10 @@ def _initialize_writable_native_runtime_dir(
         export_dir = staged_dir / FLUXON_NATIVE_EXPORT_RELATIVE_DIR
         export_dir.mkdir(parents=True, exist_ok=True)
         for file_name in FLUXON_NATIVE_EXPORT_FILE_NAMES:
-            shutil.copy2(authoritative_export_dir / file_name, export_dir / file_name)
+            staged_export_path = export_dir / file_name
+            shutil.copy2(authoritative_export_dir / file_name, staged_export_path)
+            # The authority can be sealed read-only; the target cache is mutable by contract.
+            staged_export_path.chmod(staged_export_path.stat().st_mode | 0o200)
         system_library_rewrites = {
             "libdl.so": "-ldl",
             "libm.so": "-lm",
@@ -2266,6 +2274,10 @@ def _is_core_system_runtime_lib(lib_name: str) -> bool:
     return any(lib_name.startswith(prefix) for prefix in CORE_SYSTEM_RUNTIME_LIB_PREFIXES)
 
 
+def _is_external_driver_runtime_lib(lib_name: str) -> bool:
+    return lib_name in EXTERNAL_DRIVER_RUNTIME_LIBRARY_NAMES
+
+
 def _read_runtime_dependency_entries(
     path: Path,
     *,
@@ -2307,6 +2319,12 @@ def _read_runtime_dependency_entries(
         if "=>" in line:
             needed_name, raw_target = (part.strip() for part in line.split("=>", 1))
             if raw_target == "not found":
+                if _is_external_driver_runtime_lib(needed_name):
+                    print(
+                        "wheel finalize: leaving target-driver dependency external: "
+                        f"{path} -> {needed_name}"
+                    )
+                    continue
                 raise RuntimeError(f"runtime dependency not found for {path}: {needed_name}")
             dep_path_str = raw_target.split(" ", 1)[0].strip()
         else:
