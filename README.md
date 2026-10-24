@@ -44,6 +44,7 @@ Built on the unified Rust-based transport and caching foundation, Fluxon exposes
 - [Quick Start](#quick-start)
 - [Repository Structure](#repository-structure)
 - [Contributing](#contributing)
+- [Publications](#publications)
 - [Contributors](#contributors)
 - [Acknowledgements](#acknowledgements)
 - [License](#license)
@@ -327,6 +328,16 @@ Contributions are welcome. Before you start, please read the developer docs on G
 - [Developer - 7 - Event Subscription and Full Snapshot Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---7---Event-Subscription-and-Full-Snapshot-Guidelines/)
 - [Developer - 8 - Data Structure and Index Design Guidelines](https://tele-ai.github.io/Fluxon/dev_doc/Developer---8---Data-Structure-and-Index-Design-Guidelines/)
 - [Developer - 9 - Test Extension Configuration](https://tele-ai.github.io/Fluxon/dev_doc/Developer---9---Test-Extension-Configuration/)
+
+<a id="publications"></a>
+
+## 📄 Publications
+
+- **Bridging L2–L3: A Unified KV Offloading System for Serving Large-Scale Language Models**  
+  Yuankai Fan, Yichen Zhong, Jiaqiang Ma, Jianyu Ren, Jiawei Shao, Xuelong Li\*  
+  Submitted to SIGMOD 2027 (under review).
+
+  [![Fluxon system architecture](./pics/arch.png)](./pics/arch.pdf)
 
 <a id="contributors"></a>
 

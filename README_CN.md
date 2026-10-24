@@ -43,6 +43,7 @@
 - [快速开始](#快速开始)
 - [项目结构](#项目结构)
 - [贡献](#贡献)
+- [论文](#publications)
 - [Contributors](#contributors)
 - [致谢](#致谢)
 - [许可证](#许可证)
@@ -324,6 +325,18 @@ ui
 - [开发者 - 7 - 事件订阅与全量快照规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---7---%E4%BA%8B%E4%BB%B6%E8%AE%A2%E9%98%85%E4%B8%8E%E5%85%A8%E9%87%8F%E5%BF%AB%E7%85%A7%E8%A7%84%E7%BA%A6/)
 - [开发者 - 8 - 数据结构与索引设计规约](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---8---%E6%95%B0%E6%8D%AE%E7%BB%93%E6%9E%84%E4%B8%8E%E7%B4%A2%E5%BC%95%E8%AE%BE%E8%AE%A1%E8%A7%84%E7%BA%A6/)
 - [开发者 - 9 - 测试扩展配置](https://tele-ai.github.io/Fluxon/cn/dev_doc/%E5%BC%80%E5%8F%91%E8%80%85---9---%E6%B5%8B%E8%AF%95%E6%89%A9%E5%B1%95%E9%85%8D%E7%BD%AE/)
+
+<a id="publications"></a>
+
+## 📄 论文
+
+- **Bridging L2–L3: A Unified KV Offloading System for Serving Large-Scale Language Models**  
+  Yuankai Fan, Yichen Zhong, Jiaqiang Ma, Jianyu Ren, Jiawei Shao, Xuelong Li\*  
+  已投稿至 SIGMOD 2027（审稿中）。
+
+  论文中的系统框架图（点击查看 PDF）：
+
+  [![Fluxon 系统框架图](./pics/arch.png)](./pics/arch.pdf)
 
 <a id="contributors"></a>
 
