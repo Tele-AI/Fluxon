@@ -333,11 +333,11 @@ Contributions are welcome. Before you start, please read the developer docs on G
 ## 👥 Contributors
 
 <div style="display: flex; align-items: flex-end; gap: 8px;">
-  <a href="https://github.com/ActivePeter"><img src="https://github.com/ActivePeter.png?size=128" width="64" height="64" alt="ActivePeter" style="border-radius: 50%;" /></a>
-  <a href="https://github.com/zTz01"><img src="https://github.com/zTz01.png?size=128" width="64" height="64" alt="zTz01" style="border-radius: 50%;" /></a>
-  <a href="https://github.com/yxrxy"><img src="https://github.com/yxrxy.png?size=128" width="64" height="64" alt="yxrxy" style="border-radius: 50%;" /></a>
+  <a href="https://github.com/ActivePeter"><img src="https://wsrv.nl/?url=github.com/ActivePeter.png%3Fsize%3D128&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="ActivePeter" /></a>
+  <a href="https://github.com/zTz01"><img src="https://wsrv.nl/?url=github.com/zTz01.png%3Fsize%3D128&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="zTz01" /></a>
+  <a href="https://github.com/yxrxy"><img src="https://wsrv.nl/?url=github.com/yxrxy.png%3Fsize%3D128&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="yxrxy" /></a>
   <span style="display: inline-flex; align-items: flex-end; gap: 0;">
-    <a href="https://github.com/kaimary"><img src="https://github.com/kaimary.png?size=128" width="64" height="64" alt="kaimary" style="border-radius: 50%;" /></a>
+    <a href="https://github.com/kaimary"><img src="https://wsrv.nl/?url=github.com/kaimary.png%3Fsize%3D128&amp;mask=circle&amp;w=64&amp;h=64&amp;fit=cover&amp;output=png" width="64" height="64" alt="kaimary" /></a>
     <span style="transform: translate(-4px, -4px);">（*<strong>Project Lead</strong>）</span>
   </span>
 </div>
