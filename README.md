@@ -333,7 +333,9 @@ Contributions are welcome. Before you start, please read the developer docs on G
 ## 👥 Contributors
 
 <div style="display: flex; align-items: flex-end; gap: 8px;">
-  <a href="https://github.com/Tele-AI/Fluxon/graphs/contributors"><img src="https://contrib.rocks/image?repo=Tele-AI/Fluxon" /></a>
+  <a href="https://github.com/ActivePeter"><img src="https://github.com/ActivePeter.png?size=128" width="64" height="64" alt="ActivePeter" style="border-radius: 50%;" /></a>
+  <a href="https://github.com/zTz01"><img src="https://github.com/zTz01.png?size=128" width="64" height="64" alt="zTz01" style="border-radius: 50%;" /></a>
+  <a href="https://github.com/yxrxy"><img src="https://github.com/yxrxy.png?size=128" width="64" height="64" alt="yxrxy" style="border-radius: 50%;" /></a>
   <span style="display: inline-flex; align-items: flex-end; gap: 0;">
     <a href="https://github.com/kaimary"><img src="https://github.com/kaimary.png?size=128" width="64" height="64" alt="kaimary" style="border-radius: 50%;" /></a>
     <span style="transform: translate(-4px, -4px);">（*<strong>Project Lead</strong>）</span>
