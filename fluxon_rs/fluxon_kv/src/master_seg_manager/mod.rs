@@ -392,6 +392,14 @@ pub struct NodeSegmentsManager {
     tomb_tag: NodeTombTag,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SegmentCapacitySnapshot {
+    pub node_id: NodeID,
+    pub device_id: SegmentDeviceID,
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+}
+
 struct StoredOwnerCapacityReport {
     report: OwnerCapacityReport,
     received_at: Instant,
@@ -679,20 +687,74 @@ impl MasterSegManager {
         let mut tombed_nodes = Vec::new();
         for entry in self.inner().node_allocators_and_tomb_tag.iter() {
             if entry.value().tomb_tag.is_tomb() {
-                tombed_nodes.push(entry.key().clone());
+                tombed_nodes.push((entry.key().clone(), entry.value().tomb_tag.clone()));
                 continue;
             }
             for (_devid, allocator) in entry.value().device_id_2_allocator.iter() {
                 ret.push((entry.key().clone(), allocator.clone()));
             }
         }
-        // clean up tombed nodes
-        for node_id in tombed_nodes {
+        self.prune_tombed_nodes(tombed_nodes);
+        ret
+    }
+
+    fn prune_tombed_nodes(&self, tombed_nodes: Vec<(NodeID, NodeTombTag)>) {
+        // Remove observed tombs after iterator guards drop, fencing re-registration.
+        for (node_id, tomb_tag) in tombed_nodes {
             self.inner()
                 .node_allocators_and_tomb_tag
-                .remove_if(&node_id, |_, v| v.tomb_tag.is_tomb());
+                .remove_if(&node_id, |_, node| {
+                    node.tomb_tag.same_generation(&tomb_tag) && node.tomb_tag.is_tomb()
+                });
         }
-        ret
+    }
+
+    /// Snapshot physical capacity for all live segments in O(registered segments).
+    ///
+    /// Owner values come from the latest accepted allocator report, including
+    /// prepared, pending-visible, and retained allocations. Owners without an
+    /// initial report are omitted until their free capacity is known.
+    /// These observation samples are not linearizable admission capacity.
+    pub(crate) fn snapshot_segment_capacity(&self) -> Vec<SegmentCapacitySnapshot> {
+        let mut snapshots = Vec::new();
+        let mut tombed_nodes = Vec::new();
+        for entry in self.inner().node_allocators_and_tomb_tag.iter() {
+            let node = entry.value();
+            if node.tomb_tag.is_tomb() {
+                tombed_nodes.push((entry.key().clone(), node.tomb_tag.clone()));
+                continue;
+            }
+            match node.allocation_authority {
+                SegmentAllocationAuthority::Master => {
+                    for (device_id, allocator) in &node.device_id_2_allocator {
+                        let total_bytes = allocator.total_size_bytes();
+                        snapshots.push(SegmentCapacitySnapshot {
+                            node_id: entry.key().clone(),
+                            device_id: device_id.clone(),
+                            available_bytes: total_bytes.saturating_sub(allocator.used_size_bytes()),
+                            total_bytes,
+                        });
+                    }
+                }
+                SegmentAllocationAuthority::Owner => {
+                    let Some(stored) = node.owner_capacity_report.as_ref() else {
+                        continue;
+                    };
+                    // Registration and report validation enforce one CPU segment
+                    // and the same physical capacity within this node generation.
+                    assert_eq!(node.registered_segments.len(), 1);
+                    let device_id = node.registered_segments.keys().next().unwrap();
+                    snapshots.push(SegmentCapacitySnapshot {
+                        node_id: entry.key().clone(),
+                        device_id: device_id.clone(),
+                        available_bytes: stored.report.raw_free_bytes,
+                        total_bytes: stored.report.physical_capacity_bytes,
+                    });
+                }
+            }
+        }
+        self.prune_tombed_nodes(tombed_nodes);
+        snapshots
     }
 
     fn register_rpc_handlers(&self) {
@@ -1286,6 +1348,147 @@ mod tests {
                 allocatable_bytes: physical_capacity_bytes,
             }],
         }
+    }
+
+    #[test]
+    fn segment_capacity_snapshot_combines_authorities_and_counts_reserved_owner_bytes() {
+        let capacity = 32 * 1024;
+        let (manager, owner_id) = manager_with_owner(
+            "owner-node",
+            17,
+            OwnerPlacementClass::Inference,
+            16 * 1024,
+            capacity,
+        );
+        assert!(manager.snapshot_segment_capacity().is_empty());
+        let master_id: NodeID = "master-allocated-node".to_string().into();
+        manager.inner().node_allocators_and_tomb_tag.insert(
+            master_id.clone(),
+            build_node_segments_manager(
+                19,
+                SegmentAllocationAuthority::Master,
+                OwnerPlacementClass::Invalid,
+                None,
+                one_cpu_segment(capacity),
+            )
+            .unwrap(),
+        );
+        let allocator = manager.get_node_allocators(&master_id).pop().unwrap();
+        let allocation = allocator.allocate(1).unwrap();
+
+        let mut report = valid_capacity_report(
+            17,
+            OwnerPlacementClass::Inference,
+            1,
+            1,
+            capacity,
+            16 * 1024,
+        );
+        // Physical reservations reduce free space before any cache entry is visible.
+        report.allocated_bytes = 8 * 1024;
+        report.raw_free_bytes = capacity - report.allocated_bytes;
+        report.largest_free_bytes = report.raw_free_bytes;
+        report.size_classes[0].allocatable_bytes = report.raw_free_bytes;
+        assert_eq!(report.local_weighted_bytes, 0);
+        assert_eq!(report.global_accounted_bytes, 0);
+        manager.update_owner_capacity_report(&owner_id, report).unwrap();
+
+        let mut snapshots = manager.snapshot_segment_capacity();
+        snapshots.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        assert_eq!(
+            snapshots,
+            vec![
+                SegmentCapacitySnapshot {
+                    node_id: master_id.clone(),
+                    device_id: "cpu:0".to_string(),
+                    available_bytes: capacity - 4 * 1024,
+                    total_bytes: capacity,
+                },
+                SegmentCapacitySnapshot {
+                    node_id: owner_id.clone(),
+                    device_id: "cpu:0".to_string(),
+                    available_bytes: capacity - 8 * 1024,
+                    total_bytes: capacity,
+                },
+            ]
+        );
+        assert!(manager.get_node_allocators(&owner_id).is_empty());
+
+        drop(allocation);
+        manager
+            .update_owner_capacity_report(
+                &owner_id,
+                valid_capacity_report(
+                    17,
+                    OwnerPlacementClass::Inference,
+                    2,
+                    1,
+                    capacity,
+                    16 * 1024,
+                ),
+            )
+            .unwrap();
+        let snapshots = manager.snapshot_segment_capacity();
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots.iter().all(|segment| {
+            segment.available_bytes == capacity && segment.total_bytes == capacity
+        }));
+    }
+
+    #[test]
+    fn segment_capacity_snapshot_excludes_tombs_and_waits_for_each_generations_report() {
+        let (manager, node_id) = manager_with_owner(
+            "owner-node",
+            17,
+            OwnerPlacementClass::RemoteCpu,
+            0,
+            32 * 1024,
+        );
+        let old_report = valid_capacity_report(
+            17,
+            OwnerPlacementClass::RemoteCpu,
+            1,
+            1,
+            32 * 1024,
+            0,
+        );
+        manager
+            .update_owner_capacity_report(&node_id, old_report.clone())
+            .unwrap();
+        assert_eq!(manager.snapshot_segment_capacity().len(), 1);
+        manager.mark_node_tomb_generation(&node_id, Some(17)).unwrap();
+        assert!(manager.snapshot_segment_capacity().is_empty());
+        assert!(!manager.inner().node_allocators_and_tomb_tag.contains_key(&node_id));
+
+        manager.inner().node_allocators_and_tomb_tag.insert(
+            node_id.clone(),
+            build_node_segments_manager(
+                18,
+                SegmentAllocationAuthority::Owner,
+                OwnerPlacementClass::RemoteCpu,
+                Some(0),
+                one_cpu_segment(16 * 1024),
+            )
+            .unwrap(),
+        );
+        assert!(manager.snapshot_segment_capacity().is_empty());
+        assert!(manager.update_owner_capacity_report(&node_id, old_report).is_err());
+        assert!(manager.snapshot_segment_capacity().is_empty());
+        manager
+            .update_owner_capacity_report(
+                &node_id,
+                valid_capacity_report(18, OwnerPlacementClass::RemoteCpu, 1, 1, 16 * 1024, 0),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.snapshot_segment_capacity(),
+            vec![SegmentCapacitySnapshot {
+                node_id,
+                device_id: "cpu:0".to_string(),
+                available_bytes: 16 * 1024,
+                total_bytes: 16 * 1024,
+            }]
+        );
     }
 
     #[test]

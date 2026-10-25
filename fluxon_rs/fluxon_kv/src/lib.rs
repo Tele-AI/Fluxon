@@ -710,10 +710,9 @@ enum Commands {
     },
 }
 
-// 定义框架，包含所有模块
+// Shutdown follows declaration order. Release transfer-engine dependents first,
+// then the transfer engine, P2P transport, and cluster manager.
 define_framework!(
-    cluster_manager: ClusterManager,
-    p2p: P2pModule,
     master_seg_manager: MasterSegManager,
     master_kv_router: MasterKvRouter,
     metric_reporter: MetricReporter,
@@ -721,7 +720,9 @@ define_framework!(
     client_seg_pool: ClientSegPool,
     client_transfer_engine: ClientTransferEngine,
     external_client_api: ExternalClientApi,
-    master_lease_manager: MasterLeaseManager
+    master_lease_manager: MasterLeaseManager,
+    p2p: P2pModule,
+    cluster_manager: ClusterManager
 );
 
 // fluxon-init-dag: yaml=../framework_init_steps.yaml

@@ -42,16 +42,13 @@ async fn handle_get_master_only_metric_part(
         };
     }
 
-    // Read from MasterSegManager directly instead of scraping gauges
-    let segs = view.master_seg_manager().get_all_segments_allocator();
+    // Both allocation authorities expose the same physical-capacity contract.
+    let segments = view.master_seg_manager().snapshot_segment_capacity();
     let mut map: HashMap<String, (u64, u64)> = HashMap::new();
-    for (node_id, allocator) in segs.into_iter() {
-        let total = allocator.total_size_bytes();
-        let used = allocator.used_size_bytes();
-        let available = total.saturating_sub(used);
+    for segment in segments {
         map.insert(
-            format!("{}:{}", node_id, allocator.seg_device_id),
-            (available, total),
+            format!("{}:{}", segment.node_id, segment.device_id),
+            (segment.available_bytes, segment.total_bytes),
         );
     }
     MsgPack {

@@ -7,7 +7,6 @@ use crate::cluster_manager::{
 use crate::config::{GreptimeOtlpLogConfig, MonitoringConfig, TestSpecConfig};
 use crate::master_seg_manager::MasterSegManager;
 use crate::master_seg_manager::MasterSegManagerAccessTrait;
-use crate::master_seg_manager::one_seg_allocator::OneSegAllocator;
 use crate::metrics::MetricsHandle;
 use crate::p2p::msg_pack::{MsgPack, RPCCaller, RPCHandler, RPCReq};
 use crate::p2p::p2p_module::{P2pModule, P2pModuleAccessTrait, P2pModuleView};
@@ -951,13 +950,11 @@ impl MetricReporter {
     /// Collect per-segment capacity/usage from MasterSegManager (master only).
     fn collect_segment_metrics(&self) {
         let view = self.view().clone();
-        let segs: Vec<(crate::cluster_manager::NodeID, Arc<OneSegAllocator>)> =
-            view.master_seg_manager().get_all_segments_allocator();
-        for (owner_node, alloc) in segs {
-            let node = owner_node.as_ref();
-            let device = alloc.seg_device_id.as_str();
-            let capacity = alloc.total_size_bytes();
-            let used = alloc.used_size_bytes();
+        for segment in view.master_seg_manager().snapshot_segment_capacity() {
+            let node = segment.node_id.as_ref();
+            let device = segment.device_id.as_str();
+            let capacity = segment.total_bytes;
+            let used = capacity - segment.available_bytes;
             self.metrics
                 .set_segment_capacity_bytes(node, device, capacity);
             self.metrics.set_segment_used_bytes(node, device, used);

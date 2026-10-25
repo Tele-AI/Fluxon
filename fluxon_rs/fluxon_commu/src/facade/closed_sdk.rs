@@ -1,5 +1,8 @@
 use std::fmt::{Display, Formatter};
-use std::time::Duration;
+use std::future::Future;
+use std::pin::Pin;
+
+use tokio::sync::Mutex;
 
 pub use fluxon_commu_closed_sdk_consumer::rdma_probe::{
     capture_rdma_runtime_snapshot, probe_rdma_snapshot,
@@ -25,8 +28,59 @@ pub use fluxon_commu_closed_sdk_consumer::{
     watch_cluster_manager_self_rdma_resolved_config,
 };
 pub use fluxon_commu_contract::ClosedRuntimeProcessLoggingConfig;
-use fluxon_commu_contract::{ClosedRuntimeError, FLUXON_COMMU_OPEN_SURFACE_VERSION};
+use fluxon_commu_contract::FLUXON_COMMU_OPEN_SURFACE_VERSION;
 pub use fluxon_commu_contract::{ClosedRuntimeHandle, RdmaProbeSnapshot, RdmaRuntimeSnapshot};
+
+type RuntimeHandleReleaseFuture =
+    Pin<Box<dyn Future<Output = Result<(), ClosedSdkConsumerError>> + Send>>;
+
+enum RuntimeHandleReleaseState {
+    Idle,
+    Pending(RuntimeHandleReleaseFuture),
+    Complete,
+}
+
+/// Retain the final-release operation across canceled close waiters.
+/// A successful close is a completion barrier; admission belongs to the module.
+pub(crate) struct RuntimeHandleRelease {
+    state: Mutex<RuntimeHandleReleaseState>,
+}
+
+impl RuntimeHandleRelease {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Mutex::new(RuntimeHandleReleaseState::Idle),
+        }
+    }
+
+    pub(crate) async fn run<F>(
+        &self,
+        release: impl FnOnce() -> F,
+    ) -> Result<(), ClosedSdkConsumerError>
+    where
+        F: Future<Output = Result<(), ClosedSdkConsumerError>> + Send + 'static,
+    {
+        let mut state = self.state.lock().await;
+        match &*state {
+            RuntimeHandleReleaseState::Complete => return Ok(()),
+            RuntimeHandleReleaseState::Idle => {
+                *state = RuntimeHandleReleaseState::Pending(Box::pin(release()));
+            }
+            RuntimeHandleReleaseState::Pending(_) => {}
+        }
+        // The owner keeps the FFI completion receiver if this waiter is canceled.
+        let result = match &mut *state {
+            RuntimeHandleReleaseState::Pending(operation) => operation.as_mut().await,
+            _ => unreachable!("handle release must be pending before polling"),
+        };
+        *state = if result.is_ok() {
+            RuntimeHandleReleaseState::Complete
+        } else {
+            RuntimeHandleReleaseState::Idle
+        };
+        result
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CurrentProviderContractSnapshot {
@@ -165,69 +219,72 @@ fn assert_runtime_anchor_field(
     })
 }
 
-pub(crate) fn is_live_dependent_drop_error(error: &ClosedSdkConsumerError) -> bool {
-    matches!(
-        error,
-        ClosedSdkConsumerError::RuntimeError {
-            error: ClosedRuntimeError::Internal { detail }
-        } if detail.contains("still has live")
-    )
-}
-
-pub(crate) fn spawn_deferred_drop_runtime_handle(
-    handle: ClosedRuntimeHandle,
-    reason: &'static str,
-) {
-    tokio::spawn(async move {
-        const MAX_ATTEMPTS: usize = 200;
-        const RETRY_INTERVAL: Duration = Duration::from_millis(100);
-
-        for attempt in 1..=MAX_ATTEMPTS {
-            match drop_runtime_handle(handle).await {
-                Ok(()) => {
-                    tracing::info!(
-                        reason,
-                        handle_kind = ?handle.kind,
-                        handle_raw = handle.raw,
-                        attempt,
-                        "deferred closed runtime handle drop succeeded"
-                    );
-                    return;
-                }
-                Err(error) if is_live_dependent_drop_error(&error) && attempt < MAX_ATTEMPTS => {
-                    tokio::time::sleep(RETRY_INTERVAL).await;
-                }
-                Err(ClosedSdkConsumerError::RuntimeError {
-                    error: ClosedRuntimeError::InvalidHandle { .. },
-                }) => {
-                    tracing::debug!(
-                        reason,
-                        handle_kind = ?handle.kind,
-                        handle_raw = handle.raw,
-                        "deferred closed runtime handle already dropped"
-                    );
-                    return;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        reason,
-                        handle_kind = ?handle.kind,
-                        handle_raw = handle.raw,
-                        attempt,
-                        err = %error,
-                        "deferred closed runtime handle drop failed"
-                    );
-                    return;
-                }
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{ClosedSdkConsumerError, RuntimeHandleRelease};
     use super::assert_current_provider_contract;
     use fluxon_commu_contract::FLUXON_COMMU_OPEN_SURFACE_VERSION;
+
+    #[tokio::test]
+    async fn canceled_release_waiter_resumes_one_operation_until_completion() {
+        let release = Arc::new(RuntimeHandleRelease::new());
+        let submitted = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let first_release = release.clone();
+        let first_submitted = submitted.clone();
+        let first = tokio::spawn(async move {
+            first_release
+                .run(move || async move {
+                    first_submitted.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second = release
+            .run(|| async { panic!("a canceled release must resume its original operation") });
+        tokio::pin!(second);
+        std::future::poll_fn(|cx| match second.as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(()),
+            std::task::Poll::Ready(_) => panic!("close returned before release completion"),
+        })
+        .await;
+        finish_tx.send(()).unwrap();
+        second.await.unwrap();
+        release
+            .run(|| async { panic!("completed handle release must not run twice") })
+            .await
+            .unwrap();
+        assert_eq!(submitted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_release_can_be_retried_without_marking_completion() {
+        let release = RuntimeHandleRelease::new();
+        let error = release
+            .run(|| async { Err(ClosedSdkConsumerError::RuntimeSubmitRejected { status: -1 }) })
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClosedSdkConsumerError::RuntimeSubmitRejected { status: -1 }
+        ));
+        release.run(|| async { Ok(()) }).await.unwrap();
+        release
+            .run(|| async { panic!("successful retry must finish the release") })
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn current_provider_matches_closed_sdk() {

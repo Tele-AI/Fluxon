@@ -654,8 +654,8 @@ impl ClientTransferEngine {
         Ok(())
     }
 
-    pub async fn close(&self) {
-        self.core.close().await;
+    pub async fn close(&self) -> KvResult<()> {
+        self.core.close().await.map_err(KvError::from)
     }
 
     pub async fn current_runtime_config(&self) -> ClientTransferEngineRuntimeConfig {
@@ -964,8 +964,7 @@ impl LogicalModule for ClientTransferEngine {
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
-        self.close().await;
-        Ok(())
+        self.close().await
     }
 }
 

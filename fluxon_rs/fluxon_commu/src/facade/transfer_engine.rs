@@ -18,7 +18,8 @@ use fluxon_framework_compiled::shutdown::ShutdownPoller;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::closed_sdk::{
-    construct_transfer_engine_handle, drop_runtime_handle, transfer_engine_current_runtime_config,
+    RuntimeHandleRelease, construct_transfer_engine_handle, drop_runtime_handle,
+    transfer_engine_current_runtime_config,
     transfer_engine_init2_for_init_dag, transfer_engine_register_local_segment,
     transfer_engine_transfer_data_no_copy, transfer_engine_try_send_wire_direct,
     transfer_engine_unregister_local_segment, transfer_engine_update_runtime_config,
@@ -28,6 +29,7 @@ struct ClosedTransferEngineRuntime {
     construct_arg: ClientTransferEngineNewArg,
     handle: OnceLock<ClosedRuntimeHandle>,
     construct_lock: AsyncMutex<()>,
+    release: RuntimeHandleRelease,
     current_config: RwLock<ClientTransferEngineRuntimeConfig>,
     local_segment_leases: Arc<ClosedLocalSegmentLeaseRegistry>,
     running: AtomicBool,
@@ -45,6 +47,7 @@ impl ClosedTransferEngineRuntime {
             construct_arg: arg,
             handle: OnceLock::new(),
             construct_lock: AsyncMutex::new(()),
+            release: RuntimeHandleRelease::new(),
             local_segment_leases: Arc::new(ClosedLocalSegmentLeaseRegistry::new()),
             running: AtomicBool::new(true),
         }
@@ -222,10 +225,20 @@ impl ClientTransferEngineCore {
     where
         R: ClientTransferEngineRuntime,
     {
+        if !self.closed.running.load(Ordering::Acquire) {
+            return Err(TransferEngineError::CreateEngineFailed {
+                detail: "ClientTransferEngineCore is closed".to_string(),
+            });
+        }
         if let Some(handle) = self.closed.handle.get().copied() {
             return Ok(handle);
         }
         let _guard = self.closed.construct_lock.lock().await;
+        if !self.closed.running.load(Ordering::Acquire) {
+            return Err(TransferEngineError::CreateEngineFailed {
+                detail: "ClientTransferEngineCore is closed".to_string(),
+            });
+        }
         if let Some(handle) = self.closed.handle.get().copied() {
             return Ok(handle);
         }
@@ -371,13 +384,20 @@ impl ClientTransferEngineCore {
         }
     }
 
-    pub async fn close(&self) {
-        {
-            self.closed.running.store(false, Ordering::Relaxed);
-            if let Some(handle) = self.closed.handle.get().copied() {
-                let _ = drop_runtime_handle(handle).await;
-            }
-        }
+    pub async fn close(&self) -> TransferEngineResult<()> {
+        self.closed.running.store(false, Ordering::Release);
+        let _guard = self.closed.construct_lock.lock().await;
+        let handle = self.closed.handle.get().copied();
+        self.closed
+            .release
+            .run(move || async move {
+                if let Some(handle) = handle {
+                    drop_runtime_handle(handle).await?;
+                }
+                Ok(())
+            })
+            .await
+            .map_err(transfer_engine_closed_sdk_error)
     }
 
     pub async fn register_local_segment<R>(

@@ -38,10 +38,9 @@ use tokio::sync::{Mutex, OnceCell, watch};
 use tokio::task::JoinHandle;
 
 use crate::closed_sdk::{
-    cluster_manager_call, construct_cluster_manager_handle,
+    RuntimeHandleRelease, cluster_manager_call, construct_cluster_manager_handle,
     current_cluster_manager_self_rdma_resolved_config, drop_runtime_handle,
-    is_live_dependent_drop_error, recv_cluster_event_stream,
-    recv_cluster_rdma_resolved_config_stream, spawn_deferred_drop_runtime_handle,
+    recv_cluster_event_stream, recv_cluster_rdma_resolved_config_stream,
     subscribe_cluster_manager_events, watch_cluster_manager_self_rdma_resolved_config,
 };
 
@@ -230,6 +229,7 @@ pub use self::__hidden::{ClusterManagerView, ClusterManagerViewTrait};
 
 struct ClosedClusterManagerRuntime {
     handle: ClosedRuntimeHandle,
+    release: RuntimeHandleRelease,
     self_member_id: String,
     cluster_name: String,
     etcd_endpoints: Vec<String>,
@@ -296,6 +296,7 @@ impl ClosedClusterManagerRuntime {
         let transfer_link_writer = make_runtime_transfer_link_writer(handle);
         let runtime = Self {
             handle,
+            release: RuntimeHandleRelease::new(),
             self_member_id,
             cluster_name,
             etcd_endpoints,
@@ -1409,24 +1410,19 @@ impl LogicalModule for ClusterManager {
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
-        {
-            let _ = self.leave_cluster().await;
-            match drop_runtime_handle(self.closed.handle).await {
-                Ok(()) => Ok(()),
-                Err(error) if is_live_dependent_drop_error(&error) => {
-                    tracing::info!(
-                        handle_raw = self.closed.handle.raw,
-                        "deferring closed ClusterManager handle drop until runtime dependents drain"
-                    );
-                    spawn_deferred_drop_runtime_handle(
-                        self.closed.handle,
-                        "cluster_manager_shutdown_deferred",
-                    );
-                    Ok(())
-                }
-                Err(error) => Err(cluster_manager_closed_sdk_error(error)),
-            }
-        }
+        let handle = self.closed.handle;
+        self.closed
+            .release
+            .run(move || async move {
+                let _ = closed_cluster_manager_unit_call(
+                    handle,
+                    ClosedRuntimeClusterManagerCall::LeaveCluster,
+                )
+                .await;
+                drop_runtime_handle(handle).await
+            })
+            .await
+            .map_err(cluster_manager_closed_sdk_error)
     }
 }
 

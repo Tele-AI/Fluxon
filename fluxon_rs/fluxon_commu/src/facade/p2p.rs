@@ -31,10 +31,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use crate::closed_sdk::{
-    construct_p2p_module_handle, drop_runtime_handle, is_live_dependent_drop_error,
-    p2p_call_raw_observed, p2p_register_dispatch, p2p_register_rpc_response_msg_id,
+    RuntimeHandleRelease, construct_p2p_module_handle, drop_runtime_handle, p2p_call_raw_observed,
+    p2p_register_dispatch, p2p_register_rpc_response_msg_id,
     p2p_register_user_rpc_bytes_handler, p2p_register_user_rpc_bytes_handler_async,
-    p2p_send_response_raw, spawn_deferred_drop_runtime_handle,
+    p2p_send_response_raw,
 };
 use fluxon_commu_closed_sdk_consumer::p2p_module_call;
 use fluxon_commu_closed_sdk_consumer::{ClosedRuntimeDispatchRequestRef, ClosedSdkConsumerError};
@@ -262,6 +262,8 @@ struct ClosedP2pRuntime {
     arg: CommuP2pModuleNewArg,
     handle: OnceLock<ClosedRuntimeHandle>,
     construct_lock: AsyncMutex<()>,
+    shutdown_started: std::sync::atomic::AtomicBool,
+    release: RuntimeHandleRelease,
     view: OnceLock<P2pModuleView>,
     tier_snapshot: Arc<RwLock<Arc<CommuTierSnapshot>>>,
     scheduled_rpc_response_msg_ids: Mutex<HashSet<MsgId>>,
@@ -280,6 +282,8 @@ impl ClosedP2pRuntime {
             arg,
             handle: OnceLock::new(),
             construct_lock: AsyncMutex::new(()),
+            shutdown_started: std::sync::atomic::AtomicBool::new(false),
+            release: RuntimeHandleRelease::new(),
             view: OnceLock::new(),
             snapshot_poller_started: std::sync::atomic::AtomicBool::new(false),
         }
@@ -396,10 +400,28 @@ impl P2pModule {
 
     #[doc(hidden)]
     pub async fn ensure_closed_runtime_handle(&self) -> P2PResult<ClosedRuntimeHandle> {
+        if self
+            .closed
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(P2pError::Other {
+                detail: "P2pModule is closed".to_string(),
+            });
+        }
         if let Some(handle) = self.closed_runtime_handle() {
             return Ok(handle);
         }
         let _guard = self.closed.construct_lock.lock().await;
+        if self
+            .closed
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(P2pError::Other {
+                detail: "P2pModule is closed".to_string(),
+            });
+        }
         if let Some(handle) = self.closed_runtime_handle() {
             return Ok(handle);
         }
@@ -1004,22 +1026,22 @@ impl LogicalModule for P2pModule {
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
-        {
-            if let Some(handle) = self.closed_runtime_handle() {
-                match drop_runtime_handle(handle).await {
-                    Ok(()) => {}
-                    Err(error) if is_live_dependent_drop_error(&error) => {
-                        tracing::info!(
-                            handle_raw = handle.raw,
-                            "deferring closed P2pModule handle drop until runtime dependents drain"
-                        );
-                        spawn_deferred_drop_runtime_handle(handle, "p2p_shutdown_deferred");
-                    }
-                    Err(error) => return Err(p2p_closed_sdk_error(error)),
+        self.closed
+            .shutdown_started
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Serialize final release with construction so late registrations cannot reopen it.
+        let _guard = self.closed.construct_lock.lock().await;
+        let handle = self.closed_runtime_handle();
+        self.closed
+            .release
+            .run(move || async move {
+                if let Some(handle) = handle {
+                    drop_runtime_handle(handle).await?;
                 }
-            }
-            Ok(())
-        }
+                Ok(())
+            })
+            .await
+            .map_err(p2p_closed_sdk_error)
     }
 }
 
@@ -1787,6 +1809,19 @@ mod tests {
             callback(dispatch_test_request(), bytes::Bytes::new()),
             Err(P2pError::Other { detail }) if detail.contains("host framework has been released")
         ));
+    }
+
+    #[tokio::test]
+    async fn closed_p2p_rejects_late_handle_construction_and_repeated_shutdown_succeeds() {
+        let (owner, _, _) = dispatch_test_owner();
+        LogicalModule::shutdown(&owner.module).await.unwrap();
+        let error = owner
+            .module
+            .ensure_closed_runtime_handle()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, P2pError::Other { detail } if detail.contains("is closed")));
+        LogicalModule::shutdown(&owner.module).await.unwrap();
     }
 
     #[test]
