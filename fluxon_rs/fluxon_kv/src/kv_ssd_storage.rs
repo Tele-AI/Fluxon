@@ -906,9 +906,7 @@ mod tests {
     use std::time::Duration;
 
     fn test_root(name: &str) -> PathBuf {
-        let target = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/mnt/nvme0/mjq_build/push_sglang_fluxon_target"));
+        let target = std::env::temp_dir().join("fluxon-kv-ssd-tests");
         target.join("kv_ssd_tests").join(format!(
             "{}-{}-{}",
             name,
