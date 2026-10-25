@@ -5357,6 +5357,7 @@ fn owner_local_publish_atomic_batch_complete(
 enum OwnerLocalPublishCompletion {
     Background,
     Native,
+    External,
 }
 
 enum OwnerLocalPublishItemState {
@@ -5383,6 +5384,15 @@ pub(crate) async fn publish_native_owner_local_job(
     assert_eq!(job.items.len(), job.external_pending_contexts.len());
     assert_eq!(job.items.len(), job.key_reservation_ids.len());
     publish_owner_local_job_with_completion(view, job, OwnerLocalPublishCompletion::Native).await
+}
+
+pub(crate) async fn publish_external_owner_local_job(
+    view: ClientKvApiView,
+    job: OwnerLocalPublishJob,
+) -> Vec<KvResult<()>> {
+    assert_eq!(job.items.len(), job.external_pending_contexts.len());
+    assert!(job.key_reservation_ids.is_empty());
+    publish_owner_local_job_with_completion(view, job, OwnerLocalPublishCompletion::External).await
 }
 
 fn owner_local_publish_rejection_is_terminal(error: &KvError) -> bool {
@@ -5446,6 +5456,9 @@ async fn publish_owner_local_job_with_completion(
     let mut shutdown_waiter = view.register_shutdown_waiter();
     let mut retry_delay = OWNER_LOCAL_PUBLISH_RETRY_INITIAL;
 
+    #[cfg(test)]
+    inner.test_record.wait_owner_local_publish_admission().await;
+
     while states.iter().any(|state| {
         !matches!(
             state,
@@ -5453,14 +5466,30 @@ async fn publish_owner_local_job_with_completion(
         )
     }) {
         let requested = (0..job.items.len())
-            .filter(|&index| {
-                completion == OwnerLocalPublishCompletion::Background
-                    || matches!(
-                        states[index],
-                        OwnerLocalPublishItemState::AwaitingMaster { .. }
-                    )
+            .filter(|&index| match completion {
+                OwnerLocalPublishCompletion::Background => true,
+                OwnerLocalPublishCompletion::Native => matches!(
+                    states[index],
+                    OwnerLocalPublishItemState::AwaitingMaster { .. }
+                ),
+                OwnerLocalPublishCompletion::External => !matches!(
+                    states[index],
+                    OwnerLocalPublishItemState::Published | OwnerLocalPublishItemState::Rejected(_)
+                ),
             })
             .collect::<Vec<_>>();
+        let requested_group_lens = group_lens.as_ref().map(|lens| {
+            let mut offset = 0;
+            lens.iter()
+                .copied()
+                .filter(|&len| {
+                    let start = offset;
+                    offset += len;
+                    completion != OwnerLocalPublishCompletion::External
+                        || !matches!(states[start], OwnerLocalPublishItemState::Rejected(_))
+                })
+                .collect::<Vec<_>>()
+        });
         let mut retry_reason = None;
         let mut background_batch_accepted = false;
         if incomplete_declared_group {
@@ -5468,9 +5497,10 @@ async fn publish_owner_local_job_with_completion(
                 "declared atomic group is incomplete or non-contiguous in publish job".to_string(),
             );
         } else if !requested.is_empty() {
-            let response = if completion == OwnerLocalPublishCompletion::Background
-                && let Some(atomic_group_lens) = group_lens.clone()
+            let response = if completion != OwnerLocalPublishCompletion::Native
+                && let Some(atomic_group_lens) = requested_group_lens
             {
+                assert_eq!(atomic_group_lens.iter().sum::<usize>(), requested.len());
                 inner
                     .owner_hot_counters
                     .grouped_put_done_batches
@@ -5569,7 +5599,9 @@ async fn publish_owner_local_job_with_completion(
                             }
                             Err(error) => {
                                 background_batch_accepted = false;
-                                if completion == OwnerLocalPublishCompletion::Native
+                                if (completion == OwnerLocalPublishCompletion::Native
+                                    || (completion == OwnerLocalPublishCompletion::External
+                                        && item.atomic_group.is_none()))
                                     && matches!(
                                         states[index],
                                         OwnerLocalPublishItemState::AwaitingMaster {
@@ -5641,10 +5673,14 @@ async fn publish_owner_local_job_with_completion(
                     Err(reason) => retry_reason = Some(reason),
                 }
             }
-            // Atomic background groups expose hot/replica side effects only
+            // Atomic groups expose hot/replica side effects only
             // after every member has completed master and local publication.
             if completion == OwnerLocalPublishCompletion::Native
-                || promoted_indices.len() == job.items.len()
+                || promoted_indices.len()
+                    == states
+                        .iter()
+                        .filter(|state| !matches!(state, OwnerLocalPublishItemState::Rejected(_)))
+                        .count()
             {
                 let promoted_items = promoted_indices
                     .iter()

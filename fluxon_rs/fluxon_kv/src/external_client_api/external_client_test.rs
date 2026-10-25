@@ -645,6 +645,185 @@ async fn external_client_basic_crud(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_external_put_completion_waits_for_route_publication() {
+    use crate::client_kv_api::external_api::HandlerForExternalClient;
+    use crate::client_kv_api::msg_pack::{
+        ExternalBatchPutCommitItemReq, ExternalBatchPutCommitReq, ExternalBatchPutStartItemReq,
+        ExternalBatchPutStartReq, ExternalBatchPutTransferEndItemReq,
+        ExternalBatchPutTransferEndReq,
+    };
+    use crate::client_kv_api::{ExternalLocalFirstPutKeyReservation, ExternalPutKeyOutcome};
+    use crate::rpcresp_kvresult_convert::{msg_and_error::KvError, try_from_code};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Entry {
+        TransferEnd,
+        Commit,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Scenario {
+        Success,
+        Cancel,
+        RejectIndependent,
+    }
+
+    let _test_guard = crate::kvcore_test_lib::integration_test_lock().await;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        fluxon_util::test_util::start_test_etcd().expect("start etcd for publication barrier");
+        let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
+            .expect("read test etcd endpoint");
+        let suffix = uuid::Uuid::new_v4();
+        let cluster = format!("external_publication_{suffix}");
+        let shm = format!(
+            "{}/sharemem/external_publication_{suffix}",
+            fluxon_util::test_util::test_workdir_base()
+        );
+        std::fs::create_dir_all(&shm).expect("create publication shared-memory directory");
+        let (master, _) = run_master(ConfigArg::Config(new_master_config(
+            "publication_master", None, &cluster, &etcd,
+        ))).await.expect("start publication master");
+        let (owner, _) = run_client(ConfigArg::Config(new_client_config(
+            "publication_owner", &cluster, &shm, &etcd,
+        ))).await.expect("start publication owner");
+        let owner_view = owner.client_kv_api_view();
+        let owner_api = owner_view.client_kv_api();
+        let inner = owner_api.inner();
+        let owner_info = owner.cluster_manager_view().cluster_manager().get_self_info();
+        let master_view = master.master_kv_router_view();
+        let master_inner = master_view.master_kv_router().inner();
+        wait_owner_allocation_authority(
+            master_view.clone(), &owner_info.id, Duration::from_secs(30),
+        ).await;
+
+        for entry in [Entry::TransferEnd, Entry::Commit] {
+            for scenario in [Scenario::Success, Scenario::Cancel, Scenario::RejectIndependent] {
+                let keys = (0..3).map(|index| format!("{entry:?}-{scenario:?}-{index}"))
+                    .collect::<Vec<_>>();
+                let started = owner_api.external_batch_put_start(ExternalBatchPutStartReq {
+                    items: keys.iter().map(|key| ExternalBatchPutStartItemReq {
+                        key: key.clone(),
+                        len: 4096,
+                        make_replica_task: false,
+                        ..Default::default()
+                    }).collect(),
+                    atomic_group_lens: Some(vec![1, 2]),
+                    started_time: owner_info.node_start_time,
+                }).await.expect("reserve independent key and complete atomic group");
+                try_from_code(started.error_code, started.error_json).expect("batch start");
+                assert_eq!(started.items.len(), keys.len());
+                for (index, slot) in started.items.iter().enumerate() {
+                    assert_eq!(slot.error_code, 0, "{}", slot.error_json);
+                    assert!(slot.peer_id.is_none());
+                    // The test is the external writer sharing this owner's address space.
+                    unsafe {
+                        std::ptr::write_bytes(
+                            (slot.src_base_addr + slot.src_offset) as *mut u8,
+                            0x30 + index as u8, 4096,
+                        );
+                    }
+                }
+                let before = inner.runtime_observe_snapshot();
+                let (entered, release) = owner_api.test_record().pause_next_owner_local_publish();
+                let mut completion = Box::pin(async {
+                    let lease_for = |index| {
+                        (scenario == Scenario::RejectIndependent && index == 0).then_some(u64::MAX)
+                    };
+                    match entry {
+                        Entry::TransferEnd => {
+                            let response = owner_api.external_batch_put_transfer_end(
+                                ExternalBatchPutTransferEndReq {
+                                    items: keys.iter().zip(&started.items).enumerate().map(|(index, (key, slot))| {
+                                        ExternalBatchPutTransferEndItemReq {
+                                            key: key.clone(), len: 4096,
+                                            src_offset: slot.src_offset, target_offset: slot.target_offset,
+                                            peer_id: None, target_base_addr: Some(slot.target_base_addr),
+                                            put_id: slot.put_id, lease_id: lease_for(index),
+                                        }
+                                    }).collect(),
+                                    started_time: owner_info.node_start_time,
+                                    transfer_concurrency: 1,
+                                },
+                            ).await.expect("transfer-end handler");
+                            try_from_code(response.error_code, response.error_json).expect("batch transfer end");
+                            response.items.into_iter().map(|item| try_from_code(item.error_code, item.error_json)).collect::<Vec<_>>()
+                        }
+                        Entry::Commit => {
+                            let response = owner_api.external_batch_put_commit(ExternalBatchPutCommitReq {
+                                items: keys.iter().zip(&started.items).enumerate().map(|(index, (key, slot))| {
+                                    ExternalBatchPutCommitItemReq {
+                                        key: key.clone(), len: 4096, src_offset: slot.src_offset,
+                                        remote_target: false, put_id: slot.put_id, lease_id: lease_for(index),
+                                    }
+                                }).collect(),
+                                started_time: owner_info.node_start_time,
+                            }).await.expect("commit handler");
+                            try_from_code(response.error_code, response.error_json).expect("batch commit");
+                            response.items.into_iter().map(|item| try_from_code(item.error_code, item.error_json)).collect::<Vec<_>>()
+                        }
+                    }
+                });
+                tokio::select! {
+                    biased;
+                    result = &mut completion => panic!("{entry:?} acknowledged before route publication: {result:?}"),
+                    reached = entered => reached.expect("publication worker reached gate"),
+                }
+                assert!(futures::poll!(&mut completion).is_pending());
+                for key in &keys {
+                    assert!(master_inner.kv_routes.get(key).is_none(), "gate must precede the master route");
+                }
+                let readers = keys.iter().map(|key| {
+                    inner.local_visible_mem_holder(key).expect("owner-local precommit is already readable")
+                }).collect::<Vec<_>>();
+                let followers = keys.iter().map(|key| {
+                    match inner.reserve_external_local_first_put_key(key, false, false).expect("join pending publication") {
+                        ExternalLocalFirstPutKeyReservation::WaitThenRetry(follower) => follower,
+                        _ => panic!("pending publication must retain its per-key fence"),
+                    }
+                }).collect::<Vec<_>>();
+                let results = if scenario == Scenario::Cancel {
+                    drop(completion);
+                    release.send(()).expect("release cancelled RPC's owner worker");
+                    None
+                } else {
+                    release.send(()).expect("release publication worker");
+                    Some(completion.await)
+                };
+                for (index, follower) in followers.into_iter().enumerate() {
+                    let rejected = scenario == Scenario::RejectIndependent && index == 0;
+                    assert_eq!(follower.wait().await, if rejected {
+                        ExternalPutKeyOutcome::Failed
+                    } else {
+                        ExternalPutKeyOutcome::Succeeded
+                    });
+                    follower.wait_released().await;
+                    assert_eq!(readers[index].bytes(), vec![0x30 + index as u8; 4096]);
+                    if rejected {
+                        assert!(matches!(results.as_ref().unwrap()[index], Err(KvError::LeaseMgr(_))));
+                        assert!(master_inner.kv_routes.get(&keys[index]).is_none());
+                        assert!(inner.local_visible_mem_holder(&keys[index]).is_none());
+                    } else {
+                        if let Some(results) = &results {
+                            assert!(results[index].is_ok(), "{:?}", results[index]);
+                        }
+                        let route = master_inner.kv_routes.get(&keys[index]).expect("successful Put must publish its route");
+                        assert_eq!(route.atomic_group.as_ref().map(|group| group.members.len()), (index > 0).then_some(2));
+                        drop(route);
+                        let (holder, _) = inner.get(&keys[index]).await.expect("get completed value").expect("published value exists");
+                        assert_eq!(holder.bytes(), readers[index].bytes());
+                    }
+                }
+                let after = inner.runtime_observe_snapshot();
+                assert!(after.grouped_put_done_batches > before.grouped_put_done_batches);
+                assert_eq!(after.legacy_put_done_batches, before.legacy_put_done_batches);
+                drop(readers);
+            }
+        }
+        owner.shutdown().await.expect("stop publication owner");
+        master.shutdown().await.expect("stop publication master");
+    }).await.expect("external publication barriers and fence cleanup must complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_native_put_admission_cancellation_releases_before_shutdown() {
     use crate::client_kv_api::external_api::HandlerForExternalClient;
     use crate::client_kv_api::msg_pack::{
@@ -762,7 +941,7 @@ async fn test_native_put_admission_cancellation_releases_before_shutdown() {
             let baseline_reservations = usize::from(stopping);
             let task_view = owner_view.clone();
             let task_requests = requests.clone();
-            let caller = tokio::spawn(async move {
+            let caller = ::tokio::spawn(async move {
                 task_view
                     .client_kv_api()
                     .inner()
@@ -785,7 +964,7 @@ async fn test_native_put_admission_cancellation_releases_before_shutdown() {
 
             let shutdown = if stopping {
                 let shutdown_owner = owner.clone();
-                let shutdown = tokio::spawn(async move { shutdown_owner.shutdown().await });
+                let shutdown = ::tokio::spawn(async move { shutdown_owner.shutdown().await });
                 let result = tokio::time::timeout(Duration::from_secs(10), caller)
                     .await
                     .expect("shutdown must wake blocked native admission")
@@ -1068,7 +1247,6 @@ async fn test_external_remote_get_uses_bound_owner_slot_without_master_allocator
         )
         .await
         .expect("put only on source owner");
-    wait_master_route(master_view.clone(), key, Duration::from_secs(5)).await;
     {
         let route = master_view
             .master_kv_router()

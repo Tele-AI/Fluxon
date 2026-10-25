@@ -17,6 +17,12 @@ pub struct ClientTestRecord {
     transfering_puts: DashMap<(String, u64, u32), ClientTestRecordOneTransfer>,
     /// get_id -> ClientTestRecordOneTransfer
     transfering_gets: DashMap<u64, ClientTestRecordOneTransfer>,
+    owner_local_publish_gate: parking_lot::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 impl ClientTestRecord {
@@ -24,6 +30,31 @@ impl ClientTestRecord {
         Self {
             transfering_puts: DashMap::new(),
             transfering_gets: DashMap::new(),
+            owner_local_publish_gate: parking_lot::Mutex::new(None),
+        }
+    }
+
+    pub fn pause_next_owner_local_publish(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let previous = self
+            .owner_local_publish_gate
+            .lock()
+            .replace((entered_tx, release_rx));
+        assert!(previous.is_none(), "publication gate is already armed");
+        (entered_rx, release_tx)
+    }
+
+    pub async fn wait_owner_local_publish_admission(&self) {
+        let gate = self.owner_local_publish_gate.lock().take();
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
         }
     }
 

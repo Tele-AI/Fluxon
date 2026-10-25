@@ -468,11 +468,11 @@ async fn release_external_local_first_pending_slot(
     }
 }
 
-fn spawn_external_local_first_publish(
+async fn publish_external_local_first(
     inner: &client_kv_api::ClientKvApiInner,
     items: Vec<OwnerLocalPublishItem>,
     pending_contexts: Vec<ExternalPendingPutCtx>,
-) {
+) -> KvResult<Vec<KvResult<()>>> {
     assert_eq!(
         items.len(),
         pending_contexts.len(),
@@ -480,8 +480,10 @@ fn spawn_external_local_first_publish(
     );
     let view = inner.view.clone_view();
     let spawn_view = view.clone();
+    let (completion_tx, completion_rx) = ::tokio::sync::oneshot::channel();
+    // The registered owner task retains the slots and fences if the RPC is cancelled.
     spawn_view.spawn("external_local_first_route_publish", async move {
-        client_kv_api::put::publish_owner_local_job(
+        let results = client_kv_api::put::publish_external_owner_local_job(
             view,
             OwnerLocalPublishJob {
                 items,
@@ -490,7 +492,13 @@ fn spawn_external_local_first_publish(
             },
         )
         .await;
+        let _ = completion_tx.send(results);
     });
+    completion_rx.await.map_err(|_| {
+        KvError::Api(ApiError::SystemShutdown {
+            detail: "owner Put publication task stopped before completion".to_string(),
+        })
+    })
 }
 
 pub(crate) fn normalize_external_get_start_group_lens(
@@ -4846,6 +4854,7 @@ impl HandlerForExternalClient for ClientKvApi {
         let mut revoke_pending = Vec::new();
         let mut local_publish_items = Vec::new();
         let mut local_publish_contexts = Vec::new();
+        let mut local_publish_indices = Vec::new();
 
         for (idx, item) in req.items.into_iter().enumerate() {
             let Some(put_id) = item.put_id else {
@@ -4930,10 +4939,7 @@ impl HandlerForExternalClient for ClientKvApi {
                             radix: pending_ctx.radix.clone(),
                         });
                         local_publish_contexts.push(pending_ctx);
-                        results[idx] = Some(ExternalBatchPutTransferEndItemResp {
-                            error_code: OK,
-                            error_json: String::new(),
-                        });
+                        local_publish_indices.push(idx);
                     }
                     Err(err) => {
                         release_external_local_first_pending_slot(
@@ -5006,7 +5012,19 @@ impl HandlerForExternalClient for ClientKvApi {
         }
 
         if !local_publish_items.is_empty() {
-            spawn_external_local_first_publish(inner, local_publish_items, local_publish_contexts);
+            let published =
+                publish_external_local_first(inner, local_publish_items, local_publish_contexts)
+                    .await?;
+            assert_eq!(published.len(), local_publish_indices.len());
+            for (idx, result) in local_publish_indices.into_iter().zip(published) {
+                results[idx] = Some(match result {
+                    Ok(()) => ExternalBatchPutTransferEndItemResp {
+                        error_code: OK,
+                        error_json: String::new(),
+                    },
+                    Err(error) => ExternalBatchPutTransferEndItemResp::from_error(&error),
+                });
+            }
         }
 
         if !revoke_pending.is_empty() {
@@ -5251,6 +5269,7 @@ impl HandlerForExternalClient for ClientKvApi {
         let mut revoke_pending = Vec::new();
         let mut local_publish_items = Vec::new();
         let mut local_publish_contexts = Vec::new();
+        let mut local_publish_indices = Vec::new();
 
         for (idx, item) in req.items.into_iter().enumerate() {
             let Some(put_id) = item.put_id else {
@@ -5334,10 +5353,7 @@ impl HandlerForExternalClient for ClientKvApi {
                             radix: pending_ctx.radix.clone(),
                         });
                         local_publish_contexts.push(pending_ctx);
-                        results[idx] = Some(ExternalBatchPutCommitItemResp {
-                            error_code: OK,
-                            error_json: String::new(),
-                        });
+                        local_publish_indices.push(idx);
                     }
                     Err(err) => {
                         release_external_local_first_pending_slot(
@@ -5404,7 +5420,19 @@ impl HandlerForExternalClient for ClientKvApi {
         }
 
         if !local_publish_items.is_empty() {
-            spawn_external_local_first_publish(inner, local_publish_items, local_publish_contexts);
+            let published =
+                publish_external_local_first(inner, local_publish_items, local_publish_contexts)
+                    .await?;
+            assert_eq!(published.len(), local_publish_indices.len());
+            for (idx, result) in local_publish_indices.into_iter().zip(published) {
+                results[idx] = Some(match result {
+                    Ok(()) => ExternalBatchPutCommitItemResp {
+                        error_code: OK,
+                        error_json: String::new(),
+                    },
+                    Err(error) => ExternalBatchPutCommitItemResp::from_error(&error),
+                });
+            }
         }
 
         if !revoke_pending.is_empty() {

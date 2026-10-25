@@ -74,8 +74,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-// #[cfg(test)]
-#[cfg(feature = "test_bins")]
+#[cfg(any(test, feature = "test_bins"))]
 pub mod external_client_test;
 
 type SharedMetaSignature = fluxon_util::fs_watch::FileSignature;
