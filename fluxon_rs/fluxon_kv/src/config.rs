@@ -12,6 +12,9 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+pub(crate) const DEFAULT_OWNER_LOCAL_RESERVE_SOFT_WAIT_TIMEOUT_MS: u64 = 10;
+pub(crate) const DEFAULT_OWNER_LOCAL_RESERVE_HARD_TIMEOUT_MS: u64 = 30_000;
+
 /// YAML wrapper to distinguish between:
 /// - key missing: `Option::None`
 /// - key present with null: `Some(YamlNullable::Null)`
@@ -394,10 +397,10 @@ fn validate_required_transfer_rpc_fast_path_ready_timeout(
 fn validate_owner_local_reserve_timeouts(test_spec_config: &TestSpecConfig) -> KvResult<()> {
     let soft_wait_timeout_ms = test_spec_config
         .owner_local_reserve_soft_wait_timeout_ms
-        .unwrap_or(10);
+        .unwrap_or(DEFAULT_OWNER_LOCAL_RESERVE_SOFT_WAIT_TIMEOUT_MS);
     let hard_timeout_ms = test_spec_config
         .owner_local_reserve_hard_timeout_ms
-        .unwrap_or(10_000);
+        .unwrap_or(DEFAULT_OWNER_LOCAL_RESERVE_HARD_TIMEOUT_MS);
     if soft_wait_timeout_ms == 0 {
         return Err(ConfigError::InvalidClientConfig {
             detail: "test_spec_config.owner_local_reserve_soft_wait_timeout_ms must be > 0"
@@ -1044,8 +1047,8 @@ pub struct ClientConfigYaml {
     /// logical tier schedules an asynchronous remote replica write-back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replica_writeback_hot_capacity_ratio: Option<f64>,
-    /// Explicit owner placement role.  Omission keeps the legacy migration
-    /// behavior; new owner-authoritative deployments must set this field.
+    /// Owner placement role. Defaults to inference with half of DRAM assigned
+    /// to the hot working set. Both roles allocate on the owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_placement_class: Option<OwnerPlacementClass>,
     pub fluxonkv_spec: FluxonKvSpecYaml,
@@ -1188,6 +1191,80 @@ pub struct ClientConfig {
     pub large_file_paths: LargeFilePaths, // Mandatory large-file roots for logs and caches
     pub ssd_storage: Option<KvSsdStorageConfig>,
     pub test_spec_config: TestSpecConfig,
+}
+
+impl ClientConfig {
+    /// Resolve placement and validate the segment used by the owner allocator.
+    pub(crate) fn owner_allocation(&self) -> KvResult<Option<(OwnerPlacementClass, u64)>> {
+        let capacity = &self.contribute_to_cluster_pool_size;
+        let has_vram = capacity.vram.values().any(|&bytes| bytes != 0);
+        let invalid = |detail: &str| {
+            ConfigError::InvalidClientConfig {
+                detail: detail.to_string(),
+            }
+            .into_kverror()
+        };
+        if capacity.dram == 0 && !has_vram {
+            if self.replica_writeback_hot_capacity_ratio.is_some() {
+                return Err(invalid(
+                    "replica_writeback_hot_capacity_ratio is only valid on owner configs",
+                ));
+            }
+            if self.owner_placement_class.is_some() {
+                return Err(invalid(
+                    "owner_placement_class is only valid on owner configs",
+                ));
+            }
+            return Ok(None);
+        }
+        if capacity.dram == 0
+            || capacity.dram % crate::OWNER_SEGMENT_ALLOCATION_GRANULARITY_BYTES != 0
+            || has_vram
+        {
+            return Err(invalid(
+                "owner allocation requires a non-zero 4 KiB-aligned DRAM contribution and zero VRAM contribution",
+            ));
+        }
+        let placement = self
+            .owner_placement_class
+            .unwrap_or(OwnerPlacementClass::Inference);
+        let local_target = match placement {
+            OwnerPlacementClass::Inference => {
+                let ratio = self
+                    .replica_writeback_hot_capacity_ratio
+                    .or_else(|| self.owner_placement_class.is_none().then_some(0.5))
+                    .ok_or_else(|| {
+                        invalid("owner_placement_class=inference requires replica_writeback_hot_capacity_ratio")
+                    })?;
+                if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
+                    return Err(invalid(
+                        "replica_writeback_hot_capacity_ratio must be finite and in (0, 1]",
+                    ));
+                }
+                let target = (capacity.dram as f64 * ratio).floor() as u64;
+                if target == 0 {
+                    return Err(invalid(
+                        "inference owner hot capacity must be at least one byte",
+                    ));
+                }
+                target
+            }
+            OwnerPlacementClass::RemoteCpu => {
+                if self.replica_writeback_hot_capacity_ratio.is_some() {
+                    return Err(invalid(
+                        "owner_placement_class=remote_cpu requires replica_writeback_hot_capacity_ratio to be omitted",
+                    ));
+                }
+                0
+            }
+            OwnerPlacementClass::Invalid => {
+                return Err(invalid(
+                    "owner_placement_class must be inference or remote_cpu",
+                ));
+            }
+        };
+        Ok(Some((placement, local_target)))
+    }
 }
 
 const CAPACITY_ALIGNMENT_BYTES: u64 = 16 * 1024 * 1024;
@@ -1429,29 +1506,6 @@ impl ClientConfigYaml {
             }
         }
 
-        if let Some(hot_ratio) = self.replica_writeback_hot_capacity_ratio {
-            if !hot_ratio.is_finite() || hot_ratio <= 0.0 || hot_ratio > 1.0 {
-                return Err(ConfigError::InvalidClientConfig {
-                    detail: "replica_writeback_hot_capacity_ratio must be finite and in (0, 1]"
-                        .to_string(),
-                }
-                .into_kverror());
-            }
-            if is_external {
-                return Err(ConfigError::InvalidClientConfig {
-                    detail: "replica_writeback_hot_capacity_ratio is only valid on owner configs"
-                        .to_string(),
-                }
-                .into_kverror());
-            }
-        }
-
-        if is_external && self.owner_placement_class.is_some() {
-            return Err(ConfigError::InvalidClientConfig {
-                detail: "owner_placement_class is only valid on owner configs".to_string(),
-            }
-            .into_kverror());
-        }
         if is_external && test_spec_config.owner_segment_memfd {
             return Err(ConfigError::InvalidClientConfig {
                 detail: "test_spec_config.owner_segment_memfd is only valid on owner configs"
@@ -1459,34 +1513,6 @@ impl ClientConfigYaml {
             }
             .into_kverror());
         }
-        match self.owner_placement_class {
-            Some(OwnerPlacementClass::Inference)
-                if self.replica_writeback_hot_capacity_ratio.is_none() =>
-            {
-                return Err(ConfigError::InvalidClientConfig {
-                    detail: "owner_placement_class=inference requires replica_writeback_hot_capacity_ratio"
-                        .to_string(),
-                }
-                .into_kverror());
-            }
-            Some(OwnerPlacementClass::RemoteCpu)
-                if self.replica_writeback_hot_capacity_ratio.is_some() =>
-            {
-                return Err(ConfigError::InvalidClientConfig {
-                    detail: "owner_placement_class=remote_cpu requires replica_writeback_hot_capacity_ratio to be omitted"
-                        .to_string(),
-                }
-                .into_kverror());
-            }
-            Some(OwnerPlacementClass::Invalid) => {
-                return Err(ConfigError::InvalidClientConfig {
-                    detail: "owner_placement_class must be inference or remote_cpu".to_string(),
-                }
-                .into_kverror());
-            }
-            _ => {}
-        }
-
         if let Some(expected) = &test_spec_config.owner_local_reserve_expected_capacity {
             if is_external {
                 return Err(ConfigError::InvalidClientConfig {
@@ -1836,7 +1862,7 @@ impl ClientConfigYaml {
             }
         };
 
-        Ok(ClientConfig {
+        let config = ClientConfig {
             cluster_name: fluxonkv_spec.cluster_name.clone(),
             etcd_addresses_raw,
             instance_key: self.instance_key,
@@ -1851,7 +1877,9 @@ impl ClientConfigYaml {
             large_file_paths,
             ssd_storage,
             test_spec_config,
-        })
+        };
+        config.owner_allocation()?;
+        Ok(config)
     }
 }
 
@@ -2451,6 +2479,19 @@ fluxonkv_spec:
             Some(OwnerPlacementClass::RemoteCpu)
         );
         assert_eq!(remote_cpu.replica_writeback_hot_capacity_ratio, None);
+        assert_eq!(
+            remote_cpu.owner_allocation().unwrap(),
+            Some((OwnerPlacementClass::RemoteCpu, 0))
+        );
+
+        let default_owner = ClientConfigYaml::from_str(&base.replace("OWNER_FIELDS", ""))
+            .unwrap()
+            .verify()
+            .unwrap();
+        assert_eq!(
+            default_owner.owner_allocation().unwrap(),
+            Some((OwnerPlacementClass::Inference, 8 * 1024 * 1024))
+        );
 
         let inference = ClientConfigYaml::from_str(&base.replace(
             "OWNER_FIELDS",
@@ -2462,6 +2503,10 @@ fluxonkv_spec:
         assert_eq!(
             inference.owner_placement_class,
             Some(OwnerPlacementClass::Inference)
+        );
+        assert_eq!(
+            inference.owner_allocation().unwrap(),
+            Some((OwnerPlacementClass::Inference, 12 * 1024 * 1024))
         );
 
         for fields in [
@@ -2619,6 +2664,13 @@ test_spec_config:
 
         cfg.owner_local_reserve_hard_timeout_ms = Some(20);
         validate_owner_local_reserve_timeouts(&cfg).unwrap();
+
+        cfg.owner_local_reserve_hard_timeout_ms = None;
+        cfg.owner_local_reserve_soft_wait_timeout_ms = Some(15_000);
+        validate_owner_local_reserve_timeouts(&cfg).unwrap();
+        cfg.owner_local_reserve_soft_wait_timeout_ms =
+            Some(DEFAULT_OWNER_LOCAL_RESERVE_HARD_TIMEOUT_MS);
+        assert!(validate_owner_local_reserve_timeouts(&cfg).is_err());
     }
 
     #[test]

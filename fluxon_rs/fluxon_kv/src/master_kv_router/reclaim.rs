@@ -2781,6 +2781,93 @@ fn spawn_finalize_retry(view: MasterKvRouterView, owner: NodeID, items: Vec<Owne
     });
 }
 
+/// Exercise the production owner reclaim protocol while retaining an SSD route.
+#[cfg(any(test, feature = "test_bins"))]
+pub(crate) async fn reclaim_memory_replicas_for_storage_test(view: &MasterKvRouterView, key: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let put_id = loop {
+            let route = view
+                .master_kv_router()
+                .inner()
+                .kv_routes
+                .get(key)
+                .map(|route| route.clone());
+            if let Some(route) = route
+                && route
+                    .node_replicas
+                    .read()
+                    .values()
+                    .any(|replicas| !replicas.tomb_tag.is_tomb() && replicas.ssd.is_some())
+            {
+                break route.put_id;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+
+        loop {
+            let owners = {
+                let route = view
+                    .master_kv_router()
+                    .inner()
+                    .kv_routes
+                    .get(key)
+                    .unwrap_or_else(|| panic!("SSD-backed route disappeared: key={key}"));
+                assert_eq!(
+                    route.put_id, put_id,
+                    "storage probe version changed: key={key}"
+                );
+                let replicas = route.node_replicas.read();
+                assert!(
+                    replicas
+                        .values()
+                        .any(|replica| { !replica.tomb_tag.is_tomb() && replica.ssd.is_some() }),
+                    "memory reclaim removed the SSD backing: key={key}"
+                );
+                replicas
+                    .iter()
+                    .filter_map(|(owner, replica)| {
+                        let memory = replica.memory.as_ref()?;
+                        // Local indexes and route-only GlobalShared slots have
+                        // distinct production reclaim contracts.
+                        let reason = if memory.owner_local_indexed {
+                            OwnerReclaimReason::OwnerCapacityEviction
+                        } else {
+                            OwnerReclaimReason::MasterAllocationCapacity
+                        };
+                        Some((owner.clone(), reason))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if owners.is_empty()
+                && view
+                    .master_kv_router()
+                    .inner()
+                    .key_activity
+                    .is_quiescent(key)
+            {
+                return;
+            }
+
+            for (owner, reason) in owners {
+                if let Some(item) = route_item(
+                    view,
+                    &owner,
+                    key,
+                    Some(put_id),
+                    None,
+                    reason,
+                    view.master_kv_router().next_owner_reclaim_epoch(),
+                ) {
+                    let _ = reclaim_items(view, &owner, vec![item]).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("SSD-backed memory reclaim did not complete: key={key}"));
+}
+
 async fn reclaim_items(
     view: &MasterKvRouterView,
     owner: &NodeID,
@@ -3317,24 +3404,25 @@ mod reclaim_partition_tests {
 
 #[cfg(test)]
 mod owner_get_holding_reclaim_tests {
-    use super::{OwnerReclaimBacking, OwnerReclaimReason, reclaim_items, route_item};
-    use crate::client_kv_api::PutOptionalArgs;
+    use super::{
+        KvReplicaBacking, OwnerReclaimBacking, OwnerReclaimReason, reclaim_items,
+        reclaim_memory_replicas_for_storage_test, route_item,
+    };
+    use crate::client_kv_api::{PutOptionalArg, PutOptionalArgs};
     use crate::config::KvSsdStorageConfig;
     use crate::kv_ssd_storage::MIN_CAPACITY_BYTES;
     use crate::kvcore_test_lib::{
         integration_test_lock, start_additional_client_with_config, start_master_and_client,
         start_master_and_client_with_client_config, stop_master_and_client,
     };
-    use crate::master_kv_router::msg_pack::{PutDoneReq, PutStartReq};
-    use crate::master_kv_router::put::{handle_put_done, handle_put_start};
-    use crate::master_seg_manager::msg_pack::OwnerPlacementClass;
-    use crate::memholder::{MemholderManagerTrait, NodeHolderKey};
-    use crate::p2p::msg_pack::MsgPack;
-    use crate::rpcresp_kvresult_convert::msg_and_error::OK;
-    use std::time::{Duration, Instant};
+    use crate::master_kv_router::msg_pack::GetSourceKind;
+    use crate::memholder::MemholderManagerTrait;
+    use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn completed_get_holding_does_not_block_two_sided_owner_reclaim() {
+    async fn owner_committed_slot_get_blocks_reclaim_until_holder_released() {
         let _test_guard = integration_test_lock().await;
         let (master, client) =
             start_master_and_client("reclaim_get_holding_master", "reclaim_get_holding_owner")
@@ -3344,42 +3432,47 @@ mod owner_get_holding_reclaim_tests {
         let owner_api = owner_view.client_kv_api();
         owner_api
             .inner()
-            .put(key, &[7u8; 4096], PutOptionalArgs::default())
+            .put(
+                key,
+                &[7u8; 4096],
+                PutOptionalArgs(vec![PutOptionalArg::SkipMakeReplicaTask]),
+            )
             .await
             .expect("owner put");
-        let (holder, _get_info) = owner_api
+        let (holder, get_info) = owner_api
             .inner()
             .get(key)
             .await
             .expect("owner get")
             .expect("owner get should hit");
-
-        let owner_id = client
+        assert_eq!(holder.bytes(), &[7u8; 4096]);
+        assert!(get_info.is_none(), "the committed slot must be a local hit");
+        assert_eq!(holder.holder_id(), 0);
+        let (allocation_id, segment_offset, capacity_bytes) = holder
+            .memory_info()
+            .local_reserve_resident_slot_ref()
+            .expect("the reader must pin an exact Owner committed slot");
+        let backing = OwnerReclaimBacking::CommittedSlot {
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        };
+        let owner_node = client
             .cluster_manager_view()
             .cluster_manager()
             .get_self_info()
-            .id;
-        let holding_key = NodeHolderKey::new(owner_id.clone(), holder.holder_id());
+            .id
+            .into();
         let master_view = master.master_kv_router_view().clone();
+        let router = master_view.master_kv_router().inner();
         assert!(
-            master_view
-                .master_kv_router()
-                .inner()
-                .get_holding
-                .inner()
-                .contains_key(&holding_key),
-            "get_done must install the Allocation lifetime holder"
+            router.get_holding.inner().is_empty(),
+            "Owner committed slots must not create Master Allocation ACK holders"
         );
-
         assert!(
-            master_view
-                .master_kv_router()
-                .inner()
-                .key_activity
-                .is_quiescent(key),
-            "completed get must release its master key-activity lease"
+            router.key_activity.is_quiescent(key),
+            "completed get must leave no master key-activity lease"
         );
-        let owner_node: crate::cluster_manager::NodeID = owner_id.clone().into();
         let busy_item = route_item(
             &master_view,
             &owner_node,
@@ -3390,76 +3483,71 @@ mod owner_get_holding_reclaim_tests {
             master_view.master_kv_router().next_owner_reclaim_epoch(),
         )
         .expect("active-holder owner route should be reclaimable after the reader exits");
+        assert_eq!(busy_item.backing, backing);
+        let put_id = busy_item.put_id;
         assert_eq!(
             reclaim_items(&master_view, &owner_node, vec![busy_item]).await,
             0,
             "owner Prepare must reject reclaim while the user holder is live"
         );
-
-        drop(holder);
-        limit_thirdparty::tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            master_view
-                .master_kv_router()
+        assert!(router.key_activity.is_quiescent(key));
+        assert_eq!(holder.bytes(), &[7u8; 4096]);
+        assert_eq!(
+            owner_api
                 .inner()
-                .get_holding
-                .inner()
-                .contains_key(&holding_key),
-            "the committed local index intentionally keeps MemoryInfo and its ACK holder alive"
+                .owner_local_reserve_control_snapshot()
+                .allocated_bytes,
+            capacity_bytes,
+            "a rejected reclaim must keep the reader's physical slot allocated"
         );
 
+        drop(holder);
+        assert!(
+            owner_api.inner().local_visible_mem_holder(key).is_some(),
+            "the committed local index must retain the slot after the reader exits"
+        );
         let item = route_item(
             &master_view,
             &owner_node,
             key,
-            None,
-            None,
+            Some(put_id),
+            Some(capacity_bytes),
             OwnerReclaimReason::OwnerCapacityEviction,
             master_view.master_kv_router().next_owner_reclaim_epoch(),
         )
-        .expect("current owner route should be reclaimable");
-        assert_eq!(
-            item.backing,
-            OwnerReclaimBacking::Allocation,
-            "reuse-replica get_done must publish the owner-local index on the route"
-        );
+        .expect("the same owner slot must remain reclaimable");
+        assert_eq!(item.backing, backing);
         assert_eq!(
             reclaim_items(&master_view, &owner_node, vec![item]).await,
             1
         );
-
-        let wait_started = Instant::now();
-        while master_view
-            .master_kv_router()
-            .inner()
-            .get_holding
-            .inner()
-            .contains_key(&holding_key)
-        {
-            assert!(
-                wait_started.elapsed() < Duration::from_secs(5),
-                "owner reclaim must drop MemoryInfo and deliver its delete ACK"
-            );
-            limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        assert!(router.get_holding.inner().is_empty());
+        assert!(router.key_activity.is_quiescent(key));
         assert!(
-            !master_view
-                .master_kv_router()
-                .inner()
-                .kv_routes
-                .contains_key(key),
+            !router.kv_routes.contains_key(key),
             "the reclaimed last replica route must be removed"
         );
+        assert!(owner_api.inner().local_visible_mem_holder(key).is_none());
+        let owner_state = owner_api.inner().runtime_observe_snapshot();
+        assert_eq!(owner_state.owner_segment_allocated_bytes, 0);
+        assert_eq!(owner_state.local_reserve_slots_prepared, 0);
+        assert_eq!(owner_state.local_reserve_slots_pending_visible, 0);
+        assert_eq!(owner_state.local_reserve_slots_committed, 0);
 
         stop_master_and_client(master, client).await;
     }
 
     #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn master_unindexed_allocation_reclaim_publishes_ssd_but_direct_reload_fails_closed() {
+    async fn owner_committed_slot_reclaim_preserves_ssd_batch_reload_and_stale_retry() {
         let _test_guard = integration_test_lock().await;
+        let root = std::env::temp_dir().join(format!(
+            "fluxon-owner-ssd-reclaim-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         let (master, client) = start_master_and_client_with_client_config(
-            "master_capacity_ssd_reclaim_master",
-            "master_capacity_ssd_reclaim_owner",
+            "owner_ssd_reclaim_master",
+            "owner_ssd_reclaim_source",
             |config| {
                 config.ssd_storage = Some(KvSsdStorageConfig {
                     limit_bytes: MIN_CAPACITY_BYTES,
@@ -3467,27 +3555,24 @@ mod owner_get_holding_reclaim_tests {
                     write_burst_bytes: None,
                     capacity_writeback_enabled: true,
                 });
-                let target = std::env::var("CARGO_TARGET_DIR")
-                    .expect("SSD integration test requires the NVMe Cargo target");
-                let root = format!(
-                    "{target}/kv_ssd_integration/master_capacity_reclaim-{}",
-                    std::process::id()
-                );
-                config.share_mem_path = format!("{root}/sharemem");
-                config.large_file_paths.paths = vec![format!("{root}/large")];
+                config.share_mem_path = root.join("source/sharemem").to_string_lossy().into_owned();
+                config.large_file_paths.paths =
+                    vec![root.join("source/large").to_string_lossy().into_owned()];
             },
         )
         .await;
-        let key = "master_capacity_ssd_reclaim_key";
-        let payload = vec![0x5au8; 4096];
+        let key = "owner_ssd_reclaim_key";
+        let payload = (0..4096)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
         let owner_view = client.client_kv_api_view();
         let owner_api = owner_view.client_kv_api();
-        let owner_info = client
+        let owner_id = client
             .cluster_manager_view()
             .cluster_manager()
-            .get_self_info();
-        let owner_id = owner_info.id;
-        let owner_node: crate::cluster_manager::NodeID = owner_id.clone().into();
+            .get_self_info()
+            .id;
+        let owner_node = owner_id.clone().into();
         let master_view = master.master_kv_router_view().clone();
         assert!(
             master_view
@@ -3500,96 +3585,71 @@ mod owner_get_holding_reclaim_tests {
                         .cloned()
                 })
                 .is_some_and(|value| value == "true"),
-            "master must observe the owner's SSD capability before selecting coordination"
+            "master must observe the owner's SSD capability"
         );
-
-        let (_put_id, start) = handle_put_start(
-            master_view.clone(),
-            MsgPack {
-                serialize_part: PutStartReq {
-                    key: key.to_string(),
-                    len: payload.len() as u64,
-                    reject_if_inflight_same_key: false,
-                    reject_if_exist_same_key: false,
-                    make_replica_task: true,
-                    preferred_sub_cluster: None,
-                    source_node_id: None,
-                },
-                raw_bytes: Vec::new(),
-            },
-            owner_node.clone(),
-        )
-        .await;
-        assert_eq!(
-            start.serialize_part.error_code, OK,
-            "PutStart failed: {}",
-            start.serialize_part.error_json
-        );
-        assert_eq!(start.serialize_part.node_id, owner_id);
-        owner_view
-            .client_seg_pool()
-            .copy_into_segment(start.serialize_part.target_addr, &payload)
+        owner_api
+            .inner()
+            .put(key, &payload, PutOptionalArgs::default())
             .await
-            .expect("copy payload into the master-owned owner segment Allocation");
-        let done = handle_put_done(
-            master_view.clone(),
-            MsgPack {
-                serialize_part: PutDoneReq {
-                    key: key.to_string(),
-                    put_id: start.serialize_part.put_id,
-                    lease_id: None,
-                    committed_slot: None,
-                    publish_local_cache: false,
-                    atomic_group: None,
-                    radix: None,
-                },
-                raw_bytes: Vec::new(),
-            },
-            owner_node.clone(),
-        )
-        .await;
-        assert_eq!(done.serialize_part.error_code, OK);
-        assert_eq!(done.serialize_part.local_cache_holder_id, None);
-        let route = master_view
-            .master_kv_router()
+            .expect("Owner Put must publish a committed slot");
+        limit_thirdparty::tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = owner_api.inner().runtime_observe_snapshot();
+                if snapshot.local_ssd_put_published == 1
+                    && snapshot.local_ssd_put_flights_active == 0
+                    && snapshot.remote_put_flights_active == 0
+                {
+                    break;
+                }
+                limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Owner Put must finish publishing its SSD backing");
+        let (allocation_id, segment_offset, capacity_bytes) = owner_api
             .inner()
-            .kv_routes
-            .get(key)
-            .map(|route| route.clone())
-            .expect("PutDone must publish the production unindexed Allocation route");
-        assert!(
-            route
-                .node_replicas
-                .read()
-                .get(&owner_node)
-                .and_then(|replicas| replicas.memory.as_ref())
-                .is_some_and(|memory| !memory.owner_local_indexed),
-            "production remote backing must have no owner-local key index"
-        );
-        drop(route);
-
-        let item = route_item(
-            &master_view,
-            &owner_node,
-            key,
-            None,
-            None,
-            OwnerReclaimReason::MasterAllocationCapacity,
-            master_view.master_kv_router().next_owner_reclaim_epoch(),
-        )
-        .expect("master-capacity victim must resolve to the current owner Allocation");
-        assert!(matches!(
-            item.backing,
-            OwnerReclaimBacking::UnindexedAllocation { .. }
-        ));
+            .local_visible_mem_holder(key)
+            .expect("the published source must remain indexed before reclaim")
+            .local_reserve_resident_slot_ref()
+            .expect("the source must occupy an Owner committed slot");
+        let backing = OwnerReclaimBacking::CommittedSlot {
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        };
+        limit_thirdparty::tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let item = route_item(
+                    &master_view,
+                    &owner_node,
+                    key,
+                    None,
+                    Some(capacity_bytes),
+                    OwnerReclaimReason::OwnerCapacityEviction,
+                    master_view.master_kv_router().next_owner_reclaim_epoch(),
+                )
+                .expect("the Owner source must remain routed until reclaim succeeds");
+                assert_eq!(item.backing, backing);
+                if reclaim_items(&master_view, &owner_node, vec![item]).await == 1 {
+                    break;
+                }
+                // Completed background publication may still be releasing its source pin.
+                limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the published Owner slot must become reclaimable");
+        assert!(owner_api.inner().local_visible_mem_holder(key).is_none());
         assert_eq!(
-            reclaim_items(&master_view, &owner_node, vec![item]).await,
-            1
+            owner_api
+                .inner()
+                .owner_local_reserve_control_snapshot()
+                .allocated_bytes,
+            0
         );
-
-        let route = master_view
-            .master_kv_router()
-            .inner()
+        let router = master_view.master_kv_router().inner();
+        assert!(router.key_activity.is_quiescent(key));
+        let route = router
             .kv_routes
             .get(key)
             .map(|route| route.clone())
@@ -3605,6 +3665,7 @@ mod owner_get_holding_reclaim_tests {
                 Some(payload.len() as u64)
             );
         }
+        drop(route);
         let persisted = owner_api
             .inner()
             .kv_ssd_storage_usage_snapshot()
@@ -3612,53 +3673,187 @@ mod owner_get_holding_reclaim_tests {
         assert_eq!(persisted.persist_successes, 1);
         assert_eq!(persisted.persist_failures, 0);
         assert_eq!(persisted.used_bytes, payload.len() as u64);
+        assert_eq!(persisted.load_requests, 0);
 
-        // Keep this test's SSD source on the legacy master-authoritative owner
-        // whose Allocation it was meant to reclaim.  Such an owner has no
-        // OwnerSegmentAllocator and therefore cannot provide the mandatory
-        // owner-local transient SSD staging slot.  A distinct
-        // owner-authoritative requester does not change source ownership:
-        // Plan must reject this mixed-authority source instead of restoring a
-        // master-allocated staging fallback.
+        let stale_key = "owner_ssd_reclaim_stale_key";
+        owner_api
+            .inner()
+            .put(stale_key, b"stale-ssd-payload", PutOptionalArgs::default())
+            .await
+            .expect("publish stale SSD probe");
+        reclaim_memory_replicas_for_storage_test(&master_view, stale_key).await;
+        {
+            let stale_route = router
+                .kv_routes
+                .get(stale_key)
+                .expect("SSD-only stale route");
+            let mut replicas = stale_route.node_replicas.write();
+            replicas
+                .get_mut(&owner_node)
+                .unwrap()
+                .ssd
+                .as_mut()
+                .unwrap()
+                .len += 1;
+        }
+
+        // A protocol conflict must remain an error while another item replans.
+        let rejected_key = "owner_ssd_reclaim_conflict_key";
+        owner_api
+            .inner()
+            .put(
+                rejected_key,
+                b"conflicting-memory-source",
+                PutOptionalArgs(vec![PutOptionalArg::SkipMakeReplicaTask]),
+            )
+            .await
+            .expect("publish non-stale error probe");
+        let rejected_route = router.kv_routes.get(rejected_key).unwrap().clone();
+        let original_allocation_id = {
+            let mut replicas = rejected_route.node_replicas.write();
+            let memory = replicas
+                .get_mut(&owner_node)
+                .unwrap()
+                .memory
+                .as_mut()
+                .unwrap();
+            let KvReplicaBacking::CommittedSlot(slot) = &mut memory.backing else {
+                panic!("error probe must use an Owner committed slot");
+            };
+            let original = slot.allocation_id;
+            slot.allocation_id = original.checked_add(1_000_000).unwrap();
+            original
+        };
+
         let requester = start_additional_client_with_config(
-            "master_capacity_ssd_reclaim_master",
-            "master_capacity_ssd_reclaim_requester",
+            "owner_ssd_reclaim_master",
+            "owner_ssd_reclaim_requester",
             |config| {
-                config.owner_placement_class = Some(OwnerPlacementClass::Inference);
-                config.replica_writeback_hot_capacity_ratio = Some(0.5);
-                config
-                    .test_spec_config
-                    .owner_local_reserve_expected_capacity =
-                    Some(crate::config::OwnerLocalReserveExpectedCapacity {
-                        value_len: payload.len() as u64,
-                        payload_capacity_bytes: config.contribute_to_cluster_pool_size.dram / 2,
-                    });
+                config.share_mem_path = root
+                    .join("requester/sharemem")
+                    .to_string_lossy()
+                    .into_owned();
+                config.large_file_paths.paths =
+                    vec![root.join("requester/large").to_string_lossy().into_owned()];
             },
         )
         .await;
         let requester_view = requester.client_kv_api_view();
         let requester_api = requester_view.client_kv_api();
+        let plans_before = router
+            .planned_get_counters
+            .plan_items
+            .load(Ordering::Relaxed);
+        let results = requester_api
+            .inner()
+            .batch_get(
+                vec![
+                    stale_key.to_string(),
+                    key.to_string(),
+                    rejected_key.to_string(),
+                ],
+                3,
+            )
+            .await
+            .expect("mixed SSD batch must finish each item");
+        assert_eq!(results.len(), 3);
+        let mut results = results.into_iter();
         assert!(
-            requester_api
-                .inner()
-                .get(key)
-                .await
-                .expect("mixed-authority Plan rejection is exposed as a safe Get miss")
-                .is_none(),
-            "master-authoritative SSD source must fail closed before direct reload"
+            results
+                .next()
+                .unwrap()
+                .expect("stale SSD must replan to miss")
+                .is_none()
         );
+        let (holder, get_info) = results
+            .next()
+            .unwrap()
+            .expect("cross-owner SSD reload must succeed")
+            .expect("the SSD-only route must remain readable");
+        assert!(matches!(
+            results.next().unwrap(),
+            Err(KvError::Api(ApiError::Unknown { .. }))
+        ));
+        assert_eq!(
+            router
+                .planned_get_counters
+                .plan_items
+                .load(Ordering::Relaxed)
+                - plans_before,
+            4,
+            "only the stale item may replan; the success and protocol error must remain final"
+        );
+        assert!(!router.kv_routes.contains_key(stale_key));
+        assert!(router.key_activity.is_quiescent(stale_key));
+        assert!(router.kv_routes.contains_key(rejected_key));
+        {
+            let mut replicas = rejected_route.node_replicas.write();
+            let memory = replicas
+                .get_mut(&owner_node)
+                .unwrap()
+                .memory
+                .as_mut()
+                .unwrap();
+            let KvReplicaBacking::CommittedSlot(slot) = &mut memory.backing else {
+                unreachable!();
+            };
+            slot.allocation_id = original_allocation_id;
+        }
+        assert_eq!(holder.bytes(), payload.as_slice());
+        assert_eq!(
+            get_info
+                .expect("SSD reload must report its source")
+                .source_kind(),
+            GetSourceKind::Ssd
+        );
+        let requester_slot = holder
+            .memory_info()
+            .local_reserve_resident_slot_ref()
+            .expect("SSD reload must retain its exact Owner target slot");
+        drop(holder);
         let loaded = owner_api
             .inner()
             .kv_ssd_storage_usage_snapshot()
             .expect("test owner SSD must remain configured");
-        assert_eq!(loaded.load_requests, 0);
-        assert_eq!(loaded.load_successes, 0);
+        assert_eq!(loaded.load_requests, 2);
+        assert_eq!(loaded.load_successes, 1);
+        assert_eq!(loaded.load_misses, 1);
         assert_eq!(loaded.load_failures, 0);
-        assert_eq!(loaded.load_bytes, 0);
-        assert_eq!(loaded.memory_hits + loaded.disk_hits + loaded.outer_hits, 0);
+        assert_eq!(loaded.load_bytes, payload.len() as u64);
+        assert_eq!(loaded.memory_hits + loaded.disk_hits + loaded.outer_hits, 2);
+        // Async Get returns readable bytes before Master CommitTarget and local promotion.
+        limit_thirdparty::tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if router.key_activity.is_quiescent(key)
+                    && requester_api
+                        .inner()
+                        .local_visible_mem_holder(key)
+                        .is_some_and(|memory| {
+                            memory.local_reserve_resident_slot_ref() == Some(requester_slot)
+                        })
+                {
+                    break;
+                }
+                limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("SSD Get must commit its target and release Master key activity");
+        assert!(router.key_activity.is_quiescent(key));
+        assert!(router.get_holding.inner().is_empty());
+        let requester_state = requester_api.inner().runtime_observe_snapshot();
+        assert_eq!(requester_state.local_reserve_slots_prepared, 0);
+        assert_eq!(requester_state.local_reserve_slots_pending_visible, 0);
+        assert_eq!(requester_state.local_reserve_slots_committed, 1);
+        owner_api
+            .inner()
+            .delete(rejected_key)
+            .await
+            .expect("delete protocol error probe");
 
         requester.shutdown().await.expect("stop SSD Get requester");
         stop_master_and_client(master, client).await;
+        std::fs::remove_dir_all(root).expect("remove isolated SSD reclaim test storage");
     }
 }
 

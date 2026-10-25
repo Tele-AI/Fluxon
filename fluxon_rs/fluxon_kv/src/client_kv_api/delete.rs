@@ -94,7 +94,7 @@ async fn apply_delete_client_kv_meta_cache_item(
     let client_api = view.client_kv_api();
     let client_inner = client_api.inner();
 
-    let (cached_info, pending_get) = {
+    let (cached_info, pending_get, released_global_route) = {
         let controls = client_inner.owner_key_control.lock_key(&delete_item.key);
         if controls
             .get(&delete_item.key)
@@ -140,23 +140,49 @@ async fn apply_delete_client_kv_meta_cache_item(
             });
         let pending_get = client_inner
             .pending_local_get_info
-            .remove_if(&delete_item.key, |_, pending| {
+            .get(&delete_item.key)
+            .filter(|pending| {
                 if pending.put_id.0 == delete_item.put_time_ms {
                     pending.put_id.1 <= delete_item.put_version
                 } else {
                     pending.put_id.0 <= delete_item.put_time_ms
                 }
             })
-            .map(|(_, pending)| pending);
-        (cached_info, pending_get)
+            .map(|pending| pending.value().clone());
+        if let Some(pending) = pending_get.as_ref() {
+            assert!(
+                client_inner.abort_hidden_pending_local_get_locked(&delete_item.key, pending),
+                "DELETE must close the exact hidden Get target before removing its index"
+            );
+        }
+        let released_global_route = client_inner
+            .owner_segment_allocator
+            .lock()
+            .release_deleted_global_manifest_route(
+                &delete_item.key,
+                (delete_item.put_time_ms, delete_item.put_version),
+            );
+        (cached_info, pending_get, released_global_route)
     };
+    if released_global_route.is_some() {
+        client_inner
+            .owner_local_reserve_rebalance_notify()
+            .notify_waiters();
+    }
     drop(pending_get);
     if let Some(cached_info) = cached_info {
         client_inner.owner_hot_invalidate_version(
             &delete_item.key,
             (cached_info.put_time_ms, cached_info.put_version),
         );
-        client_inner.release_local_reserve_route_for_memory_info(cached_info.mem_holder.as_ref());
+        let route_already_released = released_global_route.as_ref().is_some_and(|slot| {
+            cached_info.mem_holder.local_reserve_resident_slot_ref()
+                == Some((slot.allocation_id, slot.segment_offset, slot.capacity_bytes))
+        });
+        if !route_already_released {
+            client_inner
+                .release_local_reserve_route_for_memory_info(cached_info.mem_holder.as_ref());
+        }
     }
 
     if let Err(err) = client_inner

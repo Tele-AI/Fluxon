@@ -853,12 +853,17 @@ mod owner_put_from_source_integration_tests {
             );
             limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        super::local_reserve_rebalance::publish_owner_capacity_report(&target_view)
-            .await
-            .expect("target owner capacity report RPC must converge after registration");
+        ::tokio::time::timeout(
+            Duration::from_secs(15),
+            super::local_reserve_rebalance::publish_owner_capacity_report(&target_view),
+        )
+        .await
+        .expect("target owner capacity report RPC timed out")
+        .expect("target owner capacity report RPC must converge after registration");
         let expected_allocation_size =
             crate::owner_segment_allocation_capacity_bytes(payload.len() as u64)
                 .expect("test payload must fit the owner allocator");
+        let capacity_deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let target_capacity_ready = master_view
                 .master_seg_manager()
@@ -874,7 +879,7 @@ mod owner_put_from_source_integration_tests {
                 break;
             }
             assert!(
-                Instant::now() < registration_deadline,
+                Instant::now() < capacity_deadline,
                 "target owner capacity report did not converge for allocation_size={}",
                 expected_allocation_size,
             );
@@ -948,6 +953,7 @@ mod owner_put_from_source_integration_tests {
             limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(published_put_id, put_id);
+        let deadline = Instant::now() + Duration::from_secs(15);
         let target_flight = loop {
             if let Some(flight) = target_inner
                 .owner_put_from_source_flights
@@ -961,10 +967,11 @@ mod owner_put_from_source_integration_tests {
                 Instant::now() < deadline,
                 "PutFromSource Async target flight was not installed"
             );
-            let _ = source_inner
-                .ensure_remote_put(key, put_id, None, true)
-                .await
-                .expect("joining the exact remote Put flight must not fail");
+            // The target cannot finish while this test holds its Get barrier.
+            assert!(
+                source_inner.start_remote_put_nonblocking(key, put_id, None, true),
+                "starting or joining the exact remote Put flight must not fail"
+            );
             limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(
@@ -1012,6 +1019,7 @@ mod owner_put_from_source_integration_tests {
             &accepted,
             crate::owner_segment::OwnerSegmentTransferOutcome::PutFromSourceAcceptedRoutePending { .. }
         ));
+        let deadline = ::tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let target_published = master_view
                 .master_kv_router()
@@ -1039,13 +1047,16 @@ mod owner_put_from_source_integration_tests {
                 break;
             }
             assert!(
-                Instant::now() < deadline,
+                ::tokio::time::Instant::now() < deadline,
                 "PutFromSource did not publish the target route"
             );
-            let _ = source_inner
-                .ensure_remote_put(key, put_id, None, true)
-                .await
-                .expect("joining the exact remote Put flight must not fail");
+            let _ = ::tokio::time::timeout_at(
+                deadline,
+                source_inner.ensure_remote_put(key, put_id, None, true),
+            )
+            .await
+            .expect("remote Put must finish after releasing the Get barrier")
+            .expect("joining the exact remote Put flight must not fail");
             limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
@@ -1060,7 +1071,9 @@ mod owner_put_from_source_integration_tests {
             "retries and the explicit waiter must reuse one target flight"
         );
         assert_eq!(
-            target_flight.wait().await,
+            ::tokio::time::timeout(Duration::from_secs(5), target_flight.wait())
+                .await
+                .expect("completed PutFromSource flight replay must return promptly"),
             accepted,
             "a replay after background commit must retain the original Async outward terminal"
         );
@@ -1071,7 +1084,9 @@ mod owner_put_from_source_integration_tests {
             .map(|entry| entry.value().clone())
             .expect("Async PutFromSource must install one route task");
         assert!(matches!(
-            route_flight.wait().await,
+            ::tokio::time::timeout(Duration::from_secs(15), route_flight.wait())
+                .await
+                .expect("PutFromSource route task must reach its terminal"),
             crate::owner_segment::OwnerSegmentTransferOutcome::TargetCommitted {
                 route_epoch,
                 ..
@@ -1188,28 +1203,32 @@ mod owner_put_from_source_integration_tests {
             .await
             .expect("enqueue atomic owner-local source publication");
 
-        let atomic_deadline = Instant::now() + Duration::from_secs(15);
+        let atomic_deadline = ::tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let target_waiting = target_inner
                 .owner_put_from_source_flights
                 .iter()
                 .any(|entry| entry.value().request.target_plan.key == blocked_atomic_key);
-            let inflight_reserved = master_view
-                .master_kv_router()
-                .inner()
-                .inflight_replica_tasks
-                .get(&(
-                    blocked_atomic_key.clone(),
-                    batch_put_ids[0].0,
-                    batch_put_ids[0].1,
-                ))
-                .await
-                .is_some();
+            let inflight_reserved = ::tokio::time::timeout_at(
+                atomic_deadline,
+                master_view
+                    .master_kv_router()
+                    .inner()
+                    .inflight_replica_tasks
+                    .get(&(
+                        blocked_atomic_key.clone(),
+                        batch_put_ids[0].0,
+                        batch_put_ids[0].1,
+                    )),
+            )
+            .await
+            .expect("blocked atomic replica reservation lookup timed out")
+            .is_some();
             if target_waiting && inflight_reserved {
                 break;
             }
             assert!(
-                Instant::now() < atomic_deadline,
+                ::tokio::time::Instant::now() < atomic_deadline,
                 "blocked atomic PutFromSource did not reserve its immutable master operation"
             );
             limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1242,16 +1261,19 @@ mod owner_put_from_source_integration_tests {
             .inner()
             .kv_routes
             .insert(blocked_atomic_key.clone(), drifted_route);
-        let replay_plan = source_inner
-            .put_append_start(
+        let replay_plan = ::tokio::time::timeout(
+            Duration::from_secs(15),
+            source_inner.put_append_start(
                 &blocked_atomic_key,
                 batch_put_ids[0],
                 payload.len() as u32,
                 None,
                 true,
-            )
-            .await
-            .expect("replica Start replay must reuse the reserved operation");
+            ),
+        )
+        .await
+        .expect("replica Start replay timed out")
+        .expect("replica Start replay must reuse the reserved operation");
         assert_eq!(
             replay_plan.owner_candidates[0].atomic_batch.as_ref(),
             Some(&atomic_group),
@@ -1282,6 +1304,7 @@ mod owner_put_from_source_integration_tests {
         target_inner.untrack_external_get_flight(&blocked_atomic_get);
         blocked_atomic_get.notify.notify_waiters();
 
+        let atomic_deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let published = batch_keys.iter().zip(&batch_put_ids).all(|(key, put_id)| {
                 master_view
@@ -1314,8 +1337,16 @@ mod owner_put_from_source_integration_tests {
             limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        target.shutdown().await.expect("stop target owner");
-        stop_master_and_client(master, source).await;
+        ::tokio::time::timeout(Duration::from_secs(30), target.shutdown())
+            .await
+            .expect("target owner shutdown timed out")
+            .expect("stop target owner");
+        ::tokio::time::timeout(
+            Duration::from_secs(30),
+            stop_master_and_client(master, source),
+        )
+        .await
+        .expect("source and master shutdown timed out");
     }
 }
 
@@ -2785,6 +2816,9 @@ pub(crate) struct PendingLocalGetInfo {
     mem_holder: Arc<MemoryInfo>,
     source: PendingLocalGetSource,
     target_write_capability: Option<crate::owner_segment::OwnerTargetWriteCapability>,
+    // The hidden-index owner publishes this terminal while removing the entry.
+    // Detached completion retains this exact record across DELETE invalidation.
+    aborted: AtomicBool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -3373,7 +3407,14 @@ pub(crate) enum ExternalPutKeyOutcome {
 }
 
 pub(crate) struct ExternalPutKeySharedOp {
-    outcome: watch::Sender<ExternalPutKeyOutcome>,
+    state: watch::Sender<ExternalPutKeyState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalPutKeyState {
+    Pending,
+    Published,
+    Released(ExternalPutKeyOutcome),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3566,26 +3607,55 @@ pub(crate) enum OwnerLocalSsdPutReservation {
 
 impl ExternalPutKeySharedOp {
     fn new() -> Arc<Self> {
-        let (outcome, _receiver) = watch::channel(ExternalPutKeyOutcome::InFlight);
-        Arc::new(Self { outcome })
+        let (state, _receiver) = watch::channel(ExternalPutKeyState::Pending);
+        Arc::new(Self { state })
     }
 
-    fn complete(&self, outcome: ExternalPutKeyOutcome) {
-        debug_assert_ne!(outcome, ExternalPutKeyOutcome::InFlight);
-        if *self.outcome.borrow() == ExternalPutKeyOutcome::InFlight {
-            self.outcome.send_replace(outcome);
-        }
+    fn mark_published(&self) {
+        self.state.send_if_modified(|state| {
+            if *state == ExternalPutKeyState::Pending {
+                *state = ExternalPutKeyState::Published;
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn release(&self, outcome: ExternalPutKeyOutcome) {
+        assert_ne!(outcome, ExternalPutKeyOutcome::InFlight);
+        self.state.send_if_modified(|state| {
+            if matches!(state, ExternalPutKeyState::Released(_)) {
+                false
+            } else {
+                *state = ExternalPutKeyState::Released(outcome);
+                true
+            }
+        });
     }
 
     pub(crate) async fn wait(&self) -> ExternalPutKeyOutcome {
-        let mut outcome = self.outcome.subscribe();
+        let mut state = self.state.subscribe();
         loop {
-            let current = *outcome.borrow_and_update();
-            if current != ExternalPutKeyOutcome::InFlight {
-                return current;
+            match *state.borrow_and_update() {
+                ExternalPutKeyState::Pending => {}
+                ExternalPutKeyState::Published => return ExternalPutKeyOutcome::Succeeded,
+                ExternalPutKeyState::Released(outcome) => return outcome,
             }
-            if outcome.changed().await.is_err() {
+            if state.changed().await.is_err() {
                 return ExternalPutKeyOutcome::Failed;
+            }
+        }
+    }
+
+    pub(crate) async fn wait_released(&self) {
+        let mut state = self.state.subscribe();
+        loop {
+            if matches!(*state.borrow_and_update(), ExternalPutKeyState::Released(_)) {
+                return;
+            }
+            if state.changed().await.is_err() {
+                return;
             }
         }
     }
@@ -3594,6 +3664,8 @@ impl ExternalPutKeySharedOp {
 pub(crate) enum ExternalLocalFirstPutKeyReservation {
     Leader(Arc<ExternalPendingPutFenceGuard>),
     Wait(Arc<ExternalPutKeySharedOp>),
+    /// Overwrites wait for the preceding generation to release its admission fence.
+    WaitThenRetry(Arc<ExternalPutKeySharedOp>),
     /// An incoming PutFromSource or a detached Get CommitTarget already owns
     /// the canonical owner-slot materialization for this key.  A reusable
     /// local-first Put waits without claiming a slot, then re-evaluates its
@@ -3892,7 +3964,7 @@ impl ExternalPendingPutFenceGuard {
         );
         self.local_put_succeeded.store(true, Ordering::Release);
         if let Some(op) = self.local_put_op.as_ref() {
-            op.complete(ExternalPutKeyOutcome::Succeeded);
+            op.mark_published();
         }
     }
 
@@ -3980,7 +4052,7 @@ fn release_external_pending_put_counts(
     }
     drop(controls);
     if let Some(op) = local_put_op {
-        op.complete(if local_put_succeeded {
+        op.release(if local_put_succeeded {
             ExternalPutKeyOutcome::Succeeded
         } else {
             ExternalPutKeyOutcome::Failed
@@ -4259,6 +4331,7 @@ impl std::ops::Deref for ClientKvApiViewHolder {
 pub struct ClientKvApiInner {
     view: ClientKvApiViewHolder,
     test_spec_config: TestSpecConfig,
+    native_put_operations: Arc<put::NativePutOperationScope>,
     owner_local_reserve_physical_capacity_bytes: u64,
     allocation_authority: crate::master_seg_manager::msg_pack::SegmentAllocationAuthority,
     owner_placement_class: crate::master_seg_manager::msg_pack::OwnerPlacementClass,
@@ -4277,7 +4350,7 @@ pub struct ClientKvApiInner {
     /// may reuse its exact `MemoryInfo` under the per-key fence.  It is still
     /// excluded from the committed local index and from Moka hot-touch until
     /// the master terminal promotes it.
-    pending_local_get_info: DashMap<String, PendingLocalGetInfo>,
+    pending_local_get_info: DashMap<String, Arc<PendingLocalGetInfo>>,
     /// key -> local replica version remembered from local put/get durable-replica success.
     /// This authority is positive-only: hit means "can answer exists=true immediately when
     /// allow_local_snapshot is enabled"; miss does not imply non-existence.
@@ -5245,10 +5318,11 @@ impl ClientKvApiInner {
     ) -> KvResult<ExternalLocalFirstPutKeyReservation> {
         let mut controls = self.owner_key_control.lock_key(key);
         let reusable_singleflight = reject_if_inflight_same_key && reject_if_exist_same_key;
+        let wait_for_existing_operation = !reject_if_inflight_same_key || reusable_singleflight;
         if let Some(state) = controls.get(key)
             && state.local_access_fenced()
         {
-            return if reusable_singleflight {
+            return if wait_for_existing_operation {
                 Ok(ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(
                     state.subscribe_local_access_fence(),
                 ))
@@ -5270,7 +5344,7 @@ impl ClientKvApiInner {
         }
         let state = controls.entry(key.to_string()).or_default();
         if let Some(op) = state.owner_materialization.clone() {
-            return if reusable_singleflight {
+            return if wait_for_existing_operation {
                 Ok(ExternalLocalFirstPutKeyReservation::WaitForMaterialization(
                     op,
                 ))
@@ -5281,7 +5355,7 @@ impl ClientKvApiInner {
             };
         }
         if let Some(op) = state.external_get.clone() {
-            return if reusable_singleflight {
+            return if wait_for_existing_operation {
                 Ok(ExternalLocalFirstPutKeyReservation::WaitForGet(op))
             } else {
                 Err(KvError::Api(ApiError::KeyBeingWritten {
@@ -5289,26 +5363,27 @@ impl ClientKvApiInner {
                 }))
             };
         }
-        if reject_if_inflight_same_key && state.local_puts > 0 {
-            return (reusable_singleflight)
-                .then(|| state.external_put.clone())
-                .flatten()
-                .map_or_else(
-                    || {
-                        Err(KvError::Api(ApiError::KeyBeingWritten {
-                            key: key.to_string(),
-                        }))
-                    },
-                    |op| Ok(ExternalLocalFirstPutKeyReservation::Wait(op)),
-                );
+        if state.local_puts > 0 {
+            if reject_if_inflight_same_key && !reusable_singleflight {
+                return Err(KvError::Api(ApiError::KeyBeingWritten {
+                    key: key.to_string(),
+                }));
+            }
+            let op = state
+                .external_put
+                .clone()
+                .expect("a local Put leader must own its generation completion");
+            return if reusable_singleflight {
+                Ok(ExternalLocalFirstPutKeyReservation::Wait(op))
+            } else {
+                Ok(ExternalLocalFirstPutKeyReservation::WaitThenRetry(op))
+            };
         }
-        let local_put_op = reusable_singleflight.then(ExternalPutKeySharedOp::new);
-        if let Some(op) = local_put_op.as_ref() {
-            assert!(
-                state.external_put.replace(op.clone()).is_none(),
-                "a reject-on-inflight Put leader must own an empty shared-op slot"
-            );
-        }
+        let local_put_op = ExternalPutKeySharedOp::new();
+        assert!(
+            state.external_put.replace(local_put_op.clone()).is_none(),
+            "a local Put leader must own an empty shared-op slot"
+        );
         state.local_puts = state
             .local_puts
             .checked_add(1)
@@ -5322,7 +5397,7 @@ impl ClientKvApiInner {
                 key: key.to_string(),
                 owner_key_control: self.owner_key_control.clone(),
                 owns_local_put: true,
-                local_put_op,
+                local_put_op: Some(local_put_op),
                 local_put_succeeded: std::sync::atomic::AtomicBool::new(false),
                 local_slot_cleanup_view: Some(self.view.clone_view()),
                 local_slot_lease: Mutex::new(None),
@@ -5876,7 +5951,7 @@ impl ClientKvApiInner {
         allocation_id: u64,
         segment_offset: u64,
         capacity_bytes: u64,
-    ) -> KvResult<Arc<MemoryInfo>> {
+    ) -> KvResult<Arc<PendingLocalGetInfo>> {
         self.install_hidden_owner_slot_get(
             key,
             get_id,
@@ -5898,7 +5973,7 @@ impl ClientKvApiInner {
         get_id: u64,
         put_id: crate::master_kv_router::put::PutIDForAKey,
         capability: &crate::owner_segment::OwnerTargetWriteCapability,
-    ) -> KvResult<Arc<MemoryInfo>> {
+    ) -> KvResult<Arc<PendingLocalGetInfo>> {
         let target = &capability.slot;
         let len = u32::try_from(target.len).map_err(|_| {
             KvError::Api(ApiError::InvalidArgument {
@@ -5934,7 +6009,7 @@ impl ClientKvApiInner {
         allocation_id: u64,
         segment_offset: u64,
         capacity_bytes: u64,
-    ) -> KvResult<Arc<MemoryInfo>> {
+    ) -> KvResult<Arc<PendingLocalGetInfo>> {
         self.install_hidden_owner_slot_get(
             key,
             get_id,
@@ -5964,7 +6039,7 @@ impl ClientKvApiInner {
         capacity_bytes: u64,
         source: PendingLocalGetSource,
         target_write_capability: Option<&crate::owner_segment::OwnerTargetWriteCapability>,
-    ) -> KvResult<Arc<MemoryInfo>> {
+    ) -> KvResult<Arc<PendingLocalGetInfo>> {
         let controls = self.owner_key_control.lock_key(key);
         if controls
             .get(key)
@@ -6031,39 +6106,58 @@ impl ClientKvApiInner {
             segment_offset,
             capacity_bytes,
         ));
-        let previous = self.pending_local_get_info.insert(
-            key.to_string(),
-            PendingLocalGetInfo {
-                get_id,
-                put_id,
-                mem_holder: memory_info.clone(),
-                source,
-                target_write_capability: target_write_capability.cloned(),
-            },
-        );
+        let pending = Arc::new(PendingLocalGetInfo {
+            get_id,
+            put_id,
+            mem_holder: memory_info,
+            source,
+            target_write_capability: target_write_capability.cloned(),
+            aborted: AtomicBool::new(false),
+        });
+        let previous = self
+            .pending_local_get_info
+            .insert(key.to_string(), pending.clone());
         assert!(
             previous.is_none(),
             "pending local Get must be unique per key"
         );
         drop(controls);
-        Ok(memory_info)
+        Ok(pending)
     }
 
-    pub(crate) fn abort_hidden_pending_local_get(&self, key: &str, get_id: u64) -> bool {
+    pub(crate) fn abort_hidden_pending_local_get(
+        &self,
+        key: &str,
+        pending: &Arc<PendingLocalGetInfo>,
+    ) -> bool {
         let _controls = self.owner_key_control.lock_key(key);
-        let capability = self.pending_local_get_info.get(key).and_then(|pending| {
-            (pending.get_id == get_id)
-                .then(|| pending.target_write_capability.clone())
-                .flatten()
-        });
-        if let Some(capability) = capability {
+        self.abort_hidden_pending_local_get_locked(key, pending)
+    }
+
+    fn abort_hidden_pending_local_get_locked(
+        &self,
+        key: &str,
+        pending: &Arc<PendingLocalGetInfo>,
+    ) -> bool {
+        assert_eq!(pending.mem_holder.key, key);
+        if pending.aborted.load(Ordering::Acquire) {
+            return true;
+        }
+        if !self
+            .pending_local_get_info
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), pending))
+        {
+            return false;
+        }
+        if let Some(capability) = pending.target_write_capability.as_ref() {
             let outcome = self
                 .owner_segment_allocator
                 .lock()
                 .abort_data_ready_visible_get_target(
                     &capability.operation,
                     &capability.lease_id,
-                    "master GetDone rejected the hidden target".to_string(),
+                    "hidden Get target invalidated before local route commit".to_string(),
                 );
             if !matches!(
                 outcome,
@@ -6071,16 +6165,22 @@ impl ClientKvApiInner {
             ) {
                 tracing::error!(
                     key,
-                    get_id,
+                    get_id = pending.get_id,
                     outcome = ?outcome,
                     "refusing to remove a hidden Get target whose operation did not abort"
                 );
                 return false;
             }
         }
-        self.pending_local_get_info
-            .remove_if(key, |_, pending| pending.get_id == get_id)
-            .is_some()
+        let removed = self
+            .pending_local_get_info
+            .remove_if(key, |_, current| Arc::ptr_eq(current, pending));
+        assert!(
+            removed.is_some(),
+            "locked hidden Get target must remain exact"
+        );
+        pending.aborted.store(true, Ordering::Release);
+        true
     }
 
     pub(crate) fn promote_hidden_owner_slot_get(
@@ -9444,6 +9544,47 @@ impl OwnerSegmentAllocator {
         true
     }
 
+    /// DELETE may arrive after GetDone removed the hidden index. Resolve the
+    /// exact GlobalShared route from its manifest and release it at most once.
+    pub fn release_deleted_global_manifest_route(
+        &mut self,
+        key: &str,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
+    ) -> Option<OwnerSlotRef> {
+        use crate::owner_segment::{OwnerSlotPhysicalState, OwnerSlotScope};
+
+        let segment = self.segment.as_ref()?;
+        let manifest = segment.manifest_entry(key, put_id)?;
+        if manifest.scope != Some(OwnerSlotScope::GlobalShared)
+            || manifest.physical_state != OwnerSlotPhysicalState::Committed
+        {
+            return None;
+        }
+        let slot = manifest.slot.clone();
+        let allocation = segment
+            .allocation(slot.allocation_id)
+            .expect("committed manifest must own its allocation");
+        assert!(
+            matches!(
+                allocation.state,
+                OwnerSlotState::Committed {
+                    route_live: true,
+                    ..
+                }
+            ),
+            "committed GlobalShared manifest must retain its route"
+        );
+        assert!(
+            self.release_committed_slot_route(
+                slot.allocation_id,
+                slot.segment_offset,
+                slot.capacity_bytes,
+            ),
+            "manifest route must retain its exact allocation identity"
+        );
+        Some(slot)
+    }
+
     /// Drop the route reference and the resident `MemoryInfo` reference as one
     /// slot-pool transaction. This is the normal owner-reclaim transition and
     /// avoids exposing an intermediate state across two pool lock acquisitions.
@@ -10369,7 +10510,7 @@ async fn execute_owner_put_from_source(
                 op.wait_terminal().await;
             }
             OwnerKeyMaterializationReservation::WaitForExternalPut(op) => {
-                let _ = op.wait().await;
+                op.wait_released().await;
             }
             OwnerKeyMaterializationReservation::WaitForLocalAccess(completion) => {
                 wait_owner_local_access_fence(completion).await;
@@ -11927,7 +12068,6 @@ mod owner_reclaim_slot_tests {
     use dashmap::DashMap;
     use parking_lot::Mutex;
     use std::fs;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Weak};
     use std::time::{Duration, Instant};
@@ -12043,7 +12183,16 @@ mod owner_reclaim_slot_tests {
                 .expect("the follower must observe the leader terminal result"),
             ExternalPutKeyOutcome::Succeeded
         );
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(20), op.wait_released())
+                .await
+                .is_err(),
+            "an overwrite must wait until the preceding admission fence is released"
+        );
         drop(leader);
+        ::tokio::time::timeout(Duration::from_secs(1), op.wait_released())
+            .await
+            .expect("dropping the leader must release overwrite admission");
         assert!(controls.lock_key(key).get(key).is_none());
     }
 
@@ -12584,11 +12733,8 @@ mod owner_reclaim_slot_tests {
 
     #[limit_thirdparty::tokio::test]
     async fn early_ssd_byte_rejection_does_not_install_generation_flight() {
-        let target = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/mnt/nvme0/mjq_build/push_sglang_fluxon_target"));
-        let root = target.join("kv_ssd_tests").join(format!(
-            "early-pre-admission-{}-{}",
+        let root = std::env::temp_dir().join(format!(
+            "fluxon-early-pre-admission-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
@@ -12837,7 +12983,7 @@ mod owner_reclaim_slot_tests {
 
     #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn single_key_source_selection_fence_closes_late_get_and_rolls_back() {
-        use crate::client_kv_api::PutOptionalArgs;
+        use crate::client_kv_api::{PutOptionalArg, PutOptionalArgs};
         use crate::kvcore_test_lib::{
             integration_test_lock, start_master_and_client, stop_master_and_client,
         };
@@ -12855,7 +13001,8 @@ mod owner_reclaim_slot_tests {
             .expect("the first same-key Put must become leader")
         {
             ExternalLocalFirstPutKeyReservation::Leader(leader) => leader,
-            ExternalLocalFirstPutKeyReservation::Wait(_) => {
+            ExternalLocalFirstPutKeyReservation::Wait(_)
+            | ExternalLocalFirstPutKeyReservation::WaitThenRetry(_) => {
                 panic!("the first same-key Put cannot be a follower")
             }
             ExternalLocalFirstPutKeyReservation::WaitForMaterialization(_) => {
@@ -12873,6 +13020,9 @@ mod owner_reclaim_slot_tests {
             .expect("the second same-key Put must join the leader")
         {
             ExternalLocalFirstPutKeyReservation::Wait(waiter) => waiter,
+            ExternalLocalFirstPutKeyReservation::WaitThenRetry(_) => {
+                panic!("a reusable Put must reuse the leader result")
+            }
             ExternalLocalFirstPutKeyReservation::Leader(_) => {
                 panic!("the second same-key Put must not claim a second leader fence")
             }
@@ -12895,7 +13045,11 @@ mod owner_reclaim_slot_tests {
 
         let key = "selection-single";
         inner
-            .put(key, &[7u8; 4096], PutOptionalArgs::default())
+            .put(
+                key,
+                &[7u8; 4096],
+                PutOptionalArgs(vec![PutOptionalArg::SkipMakeReplicaTask]),
+            )
             .await
             .expect("owner put must publish a committed route");
         let (holder, _remote) = inner
@@ -12916,6 +13070,14 @@ mod owner_reclaim_slot_tests {
         };
         let source = cached.mem_holder.clone();
         drop(cached);
+        let (allocation_id, segment_offset, capacity_bytes) = source
+            .local_reserve_resident_slot_ref()
+            .expect("native owner Put must publish an exact committed slot");
+        let backing = OwnerReclaimBacking::CommittedSlot {
+            allocation_id,
+            segment_offset,
+            capacity_bytes,
+        };
         assert!(
             !owner_hot_source_has_active_holders(&source),
             "the initial victim check must see only index plus selection pins"
@@ -12959,7 +13121,8 @@ mod owner_reclaim_slot_tests {
             ExternalLocalFirstPutKeyReservation::Leader(_) => {
                 panic!("a source-fenced key cannot claim a local-Put leader")
             }
-            ExternalLocalFirstPutKeyReservation::Wait(_) => {
+            ExternalLocalFirstPutKeyReservation::Wait(_)
+            | ExternalLocalFirstPutKeyReservation::WaitThenRetry(_) => {
                 panic!("a source-fenced key has no local-Put leader to join")
             }
             ExternalLocalFirstPutKeyReservation::WaitForMaterialization(_) => {
@@ -12991,6 +13154,10 @@ mod owner_reclaim_slot_tests {
             inner.reserve_external_local_first_put_key(key, true, false),
             Err(KvError::Api(ApiError::KeyBeingWritten { .. }))
         ));
+        assert!(matches!(
+            inner.reserve_external_local_first_put_key(key, false, false),
+            Ok(ExternalLocalFirstPutKeyReservation::WaitForLocalAccess(_))
+        ));
         drop(source);
         let master_id = master
             .cluster_manager_view()
@@ -13002,7 +13169,7 @@ mod owner_reclaim_slot_tests {
             key: identity.key.clone(),
             put_id: (identity.put_time_ms, identity.put_version.wrapping_add(1)),
             epoch: 90,
-            backing: OwnerReclaimBacking::Allocation,
+            backing: backing.clone(),
             reason: OwnerReclaimReason::OwnerCapacityEviction,
         };
         let mismatch_resp = super::reclaim::handle_batch_owner_reclaim(
@@ -13034,7 +13201,7 @@ mod owner_reclaim_slot_tests {
             key: identity.key.clone(),
             put_id: (identity.put_time_ms, identity.put_version),
             epoch: 100,
-            backing: OwnerReclaimBacking::Allocation,
+            backing: backing.clone(),
             reason: OwnerReclaimReason::OwnerCapacityEviction,
         };
         let prepare_resp = super::reclaim::handle_batch_owner_reclaim(
@@ -13152,7 +13319,7 @@ mod owner_reclaim_slot_tests {
             &OwnerSourceEvictionVictim {
                 key: key.to_string(),
                 put_id: (identity.put_time_ms, identity.put_version),
-                backing: OwnerReclaimBacking::Allocation,
+                backing,
                 global_demotion_reserved: false,
                 ssd_backing_len: None,
                 ssd_policy: OwnerSourceSsdPolicy::Drop,
@@ -15220,6 +15387,7 @@ impl ClientKvApi {
         let inner = ClientKvApiInner {
             view: ClientKvApiViewHolder::new(),
             test_spec_config,
+            native_put_operations: Arc::new(put::NativePutOperationScope::default()),
             owner_local_reserve_physical_capacity_bytes,
             allocation_authority,
             owner_placement_class,
@@ -16107,7 +16275,15 @@ impl LogicalModule for ClientKvApi {
         ClientKvApi::attach_view(self, view);
     }
 
+    async fn prepare_shutdown(&self) -> Result<(), Self::Error> {
+        self.0.native_put_operations.close_admission();
+        Ok(())
+    }
+
     async fn before_shutdown(&self) -> Result<(), Self::Error> {
+        // The framework has signalled admission cancellation, while P2P and
+        // the cluster manager remain live for reservation cleanup.
+        self.0.native_put_operations.wait_finished().await?;
         // High cohesion: handle KV client drop readiness here
         tracing::info!("ClientKvApi before_shutdown: waiting until safe to drop");
         loop {

@@ -4,6 +4,9 @@ use super::{
 };
 use crate::client_seg_pool::ClientSegPoolAccessTrait;
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+use crate::config::{
+    DEFAULT_OWNER_LOCAL_RESERVE_HARD_TIMEOUT_MS, DEFAULT_OWNER_LOCAL_RESERVE_SOFT_WAIT_TIMEOUT_MS,
+};
 use crate::master_seg_manager::msg_pack::{
     OwnerCapacityReport, OwnerCapacityReportReq, OwnerPlacementClass, OwnerSizeClassCapacity,
     SegmentAllocationAuthority,
@@ -26,8 +29,6 @@ const OWNER_CAPACITY_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 // transport failure bound and is independent from the five-second freshness
 // gate used by placement.
 const OWNER_CAPACITY_REPORT_TIMEOUT: Duration = Duration::from_secs(10);
-const OWNER_LOCAL_RESERVE_DEFAULT_SOFT_WAIT_TIMEOUT: Duration = Duration::from_millis(10);
-const OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const OWNER_SLOT_PRESSURE_INTERVAL: Duration = Duration::from_millis(10);
 const OWNER_SLOT_PRESSURE_MIN_KICK_INTERVAL: Duration = Duration::from_millis(25);
 const OWNER_SLOT_PRESSURE_INITIAL_COARSE_BYTES: u64 = 64 * 1024 * 1024;
@@ -267,16 +268,18 @@ fn snapshot_rebalance(pool: &OwnerSegmentAllocator) -> RebalanceSnapshot {
 }
 
 pub(crate) fn owner_local_reserve_timeout_config(inner: &ClientKvApiInner) -> (Duration, Duration) {
-    let soft_wait_timeout = inner
-        .test_spec_config
-        .owner_local_reserve_soft_wait_timeout_ms
-        .map(Duration::from_millis)
-        .unwrap_or(OWNER_LOCAL_RESERVE_DEFAULT_SOFT_WAIT_TIMEOUT);
-    let hard_timeout = inner
-        .test_spec_config
-        .owner_local_reserve_hard_timeout_ms
-        .map(Duration::from_millis)
-        .unwrap_or(OWNER_LOCAL_RESERVE_DEFAULT_HARD_TIMEOUT);
+    let soft_wait_timeout = Duration::from_millis(
+        inner
+            .test_spec_config
+            .owner_local_reserve_soft_wait_timeout_ms
+            .unwrap_or(DEFAULT_OWNER_LOCAL_RESERVE_SOFT_WAIT_TIMEOUT_MS),
+    );
+    let hard_timeout = Duration::from_millis(
+        inner
+            .test_spec_config
+            .owner_local_reserve_hard_timeout_ms
+            .unwrap_or(DEFAULT_OWNER_LOCAL_RESERVE_HARD_TIMEOUT_MS),
+    );
     (soft_wait_timeout, hard_timeout)
 }
 

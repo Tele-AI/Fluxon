@@ -1,6 +1,6 @@
 use super::{
     ClientKvApiInner, ClientKvApiView, OwnerKeyMaterializationGuard,
-    OwnerKeyMaterializationOutcome, OwnerSlotLease,
+    OwnerKeyMaterializationOutcome, OwnerSlotLease, PendingLocalGetInfo,
 };
 use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
 use crate::memholder::{MemoryInfo, UserMemHolder, UserMemHolderExposeKind};
@@ -36,6 +36,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 const BATCH_GET_DONE_MAX_INFLIGHT: usize = 4;
+const BATCH_GET_DONE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+const BATCH_GET_MAX_STALE_PLAN_RETRIES: usize = 3;
 
 fn allocation_mode_installs_owner_index(mode: GetAllocationMode) -> bool {
     matches!(
@@ -557,6 +559,7 @@ pub struct RemoteGetInfo {
     target_addr: u64,
     node_id: NodeID,
     peer_is_src_or_target: bool,
+    source_kind: GetSourceKind,
 }
 
 impl std::fmt::Display for RemoteGetInfo {
@@ -579,6 +582,10 @@ impl RemoteGetInfo {
         self.data_len
     }
 
+    pub fn source_kind(&self) -> GetSourceKind {
+        self.source_kind
+    }
+
     pub fn is_remote_transfer(&self) -> bool {
         self.peer_is_src_or_target
     }
@@ -590,7 +597,7 @@ struct OwnerGetDonePending {
     start_item: BatchGetStartItemResp,
     peer_is_remote: bool,
     transfer_us: i64,
-    owner_slot_memory_info: Option<Arc<MemoryInfo>>,
+    owner_slot_pending: Option<Arc<PendingLocalGetInfo>>,
     target_write_capability: Option<OwnerTargetWriteCapability>,
     get_to_target_terminal: Option<(OwnerGeneration, u64)>,
     late_target: Option<GetBindTarget>,
@@ -604,6 +611,26 @@ async fn run_async_owner_get_route_commit(
     let inner = view.client_kv_api().inner();
     let mut attempt = 1u32;
     while !pending.is_empty() && view.register_shutdown_poller().is_running() {
+        // A local DELETE terminal needs no further master discovery or RPC.
+        // Each retained record proves which key generation and slot closed.
+        pending.retain_mut(|item| {
+            let target = item
+                .owner_slot_pending
+                .as_ref()
+                .expect("Async owner Get requires its exact hidden target");
+            assert_eq!(target.get_id, item.start_item.get_id);
+            assert_eq!(target.put_id, item.start_item.put_id);
+            if !target.aborted.load(std::sync::atomic::Ordering::Acquire) {
+                return true;
+            }
+            if let Some(mut guard) = item.materialization_guard.take() {
+                guard.finish(OwnerKeyMaterializationOutcome::Failed);
+            }
+            false
+        });
+        if pending.is_empty() {
+            break;
+        }
         let done_items = pending
             .iter()
             .map(|item| BatchGetDoneItemReq {
@@ -620,6 +647,18 @@ async fn run_async_owner_get_route_commit(
         match response {
             Ok(response) if batch_get_done_response_matches(&get_ids, &response) => {
                 for (mut item, terminal) in pending.into_iter().zip(response.items) {
+                    let target = item
+                        .owner_slot_pending
+                        .as_ref()
+                        .expect("Async owner Get requires its exact hidden target");
+                    assert_eq!(target.get_id, item.start_item.get_id);
+                    assert_eq!(target.put_id, item.start_item.put_id);
+                    if target.aborted.load(std::sync::atomic::Ordering::Acquire) {
+                        if let Some(mut guard) = item.materialization_guard.take() {
+                            guard.finish(OwnerKeyMaterializationOutcome::Failed);
+                        }
+                        continue;
+                    }
                     let expected_mode = if item.start_item.prepared_target.is_some() {
                         GetAllocationMode::LocalCommittedSlot
                     } else {
@@ -645,8 +684,12 @@ async fn run_async_owner_get_route_commit(
                         // eligibility and its hidden index reference; the
                         // resident MemoryInfo holder keeps the physical slot
                         // alive until the caller releases it.
-                        let target_aborted =
-                            inner.abort_hidden_pending_local_get(&item.key, item.start_item.get_id);
+                        let target_aborted = inner.abort_hidden_pending_local_get(
+                            &item.key,
+                            item.owner_slot_pending
+                                .as_ref()
+                                .expect("installed owner Get target"),
+                        );
                         if target_aborted {
                             if let Some(mut guard) = item.materialization_guard.take() {
                                 guard.finish(OwnerKeyMaterializationOutcome::Failed);
@@ -691,9 +734,9 @@ async fn run_async_owner_get_route_commit(
                         item.start_item.put_id,
                     ) {
                         Ok(memory_info) => {
-                            if let Some(prepared) = item.owner_slot_memory_info.as_ref() {
+                            if let Some(prepared) = item.owner_slot_pending.as_ref() {
                                 assert!(
-                                    Arc::ptr_eq(prepared, &memory_info),
+                                    Arc::ptr_eq(&prepared.mem_holder, &memory_info),
                                     "Async Get commit must retain the unique owner-slot MemoryInfo"
                                 );
                             }
@@ -707,6 +750,20 @@ async fn run_async_owner_get_route_commit(
                             }
                         }
                         Err(error) => {
+                            // DELETE may finish the exact hidden target after the
+                            // master response but before local promotion.
+                            if item
+                                .owner_slot_pending
+                                .as_ref()
+                                .expect("owner Get target")
+                                .aborted
+                                .load(std::sync::atomic::Ordering::Acquire)
+                            {
+                                if let Some(mut guard) = item.materialization_guard.take() {
+                                    guard.finish(OwnerKeyMaterializationOutcome::Failed);
+                                }
+                                continue;
+                            }
                             tracing::warn!(
                                 key = item.key,
                                 get_id = item.start_item.get_id,
@@ -1020,7 +1077,7 @@ impl ClientKvApiInner {
                     start_item,
                     peer_is_remote,
                     transfer_us,
-                    owner_slot_memory_info: None,
+                    owner_slot_pending: None,
                     target_write_capability: Some(capability),
                     get_to_target_terminal: Some((source_owner, terminal_sequence)),
                     late_target,
@@ -1040,7 +1097,7 @@ impl ClientKvApiInner {
                     start_item,
                     peer_is_remote,
                     transfer_us: 0,
-                    owner_slot_memory_info: None,
+                    owner_slot_pending: None,
                     target_write_capability: None,
                     get_to_target_terminal: None,
                     late_target,
@@ -1119,7 +1176,7 @@ impl ClientKvApiInner {
                         start_item,
                         peer_is_remote,
                         transfer_us,
-                        owner_slot_memory_info: None,
+                        owner_slot_pending: None,
                         target_write_capability: None,
                         get_to_target_terminal: None,
                         late_target,
@@ -1232,7 +1289,7 @@ impl ClientKvApiInner {
             };
             match install_result {
                 Ok(memory_info) => {
-                    pending.owner_slot_memory_info = memory_info;
+                    pending.owner_slot_pending = memory_info;
                     ready_done_pending.push(pending);
                 }
                 Err(err) => {
@@ -1290,7 +1347,7 @@ impl ClientKvApiInner {
         if route_commit_mode == OwnerRouteCommitMode::Async {
             let mut synchronous_pending = Vec::new();
             for mut pending in done_pending {
-                let owner_target = pending.owner_slot_memory_info.is_some()
+                let owner_target = pending.owner_slot_pending.is_some()
                     && (pending.target_write_capability.is_some()
                         || pending.start_item.reused_committed_slot.is_some());
                 if !owner_target {
@@ -1331,9 +1388,10 @@ impl ClientKvApiInner {
                 pending.materialization_guard = Some(materialization_guard);
 
                 let memory_info = pending
-                    .owner_slot_memory_info
+                    .owner_slot_pending
                     .as_ref()
                     .expect("Async owner Get requires its hidden MemoryInfo")
+                    .mem_holder
                     .clone();
                 let data_len = pending.start_item.len as usize;
                 metrics.record_l2_hit_locality(pending.peer_is_remote, data_len as u64);
@@ -1350,6 +1408,7 @@ impl ClientKvApiInner {
                     target_addr: pending.start_item.target_addr,
                     node_id: pending.start_item.node_id.clone().into(),
                     peer_is_src_or_target: pending.peer_is_remote,
+                    source_kind: pending.start_item.source_kind,
                 };
                 results[pending.idx] = Some(Ok(Some((
                     Arc::new(UserMemHolder::new(
@@ -1468,8 +1527,13 @@ impl ClientKvApiInner {
                 if pending.start_item.prepared_target.is_some()
                     || pending.start_item.reused_committed_slot.is_some()
                 {
-                    let target_aborted = self
-                        .abort_hidden_pending_local_get(&pending.key, pending.start_item.get_id);
+                    let target_aborted = self.abort_hidden_pending_local_get(
+                        &pending.key,
+                        pending
+                            .owner_slot_pending
+                            .as_ref()
+                            .expect("installed owner Get target"),
+                    );
                     let canonical = self
                         .local_committed_mem_holder_for_put_id(
                             &pending.key,
@@ -1488,7 +1552,7 @@ impl ClientKvApiInner {
                     // dropping its final local Arc performs the one valid release.
                     // Calling release_prepared_get_target here would release the same
                     // slot through the obsolete Prepared-state path.
-                    drop(pending.owner_slot_memory_info.take());
+                    drop(pending.owner_slot_pending.take());
                     // A same-version PutDone/GetDone may have won while this
                     // transfer was in flight.  Converge on the owner's
                     // canonical local backing instead of turning an already
@@ -1527,8 +1591,13 @@ impl ClientKvApiInner {
             };
             let memory_info = if let Some(expected_mode) = owner_slot_mode {
                 if done_item.allocation_mode != expected_mode {
-                    let target_aborted = self
-                        .abort_hidden_pending_local_get(&pending.key, pending.start_item.get_id);
+                    let target_aborted = self.abort_hidden_pending_local_get(
+                        &pending.key,
+                        pending
+                            .owner_slot_pending
+                            .as_ref()
+                            .expect("installed owner Get target"),
+                    );
                     if target_aborted
                         && let Some((source_owner, terminal_sequence)) =
                             pending.get_to_target_terminal.take()
@@ -1555,9 +1624,9 @@ impl ClientKvApiInner {
                         continue;
                     }
                 };
-                if let Some(prepared) = pending.owner_slot_memory_info.as_ref() {
+                if let Some(prepared) = pending.owner_slot_pending.as_ref() {
                     assert!(
-                        Arc::ptr_eq(prepared, &memory_info),
+                        Arc::ptr_eq(&prepared.mem_holder, &memory_info),
                         "Get promotion must retain the unique owner-slot MemoryInfo"
                     );
                 }
@@ -1622,6 +1691,7 @@ impl ClientKvApiInner {
                 target_addr: pending.start_item.target_addr,
                 node_id: pending.start_item.node_id.clone().into(),
                 peer_is_src_or_target: pending.peer_is_remote,
+                source_kind: pending.start_item.source_kind,
             };
             if matches!(
                 done_item.allocation_mode,
@@ -1758,7 +1828,10 @@ impl ClientKvApiInner {
             }
         }
 
-        if !missing_keys.is_empty() {
+        for attempt in 0..=BATCH_GET_MAX_STALE_PLAN_RETRIES {
+            if missing_keys.is_empty() {
+                break;
+            }
             let (start_resp, late_targets) =
                 super::external_api::batch_get_start_with_local_reserve_targets(
                     self,
@@ -1776,7 +1849,7 @@ impl ClientKvApiInner {
             }
             let finished = self
                 .batch_get_finish_started(
-                    missing_keys,
+                    std::mem::take(&mut missing_keys),
                     start_resp.items,
                     late_targets,
                     transfer_concurrency,
@@ -1791,8 +1864,20 @@ impl ClientKvApiInner {
                     ),
                 }));
             }
-            for (idx, result) in missing_indices.into_iter().zip(finished) {
-                results[idx] = Some(result);
+            for (idx, result) in std::mem::take(&mut missing_indices)
+                .into_iter()
+                .zip(finished)
+            {
+                // The failed attempt has already closed its target and revoked
+                // the old Get. A fresh Plan observes the remaining exact routes.
+                if attempt < BATCH_GET_MAX_STALE_PLAN_RETRIES
+                    && matches!(&result, Err(KvError::Api(ApiError::StaleGetPlan { .. })))
+                {
+                    missing_indices.push(idx);
+                    missing_keys.push(keys[idx].clone());
+                } else {
+                    results[idx] = Some(result);
+                }
             }
         }
 
@@ -2221,19 +2306,31 @@ impl ClientKvApiInner {
         // so a capacity scan cannot park every master Tokio worker on Moka's
         // blocking housekeeper lock.  The permit covers one RPC attempt only;
         // idempotent retry backoff releases it and lets other atomic_batches converge.
-        let _done_rpc_permit = batch_get_done_rpc_limiter()
-            .acquire()
-            .await
-            .expect("the process-wide BatchGetDone limiter is never closed");
+        let mut shutdown_waiter = self.view.register_shutdown_waiter();
+        // Admission and discovery have no remote side effects. Bound both so
+        // a detached completion can revisit an exact local DELETE terminal.
+        let (_done_rpc_permit, master_node_id) = tokio::select! {
+            biased;
+            _ = shutdown_waiter.wait() => {
+                return Err(KvError::Api(ApiError::SystemShutdown {
+                    detail: "ClientKvApi stopped before BatchGetDone RPC admission".to_string(),
+                }));
+            }
+            admission = tokio::time::timeout(BATCH_GET_DONE_ADMISSION_TIMEOUT, async {
+                let permit = batch_get_done_rpc_limiter().acquire().await
+                    .expect("the process-wide BatchGetDone limiter is never closed");
+                let master = self.view.cluster_manager().find_or_wait_master_node().await?;
+                Ok::<_, KvError>((permit, master))
+            }) => admission.map_err(|_| KvError::Api(ApiError::GetTimeout {
+                timeout_ms: BATCH_GET_DONE_ADMISSION_TIMEOUT.as_millis() as u64,
+                detail: "BatchGetDone timed out waiting for RPC admission and master discovery".to_string(),
+            }))??,
+        };
         let req = MsgPack {
             serialize_part: BatchGetDoneReq { items },
             raw_bytes: Vec::new(),
         };
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
+        // Once dispatched, consume the RPC outcome even if shutdown begins.
         let resp = call_control_plane_rpc(
             &self.rpc_caller_batch_get_done,
             self.view.p2p_module(),
@@ -2277,6 +2374,419 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn deleted_data_ready_get_releases_key_fence_and_exact_target() {
+        use super::{
+            GetToTargetAttempt, OwnerGetDonePending, execute_get_to_target_items,
+            run_async_owner_get_route_commit,
+        };
+        use crate::client_kv_api::PutOptionalArgs;
+        use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+        use crate::kvcore_test_lib::{
+            integration_test_lock, start_additional_client_with_config,
+            start_master_and_client_with_client_config,
+        };
+        use crate::master_kv_router::msg_pack::{
+            BatchDeleteClientKvMetaCacheReq, BatchGetDoneItemReq, DeleteClientKvMetaCacheItem,
+        };
+        use crate::memholder::{UserMemHolder, UserMemHolderExposeKind};
+        use crate::owner_segment::{OwnerSegmentTransferOutcome, OwnerSlotPhysicalState};
+        use crate::rpcresp_kvresult_convert::msg_and_error::OK;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let _test_guard = integration_test_lock().await;
+        let test_id = uuid::Uuid::new_v4().simple().to_string();
+        let master_name = format!("deleted_get_master_{test_id}");
+        let (master, owner) = start_master_and_client_with_client_config(
+            &master_name,
+            &format!("deleted_get_owner_{test_id}"),
+            |_| {},
+        )
+        .await;
+        let source = start_additional_client_with_config(
+            &master_name,
+            &format!("deleted_get_source_{test_id}"),
+            |_| {},
+        )
+        .await;
+        let owner_view = owner.client_kv_api_view();
+        let inner = owner_view.client_kv_api().inner();
+        let source_view = source.client_kv_api_view();
+        let source_inner = source_view.client_kv_api().inner();
+
+        // Pause between DataReady and detached GetDone, including a successful
+        // master response that has not yet reached local promotion.
+        for (reuse_global, master_committed, delete_before_completion) in [
+            (false, false, true),
+            (true, false, true),
+            (false, true, true),
+            (true, false, false),
+        ] {
+            let key =
+                format!("deleted-get-{reuse_global}-{master_committed}-{delete_before_completion}");
+            let payload = vec![0x6b; 4096];
+            let baseline_slots = inner.owner_segment_allocator.lock().used_slot_count();
+            let publisher = if reuse_global { inner } else { source_inner };
+            publisher
+                .put(&key, &payload, PutOptionalArgs::default())
+                .await
+                .expect("publish the Get source");
+            if reuse_global {
+                // Model an exact owner demotion without retaining a local index.
+                let _controls = inner.owner_key_control.lock_key(&key);
+                let (_, cached) = inner.get_cached_info.remove(&key).expect("local Put index");
+                let put_id = (cached.put_time_ms, cached.put_version);
+                let (allocation_id, offset, capacity) = cached
+                    .mem_holder
+                    .local_reserve_resident_slot_ref()
+                    .expect("owner slot");
+                inner
+                    .owner_segment_allocator
+                    .lock()
+                    .commit_legacy_a19_global_demotion(
+                        &key,
+                        put_id,
+                        allocation_id,
+                        offset,
+                        capacity,
+                    )
+                    .expect("demote exact owner manifest");
+                inner.local_snapshot_info.remove(&key);
+                let self_id: crate::cluster_manager::NodeID = owner_view
+                    .cluster_manager()
+                    .get_self_info()
+                    .id
+                    .clone()
+                    .into();
+                let router_view = master.master_kv_router_view();
+                let route = router_view
+                    .master_kv_router()
+                    .inner()
+                    .kv_routes
+                    .get(&key)
+                    .expect("source route")
+                    .clone();
+                route
+                    .node_replicas
+                    .write()
+                    .get_mut(&self_id)
+                    .expect("owner replica")
+                    .memory
+                    .as_mut()
+                    .expect("memory replica")
+                    .owner_local_indexed = false;
+                drop(cached);
+            }
+
+            let keys = vec![key.clone()];
+            let (mut starts, mut late_targets) =
+                crate::client_kv_api::external_api::batch_get_start_with_local_reserve_targets(
+                    inner, &keys,
+                )
+                .await
+                .expect("plan the owner Get");
+            let mut transfers =
+                execute_get_to_target_items(inner, &keys, &starts.items, &late_targets).await;
+            let start_item = starts.items.remove(0);
+            assert_eq!(start_item.error_code, OK);
+            let late_target = late_targets.remove(0);
+            let capability = if reuse_global {
+                assert!(transfers.remove(0).is_none());
+                None
+            } else {
+                let Some(GetToTargetAttempt::Prepared {
+                    capability,
+                    result,
+                    source_owner,
+                    terminal_sequence,
+                    ..
+                }) = transfers.remove(0)
+                else {
+                    panic!("remote Get must reach an owner target");
+                };
+                result.expect("Get transfer must become DataReady");
+                inner
+                    .owner_transfer_peer_tracker
+                    .record_terminal(&source_owner, terminal_sequence);
+                Some(capability)
+            };
+            let target = if let Some(capability) = capability.as_ref() {
+                let target = inner
+                    .install_hidden_leased_pending_local_get(
+                        &key,
+                        start_item.get_id,
+                        start_item.put_id,
+                        capability,
+                    )
+                    .expect("install hidden DataReady target");
+                assert!(matches!(
+                    inner
+                        .owner_segment_allocator
+                        .lock()
+                        .begin_data_ready_get_target_commit(capability),
+                    OwnerSegmentTransferOutcome::TargetCommitPending { .. }
+                ));
+                target
+            } else {
+                let slot = start_item
+                    .reused_committed_slot
+                    .as_ref()
+                    .expect("reused global slot");
+                inner
+                    .install_hidden_global_shared_get(
+                        &key,
+                        start_item.get_id,
+                        start_item.put_id,
+                        slot.addr,
+                        slot.base_addr,
+                        slot.len as u32,
+                        slot.allocation_id,
+                        slot.segment_offset,
+                        slot.capacity_bytes,
+                    )
+                    .expect("retain hidden reused slot")
+            };
+            let guard = inner
+                .begin_async_get_key_materialization(&key, start_item.put_id)
+                .expect("detached Get must own the key fence");
+            let holder = UserMemHolder::new(
+                target.mem_holder.clone(),
+                inner.get_or_init_all_memholder_refcount(),
+                UserMemHolderExposeKind::SegPtr,
+            );
+            assert_eq!(holder.bytes(), payload);
+            let done_request = BatchGetDoneItemReq {
+                get_id: start_item.get_id,
+                late_target: late_target.clone(),
+            };
+            if master_committed {
+                let response = inner
+                    .batch_get_done_items(vec![done_request])
+                    .await
+                    .expect("master commit before DELETE");
+                assert_eq!(response.items[0].error_code, OK);
+            }
+            let old_put_id = start_item.put_id;
+            let pending = OwnerGetDonePending {
+                idx: 0,
+                key: key.clone(),
+                start_item,
+                peer_is_remote: !reuse_global,
+                transfer_us: 0,
+                owner_slot_pending: Some(target.clone()),
+                target_write_capability: capability.clone(),
+                get_to_target_terminal: None,
+                late_target,
+                materialization_guard: Some(guard),
+            };
+            if delete_before_completion {
+                inner
+                    .delete(&key)
+                    .await
+                    .expect("DELETE before detached completion");
+                assert!(target.aborted.load(Ordering::Acquire));
+                assert!(!inner.pending_local_get_info.contains_key(&key));
+            } else {
+                // Remove the route without delivering its notification yet.
+                // GetDone must reject before the owner's DELETE cleanup runs.
+                let (_, removed) = master
+                    .master_kv_router_view()
+                    .master_kv_router()
+                    .inner()
+                    .kv_routes
+                    .remove(&key)
+                    .expect("master removes the exact old route");
+                assert_eq!(removed.put_id, old_put_id);
+            }
+            assert_eq!(
+                holder.bytes(),
+                payload,
+                "DELETE must preserve the caller's bytes"
+            );
+            if let Some(capability) = capability.as_ref() {
+                let allocator = inner.owner_segment_allocator.lock();
+                let lease = allocator
+                    .segment
+                    .as_ref()
+                    .unwrap()
+                    .target_leases
+                    .get(&capability.operation)
+                    .expect("exact target terminal");
+                assert!(matches!(
+                    lease.state,
+                    crate::client_kv_api::OwnerTargetLeaseState::Aborted { .. }
+                ));
+                assert_eq!(
+                    allocator
+                        .manifest_entry(&key, old_put_id)
+                        .unwrap()
+                        .physical_state,
+                    OwnerSlotPhysicalState::Reclaiming
+                );
+            }
+
+            let overwrite_view = owner_view.clone();
+            let overwrite_key = key.clone();
+            let overwrite = ::tokio::spawn(async move {
+                overwrite_view
+                    .client_kv_api()
+                    .inner()
+                    .put(
+                        &overwrite_key,
+                        b"new-generation",
+                        PutOptionalArgs::default(),
+                    )
+                    .await
+            });
+            ::tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    assert!(
+                        !overwrite.is_finished(),
+                        "Put must wait for the Get terminal"
+                    );
+                    if master
+                        .master_kv_router_view()
+                        .master_kv_router()
+                        .inner()
+                        .prepared_put_key_reservations
+                        .iter()
+                        .any(|reservation| reservation.value().key == key)
+                    {
+                        break;
+                    }
+                    ::tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("new Put reaches the old Get fence");
+            let blocked_done_rpc = if delete_before_completion {
+                // A proven local terminal must not wait for RPC admission.
+                Some(
+                    ::tokio::time::timeout(
+                        Duration::from_secs(5),
+                        super::batch_get_done_rpc_limiter()
+                            .acquire_many(super::BATCH_GET_DONE_MAX_INFLIGHT as u32),
+                    )
+                    .await
+                    .expect("reserve all GetDone RPC permits")
+                    .expect("GetDone RPC limiter remains open"),
+                )
+            } else {
+                None
+            };
+            ::tokio::time::timeout(
+                Duration::from_secs(5),
+                run_async_owner_get_route_commit(owner_view.clone(), vec![pending]),
+            )
+            .await
+            .expect("deleted Get must consume its terminal without retrying forever");
+            drop(blocked_done_rpc);
+            ::tokio::time::timeout(Duration::from_secs(10), overwrite)
+                .await
+                .expect("same-key Put must resume")
+                .expect("Put task")
+                .expect("new Put");
+            if !delete_before_completion {
+                assert!(target.aborted.load(Ordering::Acquire));
+                assert!(!inner.pending_local_get_info.contains_key(&key));
+                let request = crate::p2p::msg_pack::MsgPack {
+                    serialize_part: BatchDeleteClientKvMetaCacheReq {
+                        delete_items: vec![DeleteClientKvMetaCacheItem {
+                            key: key.clone(),
+                            put_time_ms: old_put_id.0,
+                            put_version: old_put_id.1,
+                        }],
+                    },
+                    raw_bytes: Vec::new(),
+                };
+                let response =
+                    crate::client_kv_api::delete::handle_batch_delete_client_kv_meta_cache(
+                        &owner_view,
+                        request,
+                        master_name.clone().into(),
+                    )
+                    .await;
+                assert_eq!(response.serialize_part.error_code, OK);
+            }
+            assert!(
+                inner.abort_hidden_pending_local_get(&key, &target),
+                "the old terminal remains idempotent after a new Put"
+            );
+            let (new_holder, _) = inner
+                .get(&key)
+                .await
+                .expect("read new generation")
+                .expect("new generation exists");
+            assert_eq!(new_holder.bytes(), b"new-generation");
+            assert_eq!(holder.bytes(), payload);
+            drop(new_holder);
+            drop(holder);
+            drop(target);
+            assert!(
+                inner
+                    .owner_segment_allocator
+                    .lock()
+                    .manifest_entry(&key, old_put_id)
+                    .is_none(),
+                "the last old holder must release the exact old slot and manifest"
+            );
+            inner.delete(&key).await.expect("delete new generation");
+            assert_eq!(
+                inner.owner_segment_allocator.lock().used_slot_count(),
+                baseline_slots,
+                "neither old Get nor new Put may leak an owner slot"
+            );
+            assert_eq!(
+                inner
+                    .owner_segment_allocator
+                    .lock()
+                    .pending_visible_slot_count(),
+                0
+            );
+            assert_eq!(
+                inner.owner_segment_allocator.lock().prepared_slot_count(),
+                0
+            );
+        }
+        source.shutdown().await.expect("source shutdown");
+        let blocked_done_rpc = super::batch_get_done_rpc_limiter()
+            .acquire_many(super::BATCH_GET_DONE_MAX_INFLIGHT as u32)
+            .await
+            .expect("reserve GetDone admission during shutdown");
+        let blocked_view = owner_view.clone();
+        let mut blocked_done = ::tokio::spawn(async move {
+            blocked_view
+                .client_kv_api()
+                .inner()
+                .batch_get_done_items(vec![BatchGetDoneItemReq {
+                    get_id: u64::MAX,
+                    late_target: None,
+                }])
+                .await
+        });
+        assert!(
+            ::tokio::time::timeout(Duration::from_millis(25), &mut blocked_done)
+                .await
+                .is_err(),
+            "the request must wait at RPC admission"
+        );
+        owner
+            .shutdown()
+            .await
+            .expect("owner shutdown must wake GetDone admission");
+        let outcome = ::tokio::time::timeout(Duration::from_secs(1), blocked_done)
+            .await
+            .expect("GetDone admission must observe shutdown")
+            .expect("GetDone admission task");
+        assert!(matches!(
+            outcome,
+            Err(KvError::Api(ApiError::SystemShutdown { .. }))
+        ));
+        drop(blocked_done_rpc);
+        master.shutdown().await.expect("master shutdown");
     }
 
     #[test]

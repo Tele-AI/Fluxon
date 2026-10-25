@@ -2092,6 +2092,7 @@ async fn run_client_impl(
     let config = load_client_config(config_arg)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to load client config: {}", e))?;
+    let owner_allocation = config.owner_allocation()?;
 
     unsafe {
         std::env::set_var(
@@ -2162,34 +2163,19 @@ async fn run_client_impl(
             config.test_spec_config.side_transfer_role,
             Some(SideTransferRole::Worker)
         );
-    let owner_placement_class = if is_external {
-        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid
-    } else {
-        config.owner_placement_class.unwrap_or_else(|| {
-            if config.replica_writeback_hot_capacity_ratio.is_some() {
-                // Transitional compatibility for already-written inference
-                // configs. New deployments set owner_placement_class
-                // explicitly; RemoteCpu is never inferred from topology.
-                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference
-            } else {
-                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid
-            }
-        })
-    };
-    let owner_allocation_authority = if owner_placement_class.is_valid() {
-        crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Owner
-    } else {
-        crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master
-    };
-    let owner_local_target_bytes = match owner_placement_class {
-        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Inference => {
-            config.replica_writeback_hot_capacity_ratio.map(|ratio| {
-                (config.contribute_to_cluster_pool_size.dram as f64 * ratio).floor() as u64
-            })
-        }
-        crate::master_seg_manager::msg_pack::OwnerPlacementClass::RemoteCpu => Some(0),
-        crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid => None,
-    };
+    let (owner_allocation_authority, owner_placement_class, owner_local_target_bytes) =
+        match owner_allocation {
+            Some((placement, local_target)) => (
+                crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Owner,
+                placement,
+                Some(local_target),
+            ),
+            None => (
+                crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
+                None,
+            ),
+        };
     let bootstrapped_shared_meta = if is_side_transfer_worker {
         Some(wait_for_external_bootstrap_bundle(&config).await?.meta)
     } else {

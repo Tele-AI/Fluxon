@@ -3,6 +3,7 @@ use limit_thirdparty::tokio::time::sleep;
 use std::time::Duration;
 
 use crate::kvcore_test_lib::{start_master_and_client, stop_master_and_client, wait_master_ready};
+use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError};
 
 // ---------- Tests aligned with lease_test.canvas ----------
 
@@ -296,13 +297,17 @@ async fn test5_eviction_when_lease_consumes_space() {
     unsafe {
         std::env::set_var("FLUXON_LOG", "debug");
     }
-    // For this canvas case, override client capacity to 100MB
-    let (master_fw, client_fw) = crate::kvcore_test_lib::start_master_and_client_with_client_dram(
-        "lease_master_t5",
-        "lease_client_t5",
-        1024 * 1024 * 100,
-    )
-    .await;
+    // Keep repeated capacity failures within the lease TTL.
+    let (master_fw, client_fw) =
+        crate::kvcore_test_lib::start_master_and_client_with_client_config(
+            "lease_master_t5",
+            "lease_client_t5",
+            |config| {
+                config.contribute_to_cluster_pool_size.dram = 1024 * 1024 * 100;
+                config.test_spec_config.owner_local_reserve_hard_timeout_ms = Some(1_000);
+            },
+        )
+        .await;
     let client_view = client_fw.client_kv_api_view();
     wait_master_ready(&client_view).await;
     sleep(Duration::from_secs(2)).await;
@@ -343,7 +348,11 @@ async fn test5_eviction_when_lease_consumes_space() {
         {
             Ok(()) => leased_success_keys.push(k),
             Err(e) => {
-                // 容量不满足等情况允许失败；只校验成功放入的 key
+                assert!(
+                    matches!(&e, KvError::Api(ApiError::NoSpace { .. })),
+                    "expected NoSpace while filling the lease, got: {}",
+                    e
+                );
                 tracing::warn!("leased put error: {}", e);
             }
         }
@@ -372,7 +381,7 @@ async fn test5_eviction_when_lease_consumes_space() {
             Ok(()) => leased_success_keys.push(k),
             Err(e) => {
                 assert!(
-                    e.to_string().contains("NoSpace"),
+                    matches!(&e, KvError::Api(ApiError::NoSpace { .. })),
                     "expected top-off to end in NoSpace, got: {}",
                     e
                 );
@@ -385,6 +394,18 @@ async fn test5_eviction_when_lease_consumes_space() {
         reached_lease_full,
         "lease top-off did not establish a full physical segment"
     );
+    for key in &initial_normal_keys {
+        assert!(
+            !client_view
+                .client_kv_api()
+                .inner()
+                .is_exist(key)
+                .await
+                .unwrap(),
+            "normal key should be reclaimed to make room for leased keys: {}",
+            key
+        );
+    }
 
     // Canvas assertion: assert 放成功的所有 lease key 都存在（TTL 尚未到期）
     tracing::info!(
@@ -414,13 +435,12 @@ async fn test5_eviction_when_lease_consumes_space() {
         .await
         .unwrap();
     tracing::info!(
-        "[test5-verify-no-space-after-lease-full] subsequent puts should fail or be evicted shortly (both lease and non-lease)"
+        "[test5-verify-no-space-after-lease-full] subsequent lease and non-lease puts must return NoSpace"
     );
     for i in 0..6u32 {
         // 少量尝试即可
         let nk = format!("t5_more_normal_{}", i);
-        // 非 lease：允许先返回 Ok（moka 容量调整是异步的），随后校验一定时间后仍不可见
-        let res = client_view
+        let error = client_view
             .client_kv_api()
             .inner()
             .put(
@@ -428,31 +448,13 @@ async fn test5_eviction_when_lease_consumes_space() {
                 &leased_value,
                 crate::client_kv_api::PutOptionalArgs::new(),
             )
-            .await;
-        match res {
-            Ok(()) => {
-                sleep(Duration::from_secs(2)).await;
-                let still_exist = client_view
-                    .client_kv_api()
-                    .inner()
-                    .is_exist(&nk)
-                    .await
-                    .unwrap();
-                assert!(
-                    !still_exist,
-                    "expected eventual eviction for non-lease put when lease is full: {}",
-                    nk
-                );
-            }
-            Err(e) => {
-                let es = e.to_string();
-                assert!(
-                    es.contains("NoSpace"),
-                    "expected NoSpace error, got: {}",
-                    es
-                );
-            }
-        }
+            .await
+            .expect_err("non-lease Put must fail when leased keys occupy all physical slots");
+        assert!(
+            matches!(&error, KvError::Api(ApiError::NoSpace { .. })),
+            "expected NoSpace error, got: {}",
+            error
+        );
         // lease：应直接 NoSpace（物理空间不足）
         let lk = format!("t5_more_lease_{}", i);
         match client_view
@@ -462,17 +464,34 @@ async fn test5_eviction_when_lease_consumes_space() {
         {
             Ok(()) => panic!("expected NoSpace for lease put: {}", lk),
             Err(e) => {
-                let es = e.to_string();
                 assert!(
-                    es.contains("NoSpace"),
+                    matches!(&e, KvError::Api(ApiError::NoSpace { .. })),
                     "expected NoSpace error, got: {}",
-                    es
+                    e
                 );
             }
         }
     }
 
+    for key in &leased_success_keys {
+        assert!(
+            client_view
+                .client_kv_api()
+                .inner()
+                .is_exist(key)
+                .await
+                .unwrap(),
+            "leased key must survive capacity pressure before TTL expiry: {}",
+            key
+        );
+    }
+
     // Step-A: delete 20MB (4 leased keys), then ensure 3 non-lease puts still fail
+    client_view
+        .client_kv_api()
+        .keepalive_lease(lease_id)
+        .await
+        .unwrap();
     let delete_20mb: Vec<String> = leased_success_keys.iter().take(4).cloned().collect();
     assert_eq!(delete_20mb.len(), 4, "need 4 leased keys to delete 20MB");
     for k in &delete_20mb {
@@ -496,8 +515,7 @@ async fn test5_eviction_when_lease_consumes_space() {
                 sleep(Duration::from_secs(1)).await;
             }
             Err(e) => {
-                let es = e.to_string();
-                if es.contains("NoSpace") {
+                if matches!(&e, KvError::Api(ApiError::NoSpace { .. })) {
                     saw_nospace = true;
                     tracing::info!(
                         "[test5-stepA-refill-lease] reached NoSpace after {} refill puts",
@@ -505,7 +523,7 @@ async fn test5_eviction_when_lease_consumes_space() {
                     );
                     break;
                 } else {
-                    panic!("unexpected error when refilling lease: {}", es);
+                    panic!("unexpected error when refilling lease: {}", e);
                 }
             }
         }
@@ -532,7 +550,7 @@ async fn test5_eviction_when_lease_consumes_space() {
                 k
             ),
             Err(e) => assert!(
-                e.to_string().contains("NoSpace"),
+                matches!(&e, KvError::Api(ApiError::NoSpace { .. })),
                 "expected NoSpace, got: {}",
                 e
             ),
@@ -543,6 +561,11 @@ async fn test5_eviction_when_lease_consumes_space() {
     // Step-B: delete 15MB (3 leased keys), then ensure 3 non-lease puts succeed
     // Rationale: leave >= 5MB stable headroom for non-lease put considering
     // source+target buffering and allocator alignment.
+    client_view
+        .client_kv_api()
+        .keepalive_lease(lease_id)
+        .await
+        .unwrap();
     let delete_15mb: Vec<String> = leased_success_keys
         .iter()
         .skip(4)

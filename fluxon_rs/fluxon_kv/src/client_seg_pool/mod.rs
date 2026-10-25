@@ -263,11 +263,7 @@ mod owner_segment_memfd_tests {
 
     #[::tokio::test]
     async fn memfd_segment_is_reopenable_through_published_procfs_symlink() {
-        let target_dir = std::env::var("CARGO_TARGET_DIR")
-            .expect("CARGO_TARGET_DIR must point at the NVMe build root");
-        let root = std::path::Path::new(&target_dir)
-            .join("fluxon_kv_tests")
-            .join(format!("owner_memfd_{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("fluxon_owner_memfd_{}", Uuid::new_v4()));
         let segment_len = 16 * 1024 * 1024u64;
         let pool = ClientSegPool::construct(ClientSegPoolNewArg {
             contribute_size: ContributeToClusterPoolSize {

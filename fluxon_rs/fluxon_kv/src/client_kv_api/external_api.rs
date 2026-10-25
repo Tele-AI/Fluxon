@@ -377,7 +377,7 @@ fn take_single_external_put_item<T>(op: &'static str, mut items: Vec<T>) -> KvRe
         .expect("single-item response length was checked"))
 }
 
-async fn commit_external_local_first_pending(
+pub(super) async fn commit_external_local_first_pending(
     inner: &client_kv_api::ClientKvApiInner,
     key: &str,
     put_id: crate::master_kv_router::put::PutIDForAKey,
@@ -1842,13 +1842,14 @@ mod external_get_start_batch_tests {
                     .pending_local_get_info
                     .insert(
                         key.to_string(),
-                        PendingLocalGetInfo {
+                        Arc::new(PendingLocalGetInfo {
                             get_id: 9001,
                             put_id,
                             mem_holder: memory_info.clone(),
                             source: PendingLocalGetSource::ExistingGlobalShared,
                             target_write_capability: None,
-                        },
+                            aborted: std::sync::atomic::AtomicBool::new(false),
+                        }),
                     )
                     .is_none()
             );
@@ -1889,7 +1890,7 @@ mod external_get_start_batch_tests {
                         GetCachedInfo {
                             put_time_ms: put_id.0,
                             put_version: put_id.1,
-                            mem_holder: pending.mem_holder,
+                            mem_holder: pending.mem_holder.clone(),
                         },
                     )
                     .is_none()
@@ -2104,6 +2105,14 @@ mod external_get_start_batch_tests {
             }
             _ => panic!("Put must not become leader while a Get owns the key flight"),
         }
+        assert!(matches!(
+            inner.reserve_external_local_first_put_key(get_first_key, false, false),
+            Ok(ExternalLocalFirstPutKeyReservation::WaitForGet(_))
+        ));
+        assert!(matches!(
+            inner.reserve_external_local_first_put_key(get_first_key, true, false),
+            Err(KvError::Api(ApiError::KeyBeingWritten { .. }))
+        ));
         assert!(
             inner
                 .owner_key_control
@@ -2233,6 +2242,43 @@ mod external_get_start_batch_tests {
                 .is_err(),
             "external_get terminal alone must not release the route-pending key fence"
         );
+        assert!(matches!(
+            inner.reserve_external_local_first_put_key(get_route_key, true, false),
+            Err(KvError::Api(ApiError::KeyBeingWritten { .. }))
+        ));
+        let overwrite_view = owner_view.clone();
+        let overwrite = ::tokio::spawn(async move {
+            overwrite_view
+                .client_kv_api()
+                .inner()
+                .put(
+                    get_route_key,
+                    b"replacement-after-get",
+                    crate::client_kv_api::PutOptionalArgs::default(),
+                )
+                .await
+        });
+        ::tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                assert!(
+                    !overwrite.is_finished(),
+                    "default Put must wait for the detached Get terminal"
+                );
+                if master
+                    .master_kv_router_view()
+                    .master_kv_router()
+                    .inner()
+                    .prepared_put_key_reservations
+                    .iter()
+                    .any(|reservation| reservation.value().key == get_route_key)
+                {
+                    break;
+                }
+                ::tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("default Put must reach admission behind the Get route fence");
         route_guard.finish(OwnerKeyMaterializationOutcome::Committed);
         assert_eq!(
             ::tokio::time::timeout(Duration::from_secs(1), &mut wait)
@@ -2240,13 +2286,29 @@ mod external_get_start_batch_tests {
                 .expect("route completion must wake PutFromSource"),
             OwnerKeyMaterializationOutcome::Committed
         );
+        ::tokio::time::timeout(Duration::from_secs(10), overwrite)
+            .await
+            .expect("default Put must resume after Get route publication")
+            .expect("default overwrite task")
+            .expect("default overwrite succeeds");
+        let (replacement, _) = inner
+            .get(get_route_key)
+            .await
+            .expect("get overwritten value")
+            .expect("overwritten value exists");
+        assert_eq!(replacement.bytes(), b"replacement-after-get");
+        drop(replacement);
         assert!(
             inner
                 .owner_key_control
                 .lock_key(get_route_key)
                 .get(get_route_key)
-                .is_none()
+                .is_none_or(|state| state.owner_materialization.is_none())
         );
+        inner
+            .delete(get_route_key)
+            .await
+            .expect("delete overwritten regression key");
 
         stop_master_and_client(master, owner).await;
     }
@@ -4437,6 +4499,7 @@ impl HandlerForExternalClient for ClientKvApi {
         let pending_fences = loop {
             let mut pending_fences = Vec::with_capacity(req.items.len());
             let mut wait_for = None;
+            let mut wait_for_previous_put = None;
             let mut wait_for_materialization = None;
             let mut wait_for_get = None;
             let mut wait_for_local_access = None;
@@ -4467,6 +4530,10 @@ impl HandlerForExternalClient for ClientKvApi {
                         wait_for = Some((item.key.clone(), op));
                         break;
                     }
+                    Ok(ExternalLocalFirstPutKeyReservation::WaitThenRetry(op)) => {
+                        wait_for_previous_put = Some(op);
+                        break;
+                    }
                     Ok(ExternalLocalFirstPutKeyReservation::WaitForMaterialization(op)) => {
                         wait_for_materialization = Some((item.key.clone(), op));
                         break;
@@ -4492,6 +4559,13 @@ impl HandlerForExternalClient for ClientKvApi {
                         });
                     }
                 }
+            }
+            if let Some(previous) = wait_for_previous_put {
+                // Release partial admission before waiting; overlapping batches may
+                // encounter the same keys in a different order.
+                drop(pending_fences);
+                previous.wait_released().await;
+                continue;
             }
             if let Some((fenced_key, mut completion)) = wait_for_local_access {
                 // A partial atomic_batch must not hold local-put fences while

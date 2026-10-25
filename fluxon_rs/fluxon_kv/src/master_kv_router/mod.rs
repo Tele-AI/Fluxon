@@ -4,6 +4,8 @@ pub mod msg_pack;
 pub mod placement;
 pub mod put;
 mod reclaim;
+#[cfg(any(test, feature = "test_bins"))]
+pub(crate) use reclaim::reclaim_memory_replicas_for_storage_test;
 
 mod count_prefix_index;
 mod radix_shadow;

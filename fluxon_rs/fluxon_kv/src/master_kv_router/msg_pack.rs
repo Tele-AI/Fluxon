@@ -344,10 +344,11 @@ pub enum GetBindTarget {
 
 impl BatchGetPlanItemResp {
     /// Materialize a transfer descriptor without a separate Bind RPC when the
-    /// source already has an exact owner capability and the target is owned by
-    /// the caller. Master validation still runs later from BatchGetDone's
+    /// memory source already has an exact owner capability and the target is
+    /// owned by the caller. Master validation still runs later from BatchGetDone's
     /// `late_target`; this helper only preserves the exact Plan/target identity
-    /// used by GetToTarget and the data transfer.
+    /// used by GetToTarget and the data transfer. SSD sources require Bind first
+    /// to establish the stage lifecycle before loading their transient source.
     pub(crate) fn materialize_owner_source_late_target(
         &self,
         target: &GetBindTarget,
@@ -395,7 +396,7 @@ impl BatchGetPlanItemResp {
                 {
                     return Err("owner SSD source token does not match the Plan");
                 }
-                None
+                return Err("SSD source requires Bind before staging");
             }
         };
 
@@ -760,18 +761,14 @@ mod planned_get_wire_tests {
             atomic_batch: None,
             plan_nonce: ssd.get_id + 1,
         });
-        let ssd_start = ssd
-            .materialize_owner_source_late_target(
+        assert_eq!(
+            ssd.materialize_owner_source_late_target(
                 &GetBindTarget::PreparedLocalReserve(prepared.clone()),
                 None,
             )
-            .expect("SSD owner token must materialize without a master staging Allocation");
-        assert_eq!(ssd_start.src_addr, 0);
-        assert_eq!(ssd_start.src_base_addr, 0);
-        assert_eq!(ssd_start.prepared_target.as_ref(), Some(&prepared));
-        assert!(ssd_start.reused_committed_slot.is_none());
-        assert!(ssd_start.source_route_token.is_none());
-        assert_eq!(ssd_start.ssd_source_route_token, ssd.ssd_source_route_token);
+            .expect_err("SSD reads must Bind before starting their source stage"),
+            "SSD source requires Bind before staging"
+        );
         assert!(
             ssd.materialize_owner_source_late_target(
                 &GetBindTarget::RequesterLocalSource,

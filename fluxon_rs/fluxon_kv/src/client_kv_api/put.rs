@@ -1,3 +1,7 @@
+use super::external_api::HandlerForExternalClient;
+use super::msg_pack::{
+    ExternalBatchPutStartItemReq, ExternalBatchPutStartReq, ExternalPutRevokeReq,
+};
 use super::{
     ClientKvApiInner, OwnerHotEvictionEvent, OwnerHotEvictionPreparation,
     OwnerHotSelectionFenceOutcome, OwnerLocalSsdPutOutcome, OwnerLocalSsdPutReservation,
@@ -12,9 +16,7 @@ use crate::master_kv_router::put::PutIDForAKey;
 use crate::p2p::control_plane_rpc::{CONTROL_PLANE_RPC_TRANSPORT_POLICY, call_control_plane_rpc};
 // no StageScope; timestamps-based metrics only
 use crate::memholder::kvclient_encode::{calc_flat_dict_encoded_len, write_flat_dict_ptrs_to_ptr};
-use crate::observe_kvope::{
-    obe_put_start_error_rpc, obe_put_start_error_status, obe_put_start_success,
-};
+use crate::observe_kvope::{obe_put_start_error_rpc, obe_put_start_success};
 use crate::owner_segment::{
     OwnerRouteCommitMode, OwnerSegmentTransferItem, OwnerSegmentTransferOutcome, OwnerSlotDesc,
     OwnerSourceReadCapability, OwnerSourceRouteToken, OwnerTargetDisposition,
@@ -49,7 +51,6 @@ use limit_thirdparty::tokio;
 use std::future::Future;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
-use tracing::info;
 
 // Bound control-plane head-of-line exposure while retaining one independent
 // result per KV. Batches run sequentially so a capacity contraction cannot
@@ -641,9 +642,96 @@ mod local_reserve_claim_tests {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub(super) struct NativePutOperationScope {
+    state: parking_lot::Mutex<NativePutOperationState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Debug)]
+struct NativePutOperationState {
+    accepting: bool,
+    active: usize,
+    cleanup_error: Option<String>,
+}
+
+impl Default for NativePutOperationScope {
+    fn default() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(NativePutOperationState {
+                accepting: true,
+                active: 0,
+                cleanup_error: None,
+            }),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl NativePutOperationScope {
+    fn admit(self: &Arc<Self>) -> KvResult<Arc<NativePutOperationGuard>> {
+        let mut state = self.state.lock();
+        if !state.accepting {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "native Put admission is closed".to_string(),
+            }));
+        }
+        state.active = state
+            .active
+            .checked_add(1)
+            .expect("native Put count overflow");
+        Ok(Arc::new(NativePutOperationGuard {
+            scope: self.clone(),
+        }))
+    }
+
+    pub(super) fn close_admission(&self) {
+        self.state.lock().accepting = false;
+    }
+
+    fn record_cleanup_error(&self, error: &KvError) {
+        self.state
+            .lock()
+            .cleanup_error
+            .get_or_insert_with(|| error.to_string());
+    }
+
+    pub(super) async fn wait_finished(&self) -> KvResult<()> {
+        fluxon_util::notify_state::wait_until(&self.changed, || self.state.lock().active == 0)
+            .await;
+        match self.state.lock().cleanup_error.as_ref() {
+            Some(error) => Err(KvError::Api(ApiError::Unknown {
+                detail: format!("native Put cleanup did not complete: {error}"),
+            })),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativePutOperationGuard {
+    scope: Arc<NativePutOperationScope>,
+}
+
+impl Drop for NativePutOperationGuard {
+    fn drop(&mut self) {
+        let mut state = self.scope.state.lock();
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("native Put count underflow");
+        drop(state);
+        self.scope.changed.notify_waiters();
+    }
+}
+
+#[derive(Debug)]
 pub struct OwnerReservedPutItem {
+    // Retain the operation across delivery and terminal cleanup without a zero-count gap.
+    _operation: Arc<NativePutOperationGuard>,
     pub key: String,
+    /// Master metadata reservation; physical storage is owned by the local pending context.
+    pub key_reservation_id: u64,
     pub put_id: PutIDForAKey,
     pub src_addr: u64,
     pub src_base_addr: u64,
@@ -655,9 +743,35 @@ pub struct OwnerReservedPutItem {
     pub remember_local_snapshot: bool,
     /// Original caller/content selection, independent of remote capacity.
     pub make_replica_task: bool,
-    /// The master pre-reserved a remote memory target for this Put.
+    /// The Owner may start replica placement after the local route is published.
     pub remote_replica_admitted: bool,
     pub preferred_sub_cluster: Option<String>,
+}
+
+struct NativePutReservationDelivery {
+    view: ClientKvApiView,
+    items: Vec<OwnerReservedPutItem>,
+}
+
+impl Drop for NativePutReservationDelivery {
+    fn drop(&mut self) {
+        let items = std::mem::take(&mut self.items);
+        if items.is_empty() {
+            return;
+        }
+        let task_view = self.view.clone();
+        self.view
+            .spawn("native_put_undelivered_cleanup", async move {
+                if let Err(error) = task_view
+                    .client_kv_api()
+                    .inner()
+                    .owner_batch_put_abort_reserved(items)
+                    .await
+                {
+                    tracing::error!(%error, "undelivered native Put reservation cleanup failed");
+                }
+            });
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -682,9 +796,9 @@ pub struct OwnerLocalPublishItem {
 pub struct OwnerLocalPublishJob {
     pub items: Vec<OwnerLocalPublishItem>,
     pub key_reservation_ids: Vec<u64>,
-    /// External local-first requests keep their owner reclaim fences here until
-    /// the grouped master terminal response and all local promotions complete.
-    /// Native/Pyo3 jobs use master key reservations instead and leave this empty.
+    /// Native and external requests retain their owner reclaim fences until
+    /// master publication and local promotion complete. Direct PyO3 slot
+    /// reservations use master key reservations and leave this empty.
     pub external_pending_contexts: Vec<super::ExternalPendingPutCtx>,
 }
 
@@ -742,6 +856,12 @@ fn owner_local_reserve_timeout_error(
     hard_wait_timeout: std::time::Duration,
     request_started_at: Instant,
 ) -> KvError {
+    if !inner.view.register_shutdown_poller().is_running() {
+        return KvError::Api(ApiError::SystemShutdown {
+            detail: "ClientKvApi is shutting down while waiting for owner segment capacity"
+                .to_string(),
+        });
+    }
     let (
         used_slots,
         free_bytes,
@@ -761,22 +881,26 @@ fn owner_local_reserve_timeout_error(
             pool.physical_capacity_bytes(),
         )
     };
-    KvError::Api(ApiError::Unknown {
-        detail: format!(
-            "owner segment allocation timeout: stage={} slot_size={} key_count={} used_allocations={} raw_free_bytes={} allocatable_slots={} slot_unallocatable_bytes={} pending_slots={} segment_bytes={} waited_ms={} soft_wait_timeout_ms={} hard_timeout_ms={}",
-            stage,
-            slot_size,
-            key_count,
-            used_slots,
-            free_bytes,
-            allocatable_slots,
-            slot_unallocatable_bytes,
-            pending_slots,
-            segment_bytes,
-            request_started_at.elapsed().as_millis(),
-            soft_wait_timeout.as_millis(),
-            hard_wait_timeout.as_millis()
-        ),
+    tracing::warn!(
+        stage,
+        slot_size,
+        key_count,
+        used_allocations = used_slots,
+        raw_free_bytes = free_bytes,
+        allocatable_slots,
+        slot_unallocatable_bytes,
+        pending_slots,
+        segment_bytes,
+        waited_ms = request_started_at.elapsed().as_millis(),
+        soft_wait_timeout_ms = soft_wait_timeout.as_millis(),
+        hard_timeout_ms = hard_wait_timeout.as_millis(),
+        "owner segment allocation timeout"
+    );
+    KvError::Api(ApiError::NoSpace {
+        node: inner.client_id_str(),
+        segment: "owner-local-reserve".to_string(),
+        total_capacity: segment_bytes,
+        free_capacity: allocatable_slots.saturating_mul(slot_size),
     })
 }
 
@@ -1232,77 +1356,186 @@ impl ClientKvApiInner {
         if start_items.is_empty() {
             return Ok(Vec::new());
         }
-        if self.short_circuit_put_payload_path_enabled() {
-            return Err(KvError::Api(ApiError::InvalidArgument {
-                detail:
-                    "owner_batch_put_start_reserved does not support short_circuit_put_payload_path"
+        if !self.view.register_shutdown_poller().is_running() {
+            return Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "ClientKvApi is shutting down; rejecting native Put reservation"
+                    .to_string(),
+            }));
+        }
+        let mut keys = std::collections::HashSet::with_capacity(start_items.len());
+        for item in &start_items {
+            if item.len > u64::from(u32::MAX) || !keys.insert(item.key.clone()) {
+                return Err(KvError::Api(ApiError::InvalidArgument {
+                    detail: "native Put reservation requires distinct keys and lengths fitting u32"
                         .to_string(),
-            }));
-        }
-        let self_node_id = self.view.cluster_manager().get_self_info().id.clone();
-        let start_resp = self.batch_put_start(start_items.clone()).await?;
-        if start_resp.items.len() != start_items.len() {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "batch_put_start response length mismatch: expected={} got={}",
-                    start_items.len(),
-                    start_resp.items.len()
-                ),
-            }));
-        }
-
-        let mut prepared_items = Vec::with_capacity(start_items.len());
-        let mut revoke_items = Vec::with_capacity(start_items.len());
-        let mut first_error: Option<KvError> = None;
-
-        for (start_req, start_item) in start_items.into_iter().zip(start_resp.items.into_iter()) {
-            if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
-                start_item.error_code,
-                start_item.error_json.clone(),
-            ) {
-                first_error = Some(err);
-                break;
+                }));
             }
-            let peer_node_id = if start_item.node_id == self_node_id {
-                None
-            } else {
-                Some(start_item.node_id.clone())
-            };
-            let replica_admitted = start_item.replica_target.is_some();
-            revoke_items.push(BatchPutRevokeItemReq {
-                key: start_req.key.clone(),
-                put_id: start_item.put_id,
-            });
-            prepared_items.push(OwnerReservedPutItem {
-                key: start_req.key,
-                put_id: start_item.put_id,
-                src_addr: start_item.src_addr,
-                src_base_addr: start_item.src_base_addr,
-                target_addr: start_item.target_addr,
-                target_base_addr: start_item.target_base_addr,
-                value_len: start_req.len,
-                lease_id,
-                peer_node_id: peer_node_id.clone(),
-                remember_local_snapshot: true,
-                make_replica_task: start_req.make_replica_task,
-                remote_replica_admitted: replica_admitted,
-                preferred_sub_cluster: start_req.preferred_sub_cluster,
-            });
         }
 
-        if let Some(err) = first_error {
-            if !revoke_items.is_empty() {
-                if let Err(revoke_err) = self.batch_put_revoke(revoke_items).await {
-                    tracing::warn!(
-                        "owner_batch_put_start_reserved batch_put_revoke failed after partial reserve: {}",
-                        revoke_err
-                    );
+        // The owner finishes admission or rolls it back even if the caller is cancelled.
+        let operation = self.native_put_operations.admit()?;
+        let view = self.view.clone_view();
+        let task_view = view.clone();
+        let (mut done_tx, done_rx) = ::tokio::sync::oneshot::channel();
+        view.spawn("native_put_reserve", async move {
+            let inner = task_view.client_kv_api().inner();
+            let mut shutdown_waiter = task_view.register_shutdown_waiter();
+            let mut reserved_items = Vec::new();
+            let mut unassigned_reservations = std::collections::HashSet::new();
+            let result = async {
+                let prepared = inner
+                    .batch_prepare_put_keys(
+                        start_items
+                            .iter()
+                            .map(|item| BatchPreparePutKeyItemReq {
+                                key: item.key.clone(),
+                                reject_if_inflight_same_key: item.reject_if_inflight_same_key,
+                                reject_if_exist_same_key: item.reject_if_exist_same_key,
+                            })
+                            .collect(),
+                    )
+                    .await?;
+                unassigned_reservations.extend(prepared.reservation_ids.iter().copied());
+                if prepared.reservation_ids.len() != start_items.len() {
+                    return Err(KvError::Api(ApiError::Unknown {
+                        detail: "native Put key reservation response length mismatch".to_string(),
+                    }));
                 }
-            }
-            return Err(err);
-        }
+                let mut ordered_items = start_items
+                    .into_iter()
+                    .zip(prepared.reservation_ids)
+                    .enumerate()
+                    .map(|(index, (item, reservation_id))| (index, item, reservation_id))
+                    .collect::<Vec<_>>();
+                // Keep one key order across length groups: a later group waits while
+                // earlier groups retain their fences. Length-first ordering can deadlock
+                // overlapping batches whose values have different sizes.
+                ordered_items.sort_unstable_by(|(_, left, _), (_, right, _)| {
+                    left.key.cmp(&right.key)
+                });
+                let mut groups: Vec<Vec<(usize, BatchPutStartItemReq, u64)>> = Vec::new();
+                for item in ordered_items {
+                    if let Some(group) = groups.last_mut().filter(|group| group[0].1.len == item.1.len) {
+                        group.push(item);
+                    } else {
+                        groups.push(vec![item]);
+                    }
+                }
+                let started_time = inner.view.cluster_manager().get_self_info().node_start_time;
+                for group in groups {
+                    let admission = task_view
+                        .client_kv_api()
+                        .external_batch_put_start(ExternalBatchPutStartReq {
+                            items: group
+                                .iter()
+                                .map(|(_, item, _)| ExternalBatchPutStartItemReq {
+                                    key: item.key.clone(),
+                                    len: item.len,
+                                    reject_if_inflight_same_key: item.reject_if_inflight_same_key,
+                                    reject_if_exist_same_key: item.reject_if_exist_same_key,
+                                    make_replica_task: item.make_replica_task,
+                                    preferred_sub_cluster: item.preferred_sub_cluster.clone(),
+                                    radix: None,
+                                })
+                                .collect(),
+                            atomic_group_lens: None,
+                            started_time,
+                        });
+                    // Local admission owns only RAII fences while suspended;
+                    // slot allocation through response delivery has no await.
+                    // Keep the master reservation RPC outside this cancellation
+                    // boundary so its returned identities always reach cleanup.
+                    let response = tokio::select! {
+                        biased;
+                        _ = done_tx.closed() => {
+                            return Err(KvError::Api(ApiError::Unknown {
+                                detail: "native Put caller cancelled during admission".to_string(),
+                            }));
+                        }
+                        _ = shutdown_waiter.wait() => {
+                            return Err(KvError::Api(ApiError::SystemShutdown {
+                                detail: "native Put admission stopped during shutdown".to_string(),
+                            }));
+                        }
+                        response = admission => response?,
+                    };
+                    crate::rpcresp_kvresult_convert::try_from_code(
+                        response.error_code,
+                        response.error_json,
+                    )?;
+                    assert_eq!(response.items.len(), group.len(), "local Owner Put response shape");
+                    let mut first_error = None;
+                    for ((index, request, reservation_id), response) in
+                        group.into_iter().zip(response.items)
+                    {
+                        if let Err(error) = crate::rpcresp_kvresult_convert::try_from_code(
+                            response.error_code,
+                            response.error_json,
+                        ) {
+                            first_error.get_or_insert(error);
+                            continue;
+                        }
+                        let put_id = response.put_id.expect("successful Owner Put has an identity");
+                        assert!(response.peer_id.is_none(), "native Owner Put target must be local");
+                        assert!(unassigned_reservations.remove(&reservation_id));
+                        reserved_items.push((index, OwnerReservedPutItem {
+                            _operation: operation.clone(),
+                            key: request.key,
+                            key_reservation_id: reservation_id,
+                            put_id,
+                            src_addr: response.src_base_addr.checked_add(response.src_offset)
+                                .expect("Owner Put source address fits u64"),
+                            src_base_addr: response.src_base_addr,
+                            target_addr: response.target_base_addr.checked_add(response.target_offset)
+                                .expect("Owner Put target address fits u64"),
+                            target_base_addr: response.target_base_addr,
+                            value_len: request.len,
+                            lease_id,
+                            peer_node_id: None,
+                            remember_local_snapshot: true,
+                            make_replica_task: request.make_replica_task,
+                            remote_replica_admitted: true,
+                            preferred_sub_cluster: request.preferred_sub_cluster,
+                        }));
+                    }
+                    if let Some(error) = first_error {
+                        return Err(error);
+                    }
+                }
+                Ok(())
+            }.await;
 
-        Ok(prepared_items)
+            if let Err(error) = result {
+                if let Err(cleanup_error) = inner.owner_batch_put_abort_reserved(
+                    reserved_items.into_iter().map(|(_, item)| item).collect(),
+                ).await {
+                    inner.native_put_operations.record_cleanup_error(&cleanup_error);
+                    tracing::error!(%cleanup_error, "native Put partial admission cleanup failed");
+                }
+                if let Err(cleanup_error) = inner.batch_release_put_key_reservations(
+                    unassigned_reservations.into_iter().collect(),
+                ).await {
+                    inner.native_put_operations.record_cleanup_error(&cleanup_error);
+                    tracing::error!(%cleanup_error, "native Put unused key reservation cleanup failed");
+                }
+                let _ = done_tx.send(Err(error));
+                return;
+            }
+            assert!(unassigned_reservations.is_empty());
+            reserved_items.sort_unstable_by_key(|(index, _)| *index);
+            let _ = done_tx.send(Ok(NativePutReservationDelivery {
+                view: task_view.clone(),
+                items: reserved_items.into_iter().map(|(_, item)| item).collect(),
+            }));
+        });
+        done_rx
+            .await
+            .map_err(|_| {
+                KvError::Api(ApiError::SystemShutdown {
+                    detail: "native Put reservation stopped before completion".to_string(),
+                })
+            })?
+            .map(|mut delivery| std::mem::take(&mut delivery.items))
     }
 
     pub async fn owner_batch_put_commit_reserved(
@@ -1313,119 +1546,118 @@ impl ClientKvApiInner {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-
-        #[derive(Clone)]
-        struct DonePending {
-            idx: usize,
-            item: OwnerReservedPutItem,
-        }
-
-        let metrics = self.metrics_handle();
-        let mut results: Vec<Option<KvResult<()>>> = (0..items.len()).map(|_| None).collect();
-        let mut done_pending = Vec::with_capacity(items.len());
-
-        for (idx, item) in items.into_iter().enumerate() {
-            metrics.record_put_io_locality(false, item.value_len, 0);
-            done_pending.push(DonePending { idx, item });
-        }
-
-        if self.skip_put_end_commit_enabled() {
-            for pending in done_pending {
-                results[pending.idx] = Some(Ok(()));
+        // After admission, the owner task owns both publication and final cleanup.
+        // The caller waits for master route/lease publication without owning its cancellation.
+        let view = self.view.clone_view();
+        let task_view = view.clone();
+        let (done_tx, done_rx) = ::tokio::sync::oneshot::channel();
+        view.spawn("native_put_commit", async move {
+            let inner = task_view.client_kv_api().inner();
+            let _operations = items
+                .iter()
+                .map(|item| item._operation.clone())
+                .collect::<Vec<_>>();
+            let item_count = items.len();
+            if inner.skip_put_end_commit_enabled() {
+                let result = inner
+                    .owner_batch_put_abort_reserved(items)
+                    .await
+                    .map(|()| (0..item_count).map(|_| Ok(())).collect());
+                let _ = done_tx.send(result);
+                return;
             }
-            return Ok(results
+            let mut results = (0..item_count).map(|_| None).collect::<Vec<_>>();
+            let mut publish_items = Vec::new();
+            let mut publish_contexts = Vec::new();
+            let mut publish_indices = Vec::new();
+            let mut key_reservation_ids = Vec::new();
+            let mut failed_items = Vec::new();
+            for (index, item) in items.into_iter().enumerate() {
+                let pending_key = (item.key.clone(), item.put_id.0, item.put_id.1);
+                let Some(context) = inner.external_pending_puts.get(&pending_key) else {
+                    results[index] = Some(Err(KvError::Api(ApiError::InvalidArgument {
+                        detail: format!(
+                            "native Put has no pending Owner reservation: key={}",
+                            item.key
+                        ),
+                    })));
+                    failed_items.push(item);
+                    continue;
+                };
+                let committed = super::external_api::commit_external_local_first_pending(
+                    inner,
+                    &item.key,
+                    item.put_id,
+                    &context,
+                    item.src_addr - item.src_base_addr,
+                    item.value_len,
+                    "native_put_commit",
+                )
+                .await;
+                match committed {
+                    Ok(committed_slot) => {
+                        inner.record_put_locality(false, item.value_len, 0);
+                        inner.external_pending_puts.invalidate(&pending_key);
+                        publish_indices.push((index, item.remember_local_snapshot));
+                        key_reservation_ids.push(item.key_reservation_id);
+                        publish_items.push(OwnerLocalPublishItem {
+                            key: item.key,
+                            put_id: item.put_id,
+                            value_len: item.value_len,
+                            lease_id: item.lease_id,
+                            committed_slot,
+                            make_replica_task: item.make_replica_task,
+                            remote_replica_admitted: item.remote_replica_admitted,
+                            preferred_sub_cluster: item.preferred_sub_cluster,
+                            atomic_group: None,
+                            radix: None,
+                        });
+                        publish_contexts.push(context);
+                    }
+                    Err(error) => {
+                        results[index] = Some(Err(error));
+                        failed_items.push(item);
+                    }
+                }
+            }
+            if let Err(error) = inner.owner_batch_put_abort_reserved(failed_items).await {
+                tracing::error!(%error, "native Put rejected reservation cleanup failed");
+            }
+            inner.external_pending_puts.run_pending_tasks();
+            let published = publish_native_owner_local_job(
+                task_view.clone(),
+                OwnerLocalPublishJob {
+                    items: publish_items.clone(),
+                    key_reservation_ids,
+                    external_pending_contexts: publish_contexts,
+                },
+            )
+            .await;
+            assert_eq!(
+                published.len(),
+                publish_indices.len(),
+                "native Put publication response shape"
+            );
+            for (((index, remember_snapshot), item), result) in publish_indices
                 .into_iter()
-                .map(|item| {
-                    item.unwrap_or_else(|| {
-                        Err(KvError::Api(ApiError::Unknown {
-                            detail: "owner_batch_put_commit_reserved result slot was not populated"
-                                .to_string(),
-                        }))
-                    })
-                })
-                .collect());
-        }
-
-        let done_req_items = done_pending
-            .iter()
-            .map(|pending| BatchPutDoneItemReq {
-                key: pending.item.key.clone(),
-                put_id: pending.item.put_id,
-                lease_id: pending.item.lease_id,
-                committed_slot: None,
-                publish_local_cache: false,
-                atomic_group: None,
-                radix: None,
-            })
-            .collect::<Vec<_>>();
-        let done_resp = self.batch_put_done(done_req_items).await?;
-        if done_resp.items.len() != done_pending.len() {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "batch_put_done response length mismatch: expected={} got={}",
-                    done_pending.len(),
-                    done_resp.items.len()
-                ),
-            }));
-        }
-
-        let mut early_ssd_candidates = Vec::new();
-        let mut remote_replica_pending = Vec::new();
-        for (pending, done_item) in done_pending.into_iter().zip(done_resp.items.into_iter()) {
-            if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
-                done_item.error_code,
-                done_item.error_json.clone(),
-            ) {
-                results[pending.idx] = Some(Err(err));
-                continue;
-            }
-            if pending.item.remember_local_snapshot {
-                self.remember_local_snapshot(&pending.item.key, pending.item.put_id);
-            }
-            if pending.item.make_replica_task {
-                early_ssd_candidates.push((
-                    pending.item.key.clone(),
-                    pending.item.put_id,
-                    pending.item.value_len,
-                ));
-            }
-            if pending.item.make_replica_task && pending.item.remote_replica_admitted {
-                remote_replica_pending.push((
-                    pending.item.key.clone(),
-                    pending.item.put_id,
-                    pending.item.preferred_sub_cluster.clone(),
-                ));
-            }
-            results[pending.idx] = Some(Ok(()));
-        }
-
-        self.start_early_owner_local_ssd_puts(early_ssd_candidates);
-        for (key, put_id, preferred_sub_cluster) in remote_replica_pending {
-            if let Err(err) = self
-                .ensure_remote_put(&key, put_id, preferred_sub_cluster, true)
-                .await
+                .zip(publish_items)
+                .zip(published)
             {
-                tracing::warn!(
-                    "owner_batch_put_commit_reserved make replica task failed after local commit: key={} put_id=({},{}) err={}",
-                    key,
-                    put_id.0,
-                    put_id.1,
-                    err
-                );
+                if result.is_ok() && remember_snapshot {
+                    inner.remember_local_snapshot(&item.key, item.put_id);
+                }
+                results[index] = Some(result);
             }
-        }
-
-        Ok(results
-            .into_iter()
-            .map(|item| {
-                item.unwrap_or_else(|| {
-                    Err(KvError::Api(ApiError::Unknown {
-                        detail: "owner_batch_put_commit_reserved result slot was not populated"
-                            .to_string(),
-                    }))
-                })
+            let _ = done_tx.send(Ok(results
+                .into_iter()
+                .map(|result| result.expect("every native Put has a terminal result"))
+                .collect()));
+        });
+        done_rx.await.map_err(|_| {
+            KvError::Api(ApiError::SystemShutdown {
+                detail: "native Put publication stopped before completion".to_string(),
             })
-            .collect())
+        })?
     }
 
     pub async fn owner_batch_put_abort_reserved(
@@ -1435,15 +1667,59 @@ impl ClientKvApiInner {
         if items.is_empty() {
             return Ok(());
         }
-        let revoke_items = items
-            .into_iter()
-            .map(|item| BatchPutRevokeItemReq {
-                key: item.key,
-                put_id: item.put_id,
+        let view = self.view.clone_view();
+        let task_view = view.clone();
+        let (done_tx, done_rx) = ::tokio::sync::oneshot::channel();
+        view.spawn("native_put_abort", async move {
+            let inner = task_view.client_kv_api().inner();
+            let _operations = items
+                .iter()
+                .map(|item| item._operation.clone())
+                .collect::<Vec<_>>();
+            let started_time = inner.view.cluster_manager().get_self_info().node_start_time;
+            let mut first_error = None;
+            let mut reservation_ids = Vec::with_capacity(items.len());
+            for item in items {
+                reservation_ids.push(item.key_reservation_id);
+                let pending_key = (item.key.clone(), item.put_id.0, item.put_id.1);
+                // Publication owns committed slots; only a pending lease is revocable here.
+                if inner.external_pending_puts.get(&pending_key).is_none() {
+                    continue;
+                }
+                let result = task_view
+                    .client_kv_api()
+                    .external_put_revoke(ExternalPutRevokeReq {
+                        key: item.key,
+                        put_id: Some(item.put_id),
+                        started_time,
+                    })
+                    .await;
+                let result = result.and_then(|response| {
+                    crate::rpcresp_kvresult_convert::try_from_code(
+                        response.error_code,
+                        response.error_json,
+                    )
+                });
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Err(error) = inner
+                .batch_release_put_key_reservations(reservation_ids)
+                .await
+            {
+                first_error.get_or_insert(error);
+            }
+            if let Some(error) = first_error.as_ref() {
+                inner.native_put_operations.record_cleanup_error(error);
+            }
+            let _ = done_tx.send(first_error.map_or(Ok(()), Err));
+        });
+        done_rx.await.map_err(|_| {
+            KvError::Api(ApiError::SystemShutdown {
+                detail: "native Put abort stopped before completion".to_string(),
             })
-            .collect::<Vec<_>>();
-        self.batch_put_revoke(revoke_items).await?;
-        Ok(())
+        })?
     }
 
     pub async unsafe fn batch_put_flat_dict_ptrs(
@@ -1451,7 +1727,7 @@ impl ClientKvApiInner {
         keys: Vec<String>,
         ptrs_groups: Vec<Vec<(u8, usize, u32, u64, u32, Option<u32>)>>,
         opts: crate::client_kv_api::PutOptionalArgs,
-        _transfer_concurrency: usize,
+        transfer_concurrency: usize,
     ) -> KvResult<Vec<KvResult<()>>> {
         if !self.view.register_shutdown_poller().is_running() {
             return Err(KvError::Api(ApiError::SystemShutdown {
@@ -1462,193 +1738,60 @@ impl ClientKvApiInner {
         if keys.len() != ptrs_groups.len() {
             return Err(KvError::Api(ApiError::InvalidArgument {
                 detail: format!(
-                    "batch_put_flat_dict_ptrs requires keys and ptrs_groups to have the same length: keys={} ptrs_groups={}",
+                    "batch_put_flat_dict_ptrs requires matching key/payload counts: keys={} payloads={}",
                     keys.len(),
-                    ptrs_groups.len()
+                    ptrs_groups.len(),
                 ),
             }));
         }
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let lease_id = opts.lease_id();
-        let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
-        let reject_if_exist_same_key = opts.reject_if_exist_same_key();
-        let make_replica_task = opts.make_replica_task();
-        let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
+        let start_items = keys
+            .iter()
+            .zip(&ptrs_groups)
+            .map(|(key, ptrs)| {
+                Ok(BatchPutStartItemReq {
+                    key: key.clone(),
+                    len: calc_flat_dict_encoded_len(ptrs)?,
+                    reject_if_inflight_same_key: opts.reject_if_inflight_same_key(),
+                    reject_if_exist_same_key: opts.reject_if_exist_same_key(),
+                    make_replica_task: opts.make_replica_task(),
+                    preferred_sub_cluster: opts.preferred_sub_cluster().map(str::to_string),
+                })
+            })
+            .collect::<KvResult<Vec<_>>>()?;
 
-        let mut start_items = Vec::with_capacity(keys.len());
-        let mut payload_lens = Vec::with_capacity(keys.len());
-        for (key, ptrs) in keys.iter().zip(ptrs_groups.iter()) {
-            let payload_len = calc_flat_dict_encoded_len(ptrs)?;
-            payload_lens.push(payload_len);
-            start_items.push(BatchPutStartItemReq {
-                key: key.clone(),
-                len: payload_len,
-                reject_if_inflight_same_key,
-                reject_if_exist_same_key,
-                make_replica_task,
-                preferred_sub_cluster: preferred_sub_cluster.clone(),
-            });
-        }
-
-        let start_resp = self.batch_put_start(start_items).await?;
-        if start_resp.items.len() != keys.len() {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "batch_put_start response length mismatch: expected={} got={}",
-                    keys.len(),
-                    start_resp.items.len()
-                ),
-            }));
-        }
-
-        #[derive(Clone)]
-        struct DonePending {
-            idx: usize,
-            key: String,
-            put_id: PutIDForAKey,
-            value_len: u64,
-            lease_id: Option<u64>,
-            remember_local_snapshot: bool,
-            make_replica_task: bool,
-            remote_replica_admitted: bool,
-            preferred_sub_cluster: Option<String>,
-        }
-
-        let mut results: Vec<Option<KvResult<()>>> = (0..keys.len()).map(|_| None).collect();
-        let mut done_pending = Vec::new();
-        let short_circuit_payload = self.short_circuit_put_payload_path_enabled();
-        let skip_put_end_commit = self.skip_put_end_commit_enabled();
-
-        for (idx, (((key, ptrs), payload_len), start_item)) in keys
-            .into_iter()
-            .zip(ptrs_groups.into_iter())
-            .zip(payload_lens.into_iter())
-            .zip(start_resp.items.into_iter())
-            .enumerate()
+        let reserved = match self
+            .owner_batch_put_start_reserved(start_items, opts.lease_id())
+            .await
         {
-            if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
-                start_item.error_code,
-                start_item.error_json.clone(),
-            ) {
-                results[idx] = Some(Err(err));
-                continue;
+            Ok(items) => items,
+            Err(_) => {
+                // Admission is all-or-nothing; the native batch contract returns one
+                // independent result per key, including repeated keys in input order.
+                let mut results = Vec::with_capacity(keys.len());
+                for (key, ptrs) in keys.into_iter().zip(ptrs_groups) {
+                    results
+                        .push(unsafe { self.put_flat_dict_ptrs(&key, ptrs, opts.clone()).await });
+                }
+                return Ok(results);
             }
-
-            let put_id = start_item.put_id;
-            let remember_local_snapshot = true;
-            let replica_admitted = start_item.replica_target.is_some();
-
-            if !short_circuit_payload {
+        };
+        assert_eq!(
+            reserved.len(),
+            ptrs_groups.len(),
+            "native Put reservation count"
+        );
+        if !self.short_circuit_put_payload_path_enabled() {
+            for (item, ptrs) in reserved.iter().zip(ptrs_groups) {
                 unsafe {
-                    write_flat_dict_ptrs_to_ptr(start_item.src_addr as *mut u8, &ptrs);
+                    write_flat_dict_ptrs_to_ptr(item.src_addr as *mut u8, &ptrs);
                 }
             }
-
-            done_pending.push(DonePending {
-                idx,
-                key,
-                put_id,
-                value_len: payload_len,
-                lease_id,
-                remember_local_snapshot,
-                make_replica_task,
-                remote_replica_admitted: replica_admitted,
-                preferred_sub_cluster: preferred_sub_cluster.clone(),
-            });
         }
-
-        if skip_put_end_commit {
-            for pending in done_pending {
-                results[pending.idx] = Some(Ok(()));
-            }
-            return Ok(results
-                .into_iter()
-                .map(|item| {
-                    item.unwrap_or_else(|| {
-                        Err(KvError::Api(ApiError::Unknown {
-                            detail: "batch_put result slot was not populated".to_string(),
-                        }))
-                    })
-                })
-                .collect());
-        }
-
-        let done_req_items = done_pending
-            .iter()
-            .map(|pending| BatchPutDoneItemReq {
-                key: pending.key.clone(),
-                put_id: pending.put_id,
-                lease_id: pending.lease_id,
-                committed_slot: None,
-                publish_local_cache: false,
-                atomic_group: None,
-                radix: None,
-            })
-            .collect::<Vec<_>>();
-        let done_resp = self.batch_put_done(done_req_items).await?;
-        if done_resp.items.len() != done_pending.len() {
-            return Err(KvError::Api(ApiError::Unknown {
-                detail: format!(
-                    "batch_put_done response length mismatch: expected={} got={}",
-                    done_pending.len(),
-                    done_resp.items.len()
-                ),
-            }));
-        }
-        let mut early_ssd_candidates = Vec::new();
-        let mut remote_replica_pending = Vec::new();
-        for (pending, done_item) in done_pending.into_iter().zip(done_resp.items.into_iter()) {
-            if let Err(err) = crate::rpcresp_kvresult_convert::try_from_code(
-                done_item.error_code,
-                done_item.error_json.clone(),
-            ) {
-                results[pending.idx] = Some(Err(err));
-                continue;
-            }
-            if pending.remember_local_snapshot {
-                self.remember_local_snapshot(&pending.key, pending.put_id);
-            }
-            if pending.make_replica_task {
-                early_ssd_candidates.push((pending.key.clone(), pending.put_id, pending.value_len));
-            }
-            if pending.make_replica_task && pending.remote_replica_admitted {
-                remote_replica_pending.push((
-                    pending.key.clone(),
-                    pending.put_id,
-                    pending.preferred_sub_cluster.clone(),
-                ));
-            }
-            results[pending.idx] = Some(Ok(()));
-        }
-
-        self.start_early_owner_local_ssd_puts(early_ssd_candidates);
-        for (key, put_id, preferred_sub_cluster) in remote_replica_pending {
-            if let Err(err) = self
-                .ensure_remote_put(&key, put_id, preferred_sub_cluster, true)
-                .await
-            {
-                tracing::warn!(
-                    "batch make replica task failed after local commit: key={} put_id=({},{}) err={}",
-                    key,
-                    put_id.0,
-                    put_id.1,
-                    err
-                );
-            }
-        }
-
-        Ok(results
-            .into_iter()
-            .map(|item| {
-                item.unwrap_or_else(|| {
-                    Err(KvError::Api(ApiError::Unknown {
-                        detail: "batch_put result slot was not populated".to_string(),
-                    }))
-                })
-            })
-            .collect())
+        self.owner_batch_put_commit_reserved(reserved, transfer_concurrency)
+            .await
     }
 
     fn start_owner_local_ssd_puts(
@@ -1931,17 +2074,8 @@ impl ClientKvApiInner {
         &self,
         key: &str,
         payload_len: u64,
-        len_for_start: u32,
-        reject_if_inflight_same_key: bool,
-        reject_if_exist_same_key: bool,
-        make_replica_task: bool,
-        preferred_sub_cluster: Option<&str>,
-        lease_id: Option<u64>,
-        _test_payload_len_u32: u32,
-        _test_remove_after_fill: bool,
+        opts: crate::client_kv_api::PutOptionalArgs,
         fill_abs_src: F,
-        dbg_addr_summary: bool,
-        info_complete_tag: Option<&'static str>,
     ) -> KvResult<()>
     where
         F: FnOnce(u64),
@@ -1949,256 +2083,84 @@ impl ClientKvApiInner {
         let client_id = self.client_id_str();
         let node_role = self.node_role();
         let metrics = self.metrics_handle();
-
-        let t1 = Utc::now().timestamp_micros();
-        let (resp, _rpc_latency) = {
-            match self
-                .put_start(
-                    key,
-                    len_for_start,
-                    reject_if_inflight_same_key,
-                    reject_if_exist_same_key,
-                    make_replica_task,
-                    preferred_sub_cluster,
-                )
-                .await
-            {
-                Ok(resp) => resp,
-                Err(err) => {
-                    obe_put_start_error_rpc(&metrics, &client_id, &node_role, key, payload_len);
-                    return Err(err);
-                }
-            }
-        };
-        let t2 = Utc::now().timestamp_micros();
-        if let Err(e) =
-            crate::rpcresp_kvresult_convert::try_from_code(resp.error_code, resp.error_json.clone())
-        {
-            obe_put_start_error_status(&metrics, &client_id, &node_role, key, payload_len);
-            return Err(e);
-        }
-        obe_put_start_success(&metrics, &client_id, &node_role, key, t1, t2);
-
-        let put_id = resp.put_id;
-        let peer_id = if &*resp.node_id == &*self.view.cluster_manager().get_self_info().id {
-            None
-        } else {
-            Some(resp.node_id.clone())
-        };
-        let abs_src = resp.src_addr;
-        let abs_target = resp.target_addr;
-        let replica_admitted = resp.replica_target.is_some();
-
-        #[cfg(test)]
-        {
-            self.test_record.add_transfering_put(
-                key.to_string(),
-                _test_payload_len_u32,
-                put_id.0,
-                put_id.1,
-                resp.node_id.to_string(),
-                format!("{:#x}", resp.target_addr),
-            );
-        }
-
-        if self.short_circuit_put_payload_path_enabled() {
-            #[cfg(test)]
-            {
-                if _test_remove_after_fill {
-                    self.test_record
-                        .remove_transfering_put(key.to_string(), put_id);
-                }
-            }
-
-            let skipped_breakdown = if peer_id.is_none() && abs_src == abs_target {
-                TransferBreakdown {
-                    local_noop: true,
-                    ..TransferBreakdown::default()
-                }
-            } else {
-                TransferBreakdown::default()
-            };
-            metrics.pending_put_set_transfer_breakdown(
-                put_id,
-                skipped_breakdown.submit_blocking_us,
-                skipped_breakdown.create_xfer_req_us,
-                skipped_breakdown.post_xfer_req_us,
-                skipped_breakdown.poll_wait_us,
-                skipped_breakdown.poll_iters,
-                skipped_breakdown.used_fast_path,
-                false,
-                skipped_breakdown.local_noop,
-                skipped_breakdown.remote_transfer,
-            );
-            self.put_end(key, put_id, lease_id).await?;
-            self.remember_local_snapshot(key, put_id);
-            if make_replica_task {
-                self.start_early_owner_local_ssd_put(key, put_id, payload_len);
-            }
-            if make_replica_task && replica_admitted {
-                if let Err(err) = self
-                    .ensure_remote_put(key, put_id, preferred_sub_cluster.map(str::to_string), true)
-                    .await
-                {
-                    tracing::warn!(
-                        "make replica task failed after short-circuit local commit: key={} put_id=({},{}) err={}",
-                        key,
-                        put_id.0,
-                        put_id.1,
-                        err
-                    );
-                }
-            }
-            if let Some(tag) = info_complete_tag {
-                info!("{tag} complete key={} bytes={}", key, payload_len);
-            }
-            return Ok(());
-        }
-
-        fill_abs_src(abs_src);
-
-        #[cfg(test)]
-        {
-            if _test_remove_after_fill {
-                self.test_record
-                    .remove_transfering_put(key.to_string(), put_id);
-            }
-        }
-
-        let base_addr = self
-            .view
-            .client_seg_pool()
-            .cpu_mem_read_guard()
+        let started_at = Utc::now().timestamp_micros();
+        let reserved = match self
+            .owner_batch_put_start_reserved(
+                vec![BatchPutStartItemReq {
+                    key: key.to_string(),
+                    len: payload_len,
+                    reject_if_inflight_same_key: opts.reject_if_inflight_same_key(),
+                    reject_if_exist_same_key: opts.reject_if_exist_same_key(),
+                    make_replica_task: opts.make_replica_task(),
+                    preferred_sub_cluster: opts.preferred_sub_cluster().map(str::to_string),
+                }],
+                opts.lease_id(),
+            )
             .await
-            .unwrap()
-            .allocated_addr;
-        if dbg_addr_summary {
-            tracing::debug!(
-                "put path addr summary: key={}, put_id=({},{}) local_base={:#x}, abs_src={:#x}, master_target_base={:#x}, abs_target={:#x}, peer_id={:?}",
-                key,
-                put_id.0,
-                put_id.1,
-                base_addr,
-                abs_src,
-                resp.target_base_addr,
-                abs_target,
-                peer_id
-            );
-        }
-
-        if self.skip_put_end_commit_enabled() {
-            let _ = metrics.pending_put_remove(&put_id);
-            tracing::warn!(
-                "skip_put_end_commit test-only fast-path: returning success without put_end; key={} put_id=({},{}) payload_len={}",
-                key,
-                put_id.0,
-                put_id.1,
-                payload_len
-            );
-            if let Some(tag) = info_complete_tag {
-                info!(
-                    "{tag} complete_without_put_end key={} bytes={}",
-                    key, payload_len
-                );
+        {
+            Ok(reserved) => reserved,
+            Err(error) => {
+                obe_put_start_error_rpc(&metrics, &client_id, &node_role, key, payload_len);
+                return Err(error);
             }
-            return Ok(());
+        };
+        assert_eq!(reserved.len(), 1, "single native Put reservation count");
+        obe_put_start_success(
+            &metrics,
+            &client_id,
+            &node_role,
+            key,
+            started_at,
+            Utc::now().timestamp_micros(),
+        );
+        let item = &reserved[0];
+        #[cfg(test)]
+        self.test_record.add_transfering_put(
+            key.to_string(),
+            payload_len as u32,
+            item.put_id.0,
+            item.put_id.1,
+            self.view.cluster_manager().get_self_info().id.to_string(),
+            format!("{:#x}", item.target_addr),
+        );
+        if !self.short_circuit_put_payload_path_enabled() {
+            fill_abs_src(item.src_addr);
         }
-
-        self.put_end(key, put_id, lease_id).await?;
-        self.remember_local_snapshot(key, put_id);
-        if make_replica_task {
-            self.start_early_owner_local_ssd_put(key, put_id, payload_len);
-        }
-        if make_replica_task && replica_admitted {
-            if let Err(err) = self
-                .ensure_remote_put(key, put_id, preferred_sub_cluster.map(str::to_string), true)
-                .await
-            {
-                tracing::warn!(
-                    "make replica task failed after local commit: key={} put_id=({},{}) err={}",
-                    key,
-                    put_id.0,
-                    put_id.1,
-                    err
-                );
-            }
-        }
-        if let Some(tag) = info_complete_tag {
-            info!("{tag} complete key={} bytes={}", key, payload_len);
-        }
-        Ok(())
+        #[cfg(test)]
+        self.test_record
+            .remove_transfering_put(key.to_string(), item.put_id);
+        let mut results = self.owner_batch_put_commit_reserved(reserved, 1).await?;
+        assert_eq!(results.len(), 1, "single native Put completion count");
+        results.pop().expect("single native Put result exists")
     }
 
-    /// Put a key/value by encoding a flat dict from raw pointers directly into the segment pool.
+    /// Encode a flat dictionary directly into an Owner-managed segment.
     ///
     /// # Safety
-    /// The caller must guarantee the pointer ranges remain readable for the duration of this async call.
+    /// The caller must keep all pointer ranges readable until this call returns.
     pub async unsafe fn put_flat_dict_ptrs(
         &self,
         key: &str,
         ptrs: Vec<(u8, usize, u32, u64, u32, Option<u32>)>,
         opts: crate::client_kv_api::PutOptionalArgs,
     ) -> KvResult<()> {
-        let lease_id = opts.lease_id();
-        let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
-        let reject_if_exist_same_key = opts.reject_if_exist_same_key();
-        let make_replica_task = opts.make_replica_task();
-        let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
-
         let payload_len = calc_flat_dict_encoded_len(&ptrs)?;
-        self.put_common(
-            key,
-            payload_len,
-            payload_len as u32,
-            reject_if_inflight_same_key,
-            reject_if_exist_same_key,
-            make_replica_task,
-            preferred_sub_cluster.as_deref(),
-            lease_id,
-            payload_len as u32,
-            /*test_remove_after_fill=*/ false,
-            move |abs_src| {
-                // Fill owner's shared memory at abs_src directly from the raw pointers.
-                unsafe {
-                    write_flat_dict_ptrs_to_ptr(abs_src as *mut u8, &ptrs);
-                }
-            },
-            /*dbg_addr_summary=*/ false,
-            Some("put_flat_dict_ptrs"),
-        )
+        self.put_common(key, payload_len, opts, move |address| unsafe {
+            write_flat_dict_ptrs_to_ptr(address as *mut u8, &ptrs);
+        })
         .await
     }
 
-    /// Put a key/value with optional args (e.g., lease binding)
+    /// Publish a value and its optional lease before returning success.
     pub async fn put(
         &self,
         key: &str,
         value: &[u8],
         opts: crate::client_kv_api::PutOptionalArgs,
     ) -> KvResult<()> {
-        let lease_id = opts.lease_id();
-        let reject_if_inflight_same_key = opts.reject_if_inflight_same_key();
-        let reject_if_exist_same_key = opts.reject_if_exist_same_key();
-        let make_replica_task = opts.make_replica_task();
-        let preferred_sub_cluster = opts.preferred_sub_cluster().map(|s| s.to_string());
-        let payload_len = value.len() as u64;
-        self.put_common(
-            key,
-            payload_len,
-            value.len() as u32,
-            reject_if_inflight_same_key,
-            reject_if_exist_same_key,
-            make_replica_task,
-            preferred_sub_cluster.as_deref(),
-            lease_id,
-            value.len() as u32,
-            /*test_remove_after_fill=*/ true,
-            |abs_src| unsafe {
-                std::ptr::copy_nonoverlapping(value.as_ptr(), abs_src as *mut u8, value.len());
-            },
-            /*dbg_addr_summary=*/ true,
-            None,
-        )
+        self.put_common(key, value.len() as u64, opts, |address| unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), address as *mut u8, value.len());
+        })
         .await
     }
 
@@ -2911,6 +2873,19 @@ impl ClientKvApiInner {
         Ok(resp.serialize_part)
     }
 
+    async fn find_put_master_before_shutdown(&self) -> KvResult<String> {
+        let mut shutdown_waiter = self.view.register_shutdown_waiter();
+        // Discovery has no remote side effects. Once dispatched, callers must
+        // consume their RPC response even if shutdown arrives in the meantime.
+        tokio::select! {
+            biased;
+            _ = shutdown_waiter.wait() => Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "Put master discovery stopped during shutdown".to_string(),
+            })),
+            master = self.view.cluster_manager().find_or_wait_master_node() => Ok(master?),
+        }
+    }
+
     pub async fn batch_prepare_put_keys(
         &self,
         items: Vec<BatchPreparePutKeyItemReq>,
@@ -2933,11 +2908,7 @@ impl ClientKvApiInner {
             serialize_part: BatchPreparePutKeysReq { items },
             raw_bytes: Vec::new(),
         };
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
+        let master_node_id = self.find_put_master_before_shutdown().await?;
         let resp = call_control_plane_rpc(
             &self.rpc_caller_batch_prepare_put_keys,
             self.view.p2p_module(),
@@ -2966,29 +2937,39 @@ impl ClientKvApiInner {
                 server_process_us: 0,
             });
         }
-        if !self.view.register_shutdown_poller().is_running() {
-            return Err(KvError::Api(ApiError::SystemShutdown {
-                detail:
-                    "ClientKvApi is shutting down; rejecting batch_release_put_key_reservations"
-                        .to_string(),
-            }));
-        }
+        // Native operation guards keep communication dependencies alive until
+        // this cleanup finishes, including after admission closes.
         let req = MsgPack {
             serialize_part: BatchReleasePutKeyReservationsReq { reservation_ids },
             raw_bytes: Vec::new(),
         };
-        let master_node_id = self
+        let master_nodes = self
             .view
             .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
-        let resp = call_control_plane_rpc(
-            &self.rpc_caller_batch_release_put_key_reservations,
+            .get_members()
+            .into_iter()
+            .filter(|member| member.metadata.contains_key("master"))
+            .map(|member| member.id)
+            .collect::<Vec<_>>();
+        let master_node_id = match master_nodes.as_slice() {
+            [master] => master.clone(),
+            [] => return Err(
+                crate::rpcresp_kvresult_convert::msg_and_error::ClusterManagerExtError::MasterNotFound {}.into(),
+            ),
+            _ => return Err(
+                crate::rpcresp_kvresult_convert::msg_and_error::ClusterManagerExtError::MultipleMasters {
+                    nodes: master_nodes,
+                }.into(),
+            ),
+        };
+        // Cleanup must remain callable after shutdown intent. Use the bounded
+        // single-attempt primitive; the ordinary retry wrapper closes admission.
+        let resp = fluxon_commu::p2p::rpc::call_rpc_with_transport_policy(
             self.view.p2p_module(),
             master_node_id.into(),
             req,
             Some(std::time::Duration::from_secs(60)),
-            2,
+            CONTROL_PLANE_RPC_TRANSPORT_POLICY,
         )
         .await
         .map_err(KvError::from)?;
@@ -3064,11 +3045,7 @@ impl ClientKvApiInner {
             serialize_part: BatchPutDoneReq { items },
             raw_bytes: Vec::new(),
         };
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
+        let master_node_id = self.find_put_master_before_shutdown().await?;
         let resp = self
             .rpc_caller_batch_put_done
             .call_with_transport_policy(
@@ -5376,68 +5353,164 @@ fn owner_local_publish_atomic_batch_complete(
     })
 }
 
-pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLocalPublishJob) {
-    let inner = view.client_kv_api().inner();
-    if job.items.is_empty() {
-        release_owner_local_publish_reservations(inner, job.key_reservation_ids).await;
-        return;
-    }
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OwnerLocalPublishCompletion {
+    Background,
+    Native,
+}
 
+enum OwnerLocalPublishItemState {
+    AwaitingMaster { uncertain: bool },
+    Accepted,
+    Published,
+    Rejected(KvError),
+}
+
+pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLocalPublishJob) {
+    let _ =
+        publish_owner_local_job_with_completion(view, job, OwnerLocalPublishCompletion::Background)
+            .await;
+}
+
+pub(crate) async fn publish_native_owner_local_job(
+    view: ClientKvApiView,
+    job: OwnerLocalPublishJob,
+) -> Vec<KvResult<()>> {
+    assert!(
+        job.items.iter().all(|item| item.atomic_group.is_none()),
+        "native publication reports independent item terminals"
+    );
+    assert_eq!(job.items.len(), job.external_pending_contexts.len());
+    assert_eq!(job.items.len(), job.key_reservation_ids.len());
+    publish_owner_local_job_with_completion(view, job, OwnerLocalPublishCompletion::Native).await
+}
+
+fn owner_local_publish_rejection_is_terminal(error: &KvError) -> bool {
+    matches!(
+        error,
+        KvError::LeaseMgr(_)
+            | KvError::Api(
+                ApiError::InvalidArgument { .. }
+                    | ApiError::InvalidPutMasterState { .. }
+                    | ApiError::KeyAlreadyExists { .. }
+                    | ApiError::KeyBeingWritten { .. }
+                    | ApiError::OwnerStartTimeMismatch { .. }
+            )
+    )
+}
+
+fn discard_rejected_owner_local_publish(
+    inner: &ClientKvApiInner,
+    item: &OwnerLocalPublishItem,
+) -> Result<(), String> {
+    let memory_info = inner
+        .precommit_local_visible_memory_info(&item.key)
+        .ok_or_else(|| format!("rejected Put precommit slot is absent: key={}", item.key))?;
+    if memory_info.local_reserve_resident_slot_ref()
+        != Some((
+            item.committed_slot.allocation_id,
+            item.committed_slot.segment_offset,
+            item.committed_slot.capacity_bytes,
+        ))
+    {
+        return Err(format!(
+            "rejected Put precommit slot identity changed: key={}",
+            item.key
+        ));
+    }
+    if !inner.remove_precommit_local_reserve_resident_slot_if_same(&item.key, &memory_info) {
+        return Err(format!(
+            "rejected Put precommit slot disappeared during cleanup: key={}",
+            item.key
+        ));
+    }
+    // MemoryInfo owns physical release; readers keep the pending slot alive.
+    drop(memory_info);
+    Ok(())
+}
+
+async fn publish_owner_local_job_with_completion(
+    view: ClientKvApiView,
+    job: OwnerLocalPublishJob,
+    completion: OwnerLocalPublishCompletion,
+) -> Vec<KvResult<()>> {
+    let inner = view.client_kv_api().inner();
     let group_lens = complete_owner_local_publish_group_lens(&job.items);
     let incomplete_declared_group =
         group_lens.is_none() && job.items.iter().any(|item| item.atomic_group.is_some());
+    let mut states = job
+        .items
+        .iter()
+        .map(|_| OwnerLocalPublishItemState::AwaitingMaster { uncertain: false })
+        .collect::<Vec<_>>();
     let mut shutdown_waiter = view.register_shutdown_waiter();
     let mut retry_delay = OWNER_LOCAL_PUBLISH_RETRY_INITIAL;
-    let mut published = false;
 
-    loop {
-        let attempt: Result<(), String> = async {
-            if incomplete_declared_group {
-                return Err(
-                    "declared atomic group is incomplete or non-contiguous in publish job"
-                        .to_string(),
-                );
-            }
-            let done_items: Vec<BatchPutDoneItemResp> =
-                if let Some(atomic_group_lens) = group_lens.clone() {
-                    inner
-                        .owner_hot_counters
-                        .grouped_put_done_batches
-                        .fetch_add(1, Ordering::Relaxed);
-                    inner
-                        .owner_hot_counters
-                        .grouped_put_done_items
-                        .fetch_add(job.items.len() as u64, Ordering::Relaxed);
-                    let items = job
-                        .items
-                        .iter()
-                        .map(|item| GroupedBatchPutDoneItemReq {
+    while states.iter().any(|state| {
+        !matches!(
+            state,
+            OwnerLocalPublishItemState::Published | OwnerLocalPublishItemState::Rejected(_)
+        )
+    }) {
+        let requested = (0..job.items.len())
+            .filter(|&index| {
+                completion == OwnerLocalPublishCompletion::Background
+                    || matches!(
+                        states[index],
+                        OwnerLocalPublishItemState::AwaitingMaster { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        let mut retry_reason = None;
+        let mut background_batch_accepted = false;
+        if incomplete_declared_group {
+            retry_reason = Some(
+                "declared atomic group is incomplete or non-contiguous in publish job".to_string(),
+            );
+        } else if !requested.is_empty() {
+            let response = if completion == OwnerLocalPublishCompletion::Background
+                && let Some(atomic_group_lens) = group_lens.clone()
+            {
+                inner
+                    .owner_hot_counters
+                    .grouped_put_done_batches
+                    .fetch_add(1, Ordering::Relaxed);
+                inner
+                    .owner_hot_counters
+                    .grouped_put_done_items
+                    .fetch_add(requested.len() as u64, Ordering::Relaxed);
+                let items = requested
+                    .iter()
+                    .map(|&index| {
+                        let item = &job.items[index];
+                        GroupedBatchPutDoneItemReq {
                             key: item.key.clone(),
                             put_id: item.put_id,
                             lease_id: item.lease_id,
                             committed_slot: Some(item.committed_slot.clone()),
                             publish_local_cache: false,
                             radix: item.radix.clone(),
-                        })
-                        .collect::<Vec<_>>();
-                    inner
-                        .grouped_batch_put_done(items, atomic_group_lens)
-                        .await
-                        .map(|resp| resp.items)
-                        .map_err(|err| format!("PutDone RPC uncertain: {err}"))?
-                } else {
-                    inner
-                        .owner_hot_counters
-                        .legacy_put_done_batches
-                        .fetch_add(1, Ordering::Relaxed);
-                    inner
-                        .owner_hot_counters
-                        .legacy_put_done_items
-                        .fetch_add(job.items.len() as u64, Ordering::Relaxed);
-                    let items = job
-                        .items
-                        .iter()
-                        .map(|item| BatchPutDoneItemReq {
+                        }
+                    })
+                    .collect();
+                inner
+                    .grouped_batch_put_done(items, atomic_group_lens)
+                    .await
+                    .map(|response| response.items)
+            } else {
+                inner
+                    .owner_hot_counters
+                    .legacy_put_done_batches
+                    .fetch_add(1, Ordering::Relaxed);
+                inner
+                    .owner_hot_counters
+                    .legacy_put_done_items
+                    .fetch_add(requested.len() as u64, Ordering::Relaxed);
+                let items = requested
+                    .iter()
+                    .map(|&index| {
+                        let item = &job.items[index];
+                        BatchPutDoneItemReq {
                             key: item.key.clone(),
                             put_id: item.put_id,
                             lease_id: item.lease_id,
@@ -5445,101 +5518,200 @@ pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLoc
                             publish_local_cache: false,
                             atomic_group: item.atomic_group.clone(),
                             radix: item.radix.clone(),
+                        }
+                    })
+                    .collect();
+                inner
+                    .batch_put_done(items)
+                    .await
+                    .map(|response| response.items)
+            };
+            let response = response
+                .map_err(|error| format!("PutDone RPC uncertain: {error}"))
+                .and_then(|items| {
+                    if items.len() != requested.len()
+                        || requested.iter().zip(&items).any(|(&index, response)| {
+                            let item = &job.items[index];
+                            response.key != item.key || response.put_id != item.put_id
                         })
-                        .collect::<Vec<_>>();
-                    inner
-                        .batch_put_done(items)
-                        .await
-                        .map(|resp| resp.items)
-                        .map_err(|err| format!("PutDone RPC uncertain: {err}"))?
-                };
-
-            if done_items.len() != job.items.len() {
-                return Err(format!(
-                    "PutDone response length mismatch: expected={} got={}",
-                    job.items.len(),
-                    done_items.len()
-                ));
-            }
-            for (item, done_item) in job.items.iter().zip(done_items.iter()) {
-                if done_item.key != item.key || done_item.put_id != item.put_id {
-                    return Err(format!(
-                        "PutDone identity mismatch: request=({},({},{}) response=({},({},{}))",
-                        item.key,
-                        item.put_id.0,
-                        item.put_id.1,
-                        done_item.key,
-                        done_item.put_id.0,
-                        done_item.put_id.1,
-                    ));
+                    {
+                        Err("PutDone response identities do not match the request".to_string())
+                    } else {
+                        Ok(items)
+                    }
+                });
+            match response {
+                Err(reason) => {
+                    for &index in &requested {
+                        if let OwnerLocalPublishItemState::AwaitingMaster { uncertain } =
+                            &mut states[index]
+                        {
+                            *uncertain = true;
+                        }
+                    }
+                    retry_reason = Some(reason);
                 }
-                crate::rpcresp_kvresult_convert::try_from_code(
-                    done_item.error_code,
-                    done_item.error_json.clone(),
-                )
-                .map_err(|err| {
-                    format!(
-                        "PutDone item unresolved: key={} put_id=({},{}) err={}",
-                        item.key, item.put_id.0, item.put_id.1, err
-                    )
-                })?;
+                Ok(responses) => {
+                    background_batch_accepted = true;
+                    for (&index, response) in requested.iter().zip(responses) {
+                        let item = &job.items[index];
+                        match crate::rpcresp_kvresult_convert::try_from_code(
+                            response.error_code,
+                            response.error_json,
+                        ) {
+                            Ok(()) => {
+                                if matches!(
+                                    states[index],
+                                    OwnerLocalPublishItemState::AwaitingMaster { .. }
+                                ) {
+                                    states[index] = OwnerLocalPublishItemState::Accepted;
+                                }
+                            }
+                            Err(error) => {
+                                background_batch_accepted = false;
+                                if completion == OwnerLocalPublishCompletion::Native
+                                    && matches!(
+                                        states[index],
+                                        OwnerLocalPublishItemState::AwaitingMaster {
+                                            uncertain: false
+                                        }
+                                    )
+                                    && owner_local_publish_rejection_is_terminal(&error)
+                                {
+                                    match discard_rejected_owner_local_publish(inner, item) {
+                                        Ok(()) => {
+                                            states[index] =
+                                                OwnerLocalPublishItemState::Rejected(error);
+                                            continue;
+                                        }
+                                        Err(reason) => {
+                                            retry_reason = Some(reason);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                retry_reason = Some(format!(
+                                    "PutDone item unresolved: key={} put_id=({},{}) err={}",
+                                    item.key, item.put_id.0, item.put_id.1, error
+                                ));
+                            }
+                        }
+                    }
+                }
             }
+        }
 
-            // Do not expose only part of an atomic/TP atomic_batch to owner-hot.
-            // First prove every master route terminal, then roll all local
-            // precommit slots forward. Replayed attempts accept members that
-            // were already promoted before a cancellation or partial local
-            // failure.
-            for item in &job.items {
-                if inner.committed_local_reserve_slot_is_current(
+        if completion == OwnerLocalPublishCompletion::Native || background_batch_accepted {
+            let mut promoted_indices = Vec::new();
+            for (index, state) in states.iter().enumerate() {
+                if !matches!(state, OwnerLocalPublishItemState::Accepted) {
+                    continue;
+                }
+                let item = &job.items[index];
+                let promotion = if inner.committed_local_reserve_slot_is_current(
                     &item.key,
                     item.put_id,
                     &item.committed_slot,
                 ) {
-                    continue;
+                    Ok(())
+                } else {
+                    inner
+                        .precommit_local_visible_memory_info(&item.key)
+                        .ok_or_else(|| {
+                            format!("precommit slot missing before promotion: key={}", item.key)
+                        })
+                        .and_then(|memory_info| {
+                            inner
+                                .promote_precommit_local_reserve_resident_slot_if_same(
+                                    &item.key,
+                                    item.put_id,
+                                    memory_info,
+                                    item.atomic_group.as_ref(),
+                                )
+                                .map_err(|error| {
+                                    format!(
+                                        "local promotion unresolved: key={} err={error}",
+                                        item.key
+                                    )
+                                })
+                        })
+                };
+                match promotion {
+                    Ok(()) => promoted_indices.push(index),
+                    Err(reason) => retry_reason = Some(reason),
                 }
-                let memory_info = inner
-                    .precommit_local_visible_memory_info(&item.key)
-                    .ok_or_else(|| {
-                        format!(
-                            "precommit slot missing before promotion: key={} put_id=({},{})",
-                            item.key, item.put_id.0, item.put_id.1
-                        )
-                    })?;
-                inner
-                    .promote_precommit_local_reserve_resident_slot_if_same(
-                        &item.key,
-                        item.put_id,
-                        memory_info,
-                        item.atomic_group.as_ref(),
-                    )
-                    .map_err(|err| {
-                        format!(
-                            "local promotion unresolved: key={} put_id=({},{}) err={}",
-                            item.key, item.put_id.0, item.put_id.1, err
-                        )
-                    })?;
             }
-            Ok(())
-        }
-        .await;
-
-        match attempt {
-            Ok(()) => {
-                published = true;
-                break;
-            }
-            Err(reason) => {
-                tracing::warn!(
-                    "owner local publish retained full atomic_batch for retry: key_count={} external_fences={} retry_ms={} reason={}",
-                    job.items.len(),
-                    job.external_pending_contexts.len(),
-                    retry_delay.as_millis(),
-                    reason,
+            // Atomic background groups expose hot/replica side effects only
+            // after every member has completed master and local publication.
+            if completion == OwnerLocalPublishCompletion::Native
+                || promoted_indices.len() == job.items.len()
+            {
+                let promoted_items = promoted_indices
+                    .iter()
+                    .map(|&index| &job.items[index])
+                    .collect::<Vec<_>>();
+                for item in &promoted_items {
+                    assert!(owner_local_publish_atomic_batch_complete(
+                        item,
+                        &promoted_items
+                    ));
+                    let _ = inner.owner_hot_admit_published_committed(&item.key, item.put_id);
+                }
+                let _ = inner.start_owner_local_ssd_puts(
+                    promoted_items
+                        .iter()
+                        .filter(|item| item.make_replica_task)
+                        .map(|item| OwnerLocalSsdPutCandidate {
+                            key: item.key.clone(),
+                            put_id: item.put_id,
+                            value_len: item.value_len,
+                            selected_victim: None,
+                        })
+                        .collect(),
+                    false,
                 );
+                for &index in &promoted_indices {
+                    let item = &job.items[index];
+                    if owner_local_publish_starts_remote(item) {
+                        if let Err(error) = inner
+                            .ensure_remote_put(
+                                &item.key,
+                                item.put_id,
+                                item.preferred_sub_cluster.clone(),
+                                true,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                key = item.key,
+                                %error,
+                                "owner local publish enqueue replica append failed"
+                            );
+                        }
+                    }
+                    if let Some(context) = job.external_pending_contexts.get(index) {
+                        context._pending_fence.mark_local_put_succeeded();
+                    }
+                    states[index] = OwnerLocalPublishItemState::Published;
+                }
             }
         }
-
+        if states.iter().all(|state| {
+            matches!(
+                state,
+                OwnerLocalPublishItemState::Published | OwnerLocalPublishItemState::Rejected(_)
+            )
+        }) {
+            break;
+        }
+        tracing::warn!(
+            key_count = job.items.len(),
+            retry_ms = retry_delay.as_millis(),
+            reason = retry_reason
+                .as_deref()
+                .unwrap_or("publication is still pending"),
+            "owner local publish retains unresolved items for retry"
+        );
         tokio::select! {
             _ = tokio::time::sleep(retry_delay) => {}
             _ = shutdown_waiter.wait() => break,
@@ -5548,77 +5720,33 @@ pub(crate) async fn publish_owner_local_job(view: ClientKvApiView, job: OwnerLoc
             .saturating_mul(2)
             .min(OWNER_LOCAL_PUBLISH_RETRY_MAX);
     }
-
-    if published {
-        let promoted_items = job.items.iter().collect::<Vec<_>>();
-        for item in &promoted_items {
-            if !owner_local_publish_atomic_batch_complete(item, &promoted_items) {
-                tracing::warn!(
-                    "owner local publish skipped hot admission for incomplete atomic group: key={} put_id=({},{})",
-                    item.key,
-                    item.put_id.0,
-                    item.put_id.1
-                );
-                continue;
-            }
-            let _ = inner.owner_hot_admit_published_committed(&item.key, item.put_id);
+    if let Err(error) =
+        release_owner_local_publish_reservations(inner, job.key_reservation_ids).await
+    {
+        if completion == OwnerLocalPublishCompletion::Native {
+            inner.native_put_operations.record_cleanup_error(&error);
         }
-
-        let _ = inner.start_owner_local_ssd_puts(
-            promoted_items
-                .iter()
-                .filter(|item| item.make_replica_task)
-                .map(|item| OwnerLocalSsdPutCandidate {
-                    key: item.key.clone(),
-                    put_id: item.put_id,
-                    value_len: item.value_len,
-                    selected_victim: None,
-                })
-                .collect(),
-            false,
-        );
-
-        for item in promoted_items {
-            if owner_local_publish_starts_remote(item) {
-                if let Err(err) = inner
-                    .ensure_remote_put(
-                        &item.key,
-                        item.put_id,
-                        item.preferred_sub_cluster.clone(),
-                        true,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "owner local publish enqueue replica append failed: key={} put_id=({},{}) err={}",
-                        item.key,
-                        item.put_id.0,
-                        item.put_id.1,
-                        err
-                    );
-                }
-            }
-        }
-
-        for context in &job.external_pending_contexts {
-            context._pending_fence.mark_local_put_succeeded();
-        }
+        tracing::warn!(%error, "owner local publish key reservation cleanup failed");
     }
-
-    release_owner_local_publish_reservations(inner, job.key_reservation_ids).await;
+    states
+        .into_iter()
+        .map(|state| match state {
+            OwnerLocalPublishItemState::Published => Ok(()),
+            OwnerLocalPublishItemState::Rejected(error) => Err(error),
+            OwnerLocalPublishItemState::AwaitingMaster { .. }
+            | OwnerLocalPublishItemState::Accepted => Err(KvError::Api(ApiError::SystemShutdown {
+                detail: "owner Put publication stopped before completion".to_string(),
+            })),
+        })
+        .collect()
 }
 
 async fn release_owner_local_publish_reservations(
     inner: &ClientKvApiInner,
     key_reservation_ids: Vec<u64>,
-) {
-    if let Err(err) = inner
+) -> KvResult<()> {
+    inner
         .batch_release_put_key_reservations(key_reservation_ids)
         .await
-    {
-        tracing::warn!(
-            "owner local publish key reservation cleanup failed: {}",
-            err
-        );
-    }
+        .map(|_| ())
 }

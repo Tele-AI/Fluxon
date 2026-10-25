@@ -150,242 +150,817 @@ fn new_zero_contribution_client_config(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn test_external_client_basic_crud() {
+    external_client_basic_crud(Some(OwnerPlacementClass::Inference), Some(0.5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_external_client_basic_crud_default_owner() {
+    external_client_basic_crud(None, None).await;
+}
+
+async fn external_client_basic_crud(
+    placement: Option<OwnerPlacementClass>,
+    hot_ratio: Option<f64>,
+) {
     let _test_guard = crate::kvcore_test_lib::integration_test_lock().await;
-    fluxon_util::test_util::start_test_etcd().expect("start etcd for external client tests");
-    // 测试仅设置日志级别，生产日志由 run_xxx 落盘
-    unsafe {
-        std::env::set_var("FLUXON_LOG", "info");
-    }
-    let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
-        .expect("read etcd endpoint from build_config_ext.yml");
-    let cluster = "test_cluster_ext";
-    let shm_path = format!(
-        "{}/sharemem/kvcache_shared_memory_exttest",
-        fluxon_util::test_util::test_workdir_base()
-    );
-    std::fs::create_dir_all(&shm_path).unwrap();
+    tokio::time::timeout(Duration::from_secs(120), async {
+        fluxon_util::test_util::start_test_etcd().expect("start etcd for external client tests");
+        // 测试仅设置日志级别，生产日志由 run_xxx 落盘
+        unsafe {
+            std::env::set_var("FLUXON_LOG", "info");
+        }
+        let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
+            .expect("read etcd endpoint from build_config_ext.yml");
+        let suffix = uuid::Uuid::new_v4();
+        let cluster = format!("test_cluster_ext_{suffix}");
+        let master_id = format!("ext_test_master_{suffix}");
+        let owner_id = format!("ext_test_owner_{suffix}");
+        let shm_path = format!(
+            "{}/sharemem/kvcache_shared_memory_exttest_{suffix}",
+            fluxon_util::test_util::test_workdir_base()
+        );
+        std::fs::create_dir_all(&shm_path).unwrap();
 
-    // Start master
-    let master_cfg = new_master_config("ext_test_master", None, cluster, &etcd);
-    let (master_fw, _) = run_master(ConfigArg::Config(master_cfg))
-        .await
-        .expect("start master");
+        // Start master
+        let master_cfg = new_master_config(&master_id, None, &cluster, &etcd);
+        let (master_fw, _) = run_master(ConfigArg::Config(master_cfg))
+            .await
+            .expect("start master");
 
-    // Start owner client (provides shared memory)
-    let owner_cfg = new_client_config("ext_test_owner", cluster, &shm_path, &etcd);
-    let (owner_fw, _) = run_client(ConfigArg::Config(owner_cfg))
-        .await
-        .expect("start owner client");
-    let owner_node_id = owner_fw
-        .cluster_manager_view()
-        .cluster_manager()
-        .get_self_info()
-        .id;
-    // Owner-authoritative registration publishes geometry and authority while
-    // deliberately leaving the master allocator map empty.
-    wait_owner_allocation_authority(
-        master_fw.master_kv_router_view(),
-        &owner_node_id,
-        Duration::from_secs(30),
-    )
-    .await;
+        // Start owner client (provides shared memory)
+        let mut owner_cfg = new_client_config(&owner_id, &cluster, &shm_path, &etcd);
+        owner_cfg.owner_placement_class = placement;
+        owner_cfg.replica_writeback_hot_capacity_ratio = hot_ratio;
+        let (owner_fw, _) = run_client(ConfigArg::Config(owner_cfg))
+            .await
+            .expect("start owner client");
+        let owner_node_id = owner_fw
+            .cluster_manager_view()
+            .cluster_manager()
+            .get_self_info()
+            .id;
+        // Owner-authoritative registration publishes geometry and authority while
+        // deliberately leaving the master allocator map empty.
+        wait_owner_allocation_authority(
+            master_fw.master_kv_router_view(),
+            &owner_node_id,
+            Duration::from_secs(30),
+        )
+        .await;
 
-    // Start external client bound to owner's shared memory
-    let ext_cfg = new_zero_contribution_client_config(&owner_node_id, cluster, &shm_path);
-    let (ext_fw, _) = run_client(ConfigArg::Config(ext_cfg))
-        .await
-        .expect("start external client");
+        // Start external client bound to owner's shared memory
+        let ext_cfg = new_zero_contribution_client_config(&owner_node_id, &cluster, &shm_path);
+        let (ext_fw, _) = run_client(ConfigArg::Config(ext_cfg))
+            .await
+            .expect("start external client");
 
-    // First RPCs will wait for P2P ready; no extra sleep
-    {
-        // Hold views in variables to extend lifetimes for borrowed APIs
-        let ext_view = ext_fw.external_client_api_view();
-        let api = ext_view.external_client_api();
-        let owner_view = owner_fw.client_kv_api_view();
-        let owner_api = owner_view.client_kv_api();
-        let key = "ext_client_test_key";
-        let value = b"hello_external";
+        // First RPCs will wait for P2P ready; no extra sleep
+        {
+            // Hold views in variables to extend lifetimes for borrowed APIs
+            let ext_view = ext_fw.external_client_api_view();
+            let api = ext_view.external_client_api();
+            let owner_view = owner_fw.client_kv_api_view();
+            let owner_api = owner_view.client_kv_api();
+            let key = "ext_client_test_key";
+            let value = b"hello_external";
 
-        // ensure not exists (owner validation)
-        match owner_api.inner().is_exist(key).await {
-            Ok(false) => {}
-            Ok(true) => {
-                // Clean up residue to ensure a clean test
+            // ensure not exists (owner validation)
+            match owner_api.inner().is_exist(key).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    // Clean up residue to ensure a clean test
+                    owner_api
+                        .inner()
+                        .delete(key)
+                        .await
+                        .expect("owner cleanup delete");
+                    assert!(
+                        !owner_api
+                            .inner()
+                            .is_exist(key)
+                            .await
+                            .expect("owner exist after cleanup")
+                    );
+                }
+                Err(e) => panic!("owner is_exist pre-check failed: {}", e),
+            }
+
+            // put (external) and owner validates
+            api.inner()
+                .put(key, value, crate::client_kv_api::PutOptionalArgs::new())
+                .await
+                .expect("external put");
+            wait_master_route(
+                master_fw.master_kv_router_view(),
+                key,
+                Duration::from_secs(5),
+            )
+            .await;
+            // owner validate exists
+            assert!(
                 owner_api
                     .inner()
-                    .delete(key)
+                    .is_exist(key)
                     .await
-                    .expect("owner cleanup delete");
+                    .expect("owner exist true after put")
+            );
+            // owner get and verify
+            match owner_api
+                .inner()
+                .get(key)
+                .await
+                .expect("owner get after put")
+            {
+                Some((holder, _)) => assert_eq!(holder.bytes(), value),
+                None => panic!("owner get returned None after external put"),
+            }
+
+            // get and verify (external)
+            let got = api
+                .inner()
+                .get(key)
+                .await
+                .expect("external get")
+                .expect("none");
+            assert_eq!(got.bytes(), value);
+            // owner re-validate data still accessible and correct
+            match owner_api
+                .inner()
+                .get(key)
+                .await
+                .expect("owner get after external get")
+            {
+                Some((holder, _)) => assert_eq!(holder.bytes(), value),
+                None => panic!("owner get returned None after external get"),
+            }
+
+            // is_exist true (external) and owner validation
+            assert!(api.inner().is_exist(key).await.expect("exist true"));
+            assert!(
+                owner_api
+                    .inner()
+                    .is_exist(key)
+                    .await
+                    .expect("owner exist true after external get")
+            );
+
+            // delete (external)
+            drop(got);
+            api.inner().delete(key).await.expect("external delete");
+            // owner validation: not exist and get returns None
+            assert!(
+                !owner_api
+                    .inner()
+                    .is_exist(key)
+                    .await
+                    .expect("owner exist false after delete")
+            );
+            match owner_api
+                .inner()
+                .get(key)
+                .await
+                .expect("owner get after delete")
+            {
+                Some(_) => panic!("owner get should be None after delete"),
+                None => {}
+            }
+
+            // is_exist false
+            match api.inner().is_exist(key).await {
+                Ok(false) => {}
+                other => panic!("expected is_exist false after delete, got {:?}", other),
+            }
+
+            // Native and external clients share the same owner allocation path.
+            owner_api
+                .inner()
+                .put(key, value, crate::client_kv_api::PutOptionalArgs::new())
+                .await
+                .expect("native owner put");
+            wait_master_route(
+                master_fw.master_kv_router_view(),
+                key,
+                Duration::from_secs(5),
+            )
+            .await;
+            let native_value = api
+                .inner()
+                .get(key)
+                .await
+                .expect("external get native put")
+                .unwrap();
+            assert_eq!(native_value.bytes(), value);
+            drop(native_value);
+
+            let rejected = owner_api
+                .inner()
+                .put(
+                    key,
+                    b"must_not_replace",
+                    crate::client_kv_api::PutOptionalArgs(vec![
+                        crate::client_kv_api::PutOptionalArg::RejectIfExists,
+                    ]),
+                )
+                .await;
+            assert!(matches!(
+                rejected,
+                Err(crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+                    crate::rpcresp_kvresult_convert::msg_and_error::ApiError::KeyAlreadyExists {
+                        key: rejected_key,
+                    }
+                )) if rejected_key == key
+            ));
+            let unchanged = api
+                .inner()
+                .get(key)
+                .await
+                .expect("external get after rejected native put")
+                .expect("rejected put must preserve the original value");
+            assert_eq!(unchanged.bytes(), value);
+            drop(unchanged);
+            api.inner().delete(key).await.expect("delete native put");
+
+            let invalid_lease = tokio::time::timeout(
+                Duration::from_secs(15),
+                owner_api.inner().put(
+                    key,
+                    value,
+                    crate::client_kv_api::PutOptionalArgs(vec![
+                        crate::client_kv_api::PutOptionalArg::LeaseId(u64::MAX),
+                    ]),
+                ),
+            )
+            .await
+            .expect("a rejected lease must not retry publication forever")
+            .expect_err("an unknown lease must reject native publication");
+            assert!(matches!(
+                invalid_lease,
+                crate::rpcresp_kvresult_convert::msg_and_error::KvError::LeaseMgr(
+                    crate::rpcresp_kvresult_convert::msg_and_error::LeaseMgrError::LeaseNotFound { .. }
+                )
+            ), "{invalid_lease}");
+            assert!(
+                owner_api.inner().get(key).await.expect("get after rejected lease").is_none(),
+                "a rejected publication must release its local visibility"
+            );
+            owner_api.inner().put(
+                key,
+                value,
+                crate::client_kv_api::PutOptionalArgs::new(),
+            ).await.expect("put after rejected lease must release the key reservation");
+            api.inner().delete(key).await.expect("delete retry after rejected lease");
+
+            let overwrite_values = (0..8_u8).map(|byte| vec![byte; 64]).collect::<Vec<_>>();
+            let overwrites = tokio::time::timeout(
+                Duration::from_secs(30),
+                futures::future::join_all(overwrite_values.iter().map(|value| {
+                    owner_api.inner().put(key, value, crate::client_kv_api::PutOptionalArgs::new())
+                })),
+            ).await.expect("concurrent owner overwrites must finish");
+            for result in overwrites {
+                result.expect("default put permits replacement after the preceding writer finishes");
+            }
+            let last_value = api.inner().get(key).await.expect("get concurrent overwrite").unwrap();
+            assert!(overwrite_values.iter().any(|value| value.as_slice() == last_value.bytes()));
+            drop(last_value);
+            api.inner().delete(key).await.expect("delete concurrent overwrite");
+
+            let batch_specs = [
+                [("native_order_a", 8_u64), ("native_order_b", 16_u64)],
+                [("native_order_b", 8_u64), ("native_order_a", 16_u64)],
+            ];
+            tokio::time::timeout(Duration::from_secs(30), futures::future::join_all(
+                batch_specs.into_iter().map(|specs| {
+                    let inner = owner_api.inner();
+                    async move {
+                        let requests = specs.into_iter().map(|(key, len)| {
+                            crate::master_kv_router::msg_pack::BatchPutStartItemReq {
+                                key: key.to_string(),
+                                len,
+                                reject_if_inflight_same_key: false,
+                                reject_if_exist_same_key: false,
+                                make_replica_task: false,
+                                preferred_sub_cluster: None,
+                            }
+                        }).collect();
+                        let items = inner.owner_batch_put_start_reserved(requests, None)
+                            .await.expect("reserve overlapping mixed-length batch");
+                        for item in &items {
+                            unsafe { std::ptr::write_bytes(item.src_addr as *mut u8, 0x5a, item.value_len as usize); }
+                        }
+                        for result in inner.owner_batch_put_commit_reserved(items, 1)
+                            .await.expect("commit overlapping mixed-length batch") {
+                            result.expect("each overlapping batch item must commit");
+                        }
+                    }
+                }),
+            )).await.expect("mixed-length batches must acquire keys in a consistent order");
+            for batch_key in ["native_order_a", "native_order_b"] {
+                let holder = api.inner().get(batch_key).await.expect("get mixed-length batch").unwrap();
+                assert!(matches!(holder.bytes().len(), 8 | 16));
+                assert!(holder.bytes().iter().all(|byte| *byte == 0x5a));
+                drop(holder);
+                api.inner().delete(batch_key).await.expect("delete mixed-length batch");
+            }
+
+            let reserved_payloads = [
+                ("native_reserved_first", b"reserved_payload".as_slice()),
+                ("native_reserved_second", b"second_payload__".as_slice()),
+            ];
+            let lease_id = owner_api.allocate_lease(120).await.expect("allocate native batch lease");
+            let reserve_requests = reserved_payloads
+                .iter()
+                .map(
+                    |(key, value)| crate::master_kv_router::msg_pack::BatchPutStartItemReq {
+                        key: (*key).to_string(),
+                        len: value.len() as u64,
+                        reject_if_inflight_same_key: true,
+                        reject_if_exist_same_key: true,
+                        make_replica_task: false,
+                        preferred_sub_cluster: None,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let aborted = tokio::time::timeout(
+                Duration::from_secs(15),
+                owner_api
+                    .inner()
+                    .owner_batch_put_start_reserved(reserve_requests.clone(), Some(lease_id)),
+            )
+            .await
+            .expect("native reservation must not wait for a master allocator")
+            .expect("reserve native owner batch for abort");
+            assert_eq!(aborted.len(), reserved_payloads.len());
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                owner_api.inner().owner_batch_put_abort_reserved(aborted),
+            )
+            .await
+            .expect("native reserved batch abort timed out")
+            .expect("abort native owner batch");
+            for (key, _) in &reserved_payloads {
                 assert!(
                     !owner_api
                         .inner()
                         .is_exist(key)
                         .await
-                        .expect("owner exist after cleanup")
+                        .expect("aborted reservation must stay unpublished")
                 );
             }
-            Err(e) => panic!("owner is_exist pre-check failed: {}", e),
-        }
 
-        // put (external) and owner validates
-        api.inner()
-            .put(key, value, crate::client_kv_api::PutOptionalArgs::new())
-            .await
-            .expect("external put");
-        wait_master_route(
-            master_fw.master_kv_router_view(),
-            key,
-            Duration::from_secs(5),
-        )
-        .await;
-        // owner validate exists
-        assert!(
-            owner_api
-                .inner()
-                .is_exist(key)
-                .await
-                .expect("owner exist true after put")
-        );
-        // owner get and verify
-        match owner_api
-            .inner()
-            .get(key)
-            .await
-            .expect("owner get after put")
-        {
-            Some((holder, _)) => assert_eq!(holder.bytes(), value),
-            None => panic!("owner get returned None after external put"),
-        }
-
-        // get and verify (external)
-        let got = api
-            .inner()
-            .get(key)
-            .await
-            .expect("external get")
-            .expect("none");
-        assert_eq!(got.bytes(), value);
-        // owner re-validate data still accessible and correct
-        match owner_api
-            .inner()
-            .get(key)
-            .await
-            .expect("owner get after external get")
-        {
-            Some((holder, _)) => assert_eq!(holder.bytes(), value),
-            None => panic!("owner get returned None after external get"),
-        }
-
-        // is_exist true (external) and owner validation
-        assert!(api.inner().is_exist(key).await.expect("exist true"));
-        assert!(
-            owner_api
-                .inner()
-                .is_exist(key)
-                .await
-                .expect("owner exist true after external get")
-        );
-
-        // delete (external)
-        api.inner().delete(key).await.expect("external delete");
-        // owner validation: not exist and get returns None
-        assert!(
-            !owner_api
-                .inner()
-                .is_exist(key)
-                .await
-                .expect("owner exist false after delete")
-        );
-        match owner_api
-            .inner()
-            .get(key)
-            .await
-            .expect("owner get after delete")
-        {
-            Some(_) => panic!("owner get should be None after delete"),
-            None => {}
-        }
-
-        // is_exist false
-        match api.inner().is_exist(key).await {
-            Ok(false) => {}
-            other => panic!("expected is_exist false after delete, got {:?}", other),
-        }
-    }
-    // The diagnostic short-circuit mode deliberately skips payload memcpy and
-    // transfer. Validate only allocation, commit, route publication, logical
-    // length, and reclaim; input-byte equality is not part of this mode.
-    ext_fw.shutdown().await.expect("shutdown ext");
-    let mut short_circuit_cfg =
-        new_zero_contribution_client_config(&owner_node_id, cluster, &shm_path);
-    short_circuit_cfg
-        .test_spec_config
-        .short_circuit_put_payload_path = true;
-    let (short_circuit_fw, _) = run_client(ConfigArg::Config(short_circuit_cfg))
-        .await
-        .expect("start short-circuit external client");
-    {
-        let short_circuit_view = short_circuit_fw.external_client_api_view();
-        let short_circuit_api = short_circuit_view.external_client_api();
-        let owner_view = owner_fw.client_kv_api_view();
-        let owner_api = owner_view.client_kv_api();
-        let key = "ext_client_short_circuit_key";
-        let logical_payload = b"payload_is_intentionally_not_copied";
-
-        short_circuit_api
-            .inner()
-            .put(
-                key,
-                logical_payload,
-                crate::client_kv_api::PutOptionalArgs::new(),
+            // Reusing the same keys verifies that abort releases their Put fences.
+            let reserved = tokio::time::timeout(
+                Duration::from_secs(15),
+                owner_api
+                    .inner()
+                    .owner_batch_put_start_reserved(reserve_requests, Some(lease_id)),
             )
             .await
-            .expect("short-circuit external put");
-        wait_master_route(
-            master_fw.master_kv_router_view(),
-            key,
-            Duration::from_secs(5),
+            .expect("aborted native reservations must release the key fences")
+            .expect("reserve native owner batch again");
+            assert_eq!(reserved.len(), reserved_payloads.len());
+            for (item, (key, value)) in reserved.iter().zip(&reserved_payloads) {
+                assert_eq!(item.key, *key);
+                assert_eq!(item.value_len, value.len() as u64);
+                assert!(item.peer_node_id.is_none());
+                assert_ne!(item.src_addr, 0);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        value.as_ptr(),
+                        item.src_addr as *mut u8,
+                        value.len(),
+                    );
+                }
+            }
+            let committed = tokio::time::timeout(
+                Duration::from_secs(15),
+                owner_api
+                    .inner()
+                    .owner_batch_put_commit_reserved(reserved, 1),
+            )
+            .await
+            .expect("native reserved batch commit timed out")
+            .expect("commit native owner batch");
+            assert_eq!(committed.len(), reserved_payloads.len());
+            for result in committed {
+                result.expect("each native reserved item must commit");
+            }
+            for (key, value) in &reserved_payloads {
+                assert_eq!(
+                    master_fw.master_kv_router_view().master_kv_router().inner()
+                        .kv_routes.get(*key).expect("native commit must publish before returning").lease_id,
+                    Some(lease_id),
+                );
+                let holder = api
+                    .inner()
+                    .get(key)
+                    .await
+                    .expect("external get native reserved value")
+                    .expect("committed native reserved value must be visible");
+                assert_eq!(holder.bytes(), *value);
+                drop(holder);
+                api.inner()
+                    .delete(key)
+                    .await
+                    .expect("delete native reserved value");
+            }
+        }
+        // The diagnostic short-circuit mode deliberately skips payload memcpy and
+        // transfer. Validate only allocation, commit, route publication, logical
+        // length, and reclaim; input-byte equality is not part of this mode.
+        ext_fw.shutdown().await.expect("shutdown ext");
+        let mut short_circuit_cfg =
+            new_zero_contribution_client_config(&owner_node_id, &cluster, &shm_path);
+        short_circuit_cfg
+            .test_spec_config
+            .short_circuit_put_payload_path = true;
+        let (short_circuit_fw, _) = run_client(ConfigArg::Config(short_circuit_cfg))
+            .await
+            .expect("start short-circuit external client");
+        {
+            let short_circuit_view = short_circuit_fw.external_client_api_view();
+            let short_circuit_api = short_circuit_view.external_client_api();
+            let owner_view = owner_fw.client_kv_api_view();
+            let owner_api = owner_view.client_kv_api();
+            let key = "ext_client_short_circuit_key";
+            let logical_payload = b"payload_is_intentionally_not_copied";
+
+            short_circuit_api
+                .inner()
+                .put(
+                    key,
+                    logical_payload,
+                    crate::client_kv_api::PutOptionalArgs::new(),
+                )
+                .await
+                .expect("short-circuit external put");
+            wait_master_route(
+                master_fw.master_kv_router_view(),
+                key,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(
+                owner_api
+                    .inner()
+                    .is_exist(key)
+                    .await
+                    .expect("owner sees short-circuit route")
+            );
+            let (holder, _) = owner_api
+                .inner()
+                .get(key)
+                .await
+                .expect("owner get after short-circuit put")
+                .expect("short-circuit owner slot");
+            assert_eq!(holder.bytes().len(), logical_payload.len());
+            drop(holder);
+
+            short_circuit_api
+                .inner()
+                .delete(key)
+                .await
+                .expect("delete short-circuit key");
+            assert!(
+                !owner_api
+                    .inner()
+                    .is_exist(key)
+                    .await
+                    .expect("owner no longer sees short-circuit key")
+            );
+        }
+        short_circuit_fw
+            .shutdown()
+            .await
+            .expect("shutdown short-circuit ext");
+
+        // Shutdown remaining services in reverse order.
+        owner_fw.shutdown().await.expect("shutdown owner");
+        master_fw.shutdown().await.expect("shutdown master");
+
+        info!("✅ external client basic crud test finished");
+    })
+    .await
+    .expect("owner CRUD must finish without allocation or cleanup timeouts");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_native_put_admission_cancellation_releases_before_shutdown() {
+    use crate::client_kv_api::external_api::HandlerForExternalClient;
+    use crate::client_kv_api::msg_pack::{
+        ExternalBatchPutStartItemReq, ExternalBatchPutStartReq, ExternalPutRevokeReq,
+    };
+    use crate::master_kv_router::msg_pack::BatchPutStartItemReq;
+    use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError};
+
+    let _test_guard = crate::kvcore_test_lib::integration_test_lock().await;
+    tokio::time::timeout(Duration::from_secs(120), async {
+        fluxon_util::test_util::start_test_etcd().expect("start etcd for admission cleanup");
+        let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
+            .expect("read test etcd endpoint");
+        let suffix = uuid::Uuid::new_v4();
+        let cluster = format!("native_admission_cleanup_{suffix}");
+        let shm_path = format!(
+            "{}/sharemem/native_admission_cleanup_{suffix}",
+            fluxon_util::test_util::test_workdir_base()
+        );
+        std::fs::create_dir_all(&shm_path).expect("create cleanup test shared memory directory");
+        let (master, _) = run_master(ConfigArg::Config(new_master_config(
+            "cleanup_master",
+            None,
+            &cluster,
+            &etcd,
+        )))
+        .await
+        .expect("start cleanup master");
+        let (owner, _) = run_client(ConfigArg::Config(new_client_config(
+            "cleanup_owner",
+            &cluster,
+            &shm_path,
+            &etcd,
+        )))
+        .await
+        .expect("start cleanup owner");
+        let owner_view = owner.client_kv_api_view();
+        let owner_api = owner_view.client_kv_api();
+        let inner = owner_api.inner();
+        let owner_info = owner
+            .cluster_manager_view()
+            .cluster_manager()
+            .get_self_info();
+        let master_view = master.master_kv_router_view();
+        wait_owner_allocation_authority(
+            master_view.clone(),
+            &owner_info.id,
+            Duration::from_secs(30),
         )
         .await;
-        assert!(
-            owner_api
-                .inner()
-                .is_exist(key)
-                .await
-                .expect("owner sees short-circuit route")
-        );
-        let (holder, _) = owner_api
-            .inner()
-            .get(key)
-            .await
-            .expect("owner get after short-circuit put")
-            .expect("short-circuit owner slot");
-        assert_eq!(holder.bytes().len(), logical_payload.len());
-        drop(holder);
 
-        short_circuit_api
-            .inner()
-            .delete(key)
+        // A disconnected external writer can leave a live slot reservation.
+        let mut external = owner_api
+            .external_batch_put_start(ExternalBatchPutStartReq {
+                items: vec![ExternalBatchPutStartItemReq {
+                    key: "z_blocked".to_string(),
+                    len: 4096,
+                    reject_if_inflight_same_key: false,
+                    reject_if_exist_same_key: false,
+                    make_replica_task: false,
+                    preferred_sub_cluster: None,
+                    radix: None,
+                }],
+                atomic_group_lens: None,
+                started_time: owner_info.node_start_time,
+            })
             .await
-            .expect("delete short-circuit key");
-        assert!(
-            !owner_api
-                .inner()
-                .is_exist(key)
-                .await
-                .expect("owner no longer sees short-circuit key")
+            .expect("reserve external predecessor");
+        assert_eq!(external.error_code, 0);
+        let predecessor = external.items.pop().expect("external predecessor item");
+        assert_eq!(predecessor.error_code, 0);
+        let predecessor_id = predecessor.put_id.expect("external predecessor identity");
+
+        let requests = vec![
+            BatchPutStartItemReq {
+                key: "a_partial".to_string(),
+                len: 8192,
+                reject_if_inflight_same_key: false,
+                reject_if_exist_same_key: false,
+                make_replica_task: false,
+                preferred_sub_cluster: None,
+            },
+            BatchPutStartItemReq {
+                key: "z_blocked".to_string(),
+                len: 4096,
+                reject_if_inflight_same_key: false,
+                reject_if_exist_same_key: false,
+                make_replica_task: false,
+                preferred_sub_cluster: None,
+            },
+        ];
+        let master_inner = master_view.master_kv_router().inner();
+        for stopping in [false, true] {
+            // Explicitly terminate this independent native reservation after
+            // checking shutdown cleanup; its guard keeps dependencies live.
+            let completion_barrier = if stopping {
+                inner
+                    .owner_batch_put_start_reserved(
+                        vec![BatchPutStartItemReq {
+                            key: "shutdown_barrier".to_string(),
+                            len: 4096,
+                            reject_if_inflight_same_key: false,
+                            reject_if_exist_same_key: false,
+                            make_replica_task: false,
+                            preferred_sub_cluster: None,
+                        }],
+                        None,
+                    )
+                    .await
+                    .expect("reserve explicit shutdown barrier")
+            } else {
+                Vec::new()
+            };
+            let baseline_slots = 1 + u64::from(stopping);
+            let baseline_reservations = usize::from(stopping);
+            let task_view = owner_view.clone();
+            let task_requests = requests.clone();
+            let caller = tokio::spawn(async move {
+                task_view
+                    .client_kv_api()
+                    .inner()
+                    .owner_batch_put_start_reserved(task_requests, None)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if master_inner.prepared_put_key_reservations.len() == baseline_reservations + 2
+                        && inner.owner_local_reserve_control_snapshot().allocated_bytes
+                            == baseline_slots * 4096 + 8192
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("native batch must own its first group before waiting on the predecessor");
+
+            let shutdown = if stopping {
+                let shutdown_owner = owner.clone();
+                let shutdown = tokio::spawn(async move { shutdown_owner.shutdown().await });
+                let result = tokio::time::timeout(Duration::from_secs(10), caller)
+                    .await
+                    .expect("shutdown must wake blocked native admission")
+                    .expect("native caller task");
+                assert!(matches!(
+                    result,
+                    Err(KvError::Api(ApiError::SystemShutdown { .. }))
+                ));
+                assert!(
+                    !shutdown.is_finished(),
+                    "shutdown must wait for the explicit reservation cleanup"
+                );
+                Some(shutdown)
+            } else {
+                caller.abort();
+                assert!(
+                    caller
+                        .await
+                        .expect_err("caller must be cancelled")
+                        .is_cancelled()
+                );
+                None
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if master_inner.prepared_put_key_reservations.len() == baseline_reservations
+                        && inner.owner_local_reserve_control_snapshot().allocated_bytes
+                            == baseline_slots * 4096
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancelled admission must release local slots and master reservations");
+            assert!(master_inner.key_activity.is_quiescent("a_partial"));
+            assert!(master_inner.key_activity.is_quiescent("z_blocked"));
+
+            if let Some(shutdown) = shutdown {
+                let revoked = owner_api
+                    .external_put_revoke(ExternalPutRevokeReq {
+                        key: "z_blocked".to_string(),
+                        put_id: Some(predecessor_id),
+                        started_time: owner_info.node_start_time,
+                    })
+                    .await
+                    .expect("release external predecessor during shutdown");
+                assert_eq!(revoked.error_code, 0);
+                inner
+                    .owner_batch_put_abort_reserved(completion_barrier)
+                    .await
+                    .expect("cleanup remains admitted after shutdown intent");
+                tokio::time::timeout(Duration::from_secs(30), shutdown)
+                    .await
+                    .expect("owner shutdown must finish after native cleanup")
+                    .expect("owner shutdown task")
+                    .expect("owner shutdown result");
+                assert!(master_inner.prepared_put_key_reservations.is_empty());
+                assert!(master_inner.key_activity.is_quiescent("shutdown_barrier"));
+            }
+        }
+        master.shutdown().await.expect("shutdown cleanup master");
+    })
+    .await
+    .expect("native cancellation and shutdown cleanup must be bounded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn test_default_owner_reclaims_capacity_across_native_and_external_puts() {
+    let _test_guard = crate::kvcore_test_lib::integration_test_lock().await;
+    tokio::time::timeout(Duration::from_secs(180), async {
+        fluxon_util::test_util::start_test_etcd().expect("start etcd for owner pressure test");
+        let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
+            .expect("read etcd endpoint from build_config_ext.yml");
+        let suffix = uuid::Uuid::new_v4();
+        let cluster = format!("test_cluster_default_owner_pressure_{suffix}");
+        let shm_path = format!(
+            "{}/sharemem/default_owner_pressure_{suffix}",
+            fluxon_util::test_util::test_workdir_base()
         );
-    }
-    short_circuit_fw
-        .shutdown()
+        std::fs::create_dir_all(&shm_path).expect("create owner pressure shared-memory directory");
+        let (master_fw, _) = run_master(ConfigArg::Config(new_master_config(
+            "owner_pressure_master",
+            None,
+            &cluster,
+            &etcd,
+        )))
         .await
-        .expect("shutdown short-circuit ext");
+        .expect("start pressure-test master");
+        let mut owner_config =
+            new_client_config("owner_pressure_owner", &cluster, &shm_path, &etcd);
+        owner_config.owner_placement_class = None;
+        owner_config.replica_writeback_hot_capacity_ratio = None;
+        assert_eq!(
+            owner_config.contribute_to_cluster_pool_size.dram,
+            64 * 1024 * 1024
+        );
+        let (owner_fw, _) = run_client(ConfigArg::Config(owner_config))
+            .await
+            .expect("start default pressure-test owner");
+        let owner_node_id = owner_fw
+            .cluster_manager_view()
+            .cluster_manager()
+            .get_self_info()
+            .id;
+        wait_owner_allocation_authority(
+            master_fw.master_kv_router_view(),
+            &owner_node_id,
+            Duration::from_secs(30),
+        )
+        .await;
+        let (ext_fw, _) = run_client(ConfigArg::Config(new_zero_contribution_client_config(
+            &owner_node_id,
+            &cluster,
+            &shm_path,
+        )))
+        .await
+        .expect("start pressure-test external client");
 
-    // Shutdown remaining services in reverse order.
-    owner_fw.shutdown().await.expect("shutdown owner");
-    master_fw.shutdown().await.expect("shutdown master");
+        {
+            let owner_view = owner_fw.client_kv_api_view();
+            let owner_api = owner_view.client_kv_api();
+            let ext_view = ext_fw.external_client_api_view();
+            let external_api = ext_view.external_client_api();
+            // Each round writes 80 MiB into a 64 MiB owner. Keep old keys so
+            // progress requires capacity reclaim instead of explicit deletes.
+            for round in 0..2 {
+                for index in 0..80 {
+                    let key = format!("owner_pressure_{round}_{index}");
+                    let payload = vec![(round * 80 + index) as u8; 1024 * 1024];
+                    tokio::time::timeout(Duration::from_secs(15), async {
+                        let opts = crate::client_kv_api::PutOptionalArgs::new();
+                        if round == 0 {
+                            owner_api
+                                .inner()
+                                .put(&key, &payload, opts)
+                                .await
+                                .expect("native put must reclaim capacity");
+                        } else {
+                            external_api
+                                .inner()
+                                .put(&key, &payload, opts)
+                                .await
+                                .expect("external put must reclaim capacity");
+                        }
+                        let holder = external_api
+                            .inner()
+                            .get(&key)
+                            .await
+                            .expect("read newest value under capacity pressure")
+                            .expect("newest value must remain readable");
+                        assert_eq!(holder.bytes(), payload.as_slice());
+                        drop(holder);
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("owner pressure round {round}, item {index} stalled")
+                    });
+                }
+            }
+        }
 
-    info!("✅ external client basic crud test finished");
+        ext_fw
+            .shutdown()
+            .await
+            .expect("stop pressure-test external client");
+        owner_fw.shutdown().await.expect("stop pressure-test owner");
+        master_fw
+            .shutdown()
+            .await
+            .expect("stop pressure-test master");
+    })
+    .await
+    .expect("default owner must reclaim capacity across both write paths");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -509,6 +1084,26 @@ async fn test_external_remote_get_uses_bound_owner_slot_without_master_allocator
         );
     }
     let target_owner_view = target_owner_fw.client_kv_api_view();
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(15),
+        target_owner_view.client_kv_api().inner().put(
+            key,
+            b"must not replace a remote value",
+            crate::client_kv_api::PutOptionalArgs(vec![
+                crate::client_kv_api::PutOptionalArg::RejectIfExists,
+            ]),
+        ),
+    )
+    .await
+    .expect("global native rejection must complete");
+    assert!(matches!(
+        rejected,
+        Err(
+            crate::rpcresp_kvresult_convert::msg_and_error::KvError::Api(
+                crate::rpcresp_kvresult_convert::msg_and_error::ApiError::KeyAlreadyExists { .. }
+            )
+        )
+    ));
     assert!(
         target_owner_view
             .client_kv_api()
