@@ -867,6 +867,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         reject_if_exist_same_key = (
             bool(opts.reject_if_exist_same_key) if opts is not None else False
         )
+        reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
         write_through = bool(opts.write_through) if opts is not None else True
         make_replica_task = bool(opts.make_replica_task) if opts is not None else True
 
@@ -889,6 +890,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 reject_if_exist_same_key=reject_if_exist_same_key,
                 write_through=write_through,
                 make_replica_task=make_replica_task,
+                reject_if_exists=reject_if_exists,
                 concurrency=concurrency if concurrency is not None else self._batch_concurrency,
             )
             if not inner_res.is_ok():
@@ -1432,6 +1434,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         reject_if_exist_same_key = (
             bool(opts.reject_if_exist_same_key) if opts is not None else False
         )
+        reject_if_exists = bool(opts.reject_if_exists) if opts is not None else False
         write_through = bool(opts.write_through) if opts is not None else True
         make_replica_task = bool(opts.make_replica_task) if opts is not None else True
 
@@ -1445,6 +1448,7 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
                 reject_if_exist_same_key=reject_if_exist_same_key,
                 write_through=write_through,
                 make_replica_task=make_replica_task,
+                reject_if_exists=reject_if_exists,
             )
             if inner_res.is_ok():
                 submit_results = list(inner_res.unwrap())

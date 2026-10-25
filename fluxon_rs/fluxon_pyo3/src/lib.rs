@@ -3549,6 +3549,7 @@ fn build_put_optional_args(
     reject_if_exist_same_key: bool,
     write_through: bool,
     make_replica_task: bool,
+    reject_if_exists: bool,
 ) -> fluxon_kv::client_kv_api::PutOptionalArgs {
     let mut opts = fluxon_kv::client_kv_api::PutOptionalArgs::new();
     if let Some(id) = lease_id {
@@ -3562,6 +3563,10 @@ fn build_put_optional_args(
     if reject_if_exist_same_key {
         opts.0
             .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExistSameKey);
+    }
+    if reject_if_exists {
+        opts.0
+            .push(fluxon_kv::client_kv_api::PutOptionalArg::RejectIfExists);
     }
     if write_through || !make_replica_task {
         opts.0
@@ -5826,7 +5831,7 @@ impl KvClient {
     /// on the caller to keep the pointed-to memory alive until the async call completes.
     ///
     /// The backend encoding/copy runs on the Rust runtime without holding the Python GIL.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, callback=None, write_through=true, make_replica_task=true))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, callback=None, write_through=true, make_replica_task=true, reject_if_exists=false))]
     fn put(
         &self,
         key: &str,
@@ -5837,6 +5842,7 @@ impl KvClient {
         callback: Option<PyObject>,
         write_through: bool,
         make_replica_task: bool,
+        reject_if_exists: bool,
         py: Python,
     ) -> PyObject {
         fn put_inner(
@@ -5849,6 +5855,7 @@ impl KvClient {
             callback: Option<PyObject>,
             write_through: bool,
             make_replica_task: bool,
+            reject_if_exists: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if ptrs.len() > (u32::MAX as usize) {
@@ -5874,6 +5881,7 @@ impl KvClient {
                 reject_if_exist_same_key,
                 write_through,
                 make_replica_task,
+                reject_if_exists,
             );
 
             let future = async move {
@@ -5936,13 +5944,14 @@ impl KvClient {
             callback,
             write_through,
             make_replica_task,
+            reject_if_exists,
             py,
         )
         .into_py_object(py)
     }
 
     /// Put a key-value pair and wait for completion before returning.
-    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true))]
+    #[pyo3(signature = (key, ptrs, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true, reject_if_exists=false))]
     fn put_blocking(
         &self,
         key: &str,
@@ -5952,6 +5961,7 @@ impl KvClient {
         reject_if_exist_same_key: bool,
         write_through: bool,
         make_replica_task: bool,
+        reject_if_exists: bool,
         py: Python,
     ) -> PyObject {
         fn put_blocking_inner(
@@ -5963,6 +5973,7 @@ impl KvClient {
             reject_if_exist_same_key: bool,
             write_through: bool,
             make_replica_task: bool,
+            reject_if_exists: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if ptrs.len() > (u32::MAX as usize) {
@@ -5989,6 +6000,7 @@ impl KvClient {
                 reject_if_exist_same_key,
                 write_through,
                 make_replica_task,
+                reject_if_exists,
             );
             let result = match py.allow_threads(|| {
                 runtime.run_async_from_sync(async {
@@ -6040,6 +6052,7 @@ impl KvClient {
             reject_if_exist_same_key,
             write_through,
             make_replica_task,
+            reject_if_exists,
             py,
         )
         .into_py_object(py)
@@ -6048,7 +6061,7 @@ impl KvClient {
     /// Put a batch of key-value pairs and wait for completion before returning.
     ///
     /// Each item uses the same flatdict encoding contract as `put_blocking()`.
-    #[pyo3(signature = (keys, ptrs_groups, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, concurrency=None, write_through=true, make_replica_task=true))]
+    #[pyo3(signature = (keys, ptrs_groups, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, concurrency=None, write_through=true, make_replica_task=true, reject_if_exists=false))]
     fn batch_put_blocking(
         &self,
         keys: Vec<String>,
@@ -6059,6 +6072,7 @@ impl KvClient {
         concurrency: Option<usize>,
         write_through: bool,
         make_replica_task: bool,
+        reject_if_exists: bool,
         py: Python,
     ) -> PyObject {
         fn batch_put_blocking_inner(
@@ -6071,6 +6085,7 @@ impl KvClient {
             concurrency: Option<usize>,
             write_through: bool,
             make_replica_task: bool,
+            reject_if_exists: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if keys.len() != ptrs_groups.len() {
@@ -6115,6 +6130,7 @@ impl KvClient {
                 reject_if_exist_same_key,
                 write_through,
                 make_replica_task,
+                reject_if_exists,
             );
 
             if !framework.is_external_mode() {
@@ -6284,6 +6300,7 @@ impl KvClient {
             concurrency,
             write_through,
             make_replica_task,
+            reject_if_exists,
             py,
         )
         .into_py_object(py)
@@ -6504,7 +6521,7 @@ impl KvClient {
     }
 
     /// Native blocking batch put path for payload pointers.
-    #[pyo3(signature = (keys, payload_ptrs, payload_sizes, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true))]
+    #[pyo3(signature = (keys, payload_ptrs, payload_sizes, lease_id=None, reject_if_inflight_same_key=false, reject_if_exist_same_key=false, write_through=true, make_replica_task=true, reject_if_exists=false))]
     fn batch_put_from(
         &self,
         keys: Vec<String>,
@@ -6515,6 +6532,7 @@ impl KvClient {
         reject_if_exist_same_key: bool,
         write_through: bool,
         make_replica_task: bool,
+        reject_if_exists: bool,
         py: Python,
     ) -> PyObject {
         fn batch_put_from_inner(
@@ -6527,6 +6545,7 @@ impl KvClient {
             reject_if_exist_same_key: bool,
             write_through: bool,
             make_replica_task: bool,
+            reject_if_exists: bool,
             py: Python,
         ) -> ApiResult<PyObject> {
             if keys.len() != payload_ptrs.len() || keys.len() != payload_sizes.len() {
@@ -6592,6 +6611,7 @@ impl KvClient {
                 reject_if_exist_same_key,
                 write_through,
                 make_replica_task,
+                reject_if_exists,
             );
 
             let keys_for_backend = keys.clone();
@@ -6714,6 +6734,7 @@ impl KvClient {
             reject_if_exist_same_key,
             write_through,
             make_replica_task,
+            reject_if_exists,
             py,
         )
         .into_py_object(py)
@@ -8446,9 +8467,9 @@ mod tests {
 
     #[test]
     fn put_options_control_async_replica_task() {
-        let write_through = build_put_optional_args(None, false, false, true, true);
-        let write_back = build_put_optional_args(None, false, false, false, true);
-        let local_only = build_put_optional_args(None, false, false, false, false);
+        let write_through = build_put_optional_args(None, false, false, true, true, false);
+        let write_back = build_put_optional_args(None, false, false, false, true, false);
+        let local_only = build_put_optional_args(None, false, false, false, false, false);
 
         assert!(!write_through.make_replica_task());
         assert!(write_back.make_replica_task());

@@ -225,14 +225,15 @@ def _prepare_cargo_env(env: dict[str, str] | None) -> dict[str, str] | None:
     prepared_env = os.environ.copy() if env is None else dict(env)
     authoritative_entries: list[str] = []
 
+    # Load the SDK used at link time before any wheel-bundled copy of the core.
+    if closed_sdk_root is not None:
+        prepared_env["FLUXON_COMMU_CLOSED_SDK_ROOT"] = str(closed_sdk_root)
+        authoritative_entries.append(str((closed_sdk_root / "lib").resolve()))
+
     if libs_dir is not None:
         authoritative_entry = str(libs_dir)
         prepared_env["FLUXON_PYO3_LIBS_DIR"] = authoritative_entry
         authoritative_entries.append(authoritative_entry)
-
-    if closed_sdk_root is not None:
-        prepared_env["FLUXON_COMMU_CLOSED_SDK_ROOT"] = str(closed_sdk_root)
-        authoritative_entries.append(str((closed_sdk_root / "lib").resolve()))
 
     if authoritative_entries:
         prepared_env["LD_LIBRARY_PATH"] = _sanitize_cargo_ld_library_path(
@@ -249,7 +250,6 @@ def run_cargo(
     env: dict[str, str] | None = None,
     passthrough: Sequence[str] | None = None,
 ) -> int:
-    # Rust test binaries launched via cargo run/load depend on the wheel-bundled native
-    # runtime under the active venv. Keep one authoritative search root for all wrappers.
+    # Cargo loads the repository SDK, then its dependencies from the active wheel.
     effective_passthrough = [] if passthrough is None else list(passthrough)
     return call(["cargo", *args, *effective_passthrough], env=_prepare_cargo_env(env))

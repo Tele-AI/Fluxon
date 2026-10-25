@@ -239,6 +239,25 @@ pub mod __hidden {
 
 pub use self::__hidden::{P2pModuleView, P2pModuleViewTrait};
 
+fn bind_dispatch_view<F>(
+    view: P2pModuleView,
+    handler: F,
+) -> impl Fn(ClosedRuntimeDispatchRequestRef<'_>, bytes::Bytes) -> P2PResult<()> + Send + Sync
+where
+    F: Fn(&str, &P2pModule, ClosedRuntimeDispatchRequestRef<'_>, &bytes::Bytes) -> P2PResult<()>
+        + Send
+        + Sync,
+{
+    move |request, body| {
+        // The closed transport may finish dispatch after its host framework is released.
+        // Admit only a live owner, and retain it through all nested view accesses.
+        let owner = view.upgrade_arc().ok_or_else(|| P2pError::Other {
+            detail: "P2P dispatch rejected: host framework has been released".to_string(),
+        })?;
+        handler(request.reply_next_hop, owner.p2p_module(), request, &body)
+    }
+}
+
 struct ClosedP2pRuntime {
     arg: CommuP2pModuleNewArg,
     handle: OnceLock<ClosedRuntimeHandle>,
@@ -737,21 +756,17 @@ impl P2pModule {
     {
         {
             let view = self.module_view();
+            let owner = view
+                .upgrade_arc()
+                .expect("P2P dispatch registration requires a live host framework");
             tokio::spawn(async move {
-                let handle = match view.p2p_module().ensure_closed_runtime_handle().await {
+                let handle = match owner.p2p_module().ensure_closed_runtime_handle().await {
                     Ok(handle) => handle,
                     Err(_) => return,
                 };
-                let _ = p2p_register_dispatch(
-                    handle,
-                    msg_id,
-                    Arc::new(
-                        move |request: ClosedRuntimeDispatchRequestRef<'_>, body: bytes::Bytes| {
-                            f(request.reply_next_hop, view.p2p_module(), request, &body).map(|_| ())
-                        },
-                    ),
-                )
-                .await;
+                let _ =
+                    p2p_register_dispatch(handle, msg_id, Arc::new(bind_dispatch_view(view, f)))
+                        .await;
             });
         }
     }
@@ -778,17 +793,9 @@ impl P2pModule {
     {
         let view = self.module_view();
         let handle = self.ensure_closed_runtime_handle().await?;
-        p2p_register_dispatch(
-            handle,
-            msg_id,
-            Arc::new(
-                move |request: ClosedRuntimeDispatchRequestRef<'_>, body: bytes::Bytes| {
-                    f(request.reply_next_hop, view.p2p_module(), request, &body).map(|_| ())
-                },
-            ),
-        )
-        .await
-        .map_err(p2p_closed_sdk_error)
+        p2p_register_dispatch(handle, msg_id, Arc::new(bind_dispatch_view(view, f)))
+            .await
+            .map_err(p2p_closed_sdk_error)
     }
 
     pub(crate) fn register_rpc_response_msg_id(&self, msg_id: MsgId) {
@@ -1644,6 +1651,143 @@ pub fn network_transport_kind() -> P2pTransportKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DispatchTestOwner {
+        module: P2pModule,
+        released: Arc<AtomicBool>,
+    }
+
+    impl Drop for DispatchTestOwner {
+        fn drop(&mut self) {
+            self.released.store(true, Ordering::Release);
+        }
+    }
+
+    impl P2pModuleAccessTrait for DispatchTestOwner {
+        fn p2p_module(&self) -> &P2pModule {
+            &self.module
+        }
+    }
+
+    impl ClusterManagerAccessTrait for DispatchTestOwner {
+        fn cluster_manager(&self) -> &crate::ClusterManager {
+            unreachable!("dispatch lifetime tests do not use cluster services")
+        }
+    }
+
+    impl ResourceRegistryAccessTrait for DispatchTestOwner {
+        fn resource_registry(&self) -> &ResourceRegistry {
+            unreachable!("dispatch lifetime tests do not use registry services")
+        }
+    }
+
+    impl ViewShutdownExt for DispatchTestOwner {
+        fn register_shutdown_poller(&self) -> ShutdownPoller {
+            unreachable!("dispatch lifetime tests do not use shutdown services")
+        }
+
+        fn register_shutdown_waiter(&self) -> ShutdownWaiter {
+            unreachable!("dispatch lifetime tests do not use shutdown services")
+        }
+    }
+
+    impl AsyncPanicSendExt for DispatchTestOwner {
+        fn async_panic(&self, message: String) {
+            panic!("{message}");
+        }
+    }
+
+    impl ViewSpawnExt for DispatchTestOwner {
+        fn push_join_handle(&self, _: String, _: JoinHandle<()>) {
+            unreachable!("dispatch lifetime tests do not spawn tasks")
+        }
+
+        fn runtime_num_workers(&self) -> usize {
+            1
+        }
+
+        fn spawn_boxed(
+            &self,
+            _: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        ) -> JoinHandle<()> {
+            unreachable!("dispatch lifetime tests do not spawn tasks")
+        }
+    }
+
+    fn dispatch_test_owner() -> (Arc<DispatchTestOwner>, P2pModuleView, Arc<AtomicBool>) {
+        let released = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(DispatchTestOwner {
+            module: P2pModule {
+                closed: ClosedP2pRuntime::new(CommuP2pModuleNewArg::new(
+                    None,
+                    P2pTcpThreadTransportTuning::default(),
+                    false,
+                    false,
+                )),
+            },
+            released: released.clone(),
+        });
+        let erased: Arc<dyn P2pModuleViewTrait> = owner.clone();
+        let view = P2pModuleView::new(&erased);
+        owner.module.attach_view(view.clone());
+        (owner, view, released)
+    }
+
+    fn dispatch_test_request() -> ClosedRuntimeDispatchRequestRef<'static> {
+        ClosedRuntimeDispatchRequestRef {
+            reply_next_hop: "test-peer",
+            msg_id: 1,
+            task_id: 1,
+            logical_source_peer_id: "test-peer",
+            logical_source_node_start_time: 1,
+            logical_target_peer_id: "test-owner",
+            logical_target_node_start_time: 1,
+            remaining_hops: 0,
+            default_resp_transport_policy:
+                fluxon_commu_contract::ClosedRuntimeDispatchTransportPolicy::ForceTransport,
+            incoming_frame_recv_done_ts_us: 0,
+            incoming_dispatch_enqueued_ts_us: 0,
+            incoming_dispatch_started_ts_us: 0,
+            incoming_complete_pending_call_ts_us: 0,
+            body_serialize_part_len: 0,
+            body_raw_bytes_lengths: &[],
+        }
+    }
+
+    #[test]
+    fn dispatch_retains_owner_through_nested_view_access_without_a_reference_cycle() {
+        let (owner, view, released) = dispatch_test_owner();
+        let last_owner = Mutex::new(Some(owner));
+        let nested_view = view.clone();
+        let observed_release = released.clone();
+        let callback = bind_dispatch_view(view.clone(), move |_, module, _, _| {
+            drop(last_owner.lock().unwrap().take());
+            assert!(!observed_release.load(Ordering::Acquire));
+            assert!(std::ptr::eq(module, nested_view.p2p_module()));
+            Ok(())
+        });
+
+        callback(dispatch_test_request(), bytes::Bytes::new()).unwrap();
+        assert!(released.load(Ordering::Acquire));
+        assert!(view.upgrade_arc().is_none());
+        assert!(callback(dispatch_test_request(), bytes::Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn dispatch_rejects_released_owner_before_entering_the_host_handler() {
+        let (owner, view, released) = dispatch_test_owner();
+        let callback = bind_dispatch_view(view, |_, _, _, _| {
+            panic!("a late dispatch must not enter its released host")
+        });
+        drop(owner);
+
+        assert!(released.load(Ordering::Acquire));
+        assert!(matches!(
+            callback(dispatch_test_request(), bytes::Bytes::new()),
+            Err(P2pError::Other { detail }) if detail.contains("host framework has been released")
+        ));
+    }
 
     #[test]
     fn closed_runtime_p2p_error_keeps_its_detail_and_transport_category() {

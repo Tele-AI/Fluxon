@@ -34,7 +34,12 @@ fn actual_closed_cdylib_requires_and_writes_process_log() {
     let maps = fs::read_to_string("/proc/self/maps").expect("read integration test process maps");
     assert!(
         maps.lines()
-            .any(|line| { line.split_whitespace().last() == expected_core.to_str() })
+            .any(|line| { line.split_whitespace().last() == expected_core.to_str() }),
+        "expected closed core at {}; loaded core mappings: {:?}",
+        expected_core.display(),
+        maps.lines()
+            .filter(|line| line.contains("libfluxon_commu_core"))
+            .collect::<Vec<_>>()
     );
     println!("closed_core_loaded_from={}", expected_core.display());
 

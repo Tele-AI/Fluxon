@@ -2734,6 +2734,17 @@ mod tests {
                 "the last old holder must release the exact old slot and manifest"
             );
             inner.delete(&key).await.expect("delete new generation");
+            // DELETE removes the route; a background replica Put may still own
+            // its source holder until its terminal result releases the slot.
+            let released = inner.owner_local_reserve_rebalance_notify();
+            ::tokio::time::timeout(
+                Duration::from_secs(5),
+                fluxon_util::notify_state::wait_until(&released, || {
+                    inner.owner_segment_allocator.lock().used_slot_count() == baseline_slots
+                }),
+            )
+            .await
+            .expect("deleted slots must be reclaimed after in-flight holders finish");
             assert_eq!(
                 inner.owner_segment_allocator.lock().used_slot_count(),
                 baseline_slots,
