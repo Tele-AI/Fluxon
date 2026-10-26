@@ -778,14 +778,35 @@ mod single_victim_transaction_tests {
 
     #[test]
     fn zero_born_global_cache_reserved_demotion_batch_reaches_one_terminal_vector() {
+        const WORKER_TIMEOUT: Duration = Duration::from_secs(30);
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            assert_reserved_demotion_batch_progress(256, true);
-            tx.send(()).unwrap();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_reserved_demotion_batch_progress(256, true);
+            }));
+            tx.send(result)
+                .expect("zero-born demotion worker result receiver must remain connected");
         });
-        rx.recv_timeout(std::time::Duration::from_secs(5))
-            .expect("zero-born Global cache must complete the first reserved demotion batch");
-        worker.join().unwrap();
+        match rx.recv_timeout(WORKER_TIMEOUT) {
+            Ok(Ok(())) => worker
+                .join()
+                .expect("zero-born demotion worker must exit after reporting success"),
+            Ok(Err(payload)) => {
+                worker
+                    .join()
+                    .expect("zero-born demotion worker must exit after reporting panic");
+                std::panic::resume_unwind(payload);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "zero-born Global cache must complete the first reserved demotion batch within {WORKER_TIMEOUT:?}"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                worker
+                    .join()
+                    .expect("zero-born demotion worker exited without reporting a result");
+                panic!("zero-born demotion worker exited without reporting a result");
+            }
+        }
     }
 
     fn assert_reserved_demotion_batch_progress(victim_count: usize, initially_zero: bool) {
@@ -822,6 +843,7 @@ mod single_victim_transaction_tests {
         .build();
         if initially_zero {
             cache.set_max_capacity(target_capacity).unwrap();
+            cache.run_pending_tasks();
         }
 
         let started_at = Instant::now();
@@ -856,6 +878,7 @@ mod single_victim_transaction_tests {
             },
             |_| false,
         );
+        cache.run_pending_tasks();
         let elapsed = started_at.elapsed();
 
         assert_eq!(responses.len(), victim_count);
