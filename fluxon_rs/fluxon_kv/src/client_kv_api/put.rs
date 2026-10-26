@@ -1252,6 +1252,9 @@ impl ClientKvApiInner {
 
     pub fn owner_retain_global_shared_slot_holder(
         &self,
+        key: &str,
+        get_id: u64,
+        put_id: crate::master_kv_router::put::PutIDForAKey,
         allocation_id: u64,
         segment_offset: u64,
         capacity_bytes: u64,
@@ -1262,10 +1265,12 @@ impl ClientKvApiInner {
             segment_offset,
             capacity_bytes,
         ) {
-            return Err(KvError::Api(ApiError::Unknown {
+            return Err(KvError::Api(ApiError::StaleGetPlan {
+                get_id,
+                key: key.to_string(),
                 detail: format!(
-                    "GlobalShared owner slot is no longer route-only: allocation_id={} offset={} capacity={}",
-                    allocation_id, segment_offset, capacity_bytes
+                    "GlobalShared owner slot is no longer route-only: allocation_id={} offset={} capacity={} put_id=({},{})",
+                    allocation_id, segment_offset, capacity_bytes, put_id.0, put_id.1,
                 ),
             }));
         }

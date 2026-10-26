@@ -2379,8 +2379,8 @@ mod tests {
     #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn deleted_data_ready_get_releases_key_fence_and_exact_target() {
         use super::{
-            GetToTargetAttempt, OwnerGetDonePending, execute_get_to_target_items,
-            run_async_owner_get_route_commit,
+            BATCH_GET_MAX_STALE_PLAN_RETRIES, GetToTargetAttempt, OwnerGetDonePending,
+            execute_get_to_target_items, run_async_owner_get_route_commit,
         };
         use crate::client_kv_api::PutOptionalArgs;
         use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
@@ -2481,62 +2481,63 @@ mod tests {
                 drop(cached);
             }
 
-            let keys = vec![key.clone()];
-            let (mut starts, mut late_targets) =
-                crate::client_kv_api::external_api::batch_get_start_with_local_reserve_targets(
-                    inner, &keys,
-                )
-                .await
-                .expect("plan the owner Get");
-            let mut transfers =
-                execute_get_to_target_items(inner, &keys, &starts.items, &late_targets).await;
-            let start_item = starts.items.remove(0);
-            assert_eq!(start_item.error_code, OK);
-            let late_target = late_targets.remove(0);
-            let capability = if reuse_global {
-                assert!(transfers.remove(0).is_none());
-                None
-            } else {
-                let Some(GetToTargetAttempt::Prepared {
-                    capability,
-                    result,
-                    source_owner,
-                    terminal_sequence,
-                    ..
-                }) = transfers.remove(0)
-                else {
-                    panic!("remote Get must reach an owner target");
-                };
-                result.expect("Get transfer must become DataReady");
-                inner
-                    .owner_transfer_peer_tracker
-                    .record_terminal(&source_owner, terminal_sequence);
-                Some(capability)
-            };
-            let target = if let Some(capability) = capability.as_ref() {
-                let target = inner
-                    .install_hidden_leased_pending_local_get(
-                        &key,
-                        start_item.get_id,
-                        start_item.put_id,
-                        capability,
+            let mut stale_plan_retries = 0;
+            let (start_item, late_target, capability, target) = 'prepare_get: loop {
+                let keys = vec![key.clone()];
+                let (mut starts, mut late_targets) =
+                    crate::client_kv_api::external_api::batch_get_start_with_local_reserve_targets(
+                        inner, &keys,
                     )
-                    .expect("install hidden DataReady target");
-                assert!(matches!(
+                    .await
+                    .expect("plan the owner Get");
+                let mut transfers =
+                    execute_get_to_target_items(inner, &keys, &starts.items, &late_targets).await;
+                let start_item = starts.items.remove(0);
+                assert_eq!(start_item.error_code, OK);
+                let late_target = late_targets.remove(0);
+                let capability = if reuse_global {
+                    assert!(transfers.remove(0).is_none());
+                    None
+                } else {
+                    let Some(GetToTargetAttempt::Prepared {
+                        capability,
+                        result,
+                        source_owner,
+                        terminal_sequence,
+                        ..
+                    }) = transfers.remove(0)
+                    else {
+                        panic!("remote Get must reach an owner target");
+                    };
+                    result.expect("Get transfer must become DataReady");
                     inner
-                        .owner_segment_allocator
-                        .lock()
-                        .begin_data_ready_get_target_commit(capability),
-                    OwnerSegmentTransferOutcome::TargetCommitPending { .. }
-                ));
-                target
-            } else {
-                let slot = start_item
-                    .reused_committed_slot
-                    .as_ref()
-                    .expect("reused global slot");
-                inner
-                    .install_hidden_global_shared_get(
+                        .owner_transfer_peer_tracker
+                        .record_terminal(&source_owner, terminal_sequence);
+                    Some(capability)
+                };
+                let target = if let Some(capability) = capability.as_ref() {
+                    let target = inner
+                        .install_hidden_leased_pending_local_get(
+                            &key,
+                            start_item.get_id,
+                            start_item.put_id,
+                            capability,
+                        )
+                        .expect("install hidden DataReady target");
+                    assert!(matches!(
+                        inner
+                            .owner_segment_allocator
+                            .lock()
+                            .begin_data_ready_get_target_commit(capability),
+                        OwnerSegmentTransferOutcome::TargetCommitPending { .. }
+                    ));
+                    target
+                } else {
+                    let slot = start_item
+                        .reused_committed_slot
+                        .as_ref()
+                        .expect("reused global slot");
+                    match inner.install_hidden_global_shared_get(
                         &key,
                         start_item.get_id,
                         start_item.put_id,
@@ -2546,8 +2547,24 @@ mod tests {
                         slot.allocation_id,
                         slot.segment_offset,
                         slot.capacity_bytes,
-                    )
-                    .expect("retain hidden reused slot")
+                    ) {
+                        Ok(target) => target,
+                        Err(KvError::Api(ApiError::StaleGetPlan { get_id, .. })) => {
+                            stale_plan_retries += 1;
+                            assert!(
+                                stale_plan_retries <= BATCH_GET_MAX_STALE_PLAN_RETRIES,
+                                "deleted Get test exhausted stale-plan retries"
+                            );
+                            inner
+                                .batch_get_revoke(vec![get_id])
+                                .await
+                                .expect("revoke stale owner Get plan");
+                            continue 'prepare_get;
+                        }
+                        Err(err) => panic!("retain hidden reused slot: {err}"),
+                    }
+                };
+                break (start_item, late_target, capability, target);
             };
             let guard = inner
                 .begin_async_get_key_materialization(&key, start_item.put_id)

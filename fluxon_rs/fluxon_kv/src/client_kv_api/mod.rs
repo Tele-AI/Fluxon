@@ -967,11 +967,20 @@ mod owner_put_from_source_integration_tests {
                 Instant::now() < deadline,
                 "PutFromSource Async target flight was not installed"
             );
-            // The target cannot finish while this test holds its Get barrier.
-            assert!(
-                source_inner.start_remote_put_nonblocking(key, put_id, None, true),
-                "starting or joining the exact remote Put flight must not fail"
-            );
+            // Master route publication can precede the source owner's local
+            // cache promotion.  Admission is valid only after that source
+            // generation is visible locally; retry the observation until the
+            // canonical owner state is ready.
+            if source_inner
+                .local_committed_mem_holder_for_put_id(key, put_id)
+                .await
+                .is_some()
+            {
+                assert!(
+                    source_inner.start_remote_put_nonblocking(key, put_id, None, true),
+                    "starting or joining the exact remote Put flight must not fail after source promotion"
+                );
+            }
             limit_thirdparty::tokio::time::sleep(Duration::from_millis(20)).await;
         };
         assert_eq!(
@@ -6088,6 +6097,9 @@ impl ClientKvApiInner {
             }
             PendingLocalGetSource::ExistingGlobalShared => {
                 self.owner_retain_global_shared_slot_holder(
+                    key,
+                    get_id,
+                    put_id,
                     allocation_id,
                     segment_offset,
                     capacity_bytes,
