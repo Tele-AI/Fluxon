@@ -645,7 +645,7 @@ async fn external_client_basic_crud(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn test_external_put_completion_waits_for_route_publication() {
+async fn test_external_put_acknowledges_local_commit_before_route_publication() {
     use crate::client_kv_api::external_api::HandlerForExternalClient;
     use crate::client_kv_api::msg_pack::{
         ExternalBatchPutCommitItemReq, ExternalBatchPutCommitReq, ExternalBatchPutStartItemReq,
@@ -653,7 +653,7 @@ async fn test_external_put_completion_waits_for_route_publication() {
         ExternalBatchPutTransferEndReq,
     };
     use crate::client_kv_api::{ExternalLocalFirstPutKeyReservation, ExternalPutKeyOutcome};
-    use crate::rpcresp_kvresult_convert::{msg_and_error::KvError, try_from_code};
+    use crate::rpcresp_kvresult_convert::try_from_code;
 
     #[derive(Clone, Copy, Debug)]
     enum Entry {
@@ -663,13 +663,12 @@ async fn test_external_put_completion_waits_for_route_publication() {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Scenario {
         Success,
-        Cancel,
         RejectIndependent,
     }
 
     let _test_guard = crate::kvcore_test_lib::integration_test_lock().await;
     tokio::time::timeout(Duration::from_secs(120), async {
-        fluxon_util::test_util::start_test_etcd().expect("start etcd for publication barrier");
+        fluxon_util::test_util::start_test_etcd().expect("start etcd for local commit acknowledgement");
         let etcd = fluxon_util::dev_config::read_etcd_endpoint_from_build_config()
             .expect("read test etcd endpoint");
         let suffix = uuid::Uuid::new_v4();
@@ -696,7 +695,7 @@ async fn test_external_put_completion_waits_for_route_publication() {
         ).await;
 
         for entry in [Entry::TransferEnd, Entry::Commit] {
-            for scenario in [Scenario::Success, Scenario::Cancel, Scenario::RejectIndependent] {
+            for scenario in [Scenario::Success, Scenario::RejectIndependent] {
                 let keys = (0..3).map(|index| format!("{entry:?}-{scenario:?}-{index}"))
                     .collect::<Vec<_>>();
                 let started = owner_api.external_batch_put_start(ExternalBatchPutStartReq {
@@ -762,12 +761,18 @@ async fn test_external_put_completion_waits_for_route_publication() {
                         }
                     }
                 });
-                tokio::select! {
-                    biased;
-                    result = &mut completion => panic!("{entry:?} acknowledged before route publication: {result:?}"),
-                    reached = entered => reached.expect("publication worker reached gate"),
-                }
-                assert!(futures::poll!(&mut completion).is_pending());
+                let results = tokio::time::timeout(Duration::from_secs(5), &mut completion)
+                    .await
+                    .expect("local commit must acknowledge while Master publication is paused");
+                assert_eq!(results.len(), keys.len());
+                assert!(results.iter().all(Result::is_ok), "local commit results: {results:?}");
+                // The caller can leave after the local ACK; the owner retains publication.
+                drop(completion);
+                drop(results);
+                tokio::time::timeout(Duration::from_secs(5), entered)
+                    .await
+                    .expect("publication worker must reach the gate")
+                    .expect("publication worker reached gate");
                 for key in &keys {
                     assert!(master_inner.kv_routes.get(key).is_none(), "gate must precede the master route");
                 }
@@ -780,14 +785,15 @@ async fn test_external_put_completion_waits_for_route_publication() {
                         _ => panic!("pending publication must retain its per-key fence"),
                     }
                 }).collect::<Vec<_>>();
-                let results = if scenario == Scenario::Cancel {
-                    drop(completion);
-                    release.send(()).expect("release cancelled RPC's owner worker");
-                    None
-                } else {
-                    release.send(()).expect("release publication worker");
-                    Some(completion.await)
-                };
+                for (index, reader) in readers.iter().enumerate() {
+                    assert_eq!(reader.bytes(), vec![0x30 + index as u8; 4096]);
+                }
+                for follower in &followers {
+                    let wait = follower.wait_released();
+                    futures::pin_mut!(wait);
+                    assert!(futures::poll!(&mut wait).is_pending(), "local ACK must retain the publication fence");
+                }
+                release.send(()).expect("release the departed caller's owner publication");
                 for (index, follower) in followers.into_iter().enumerate() {
                     let rejected = scenario == Scenario::RejectIndependent && index == 0;
                     assert_eq!(follower.wait().await, if rejected {
@@ -798,14 +804,11 @@ async fn test_external_put_completion_waits_for_route_publication() {
                     follower.wait_released().await;
                     assert_eq!(readers[index].bytes(), vec![0x30 + index as u8; 4096]);
                     if rejected {
-                        assert!(matches!(results.as_ref().unwrap()[index], Err(KvError::LeaseMgr(_))));
+                        // Publication rejection does not retract the local ACK or invalidate holders.
                         assert!(master_inner.kv_routes.get(&keys[index]).is_none());
                         assert!(inner.local_visible_mem_holder(&keys[index]).is_none());
                     } else {
-                        if let Some(results) = &results {
-                            assert!(results[index].is_ok(), "{:?}", results[index]);
-                        }
-                        let route = master_inner.kv_routes.get(&keys[index]).expect("successful Put must publish its route");
+                        let route = master_inner.kv_routes.get(&keys[index]).expect("background publication must eventually expose the route");
                         assert_eq!(route.atomic_group.as_ref().map(|group| group.members.len()), (index > 0).then_some(2));
                         drop(route);
                         let (holder, _) = inner.get(&keys[index]).await.expect("get completed value").expect("published value exists");
@@ -815,12 +818,31 @@ async fn test_external_put_completion_waits_for_route_publication() {
                 let after = inner.runtime_observe_snapshot();
                 assert!(after.grouped_put_done_batches > before.grouped_put_done_batches);
                 assert_eq!(after.legacy_put_done_batches, before.legacy_put_done_batches);
+                assert_eq!(
+                    after.owner_segment_allocated_bytes,
+                    before.owner_segment_allocated_bytes,
+                    "a rejected publication must retain its physical slot while a reader holds it"
+                );
+                let rejected_capacity = if scenario == Scenario::RejectIndependent {
+                    readers[0].local_reserve_resident_slot_ref()
+                        .expect("rejected local value retains its exact slot").2
+                } else {
+                    0
+                };
+                let released = inner.owner_local_reserve_rebalance_notify();
                 drop(readers);
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    fluxon_util::notify_state::wait_until(&released, || {
+                        inner.owner_local_reserve_control_snapshot().allocated_bytes
+                            == after.owner_segment_allocated_bytes - rejected_capacity
+                    }),
+                ).await.expect("the last rejected reader must release its slot without freeing published values");
             }
         }
         owner.shutdown().await.expect("stop publication owner");
         master.shutdown().await.expect("stop publication master");
-    }).await.expect("external publication barriers and fence cleanup must complete");
+    }).await.expect("local ACK, background publication, and fence cleanup must complete");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1247,6 +1269,7 @@ async fn test_external_remote_get_uses_bound_owner_slot_without_master_allocator
         )
         .await
         .expect("put only on source owner");
+    wait_master_route(master_view.clone(), key, Duration::from_secs(5)).await;
     {
         let route = master_view
             .master_kv_router()
