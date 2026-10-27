@@ -974,7 +974,7 @@ checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 
 [[package]]
 name = "fluxon_commu"
-version = "0.1.6"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_framework"
-version = "0.1.6"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "fluxon_framework_compiled",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_framework_compiled"
-version = "0.1.6"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "crossbeam-queue",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_fs"
-version = "0.0.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_fs_core"
-version = "0.0.1"
+version = "0.2.2"
 dependencies = [
  "base64 0.21.7",
  "hex",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_fs_s3_gateway"
-version = "0.1.6"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "askama",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_kv"
-version = "0.1.6"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_observability"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1234,7 +1234,7 @@ dependencies = [
 
 [[package]]
 name = "fluxon_util"
-version = "0.1.6"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2324,7 +2324,7 @@ dependencies = [
 
 [[package]]
 name = "limit_thirdparty"
-version = "0.1.6"
+version = "0.2.2"
 dependencies = [
  "tokio",
 ]

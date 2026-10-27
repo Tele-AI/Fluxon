@@ -13,6 +13,10 @@ pub enum MsgId {
     RequestSegmentRegistrationResp = 2002,
     ResolveSideTransferLaneReq = 2003,
     ResolveSideTransferLaneResp = 2004,
+    RegisterNodeSegmentsReq = 2005,
+    RegisterNodeSegmentsResp = 2006,
+    ConfirmNodeSegmentsRegisteredReq = 2007,
+    ConfirmNodeSegmentsRegisteredResp = 2008,
     GetStartReq = 3001,
     GetStartResp = 3002,
     GetRevokeReq = 3003,
@@ -35,12 +39,6 @@ pub enum MsgId {
     DeleteAckResp = 3024,
     BatchDeleteAckReq = 3029,
     BatchDeleteAckResp = 3030,
-    SsdReplicaCommitReq = 3031,
-    SsdReplicaCommitResp = 3032,
-    BatchSsdReplicaEvictReq = 3033,
-    BatchSsdReplicaEvictResp = 3034,
-    SsdStageBeginReq = 3035,
-    SsdStageBeginResp = 3036,
     GetMetaReq = 3019,
     GetMetaResp = 3020,
     BatchDeleteClientKvMetaCacheReq = 3021,
@@ -49,6 +47,58 @@ pub enum MsgId {
     CountPrefixResp = 3026,
     GetMasterOnlyMetricPartReq = 3027,
     GetMasterOnlyMetricPartResp = 3028,
+    BatchIsExistReq = 3031,
+    BatchIsExistResp = 3032,
+    PutAppendStartReq = 3033,
+    PutAppendStartResp = 3034,
+    PutAppendRevokeReq = 3035,
+    PutAppendRevokeResp = 3036,
+    PutAppendDoneReq = 3037,
+    PutAppendDoneResp = 3038,
+    BatchPutStartReq = 3039,
+    BatchPutStartResp = 3040,
+    BatchPutRevokeReq = 3041,
+    BatchPutRevokeResp = 3042,
+    BatchPutDoneReq = 3043,
+    BatchPutDoneResp = 3044,
+    BatchGetStartReq = 3045,
+    BatchGetStartResp = 3046,
+    BatchGetRevokeReq = 3047,
+    BatchGetRevokeResp = 3048,
+    BatchGetDoneReq = 3049,
+    BatchGetDoneResp = 3050,
+    BatchPreparePutKeysReq = 3055,
+    BatchPreparePutKeysResp = 3056,
+    BatchReleasePutKeyReservationsReq = 3057,
+    BatchReleasePutKeyReservationsResp = 3058,
+    BatchOwnerReclaimReq = 3059,
+    BatchOwnerReclaimResp = 3060,
+    BatchEnqueueReplicaTaskReq = 3061,
+    BatchEnqueueReplicaTaskResp = 3062,
+    GroupedBatchPutDoneReq = 3063,
+    GroupedBatchPutDoneResp = 3064,
+    BatchPutAppendStartReq = 3065,
+    BatchPutAppendStartResp = 3066,
+    BatchPutAppendDoneReq = 3067,
+    BatchPutAppendDoneResp = 3068,
+    BatchEvictOwnerSourceReq = 3069,
+    BatchEvictOwnerSourceResp = 3070,
+    BatchGetPlanReq = 3071,
+    BatchGetPlanResp = 3072,
+    BatchGetBindReq = 3073,
+    BatchGetBindResp = 3074,
+    BatchPublishOwnerSsdReq = 3075,
+    BatchPublishOwnerSsdResp = 3076,
+    SsdStageBeginReq = 3077,
+    SsdStageBeginResp = 3078,
+    SsdStageDoneReq = 3079,
+    SsdStageDoneResp = 3080,
+    OwnerLocalReserveControlReq = 3081,
+    OwnerLocalReserveControlResp = 3082,
+    OwnerSegmentTransferReq = 3083,
+    OwnerSegmentTransferResp = 3084,
+    OwnerCapacityReportReq = 3085,
+    OwnerCapacityReportResp = 3086,
     ExternalGetReq = 4001,
     ExternalGetResp = 4002,
     ExternalPutStartReq = 4003,
@@ -57,6 +107,8 @@ pub enum MsgId {
     ExternalPutTransferEndResp = 4006,
     ExternalDeleteReq = 4009,
     ExternalDeleteResp = 4010,
+    ExternalBatchIsExistReq = 4015,
+    ExternalBatchIsExistResp = 4016,
     AllocateClientLeaseReq = 5001,
     AllocateClientLeaseResp = 5002,
     ClientLeaseKeepaliveReq = 5003,
@@ -312,9 +364,6 @@ impl From<fluxon_commu::TransferEngineError> for TransferEngineError {
             fluxon_commu::TransferEngineError::UnregisterLocalSegmentFailed { detail } => {
                 TransferEngineError::UnregisterLocalSegmentFailed { detail }
             }
-            fluxon_commu::TransferEngineError::RequiredDirectFastPathNotReady => {
-                TransferEngineError::RequiredDirectFastPathNotReady {}
-            }
             fluxon_commu::TransferEngineError::CreateEngineFailed { detail } => {
                 TransferEngineError::CreateEngineFailed { detail }
             }
@@ -326,6 +375,9 @@ impl From<fluxon_commu::TransferEngineError> for TransferEngineError {
             }
             fluxon_commu::TransferEngineError::BackendFatal { detail } => {
                 TransferEngineError::BackendFatal { detail }
+            }
+            fluxon_commu::TransferEngineError::RequiredDirectFastPathNotReady => {
+                TransferEngineError::RequiredDirectFastPathNotReady {}
             }
         }
     }
@@ -440,7 +492,7 @@ impl KvError {
         })
     }
 
-    /// Map every error category to the unified numeric error code.
+    /// Back-compat convenience: map to unified numeric error code
     pub fn code(&self) -> ErrorCode {
         match self {
             KvError::Api(v) => v.code(),
@@ -719,6 +771,9 @@ crate::define_err_group! {
         ,
         (123, KeyAlreadyExists { key: String },
             msg: "Key already exists: key={key}")
+        ,
+        (124, StaleGetPlan { get_id: u64, key: String, detail: String },
+            msg: "Get plan is stale: get_id={get_id}, key={key}, detail={detail}")
     }
 }
 
@@ -766,7 +821,7 @@ impl ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, KvError, TransferEngineError, TransportKind, TransportUser};
+    use super::{ApiError, KvError, TransportKind, TransportUser};
     use crate::cluster_manager::ClusterError;
 
     #[test]
@@ -812,17 +867,5 @@ mod tests {
             }
             other => panic!("unexpected mapped error: {:?}", other),
         }
-    }
-
-    #[test]
-    fn required_direct_fast_path_not_ready_keeps_typed_identity() {
-        let mapped = TransferEngineError::from(
-            fluxon_commu::TransferEngineError::RequiredDirectFastPathNotReady,
-        );
-
-        assert!(matches!(
-            mapped,
-            TransferEngineError::RequiredDirectFastPathNotReady {}
-        ));
     }
 }

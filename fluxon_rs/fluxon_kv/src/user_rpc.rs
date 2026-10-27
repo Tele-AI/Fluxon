@@ -2,10 +2,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use fluxon_commu::p2p::rpc::{
-    USER_RPC_OBSERVE_TRACE_RAW_BYTES_INDEX, USER_RPC_OWNER1_OBSERVE_TRACE_RAW_BYTES_INDEX,
-    UserRpcObserveTrace, UserRpcOwner1ObserveTrace, UserRpcTransportPathKind,
-    current_cross_process_monotonic_us, decode_user_rpc_observe_trace,
-    decode_user_rpc_owner1_observe_trace,
+    MIN_EXPLICIT_RPC_TIMEOUT_MS, USER_RPC_OBSERVE_TRACE_RAW_BYTES_INDEX,
+    USER_RPC_OWNER1_OBSERVE_TRACE_RAW_BYTES_INDEX, UserRpcObserveTrace, UserRpcOwner1ObserveTrace,
+    UserRpcTransportPathKind, current_cross_process_monotonic_us, decode_user_rpc_observe_trace,
+    decode_user_rpc_owner1_observe_trace, validate_explicit_rpc_timeout_ms,
 };
 use prost::bytes::Bytes;
 
@@ -15,7 +15,34 @@ use crate::p2p::p2p_module::UserRpcReq;
 use crate::rpcresp_kvresult_convert;
 use crate::rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult};
 
-pub const USER_RPC_MIN_TIMEOUT_MS: u64 = 10_000;
+pub const USER_RPC_MIN_TIMEOUT_MS: u64 = MIN_EXPLICIT_RPC_TIMEOUT_MS;
+
+pub fn validate_timeout_ms(timeout_ms: u64) -> KvResult<()> {
+    validate_explicit_rpc_timeout_ms(timeout_ms).map_err(KvError::from)
+}
+
+#[cfg(test)]
+mod timeout_validation_tests {
+    use super::*;
+    use fluxon_commu::p2p::P2pError;
+
+    #[test]
+    fn invalid_user_rpc_timeout_preserves_typed_p2p_error() {
+        let timeout_ms = USER_RPC_MIN_TIMEOUT_MS - 1;
+        let err = validate_timeout_ms(timeout_ms).unwrap_err();
+        match err {
+            KvError::P2p(P2pError::InvalidRpcTimeout {
+                timeout_ms: actual_timeout_ms,
+                min_timeout_ms,
+                ..
+            }) => {
+                assert_eq!(actual_timeout_ms, timeout_ms);
+                assert_eq!(min_timeout_ms, USER_RPC_MIN_TIMEOUT_MS);
+            }
+            other => panic!("expected typed InvalidRpcTimeout, got {other:?}"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UserRpcOwnerPathKind {
@@ -140,14 +167,7 @@ pub async fn user_rpc_call_observed(
     payload: Vec<u8>,
     timeout_ms: u64,
 ) -> KvResult<UserRpcCallOutput> {
-    if timeout_ms < USER_RPC_MIN_TIMEOUT_MS {
-        return Err(KvError::Api(ApiError::InvalidArgument {
-            detail: format!(
-                "timeout_ms must be >= {} (got {})",
-                USER_RPC_MIN_TIMEOUT_MS, timeout_ms
-            ),
-        }));
-    }
+    validate_timeout_ms(timeout_ms)?;
 
     let path_for_error = path.clone();
     let req = MsgPack {

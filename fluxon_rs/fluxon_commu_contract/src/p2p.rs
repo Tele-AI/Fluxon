@@ -9,15 +9,16 @@ pub mod surface;
 pub mod wire;
 
 pub use rpc::{
-    MIN_EXPLICIT_RPC_TIMEOUT_SECS, MsgPack, MsgPackSerializePart, RPCReq, RpcCallObserveTrace,
-    RpcCallObservedOutput, USER_RPC_OBSERVE_TRACE_RAW_BYTES_INDEX,
+    MIN_EXPLICIT_RPC_TIMEOUT_MS, MIN_EXPLICIT_RPC_TIMEOUT_SECS, MsgPack, MsgPackSerializePart,
+    RPCReq, RpcCallObserveTrace, RpcCallObservedOutput, USER_RPC_OBSERVE_TRACE_RAW_BYTES_INDEX,
     USER_RPC_OWNER1_OBSERVE_TRACE_RAW_BYTES_INDEX, USER_RPC_REQ_MSG_ID,
     USER_RPC_REQUEST_OWNER1_OBSERVE_TRACE_RAW_BYTES_INDEX, USER_RPC_RESP_MSG_ID,
     UserRpcBytesAsyncHandler, UserRpcBytesError, UserRpcBytesFuture, UserRpcBytesHandler,
     UserRpcObserveTrace, UserRpcOwner1ObserveTrace, UserRpcTransportPathKind,
     current_cross_process_monotonic_us, decode_user_rpc_observe_trace,
     decode_user_rpc_owner1_observe_trace, encode_user_rpc_observe_trace,
-    encode_user_rpc_owner1_observe_trace,
+    encode_user_rpc_owner1_observe_trace, validate_explicit_rpc_timeout,
+    validate_explicit_rpc_timeout_ms,
 };
 pub use surface::*;
 pub use wire::*;
@@ -178,6 +179,27 @@ impl TierSnapshot {
         self.is_send_ready_intra_effective(peer_gen) || self.is_send_ready_direct(peer_gen)
     }
 
+    /// Whether both directions of the exact peer's direct control path have
+    /// reached the shared P2P DAG snapshot.
+    ///
+    /// `is_any_send_ready` is a local lane property.  During cold join it can
+    /// become true before the reverse direction has been advertised, which is
+    /// insufficient for a request/response RPC.  Startup-critical RPCs use
+    /// this stronger graph predicate before consuming a long wire timeout.
+    pub fn is_bidirectional_direct_advertised(&self, peer_gen: &PeerGen) -> bool {
+        if !self.verify_peer_gen_is_current(peer_gen) {
+            return false;
+        }
+        let self_id = &self.self_peer_gen.peer_id;
+        self.direct_graph
+            .get(self_id)
+            .is_some_and(|targets| targets.contains(&peer_gen.peer_id))
+            && self
+                .direct_graph
+                .get(&peer_gen.peer_id)
+                .is_some_and(|targets| targets.contains(self_id))
+    }
+
     pub fn is_transfer_rpc_ready(&self, peer_gen: &PeerGen) -> bool {
         self.peers.get(&peer_gen.peer_id).is_some_and(|v| {
             v.peer_gen.as_ref() == Some(peer_gen)
@@ -222,5 +244,60 @@ impl TierSnapshot {
             (Some(lhs_owner), Some(rhs_owner)) => lhs_owner == rhs_owner,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tier_snapshot_tests {
+    use super::{PeerGen, TierPeerView, TierSnapshot};
+    use std::collections::HashMap;
+
+    #[test]
+    fn local_send_ready_is_not_a_bidirectional_dag_terminal() {
+        let self_id: crate::NodeID = "owner".to_string().into();
+        let peer_id: crate::NodeID = "master".to_string().into();
+        let peer_gen = PeerGen {
+            peer_id: peer_id.clone(),
+            node_start_time: 22,
+        };
+        let mut snapshot = TierSnapshot {
+            self_peer_gen: PeerGen {
+                peer_id: self_id.clone(),
+                node_start_time: 11,
+            },
+            disable_crossowner_ipc: false,
+            peers: HashMap::from([(
+                peer_id.clone(),
+                TierPeerView {
+                    peer_gen: Some(peer_gen.clone()),
+                    intra_conn_ready: true,
+                    direct_conn_ready: true,
+                    transfer_backend_epoch: None,
+                    transfer_rpc_ready_backend_epoch: None,
+                    share_group_owner: None,
+                    is_p2p_relay: false,
+                },
+            )]),
+            relay_set_snapshot: Vec::new(),
+            relay_caps_by_hop: HashMap::new(),
+            direct_graph: HashMap::new(),
+        };
+
+        assert!(snapshot.is_any_send_ready(&peer_gen));
+        assert!(!snapshot.is_bidirectional_direct_advertised(&peer_gen));
+
+        snapshot
+            .direct_graph
+            .insert(self_id.clone(), vec![peer_id.clone()]);
+        assert!(!snapshot.is_bidirectional_direct_advertised(&peer_gen));
+
+        snapshot.direct_graph.insert(peer_id.clone(), vec![self_id]);
+        assert!(snapshot.is_bidirectional_direct_advertised(&peer_gen));
+
+        let stale_peer_gen = PeerGen {
+            peer_id,
+            node_start_time: 21,
+        };
+        assert!(!snapshot.is_bidirectional_direct_advertised(&stale_peer_gen));
     }
 }

@@ -364,6 +364,7 @@ pub(crate) fn new_payload_lease_not_found_error(
 /// - TransferEngine::TransferFailedForBlock -> TransferBlockFailedError（可重试）
 /// - Api::InvalidPutMasterState -> PutDoneFailedError
 /// - Api::KeyNotFound -> KeyNotFoundError（携带 key）
+/// - Api::KeyAlreadyExists -> KeyAlreadyExistsError（携带 key）
 /// - Api::KeyBeingWritten -> KeyBeingWrittenError（携带 key）
 /// - Api::KeyAlreadyExists -> KeyAlreadyExistsError（携带 key）
 /// - Api::NoSpace -> StorageFullError（available_space=free_capacity）
@@ -374,7 +375,8 @@ pub(crate) fn py_error_from_kv_error(
     prefix: &str,
 ) -> PyObject {
     use fluxon_kv::rpcresp_kvresult_convert::msg_and_error::{
-        ApiError as CoreApiError, KvError, LeaseMgrError, TransferEngineError,
+        ApiError as CoreApiError, KvError, LeaseMgrError, P2pError as CoreP2pError,
+        TransferEngineError,
     };
     let msg = format!("{}: {}", prefix, e);
     match e {
@@ -394,6 +396,11 @@ pub(crate) fn py_error_from_kv_error(
             &format!("{}: Key not found: {}", prefix, key),
             Some(key),
         ),
+        KvError::Api(CoreApiError::KeyAlreadyExists { key }) => new_key_already_exists_error(
+            py,
+            &format!("{}: Key already exists: {}", prefix, key),
+            Some(key),
+        ),
         KvError::Api(CoreApiError::KeyBeingWritten { key }) => new_key_being_written_error(
             py,
             &format!("{}: Key is currently being written: {}", prefix, key),
@@ -406,6 +413,9 @@ pub(crate) fn py_error_from_kv_error(
         ),
         KvError::Api(CoreApiError::InvalidArgument { detail }) => {
             new_invalid_argument_error(py, &format!("{}: Invalid argument: {}", prefix, detail))
+        }
+        KvError::P2p(CoreP2pError::InvalidRpcTimeout { .. }) => {
+            new_invalid_argument_error(py, &msg)
         }
         KvError::Api(CoreApiError::FileWriteError {
             path,

@@ -7,17 +7,18 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 use std::time::{Duration, Instant};
 
+use crate::memholder::lifetime::MemholderManagerTrait;
 use limit_thirdparty::tokio::time::sleep;
 
 use crate::config::{
     ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, MasterConfig, MonitoringConfig,
-    ProtocolConfig, ProtocolType, TestSpecConfig, TransferEngineType,
+    ProtocolConfig, ProtocolType, ReplicaTaskPlacementConfig, TestSpecConfig, TransferEngineType,
 };
 use crate::master_kv_router::MasterKvRouterView;
-use crate::master_seg_manager::one_seg_allocator::Allocation;
+use crate::master_seg_manager::msg_pack::{OwnerPlacementClass, SegmentAllocationAuthority};
 use crate::memholder::NodeHolderKey;
 
 // Helpers: config builders mirroring kv_test.rs pattern
@@ -55,9 +56,15 @@ fn new_master_config(
             otlp_log_api: None,
         }),
         network: None,
-        log_dir: "/tmp/fluxon_master_logs".to_string(),
+        log_dir: format!(
+            "{}/memholder_master_logs",
+            fluxon_util::test_util::test_workdir_base()
+        ),
         pprof_duration_seconds: None,
         master_ui: None,
+        replica_task_placement: ReplicaTaskPlacementConfig::default(),
+        replica_cache_capacity_ratio: crate::config::DEFAULT_REPLICA_CACHE_CAPACITY_RATIO,
+        replica_writeback_tier1_capacity_ratio: None,
         test_spec_config: TestSpecConfig::default(),
     }
 }
@@ -89,6 +96,8 @@ fn new_client_config_with_size(
             tcp_thread_reactor: Default::default(),
         },
         pprof_duration_seconds: None,
+        replica_writeback_hot_capacity_ratio: Some(0.5),
+        owner_placement_class: Some(OwnerPlacementClass::Inference),
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: vec![etcd.to_string()],
@@ -98,9 +107,17 @@ fn new_client_config_with_size(
             enable_transfer_rpc_fast_path: true,
             sub_cluster: None,
         },
-        share_mem_path: format!("/tmp/kvcache_shared_memory/{}", instance_key),
+        share_mem_path: format!(
+            "{}/sharemem/{}",
+            fluxon_util::test_util::test_workdir_base(),
+            instance_key
+        ),
         large_file_paths: crate::config::LargeFilePaths {
-            paths: vec![format!("/tmp/kvcache_large/{}", instance_key)],
+            paths: vec![format!(
+                "{}/large/{}",
+                fluxon_util::test_util::test_workdir_base(),
+                instance_key
+            )],
         },
         ssd_storage: None,
         test_spec_config: TestSpecConfig::default(),
@@ -126,6 +143,8 @@ fn new_zero_contribution_client_config(
             tcp_thread_reactor: Default::default(),
         },
         pprof_duration_seconds: None,
+        replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: Vec::new(),
@@ -135,7 +154,11 @@ fn new_zero_contribution_client_config(
             enable_transfer_rpc_fast_path: false,
             sub_cluster: None,
         },
-        share_mem_path: format!("/tmp/kvcache_shared_memory/{}", owner_instance_key),
+        share_mem_path: format!(
+            "{}/sharemem/{}",
+            fluxon_util::test_util::test_workdir_base(),
+            owner_instance_key
+        ),
         large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
         ssd_storage: None,
         test_spec_config: TestSpecConfig::default(),
@@ -150,48 +173,61 @@ fn unique_cluster_name(prefix: &str) -> String {
     format!("{}_{}", prefix, ts)
 }
 
-// Helper: wait until master has non-tomb allocators for a node
-async fn wait_node_allocators(master_view: MasterKvRouterView, node_id: &str, timeout: Duration) {
+// Helper: wait until the owner-authoritative segment contract is visible on master.
+async fn wait_owner_allocation_authority(
+    master_view: MasterKvRouterView,
+    node_id: &str,
+    timeout: Duration,
+) {
     let start = Instant::now();
     loop {
         if start.elapsed() > timeout {
-            panic!("timeout waiting node allocators for {}", node_id);
+            panic!("timeout waiting owner allocation authority for {}", node_id);
         }
-        // Convert to owned Cow<'static, str> so it can be referenced safely
         let node_cow: crate::cluster_manager::NodeID = node_id.to_string().into();
-        let allocs = master_view
+        let authority = master_view
             .master_seg_manager()
-            .get_node_allocators(&node_cow);
-        if !allocs.is_empty() {
+            .get_node_allocation_authority(&node_cow);
+        if authority == Some(SegmentAllocationAuthority::Owner) {
+            let allocators = master_view
+                .master_seg_manager()
+                .get_node_allocators(&node_cow);
+            assert!(
+                allocators.is_empty(),
+                "owner-authoritative node must not expose master allocators: node={} count={}",
+                node_id,
+                allocators.len()
+            );
             return;
         }
         sleep(Duration::from_millis(200)).await;
     }
 }
 
-// Helper: capture a Weak<Allocation> from master's get_holding for a specific holder
-fn capture_master_holding_allocation(
-    master_view: &MasterKvRouterView,
-    node_id: &str,
-    holder_id: u64,
-) -> Option<Weak<Allocation>> {
-    let key = NodeHolderKey::new(node_id.to_string(), holder_id);
-    master_view
-        .master_kv_router()
-        .inner()
-        .get_holding
-        .get(&key)
-        .map(|holding| Arc::downgrade(&holding.allocation))
+// Helper: wait until an owner MemoryInfo generation no longer has a live slot reference.
+async fn wait_weak_drop<T>(label: &str, weak: &Weak<T>, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            panic!("timeout waiting weak allocation drop: {label}");
+        }
+        if weak.upgrade().is_none() {
+            return;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Group: test block defer (memholder holds shutdown for ~10s)
 #[cfg(test)]
 pub mod test_memholder {
     use super::{
-        capture_master_holding_allocation, new_client_config_with_size, new_master_config,
-        new_zero_contribution_client_config, read_etcd, unique_cluster_name, wait_node_allocators,
+        new_client_config_with_size, new_master_config, new_zero_contribution_client_config,
+        read_etcd, unique_cluster_name, wait_owner_allocation_authority, wait_weak_drop,
     };
+    use crate::memholder::{MemholderManagerTrait, NodeHolderKey};
     use crate::{ConfigArg, run_client, run_master};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use tokio::time::sleep;
     use tracing::{info, warn};
@@ -230,13 +266,13 @@ pub mod test_memholder {
         .await
         .expect("start owner");
 
-        // Wait master to register owner's segments
+        // Wait for owner authority and geometry without creating a master allocator.
         let owner_id = owner
             .cluster_manager_view()
             .cluster_manager()
             .get_self_info()
             .id;
-        wait_node_allocators(
+        wait_owner_allocation_authority(
             master.master_kv_router_view().clone(),
             &owner_id,
             Duration::from_secs(30),
@@ -261,7 +297,8 @@ pub mod test_memholder {
             external_id, owner_id
         );
 
-        // 2) owner put and get memholder; external get memholder
+        // 2) Seed through the owner-authoritative external Put path, then
+        // acquire one owner holder and one external holder for the same slot.
         let owner_view = owner.client_kv_api_view();
         let owner_api = owner_view.client_kv_api();
         let external_view = external.external_client_api_view();
@@ -270,11 +307,11 @@ pub mod test_memholder {
         let key = "mh_block_defer_key";
         let val = vec![1u8; 256 * 1024];
 
-        owner_api
+        external_api
             .inner()
             .put(key, &val, crate::client_kv_api::PutOptionalArgs::default())
             .await
-            .expect("owner put");
+            .expect("external seed put");
         let (owner_holder, _info) = owner_api
             .inner()
             .get(key)
@@ -372,8 +409,6 @@ pub mod test_memholder {
         sleep(Duration::from_secs(2)).await;
 
         let owner_name = "pin_owner";
-        // 第二个 owner 必须使用不同的 member key（也会带来不同的 share_mem_path）
-        let owner2_name = "pin_owner2";
         let (owner, _) = run_client(ConfigArg::Config(new_client_config_with_size(
             owner_name,
             4 * 1024 * 1024,
@@ -382,27 +417,9 @@ pub mod test_memholder {
         )))
         .await
         .expect("start owner");
-        wait_node_allocators(
+        wait_owner_allocation_authority(
             master.master_kv_router_view().clone(),
             &owner
-                .cluster_manager_view()
-                .cluster_manager()
-                .get_self_info()
-                .id,
-            Duration::from_secs(30),
-        )
-        .await;
-        let (owner2, _) = run_client(ConfigArg::Config(new_client_config_with_size(
-            owner2_name,
-            4 * 1024 * 1024,
-            &cluster,
-            &etcd,
-        )))
-        .await
-        .expect("start owner");
-        wait_node_allocators(
-            master.master_kv_router_view().clone(),
-            &owner2
                 .cluster_manager_view()
                 .cluster_manager()
                 .get_self_info()
@@ -419,14 +436,9 @@ pub mod test_memholder {
         .expect("start external");
 
         let owner_api_view = owner.client_kv_api_view();
-        let owner_api = owner_api_view.client_kv_api();
-
-        let owner2_api_view = owner2.client_kv_api_view();
-        let owner2_api = owner2_api_view.client_kv_api();
 
         let external_api_view = external.external_client_api_view();
         let external_api = external_api_view.external_client_api();
-        let master_view = master.master_kv_router_view().clone();
 
         let owner_id = owner
             .cluster_manager_view()
@@ -447,7 +459,9 @@ pub mod test_memholder {
             4 * 1024 * 1024
         );
 
-        // 2) owner/external put + get twice; keep one holder for *_hold keys; drop all for *_release keys
+        // 2) Seed every generation through the owner-authoritative external
+        // Put path. The owner/external labels below describe the holder origin,
+        // not a second allocation path.
         let kv_owner_hold = "kv_owner_hold";
         let kv_owner_release = "kv_owner_release";
         let kv_ext_hold = "kv_ext_hold";
@@ -458,7 +472,7 @@ pub mod test_memholder {
         let v3 = vec![4u8; 40 * 1024];
         let v4 = vec![5u8; 40 * 1024];
 
-        owner_api
+        external_api
             .inner()
             .put(
                 kv_owner_hold,
@@ -467,7 +481,7 @@ pub mod test_memholder {
             )
             .await
             .expect("put owner_hold");
-        owner_api
+        external_api
             .inner()
             .put(
                 kv_owner_release,
@@ -496,30 +510,40 @@ pub mod test_memholder {
             .expect("put ext_release");
 
         // Owner get twice per key
-        let (oh1, _) = owner_api.inner().get(kv_owner_hold).await.unwrap().unwrap();
-        let (oh2, _) = owner_api.inner().get(kv_owner_hold).await.unwrap().unwrap();
+        let (oh1, _) = owner_api_view
+            .client_kv_api()
+            .inner()
+            .get(kv_owner_hold)
+            .await
+            .unwrap()
+            .unwrap();
+        let (oh2, _) = owner_api_view
+            .client_kv_api()
+            .inner()
+            .get(kv_owner_hold)
+            .await
+            .unwrap()
+            .unwrap();
         let owner_hold_holder_id = oh1.holder_id();
-        let owner_hold_weak =
-            capture_master_holding_allocation(&master_view, &owner_id, owner_hold_holder_id)
-                .expect("capture owner_hold weak");
+        let owner_hold_weak = Arc::downgrade(&oh1.memory_info);
         drop(oh2); // drop one; keep one
 
-        let (or1, _) = owner_api
+        let (or1, _) = owner_api_view
+            .client_kv_api()
             .inner()
             .get(kv_owner_release)
             .await
             .unwrap()
             .unwrap();
-        let (or2, _) = owner_api
+        let (or2, _) = owner_api_view
+            .client_kv_api()
             .inner()
             .get(kv_owner_release)
             .await
             .unwrap()
             .unwrap();
         let owner_release_holder_id = or1.holder_id();
-        let owner_release_weak =
-            capture_master_holding_allocation(&master_view, &owner_id, owner_release_holder_id)
-                .expect("capture owner_release weak");
+        let owner_release_weak = Arc::downgrade(&or1.memory_info);
         drop(or1);
         drop(or2); // drop all for release key
 
@@ -537,11 +561,17 @@ pub mod test_memholder {
             .unwrap()
             .unwrap();
         let ext_hold_holder_id = eh1.holder_id;
-        // Note: master's get_holding is keyed by the requesting node of the inner owner get
-        // for external GET, the owner performs an inner get, so the node is the owner
-        let ext_hold_weak =
-            capture_master_holding_allocation(&master_view, &owner_id, ext_hold_holder_id)
-                .expect("capture ext_hold weak");
+        let ext_hold_memory_info = owner_api_view
+            .client_kv_api()
+            .inner()
+            .external_get_holding
+            .inner_map()
+            .get(&NodeHolderKey::new(external_id.clone(), ext_hold_holder_id))
+            .expect("capture ext_hold owner holding")
+            .memory_info
+            .clone();
+        let ext_hold_weak = Arc::downgrade(&ext_hold_memory_info);
+        drop(ext_hold_memory_info);
         drop(eh2);
 
         let er1 = external_api
@@ -556,13 +586,44 @@ pub mod test_memholder {
             .await
             .unwrap()
             .unwrap();
-        let ext_release_holder_id = er1.holder_id;
-        // Similar rationale as above: use owner_id when capturing master's holding entry
-        let ext_release_weak =
-            capture_master_holding_allocation(&master_view, &owner_id, ext_release_holder_id)
-                .expect("capture ext_release weak");
+        let ext_release_holder_ids = [er1.holder_id, er2.holder_id];
+        let ext_release_holder_id = ext_release_holder_ids[0];
+        let ext_release_memory_info = owner_api_view
+            .client_kv_api()
+            .inner()
+            .external_get_holding
+            .inner_map()
+            .get(&NodeHolderKey::new(
+                external_id.clone(),
+                ext_release_holder_id,
+            ))
+            .expect("capture ext_release owner holding")
+            .memory_info
+            .clone();
+        let ext_release_weak = Arc::downgrade(&ext_release_memory_info);
+        drop(ext_release_memory_info);
         drop(er1);
         drop(er2); // drop all for release key
+
+        let external_release_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let all_released = ext_release_holder_ids.iter().all(|holder_id| {
+                !owner_api_view
+                    .client_kv_api()
+                    .inner()
+                    .external_get_holding
+                    .inner_map()
+                    .contains_key(&NodeHolderKey::new(external_id.clone(), *holder_id))
+            });
+            if all_released {
+                break;
+            }
+            assert!(
+                Instant::now() < external_release_deadline,
+                "timeout waiting external release holders to unpin owner slots"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
 
         info!(
             "[PUT_GET] holders prepared: owner_hold_holder_id={} owner_release_holder_id={} ext_hold_holder_id={} ext_release_holder_id={}",
@@ -572,40 +633,28 @@ pub mod test_memholder {
             ext_release_holder_id
         );
 
-        // 3) 大量 put 触发 cache eviction。
-        // The cache weight is metadata-heavy; using smaller payloads lets the test create enough
-        // entries to pressure Moka before the 4MiB test segment runs out of allocation space.
+        // 3) Drive owner-local Moka and the sole OwnerSegmentAllocator past both
+        // the local budget and physical capacity through that same external Put
+        // path. Pinned generations must not become victims; released
+        // generations should be selected and freed.
         let chunk_sz = 1024;
         let mut put_ok: u32 = 0;
         let mut put_nospace: u32 = 0;
         let mut put_err: u32 = 0;
         info!(
-            "[LOOP1-EVICT] start eviction fill: chunk_sz={}B count=3000 (owners_put=1, get_apis=2)",
+            "[LOOP1-EVICT] start owner-local eviction fill: chunk_sz={}B count=1500",
             chunk_sz
         );
-        for i in 0..3000u32 {
+        for i in 0..1500u32 {
             let k = format!("fill_key_{:03}", i);
             let v = vec![0xAu8; chunk_sz];
-            // 仅由 owner 执行 put；随后 owner 与 owner2 各自 get 一次
-            match owner_api
+            match external_api
                 .inner()
                 .put(&k, &v, crate::client_kv_api::PutOptionalArgs::default())
                 .await
             {
                 Ok(_) => {
                     put_ok += 1;
-                    // 放完立即由两侧各自 get 一次，避免 pin 并提升热度
-                    for api in [&owner_api, &owner2_api] {
-                        match api.inner().get(&k).await {
-                            Ok(Some((_holder, _info))) => { /* drop immediately to avoid pin */ }
-                            Ok(None) => {
-                                warn!("fill get {} returned None after successful put", k);
-                            }
-                            Err(e) => {
-                                warn!("fill get {} error: {}", k, e);
-                            }
-                        }
-                    }
                 }
                 Err(e) => {
                     let es = e.to_string();
@@ -629,8 +678,43 @@ pub mod test_memholder {
             "[LOOP1-EVICT] fill summary: ok={} nospace={} err={} (chunk_sz={}B)",
             put_ok, put_nospace, put_err, chunk_sz
         );
-        // 4) Live holders keep their backing allocations pinned regardless of
-        // whether normal cache pressure has already evicted a route replica.
+        assert!(
+            put_ok >= 1024,
+            "owner pressure did not admit enough fill keys: ok={} nospace={} err={}",
+            put_ok,
+            put_nospace,
+            put_err
+        );
+        assert_eq!(put_err, 0, "owner pressure returned unexpected errors");
+
+        // 4) asserts
+        info!(
+            "[LOOP1-ASSERT_WEAK] expect owner release weak dropped for key='{}'",
+            kv_owner_release
+        );
+        wait_weak_drop(
+            "owner_release",
+            &owner_release_weak,
+            Duration::from_secs(20),
+        )
+        .await;
+        info!(
+            "[LOOP1-ASSERT_WEAK] owner_release weak dropped (holder_id={})",
+            owner_release_holder_id
+        );
+
+        info!(
+            "[LOOP1-ASSERT_WEAK] expect external release weak dropped for key='{}'",
+            kv_ext_release
+        );
+        wait_weak_drop("ext_release", &ext_release_weak, Duration::from_secs(20)).await;
+        info!(
+            "[LOOP1-ASSERT_WEAK] ext_release weak dropped (holder_id={})",
+            ext_release_holder_id
+        );
+
+        // Hold keys: live owner/external holders keep the exact owner slot
+        // generation pinned outside Moka victim selection.
         info!(
             "[LOOP1-ASSERT_WEAK] expect owner hold weak still pinned for key='{}'",
             kv_owner_hold
@@ -665,29 +749,41 @@ pub mod test_memholder {
             assert!(ext_hold_weak.upgrade().is_some());
         }
 
-        // 6) Restart the owner after product-owned MemberLeft cleanup completes.
-        // owner.shutdown waits in ClientKvApi::before_shutdown while user MemHolders remain.
-        // Drop the live holders first so shutdown does not wait for retries.
+        // 6) Drop the holders, then restart the owner. The old generation's
+        // MemoryInfo references must disappear before the new generation is ready.
         info!("[LOOP2-OWNER_RESTART] dropping live holders before owner shutdown");
-        drop(oh1); // release owner-side live holder for kv_owner_hold
-        drop(eh1); // release external-side live holder for kv_ext_hold (owner shutdown is owner-local)
+        drop(oh1);
+        let ext_hold_key = NodeHolderKey::new(external_id.clone(), ext_hold_holder_id);
+        drop(eh1);
+        let external_hold_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !owner_api_view
+                .client_kv_api()
+                .inner()
+                .external_get_holding
+                .inner_map()
+                .contains_key(&ext_hold_key)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < external_hold_deadline,
+                "timeout waiting external hold to unpin before owner shutdown"
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
         info!("[LOOP2-OWNER_RESTART] shutting down owner to release pinned allocations");
         owner.shutdown().await.expect("owner shutdown");
-        // Membership reconciliation runs every two seconds. The test only waits for the
-        // product-owned MemberLeft cleanup; it does not trigger delete/get/eviction paths.
-        sleep(Duration::from_secs(15)).await;
-        for (label, weak) in [
-            ("owner_hold", &owner_hold_weak),
-            ("owner_release", &owner_release_weak),
-            ("ext_hold", &ext_hold_weak),
-            ("ext_release", &ext_release_weak),
-        ] {
-            assert!(
-                weak.upgrade().is_none(),
-                "allocation must be released by MemberLeft cleanup: {label}"
-            );
-        }
-        info!("[LOOP2-ASSERT_WEAK] all departed-owner allocations were released");
+        // shutdown() closes modules and joins their tasks, but the Framework
+        // still owns those modules until the old generation itself is dropped.
+        drop(owner);
+        drop(owner_api_view);
+        // allow master to observe owner down
+        sleep(Duration::from_secs(2)).await;
+        // The old owner generation must own no live physical slot references.
+        wait_weak_drop("owner_hold", &owner_hold_weak, Duration::from_secs(10)).await;
+        wait_weak_drop("ext_hold", &ext_hold_weak, Duration::from_secs(10)).await;
+        info!("[LOOP2-ASSERT_WEAK] pinned allocations dropped after owner shutdown");
 
         // Recreate owner
         info!("[LOOP2-OWNER_RESTART] restarting owner");
@@ -704,7 +800,7 @@ pub mod test_memholder {
             .cluster_manager()
             .get_self_info()
             .id;
-        wait_node_allocators(
+        wait_owner_allocation_authority(
             master.master_kv_router_view().clone(),
             &owner_restarted_id,
             Duration::from_secs(30),
@@ -721,7 +817,6 @@ pub mod test_memholder {
             .shutdown()
             .await
             .expect("restarted owner shutdown");
-        owner2.shutdown().await.expect("peer owner shutdown");
         master.shutdown().await.expect("master shutdown");
 
         info!("[END] test_memholder_pin OK");

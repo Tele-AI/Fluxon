@@ -62,6 +62,10 @@ a{color:inherit;text-decoration:none;}
 .userpill{font-size:12px;color:var(--muted);border:1px solid var(--border);background:#fff;border-radius:999px;padding:6px 10px;}
 .content{flex:1 1 auto;overflow:auto;padding:18px;}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;box-shadow:0 1px 2px rgba(15,23,42,.06);overflow:hidden;}
+.card > .warn{margin:16px 16px 0;}
+.card > .warn:last-child{margin-bottom:16px;}
+.card > .workspace_notice.open{margin:16px 16px 0;}
+.card > .row{margin:16px;}
 .card_head{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--border);}
 .title{font-size:18px;font-weight:700;margin:0;}
 .subtitle{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.35;}
@@ -150,6 +154,22 @@ tbody tr:hover{background:#f8fafc;}
 .code_area.tall{min-height:520px;}
 .modal_foot{display:flex;gap:10px;justify-content:flex-end;padding:12px 16px;border-top:1px solid var(--border);background:#f8fafc;}
 .hint{font-size:12px;color:var(--muted);line-height:1.45;}
+.account_credentials_body{
+  display:flex;
+  flex-direction:column;
+  gap:18px;
+  padding:20px;
+}
+.account_credentials_intro{font-size:13px;line-height:1.55;}
+.account_credentials_form{
+  display:flex;
+  flex-direction:column;
+  gap:14px;
+  width:100%;
+  max-width:560px;
+}
+.account_credentials_form .field{margin:0;}
+.account_credentials_actions{display:flex;align-items:center;gap:10px;padding-top:2px;}
 .workspace{display:flex;flex-direction:column;gap:14px;padding:16px;min-height:100%;}
 .workspace_notice{display:none;border:1px solid var(--border);border-radius:12px;background:#f8fafc;color:var(--muted);padding:12px 14px;font-size:13px;}
 .workspace_notice.open{display:block;}

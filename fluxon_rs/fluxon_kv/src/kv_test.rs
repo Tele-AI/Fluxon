@@ -12,10 +12,11 @@
 use crate::cluster_manager::ClusterManagerRdmaControlInit;
 use crate::config::{
     ClientConfig, ContributeToClusterPoolSize, FluxonKvSpec, KvSsdStorageConfig, LargeFilePaths,
-    MasterConfig, MonitoringConfig, ProtocolConfig, ProtocolType, TestSpecConfig,
-    TestSpecTransportMode, TransferEngineType,
+    MasterConfig, MonitoringConfig, ProtocolConfig, ProtocolType, ReplicaTaskPlacementConfig,
+    TestSpecConfig, TestSpecTransportMode, TransferEngineType,
 };
 use crate::master_kv_router::msg_pack::GetSourceKind;
+use crate::master_kv_router::reclaim_memory_replicas_for_storage_test;
 use crate::run_master_with_test_overrides;
 use crate::{ClientRunTestOverrides, MasterRunTestOverrides, run_client_with_test_overrides};
 // external client runs via run_client when contribution is zero
@@ -41,7 +42,6 @@ const TRANSFER_DATA_PROBE_VALUE_LEN: usize = 256 * 1024;
 const KV_TEST_TRANSFER_PROBE_IO_TIMEOUT_SECS: u64 = 10;
 const KV_TEST_SHUTDOWN_TIMEOUT_SECS: u64 = 60;
 const KV_TEST_SSD_STORAGE_BYTES: u64 = 64 * 1024 * 1024;
-const KV_TEST_STORAGE_PROFILE_SSD_ROUTE_TIMEOUT_SECS: u64 = 30;
 
 fn kv_test_run_scope() -> &'static str {
     static RUN_SCOPE: OnceLock<String> = OnceLock::new();
@@ -185,166 +185,68 @@ fn build_transfer_data_probe_attempt(
     )
 }
 
-async fn verify_external_side_transfer_lane_mapping(
+async fn verify_external_put_uses_bound_owner(
     round: &KvTestRoundOptions,
     external_framework: &Arc<crate::Framework>,
-    remote_owner_instance_key: &str,
+    bound_owner_framework: &Arc<crate::Framework>,
+    bound_owner_instance_key: &str,
 ) {
-    let Some(worker_count) = kv_test_side_transfer_worker_count() else {
-        info!("Skipping external side-transfer lane probe because side-transfer is disabled");
-        return;
-    };
-
     let external_view = external_framework.external_client_api_view().clone();
     let external_api = external_view.external_client_api();
-    let remote_owner_id = round.scoped_instance_key(remote_owner_instance_key);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut attempt = 0_u64;
+    let expected_owner_id = round.scoped_instance_key(bound_owner_instance_key);
+    let actual_owner_id = bound_owner_framework
+        .cluster_manager_view()
+        .cluster_manager()
+        .get_self_info()
+        .id;
+    assert_eq!(actual_owner_id, expected_owner_id);
 
-    loop {
-        attempt += 1;
-        let trace_sink: crate::client_kv_api::TestObservePutPhaseSink = Arc::new(Mutex::new(None));
-        let (key, value) = build_transfer_data_probe_attempt(
-            "external_side_lane_probe",
-            &round.round_name,
-            attempt,
-        );
-        let opts = crate::client_kv_api::PutOptionalArgs(vec![
-            crate::client_kv_api::PutOptionalArg::TestObservePutPhases(trace_sink.clone()),
-        ]);
-        external_api
-            .inner()
-            .put(&key, &value, opts)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "external side-transfer lane probe put failed: key={} attempt={} err={}",
-                    key, attempt, e
-                )
-            });
+    let trace_sink: crate::client_kv_api::TestObservePutPhaseSink = Arc::new(Mutex::new(None));
+    let (key, value) =
+        build_transfer_data_probe_attempt("external_owner_put_probe", &round.round_name, 1);
+    let opts = crate::client_kv_api::PutOptionalArgs(vec![
+        crate::client_kv_api::PutOptionalArg::TestObservePutPhases(trace_sink.clone()),
+    ]);
+    timeout(
+        Duration::from_secs(KV_TEST_TRANSFER_PROBE_IO_TIMEOUT_SECS),
+        external_api.inner().put(&key, &value, opts),
+    )
+    .await
+    .expect("external owner-path Put timed out")
+    .unwrap_or_else(|e| panic!("external owner-path Put failed: key={} err={}", key, e));
 
-        let trace = trace_sink.lock().clone().unwrap_or_else(|| {
+    let trace = trace_sink
+        .lock()
+        .clone()
+        .unwrap_or_else(|| panic!("external owner-path Put missing trace output: key={}", key));
+    assert_eq!(
+        trace.external_side_transfer_peer_id, None,
+        "external Put must not select a side-WRITE peer"
+    );
+    assert_eq!(
+        trace.external_side_transfer_lane_idx, None,
+        "external Put must not bind a side-WRITE lane"
+    );
+    assert_eq!(
+        trace.owner_put_transfer_peer_id, None,
+        "bound-owner shared-memory Put must not perform a source-WRITE transfer"
+    );
+
+    let owner_value = get_owner_probe_value(bound_owner_framework, &key)
+        .await
+        .unwrap_or_else(|e| {
             panic!(
-                "external side-transfer lane probe missing trace output: key={} attempt={}",
-                key, attempt
+                "bound owner could not read external Put: key={} err={}",
+                key, e
             )
         });
-
-        let Some(remote_peer_id) = trace.owner_put_transfer_peer_id.clone() else {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for remote transfer peer: key={} attempt={} owner={} trace={:?}",
-                    key, attempt, remote_owner_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe waiting for remote transfer peer: key={} attempt={} owner={} trace={:?}",
-                key, attempt, remote_owner_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-
-        if !remote_peer_id.starts_with(remote_owner_id.as_str()) {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for owner namespace match: key={} attempt={} owner={} peer={} trace={:?}",
-                    key, attempt, remote_owner_id, remote_peer_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe observed unexpected remote peer before convergence: key={} attempt={} owner={} peer={} trace={:?}",
-                key, attempt, remote_owner_id, remote_peer_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
-        let Some(local_side_id) = trace.external_side_transfer_peer_id.clone() else {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for local side selection: key={} attempt={} remote_peer={} trace={:?}",
-                    key, attempt, remote_peer_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe waiting for local side selection: key={} attempt={} remote_peer={} trace={:?}",
-                key, attempt, remote_peer_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-
-        let Some(local_lane) = trace.external_side_transfer_lane_idx.or_else(|| {
-            crate::client_seg_pool::parse_side_transfer_worker_lane_idx(&local_side_id)
-        }) else {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for local lane parse: key={} attempt={} local_side={} trace={:?}",
-                    key, attempt, local_side_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe waiting for local lane parse: key={} attempt={} local_side={} trace={:?}",
-                key, attempt, local_side_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-
-        if !remote_peer_id.starts_with(&(remote_owner_id.clone() + "__side_")) {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for remote side worker: key={} attempt={} local_side={} remote_peer={} trace={:?}",
-                    key, attempt, local_side_id, remote_peer_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe remote side not ready yet: key={} attempt={} local_side={} remote_peer={} trace={:?}",
-                key, attempt, local_side_id, remote_peer_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
-        let Some(remote_lane) =
-            crate::client_seg_pool::parse_side_transfer_worker_lane_idx(&remote_peer_id)
-        else {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for remote lane parse: key={} attempt={} remote_peer={} trace={:?}",
-                    key, attempt, remote_peer_id, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe waiting for remote lane parse: key={} attempt={} remote_peer={} trace={:?}",
-                key, attempt, remote_peer_id, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        };
-
-        if local_lane != remote_lane {
-            if Instant::now() >= deadline {
-                panic!(
-                    "external side-transfer lane probe timed out waiting for lane alignment: key={} attempt={} local_side={} remote_peer={} local_lane={} remote_lane={} trace={:?}",
-                    key, attempt, local_side_id, remote_peer_id, local_lane, remote_lane, trace
-                );
-            }
-            warn!(
-                "external side-transfer lane probe lane mismatch before convergence: key={} attempt={} local_side={} remote_peer={} local_lane={} remote_lane={} trace={:?}",
-                key, attempt, local_side_id, remote_peer_id, local_lane, remote_lane, trace
-            );
-            sleep(Duration::from_secs(1)).await;
-            continue;
-        }
-
-        info!(
-            "✅ External side-transfer lane mapping verified: key={} worker_count={} local_side={} remote_peer={} lane={}",
-            key, worker_count, local_side_id, remote_peer_id, local_lane
-        );
-        return;
-    }
+    assert_eq!(owner_value, value);
+    info!(
+        "✅ External Put used bound owner without side-WRITE: key={} owner={} configured_side_workers={}",
+        key,
+        expected_owner_id,
+        kv_test_side_transfer_worker_count().unwrap_or(0)
+    );
 }
 
 async fn put_external_probe_value(
@@ -679,7 +581,10 @@ impl KvTestStorageProfile {
         match self {
             Self::Memory => None,
             Self::Ssd | Self::MemorySsd => Some(KvSsdStorageConfig {
-                large_limit_size: vec![KV_TEST_SSD_STORAGE_BYTES],
+                limit_bytes: KV_TEST_SSD_STORAGE_BYTES,
+                write_rate_limit_bytes_per_sec: None,
+                write_burst_bytes: None,
+                capacity_writeback_enabled: true,
             }),
         }
     }
@@ -1083,6 +988,9 @@ fn new_master_launch(
             network: None,
             log_dir,
             master_ui: None,
+            replica_task_placement: ReplicaTaskPlacementConfig::default(),
+            replica_cache_capacity_ratio: crate::config::DEFAULT_REPLICA_CACHE_CAPACITY_RATIO,
+            replica_writeback_tier1_capacity_ratio: None,
             // Keep kv_test self-describing: each round carries the intended transfer mode.
             test_spec_config: kv_test_round_test_spec_config(round.round_profile),
         },
@@ -1124,6 +1032,8 @@ fn build_client_launch(
         contribute_to_cluster_pool_size: contribute_to_cluster_pool_size.clone(),
         protocol: options.protocol_config.unwrap_or_else(tcp_protocol_config),
         pprof_duration_seconds: None,
+        replica_writeback_hot_capacity_ratio: None,
+        owner_placement_class: None,
         redis_compat_listen_addr: None,
         fluxonkv_spec: FluxonKvSpec {
             etcd_addresses: fluxonkv_etcd_addresses,
@@ -1694,84 +1604,24 @@ fn build_storage_profile_probe_value_with_len(tag: &str, len: usize) -> Vec<u8> 
     value
 }
 
-async fn force_evict_memory_replicas_for_storage_probe(
-    master_framework: &crate::Framework,
-    key: &str,
-) {
-    let master_view = master_framework.master_kv_router_view();
-    let deadline =
-        Instant::now() + Duration::from_secs(KV_TEST_STORAGE_PROFILE_SSD_ROUTE_TIMEOUT_SECS);
-    let (put_id, memory_replica_nodes) = loop {
-        if let Some(route) = master_view.master_kv_router().inner().kv_routes.get(key) {
-            let put_id = route.put_id;
-            let memory_replica_nodes = route
-                .node_replicas
-                .read()
-                .iter()
-                .filter_map(|(node_id, replicas)| {
-                    replicas.memory.as_ref().map(|allocation| {
-                        (node_id.clone(), replicas.generation, Arc::clone(allocation))
-                    })
-                })
-                .collect::<Vec<_>>();
-            let ssd_replica_count = route
-                .node_replicas
-                .read()
-                .values()
-                .filter(|replicas| replicas.ssd.is_some())
-                .count();
-            if ssd_replica_count > 0 {
-                break (put_id, memory_replica_nodes);
+async fn wait_storage_probe_ssd_writes_finished(writer_framework: &crate::Framework) {
+    let writer_view = writer_framework.client_kv_api_view();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if writer_view
+                .client_kv_api()
+                .inner()
+                .runtime_observe_snapshot()
+                .local_ssd_put_flights_active
+                == 0
+            {
+                return;
             }
+            sleep(Duration::from_millis(50)).await;
         }
-
-        if Instant::now() >= deadline {
-            panic!(
-                "storage profile probe expected at least one SSD replica before memory eviction: key={} timeout={}s",
-                key, KV_TEST_STORAGE_PROFILE_SSD_ROUTE_TIMEOUT_SECS
-            );
-        }
-        sleep(Duration::from_millis(50)).await;
-    };
-
-    for (node_id, generation, allocation) in memory_replica_nodes {
-        crate::master_kv_router::delete::evict_one_kv_replica_for_node(
-            &master_view,
-            key.to_string(),
-            node_id.clone(),
-            generation,
-            put_id,
-            &allocation,
-        )
-        .unwrap_or_else(|code| {
-            panic!(
-                "storage profile probe failed to evict memory replica: key={} node={} put_id=({},{}) code={}",
-                key, node_id, put_id.0, put_id.1, code
-            )
-        });
-    }
-
-    let Some(route) = master_view.master_kv_router().inner().kv_routes.get(key) else {
-        panic!("storage profile probe route disappeared after memory replicas eviction: key={key}");
-    };
-    assert!(
-        route
-            .node_replicas
-            .read()
-            .values()
-            .all(|replicas| replicas.memory.is_none()),
-        "storage profile probe memory replicas still exist after eviction: key={}",
-        key
-    );
-    assert!(
-        route
-            .node_replicas
-            .read()
-            .values()
-            .any(|replicas| replicas.ssd.is_some()),
-        "storage profile probe SSD replica disappeared after memory replicas eviction: key={}",
-        key
-    );
+    })
+    .await
+    .expect("storage probe writer did not finish outstanding SSD writes");
 }
 
 async fn assert_owner_get_source_kind(
@@ -1825,16 +1675,20 @@ fn invalidate_ssd_route_len_for_storage_probe(master_framework: &crate::Framewor
         .get(key)
         .unwrap_or_else(|| panic!("stale SSD route probe is missing key={key}"));
     let mut node_replicas = route.node_replicas.write();
+    let mut invalidated = 0;
     for replicas in node_replicas.values_mut() {
         if let Some(ssd) = replicas.ssd.as_mut() {
             ssd.len = ssd
                 .len
                 .checked_add(1)
                 .expect("stale SSD route probe length must not overflow");
-            return;
+            invalidated += 1;
         }
     }
-    panic!("stale SSD route probe found no SSD replica for key={key}");
+    assert!(
+        invalidated > 0,
+        "stale SSD route probe found no SSD replica for key={key}"
+    );
 }
 
 async fn assert_stale_ssd_route_retries_to_miss(
@@ -1888,6 +1742,12 @@ async fn run_non_rdma_storage_profile_coverage(
         ])
     };
 
+    // Early SSD writes use a nonblocking admission gate. Drain earlier test
+    // traffic before requiring a fresh probe's SSD publication.
+    if round.storage_profile.requires_ssd_source() {
+        wait_storage_probe_ssd_writes_finished(writer_framework).await;
+    }
+
     let memory_key = format!("storage_profile_memory_key_{}", round.round_name);
     let memory_value = build_storage_profile_probe_value(&format!("{}:memory", round.round_name));
     if round.storage_profile.requires_memory_source() {
@@ -1901,6 +1761,9 @@ async fn run_non_rdma_storage_profile_coverage(
                     memory_key, err
                 )
             });
+        if round.storage_profile.requires_ssd_source() {
+            wait_storage_probe_ssd_writes_finished(writer_framework).await;
+        }
     }
 
     let ssd_key = format!("storage_profile_ssd_key_{}", round.round_name);
@@ -1929,7 +1792,11 @@ async fn run_non_rdma_storage_profile_coverage(
                     ssd_key, err
                 )
             });
-        force_evict_memory_replicas_for_storage_probe(master_framework, &ssd_key).await;
+        reclaim_memory_replicas_for_storage_test(
+            &master_framework.master_kv_router_view(),
+            &ssd_key,
+        )
+        .await;
 
         writer_api
             .inner()
@@ -1945,7 +1812,11 @@ async fn run_non_rdma_storage_profile_coverage(
                     local_small_ssd_key, err
                 )
             });
-        force_evict_memory_replicas_for_storage_probe(master_framework, &local_small_ssd_key).await;
+        reclaim_memory_replicas_for_storage_test(
+            &master_framework.master_kv_router_view(),
+            &local_small_ssd_key,
+        )
+        .await;
 
         writer_api
             .inner()
@@ -1957,7 +1828,11 @@ async fn run_non_rdma_storage_profile_coverage(
                     stale_ssd_key, err
                 )
             });
-        force_evict_memory_replicas_for_storage_probe(master_framework, &stale_ssd_key).await;
+        reclaim_memory_replicas_for_storage_test(
+            &master_framework.master_kv_router_view(),
+            &stale_ssd_key,
+        )
+        .await;
         invalidate_ssd_route_len_for_storage_probe(master_framework, &stale_ssd_key);
     }
 
@@ -2876,41 +2751,40 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
             "🔍 Checking cross-owner replica count for key: {}",
             CLIENT_COMMUNICATION_KEY
         );
-        if let Some(one_kv_nodes_routes) = master_framework
-            .master_kv_router_view()
-            .master_kv_router()
-            .inner()
-            .kv_routes
-            .get(CLIENT_COMMUNICATION_KEY)
-        {
-            let replicas = one_kv_nodes_routes.node_replicas.read();
-            let active_replica_count = replicas
-                .iter()
-                .filter(|(_, replicas)| !replicas.tomb_tag.is_tomb() && replicas.memory.is_some())
-                .count();
-
-            info!(
-                "📊 Replica count for key '{}': {} active replicas",
-                CLIENT_COMMUNICATION_KEY, active_replica_count
-            );
-
-            if active_replica_count < CROSS_OWNER_REPLICA_TARGET_COUNT {
-                panic!(
-                    "Cross-owner replica count check failed: expected >= {}, got {}",
-                    CROSS_OWNER_REPLICA_TARGET_COUNT, active_replica_count
-                );
+        // Async GET may return data before its target route is committed.
+        let replica_count_deadline = Instant::now() + Duration::from_secs(30);
+        let active_replica_count = loop {
+            let active_replica_count = master_framework
+                .master_kv_router_view()
+                .master_kv_router()
+                .inner()
+                .kv_routes
+                .get(CLIENT_COMMUNICATION_KEY)
+                .map(|route| {
+                    route
+                        .node_replicas
+                        .read()
+                        .values()
+                        .filter(|kv_info| !kv_info.tomb_tag.is_tomb())
+                        .count()
+                })
+                .unwrap_or(0);
+            if active_replica_count >= CROSS_OWNER_REPLICA_TARGET_COUNT {
+                break active_replica_count;
             }
-
-            info!(
-                "✅ Cross-owner replica count check PASSED: {} >= {} replicas",
-                active_replica_count, CROSS_OWNER_REPLICA_TARGET_COUNT
+            assert!(
+                Instant::now() < replica_count_deadline,
+                "Cross-owner replica count did not converge for key '{}': expected >= {}, got {}",
+                CLIENT_COMMUNICATION_KEY,
+                CROSS_OWNER_REPLICA_TARGET_COUNT,
+                active_replica_count
             );
-        } else {
-            panic!(
-                "Key '{}' not found in master kv_routes during cross-owner replica count check",
-                CLIENT_COMMUNICATION_KEY
-            );
-        }
+            sleep(Duration::from_millis(50)).await;
+        };
+        info!(
+            "✅ Cross-owner replica count check PASSED: {} >= {} replicas",
+            active_replica_count, CROSS_OWNER_REPLICA_TARGET_COUNT
+        );
 
         // 新客户端尝试获取特殊持久性数据
         info!("New client attempting to get special data stored by the shutdown client");
@@ -3032,8 +2906,13 @@ async fn run_kv_round(round: &KvTestRoundOptions) {
         }
         info!("✅ New client successfully wrote 10 key-value pairs");
 
-        verify_external_side_transfer_lane_mapping(round, &client3_framework, "test_client_new")
-            .await;
+        verify_external_put_uses_bound_owner(
+            round,
+            &client3_framework,
+            &new_client_framework,
+            "test_client_new",
+        )
+        .await;
 
         new_client_framework
     };

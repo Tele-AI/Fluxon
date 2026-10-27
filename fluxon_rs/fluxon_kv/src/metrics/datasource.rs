@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::master_kv_router::MasterKvRouterView;
 use crate::master_kv_router::msg_pack::{GetMasterOnlyMetricPartReq, GetMasterOnlyMetricPartResp};
+use crate::p2p::control_plane_rpc::send_control_plane_rpc_response;
 use crate::p2p::msg_pack::{MsgPack, RPCHandler};
 use crate::rpcresp_kvresult_convert::msg_and_error::KvError;
 use crate::rpcresp_kvresult_convert::{self};
@@ -14,7 +15,7 @@ pub fn register_master_only_metric_handler(view: &MasterKvRouterView) {
         let view_task = view.clone();
         let _ = view.spawn("rpc_get_master_only_metric_part", async move {
             let ack = handle_get_master_only_metric_part(&view_task, msg).await;
-            let _ = resp.send_resp(ack).await;
+            let _ = send_control_plane_rpc_response(&resp, ack).await;
         });
         Ok(())
     });
@@ -41,16 +42,13 @@ async fn handle_get_master_only_metric_part(
         };
     }
 
-    // Read from MasterSegManager directly instead of scraping gauges
-    let segs = view.master_seg_manager().get_all_segments_allocator();
+    // Both allocation authorities expose the same physical-capacity contract.
+    let segments = view.master_seg_manager().snapshot_segment_capacity();
     let mut map: HashMap<String, (u64, u64)> = HashMap::new();
-    for (node_id, allocator) in segs.into_iter() {
-        let total = allocator.total_size_bytes();
-        let used = allocator.used_size_bytes();
-        let available = total.saturating_sub(used);
+    for segment in segments {
         map.insert(
-            format!("{}:{}", node_id, allocator.seg_device_id),
-            (available, total),
+            format!("{}:{}", segment.node_id, segment.device_id),
+            (segment.available_bytes, segment.total_bytes),
         );
     }
     MsgPack {

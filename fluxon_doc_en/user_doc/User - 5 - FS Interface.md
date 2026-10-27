@@ -237,6 +237,7 @@ User-facing examples should set identity explicitly instead of depending on an i
 fluxon_fs:
   master_panel:
     access_db_path: /path/to/access.db
+    require_bootstrap_credentials_change: true
     bootstrap_access_model:
       users:
         - username: admin
@@ -251,6 +252,10 @@ Rules:
 - `bootstrap_access_model` must be provided explicitly in startup config
 - it only writes when `access_db` has no users yet
 - once users already exist, restarts follow the database state
+- `require_bootstrap_credentials_change` defaults to `false`; when enabled, accounts seeded into an empty database must change both their username and password in the Web UI before first use
+- pending accounts can only open the `Change Credentials` page, and S3 requests return `AccessDenied`
+- the pending state and updated credentials are persisted in `access_db`; enabling the option later does not mark accounts already present in the database
+- on Unix, the `access_db` file mode is restricted to `0600`
 - `can_manage_users: true` grants runtime access to all current exports without writing synthetic root scopes
 
 ## Mount Directory Rules

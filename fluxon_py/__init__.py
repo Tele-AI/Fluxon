@@ -66,6 +66,9 @@ __all__ = [
     "KvFuture",
     "MemHolder",
     "FluxonMemHolder",
+    "GpuBufferRegistration",
+    "GpuDestination",
+    "GpuGetStartHandle",
     # Backend management
     "KvClientType",
     "new_store",
@@ -148,6 +151,9 @@ _LAZY_API_EXT_CHAN = {
 
 _LAZY_PYO3 = {
     "FluxonMemHolder": ("kvclient.fluxon", "FluxonMemHolder"),
+    "GpuBufferRegistration": ("kvclient.fluxon", "GpuBufferRegistration"),
+    "GpuDestination": ("kvclient.fluxon", "GpuDestination"),
+    "GpuGetStartHandle": ("kvclient.fluxon", "GpuGetStartHandle"),
 }
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import stat
 import sys
 import tempfile
 import types
@@ -185,6 +186,35 @@ class BridgePrebuiltAuthorityMaterializationTest(unittest.TestCase):
 
             self.assertTrue((target_cache_dir / "meson-0.64.0").is_dir())
             self.assertFalse((target_cache_dir / "meson-0.64.0").is_symlink())
+
+    def test_read_only_native_exports_are_copied_into_writable_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            authoritative_export_dir = root / "authority" / "lib" / "cmake" / "FluxonNative"
+            authoritative_export_dir.mkdir(parents=True)
+            source_bytes = b"/sealed/native_runtime/lib/libexample.so\n"
+            for file_name in _PACKMOD.FLUXON_NATIVE_EXPORT_FILE_NAMES:
+                source_path = authoritative_export_dir / file_name
+                source_path.write_bytes(source_bytes)
+                source_path.chmod(0o555)
+
+            staged_dir = root / "target-cache" / "native_runtime"
+            _PACKMOD._initialize_writable_native_runtime_dir(
+                staged_dir=staged_dir,
+                dir_name="native_runtime",
+                authoritative_export_dir=authoritative_export_dir,
+            )
+
+            for file_name in _PACKMOD.FLUXON_NATIVE_EXPORT_FILE_NAMES:
+                source_path = authoritative_export_dir / file_name
+                staged_path = staged_dir / _PACKMOD.FLUXON_NATIVE_EXPORT_RELATIVE_DIR / file_name
+                self.assertEqual(source_path.read_bytes(), source_bytes)
+                self.assertEqual(stat.S_IMODE(source_path.stat().st_mode), 0o555)
+                self.assertEqual(stat.S_IMODE(staged_path.stat().st_mode), 0o755)
+                self.assertEqual(
+                    staged_path.read_text(encoding="utf-8"),
+                    "/workspace/fluxon_rs/target/native_runtime/lib/libexample.so\n",
+                )
 
     def test_direct_bridge_mounts_skip_dynamic_target_support_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

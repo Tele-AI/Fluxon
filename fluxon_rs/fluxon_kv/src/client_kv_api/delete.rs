@@ -11,25 +11,10 @@ use crate::memholder::{
 use crate::{
     cluster_manager::app_logic_ext::ClusterManagerAppLogicExt,
     master_kv_router::msg_pack::DeleteReq,
-    p2p::msg_pack::MsgPack,
+    p2p::{control_plane_rpc::call_control_plane_rpc, msg_pack::MsgPack},
     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult, OK},
 };
 use limit_thirdparty::tokio;
-
-fn remove_local_cached_info_for_delete(
-    client_inner: &ClientKvApiInner,
-    delete_item: &DeleteClientKvMetaCacheItem,
-) {
-    client_inner
-        .get_cached_info
-        .remove_if(&delete_item.key, |_, v| {
-            if v.put_time_ms == delete_item.put_time_ms {
-                v.put_version <= delete_item.put_version
-            } else {
-                v.put_time_ms <= delete_item.put_time_ms
-            }
-        });
-}
 
 impl ClientKvApiInner {
     pub async fn delete(&self, key: &str) -> KvResult<()> {
@@ -53,25 +38,28 @@ impl ClientKvApiInner {
             .await?;
 
         // 调用 RPC
-        let resp = self
-            .rpc_caller_delete
-            .call(self.view.p2p_module(), master_node_id.into(), req, None, 0)
-            .await
-            .map_err(KvError::from)?;
+        let resp = call_control_plane_rpc(
+            &self.rpc_caller_delete,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            req,
+            None,
+            0,
+        )
+        .await
+        .map_err(KvError::from)?;
 
         crate::rpcresp_kvresult_convert::try_from_code(
             resp.serialize_part.error_code,
             resp.serialize_part.error_json.clone(),
         )?;
 
-        remove_local_cached_info_for_delete(
-            self,
-            &DeleteClientKvMetaCacheItem {
-                key: key.to_string(),
-                put_time_ms: resp.serialize_part.deleted_put_time_ms,
-                put_version: resp.serialize_part.deleted_put_version,
-            },
-        );
+        let delete_item = DeleteClientKvMetaCacheItem {
+            key: key.to_string(),
+            put_time_ms: resp.serialize_part.deleted_put_time_ms,
+            put_version: resp.serialize_part.deleted_put_version,
+        };
+        apply_delete_client_kv_meta_cache_item(&self.view, &delete_item).await;
 
         Ok(())
     }
@@ -99,6 +87,118 @@ pub fn spawn_owner_delete_ack_batch(
     });
 }
 
+async fn apply_delete_client_kv_meta_cache_item(
+    view: &ClientKvApiView,
+    delete_item: &DeleteClientKvMetaCacheItem,
+) {
+    let client_api = view.client_kv_api();
+    let client_inner = client_api.inner();
+
+    let (cached_info, pending_get, released_global_route) = {
+        let controls = client_inner.owner_key_control.lock_key(&delete_item.key);
+        if controls
+            .get(&delete_item.key)
+            .is_some_and(|state| state.local_access_fenced())
+        {
+            tracing::debug!(
+                "skip legacy local-index delete while owner reclaim fence is active: key={}",
+                delete_item.key
+            );
+            return;
+        }
+        let cached_info = client_inner
+            .get_cached_info
+            .remove_if(&delete_item.key, |_, v| {
+                let res = if v.put_time_ms == delete_item.put_time_ms {
+                    v.put_version <= delete_item.put_version
+                } else {
+                    v.put_time_ms <= delete_item.put_time_ms
+                };
+                if res {
+                    tracing::debug!("do remove local cache for key: {}", delete_item.key);
+                } else {
+                    tracing::debug!(
+                        "skip remove local cache for key: {}, request ({},{}), local ({},{})",
+                        delete_item.key,
+                        delete_item.put_time_ms,
+                        delete_item.put_version,
+                        v.put_time_ms,
+                        v.put_version
+                    );
+                }
+                res
+            })
+            .map(|(_, cached_info)| cached_info);
+        let _ = client_inner
+            .local_snapshot_info
+            .remove_if(&delete_item.key, |_, snapshot| {
+                if snapshot.put_time_ms == delete_item.put_time_ms {
+                    snapshot.put_version <= delete_item.put_version
+                } else {
+                    snapshot.put_time_ms <= delete_item.put_time_ms
+                }
+            });
+        let pending_get = client_inner
+            .pending_local_get_info
+            .get(&delete_item.key)
+            .filter(|pending| {
+                if pending.put_id.0 == delete_item.put_time_ms {
+                    pending.put_id.1 <= delete_item.put_version
+                } else {
+                    pending.put_id.0 <= delete_item.put_time_ms
+                }
+            })
+            .map(|pending| pending.value().clone());
+        if let Some(pending) = pending_get.as_ref() {
+            assert!(
+                client_inner.abort_hidden_pending_local_get_locked(&delete_item.key, pending),
+                "DELETE must close the exact hidden Get target before removing its index"
+            );
+        }
+        let released_global_route = client_inner
+            .owner_segment_allocator
+            .lock()
+            .release_deleted_global_manifest_route(
+                &delete_item.key,
+                (delete_item.put_time_ms, delete_item.put_version),
+            );
+        (cached_info, pending_get, released_global_route)
+    };
+    if released_global_route.is_some() {
+        client_inner
+            .owner_local_reserve_rebalance_notify()
+            .notify_waiters();
+    }
+    drop(pending_get);
+    if let Some(cached_info) = cached_info {
+        client_inner.owner_hot_invalidate_version(
+            &delete_item.key,
+            (cached_info.put_time_ms, cached_info.put_version),
+        );
+        let route_already_released = released_global_route.as_ref().is_some_and(|slot| {
+            cached_info.mem_holder.local_reserve_resident_slot_ref()
+                == Some((slot.allocation_id, slot.segment_offset, slot.capacity_bytes))
+        });
+        if !route_already_released {
+            client_inner
+                .release_local_reserve_route_for_memory_info(cached_info.mem_holder.as_ref());
+        }
+    }
+
+    if let Err(err) = client_inner
+        .external_invalidate_delete
+        .sender()
+        .send(delete_item.clone())
+        .await
+    {
+        tracing::warn!(
+            "Failed to enqueue external weak-index invalidation for key '{}': {}",
+            delete_item.key,
+            err
+        );
+    }
+}
+
 /// 批量删除客户端 KV 元数据缓存的处理函数
 pub async fn handle_batch_delete_client_kv_meta_cache(
     view: &ClientKvApiView,
@@ -111,9 +211,6 @@ pub async fn handle_batch_delete_client_kv_meta_cache(
         req.serialize_part.delete_items.len()
     );
 
-    let client_api = view.client_kv_api();
-    let client_inner = client_api.inner();
-
     let mut deleted_count = 0u32;
 
     for delete_item in &req.serialize_part.delete_items {
@@ -124,28 +221,8 @@ pub async fn handle_batch_delete_client_kv_meta_cache(
             delete_item.put_version
         );
 
-        // A remote GET holds this per-key lock until it has installed the
-        // MemoryInfo returned by GetDone. Waiting here prevents an eviction
-        // from arriving before that install and leaving a stale holder cached.
-        let get_lock = client_inner
-            .get_remote_kv_lock
-            .get_lock(delete_item.key.clone());
-        let _get_guard = get_lock.lock().await;
-        remove_local_cached_info_for_delete(client_inner, delete_item);
+        apply_delete_client_kv_meta_cache_item(view, delete_item).await;
         deleted_count += 1;
-
-        if let Err(err) = client_inner
-            .external_invalidate_delete
-            .sender()
-            .send(delete_item.clone())
-            .await
-        {
-            tracing::warn!(
-                "Failed to enqueue external weak-index invalidation for key '{}': {}",
-                delete_item.key,
-                err
-            );
-        }
     }
 
     tracing::debug!(

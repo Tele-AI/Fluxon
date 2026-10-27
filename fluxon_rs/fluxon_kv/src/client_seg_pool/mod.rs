@@ -1,9 +1,14 @@
 use crate::ClientKvApiAccessTrait;
 use crate::client_kv_api::ClientKvApi;
 use crate::client_transfer_engine::{ClientTransferEngine, ClientTransferEngineAccessTrait};
-use crate::cluster_manager::ClusterManagerAccessTrait;
+use crate::cluster_manager::app_logic_ext::ClusterManagerAppLogicExt;
+use crate::cluster_manager::{ClusterManagerAccessTrait, NodeID, NodeRole};
 use crate::config::ContributeToClusterPoolSize;
-use crate::master_seg_manager::msg_pack::SegmentDeviceMemInfo;
+use crate::master_seg_manager::msg_pack::{
+    ConfirmNodeSegmentsRegisteredReq, ConfirmNodeSegmentsRegisteredResp, NodeSegmentRegistration,
+    OwnerPlacementClass, RegisterNodeSegmentsReq, SegmentAllocationAuthority, SegmentDeviceMemInfo,
+};
+use crate::p2p::control_plane_rpc::{call_control_plane_rpc, send_control_plane_rpc_response};
 use crate::p2p::p2p_module::P2pModule;
 use crate::p2p::p2p_module::P2pModuleAccessTrait;
 use crate::rpcresp_kvresult_convert::FromError;
@@ -16,6 +21,7 @@ use crate::{
     p2p::msg_pack::{MsgPack, MsgPackSerializePart, RPCCaller, RPCHandler, RPCReq},
     rpcresp_kvresult_convert::msg_and_error::{ApiError, KvError, KvResult},
 };
+use ::tokio::sync::watch;
 use async_trait::async_trait;
 use bitcode::{Decode, Encode};
 use fluxon_commu::{CpuAllocatedMem, ShareGroupOwnerRef};
@@ -44,6 +50,12 @@ define_module!(
 #[derive(Clone, Debug)]
 pub struct ClientSegPoolNewArg {
     pub contribute_size: ContributeToClusterPoolSize,
+    pub allocation_authority: SegmentAllocationAuthority,
+    pub owner_placement_class: OwnerPlacementClass,
+    /// Initial LocalExclusive byte budget reported with owner-authoritative
+    /// segment registration. None means the master owns allocation.
+    pub owner_local_target_bytes: Option<u64>,
+    pub owner_segment_memfd: bool,
     pub share_mem_path: String,
     pub large_file_paths: crate::config::LargeFilePaths,
     pub cluster_name: String,
@@ -118,6 +130,207 @@ impl MsgPackSerializePart for ResolveSideTransferLaneResp {
 }
 
 pub const SIDE_TRANSFER_PEERS_DIRNAME: &str = "side_transfer_peers";
+
+#[derive(Debug)]
+struct TransferRpcRequiredPeerSet {
+    members: Vec<ClusterMember>,
+    owner_peer_count: usize,
+}
+
+impl TransferRpcRequiredPeerSet {
+    fn has_complete_roles(&self) -> bool {
+        self.owner_peer_count > 0
+    }
+}
+
+fn transfer_rpc_required_peer_set(
+    self_member_id: &str,
+    members: Vec<ClusterMember>,
+) -> TransferRpcRequiredPeerSet {
+    let mut required = Vec::new();
+    let mut owner_peer_count = 0;
+
+    for member in members {
+        if member.id == self_member_id {
+            continue;
+        }
+        match member.node_role() {
+            NodeRole::Client
+                if member
+                    .metadata
+                    .get("p2p_relay")
+                    .is_some_and(|value| value == "true")
+                    && !member
+                        .metadata
+                        .get("side_transfer_worker")
+                        .is_some_and(|value| value == "true") =>
+            {
+                owner_peer_count += 1;
+                required.push(member);
+            }
+            _ => {}
+        }
+    }
+    required.sort_by(|left, right| left.id.cmp(&right.id));
+    required.dedup_by(|left, right| left.id == right.id);
+
+    TransferRpcRequiredPeerSet {
+        members: required,
+        owner_peer_count,
+    }
+}
+
+#[cfg(test)]
+mod transfer_rpc_required_peer_tests {
+    use super::{ClusterMember, transfer_rpc_required_peer_set};
+    use std::collections::HashMap;
+
+    fn member(id: &str, metadata: &[(&str, &str)]) -> ClusterMember {
+        ClusterMember {
+            id: id.to_string(),
+            addresses: Vec::new(),
+            port: None,
+            node_start_time: 1,
+            metadata: metadata
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<HashMap<_, _>>(),
+            sub_cluster: None,
+            network: None,
+        }
+    }
+
+    #[test]
+    fn required_set_contains_segment_owners_but_not_metadata_only_master() {
+        let peers = transfer_rpc_required_peer_set(
+            "owner-self",
+            vec![
+                member("owner-self", &[("client", "true"), ("p2p_relay", "true")]),
+                member("master", &[("master", "true")]),
+                member("owner-peer", &[("client", "true"), ("p2p_relay", "true")]),
+                member(
+                    "side-worker",
+                    &[
+                        ("client", "true"),
+                        ("p2p_relay", "true"),
+                        ("side_transfer_worker", "true"),
+                    ],
+                ),
+                member("external", &[("external_client", "true")]),
+            ],
+        );
+
+        assert!(peers.has_complete_roles());
+        assert_eq!(peers.owner_peer_count, 1);
+        assert_eq!(
+            peers
+                .members
+                .iter()
+                .map(|member| member.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["owner-peer"]
+        );
+    }
+
+    #[test]
+    fn required_set_needs_an_owner_peer_but_never_waits_for_master_transfer_rpc() {
+        let owner_only = transfer_rpc_required_peer_set(
+            "owner-self",
+            vec![member(
+                "owner-peer",
+                &[("client", "true"), ("p2p_relay", "true")],
+            )],
+        );
+        assert!(owner_only.has_complete_roles());
+
+        let master_only = transfer_rpc_required_peer_set(
+            "owner-self",
+            vec![member("master", &[("master", "true")])],
+        );
+        assert!(!master_only.has_complete_roles());
+        assert!(master_only.members.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod owner_segment_memfd_tests {
+    use super::{ClientSegPool, ClientSegPoolNewArg};
+    use crate::config::{ContributeToClusterPoolSize, LargeFilePaths};
+    use crate::master_seg_manager::msg_pack::{OwnerPlacementClass, SegmentAllocationAuthority};
+    use std::collections::HashMap;
+    use std::os::fd::AsRawFd;
+    use uuid::Uuid;
+
+    #[::tokio::test]
+    async fn memfd_segment_is_reopenable_through_published_procfs_symlink() {
+        let root = std::env::temp_dir().join(format!("fluxon_owner_memfd_{}", Uuid::new_v4()));
+        let segment_len = 16 * 1024 * 1024u64;
+        let pool = ClientSegPool::construct(ClientSegPoolNewArg {
+            contribute_size: ContributeToClusterPoolSize {
+                dram: segment_len,
+                vram: HashMap::new(),
+            },
+            allocation_authority: SegmentAllocationAuthority::Owner,
+            owner_placement_class: OwnerPlacementClass::Inference,
+            owner_local_target_bytes: Some(segment_len / 2),
+            owner_segment_memfd: true,
+            share_mem_path: root.to_string_lossy().into_owned(),
+            large_file_paths: LargeFilePaths { paths: Vec::new() },
+            cluster_name: "memfd-test".to_string(),
+            etcd_addresses: vec!["127.0.0.1:2379".to_string()],
+            attach_existing_meta: None,
+            side_transfer_worker: false,
+            require_transfer_rpc_fast_path_ready_timeout: None,
+        })
+        .await
+        .unwrap();
+
+        let path = root.join("mmap.file");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let target = std::fs::read_link(&path).unwrap();
+        assert!(
+            target
+                .to_string_lossy()
+                .starts_with(&format!("/proc/{}/fd/", std::process::id()))
+        );
+        let reopened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(reopened.metadata().unwrap().len(), segment_len);
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                segment_len as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                reopened.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapped, libc::MAP_FAILED);
+        unsafe {
+            *(mapped as *mut u8) = 0x5a;
+        }
+        let guard = pool.0.cpu_allocated_mem.read().await;
+        assert_eq!(
+            unsafe { *(guard.as_ref().unwrap().allocated_addr as *const u8) },
+            0x5a
+        );
+        drop(guard);
+        unsafe {
+            libc::munmap(mapped, segment_len as usize);
+        }
+        drop(pool);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
 
 pub(crate) fn parse_side_transfer_worker_lane_idx(instance_key: &str) -> Option<u16> {
     let (_, suffix) = instance_key.rsplit_once("__side_")?;
@@ -205,6 +418,11 @@ pub struct ClientSegPoolInner {
     large_file_paths: crate::config::LargeFilePaths,
     side_transfer_worker: bool,
     attach_owner_ref: Option<ShareGroupOwnerRef>,
+    allocation_authority: SegmentAllocationAuthority,
+    owner_placement_class: OwnerPlacementClass,
+    owner_local_target_bytes: Option<u64>,
+    rpc_caller_register_node_segments: RPCCaller<RegisterNodeSegmentsReq>,
+    master_registration_terminal_tx: watch::Sender<Option<MasterRegistrationTerminal>>,
 
     // Redundant fields written to shared.json for external bootstrap and strict validation.
     cluster_name: String,
@@ -213,6 +431,41 @@ pub struct ClientSegPoolInner {
 
     /// Whether we've already notified external by writing memory.file after readiness
     ready_notified: AtomicBool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MasterRegistrationTerminal {
+    master_node_id: String,
+    master_node_start_time: i64,
+    owner_node_start_time: i64,
+}
+
+fn new_master_registration_terminal_tx() -> watch::Sender<Option<MasterRegistrationTerminal>> {
+    watch::channel(None).0
+}
+
+fn master_registration_terminal_matches(
+    inner: &ClientSegPoolInner,
+    terminal: Option<&MasterRegistrationTerminal>,
+    master_node_id: &NodeID,
+    owner_node_start_time: i64,
+) -> bool {
+    let Some(terminal) = terminal else {
+        return false;
+    };
+    if terminal.master_node_id != master_node_id.as_ref()
+        || terminal.owner_node_start_time != owner_node_start_time
+    {
+        return false;
+    }
+    inner
+        .view()
+        .cluster_manager()
+        .get_member_info_cached(master_node_id.as_ref())
+        .is_some_and(|member| {
+            member.node_role() == NodeRole::Master
+                && member.node_start_time == terminal.master_node_start_time
+        })
 }
 
 #[inline]
@@ -261,6 +514,7 @@ fn mapped_range_contains(
 mod range_guard_tests {
     use super::{
         ARwLock, AtomicBool, ClientMappedMem, ClientSegPool, ClientSegPoolInner, CpuAllocatedMem,
+        RPCCaller, new_master_registration_terminal_tx,
     };
     use std::fs::File;
     use std::sync::Arc;
@@ -282,6 +536,11 @@ mod range_guard_tests {
             large_file_paths: crate::config::LargeFilePaths { paths: Vec::new() },
             side_transfer_worker: false,
             attach_owner_ref: None,
+            allocation_authority: super::SegmentAllocationAuthority::Master,
+            owner_placement_class: super::OwnerPlacementClass::Invalid,
+            owner_local_target_bytes: None,
+            rpc_caller_register_node_segments: RPCCaller::new(),
+            master_registration_terminal_tx: new_master_registration_terminal_tx(),
             cluster_name: String::new(),
             etcd_addresses: Vec::new(),
             require_transfer_rpc_fast_path_ready_timeout: None,
@@ -353,6 +612,10 @@ impl ClientSegPool {
         );
 
         let contribute_size = arg.contribute_size;
+        let allocation_authority = arg.allocation_authority;
+        let owner_placement_class = arg.owner_placement_class;
+        let owner_local_target_bytes = arg.owner_local_target_bytes;
+        let owner_segment_memfd = arg.owner_segment_memfd;
         let share_mem_path = arg.share_mem_path;
         let large_file_paths = arg.large_file_paths;
         let cluster_name = arg.cluster_name;
@@ -451,6 +714,11 @@ impl ClientSegPool {
                 large_file_paths: large_file_paths.clone(),
                 side_transfer_worker,
                 attach_owner_ref,
+                allocation_authority,
+                owner_placement_class,
+                owner_local_target_bytes,
+                rpc_caller_register_node_segments: RPCCaller::new(),
+                master_registration_terminal_tx: new_master_registration_terminal_tx(),
                 cluster_name: cluster_name.clone(),
                 etcd_addresses: etcd_addresses.clone(),
                 require_transfer_rpc_fast_path_ready_timeout,
@@ -467,6 +735,11 @@ impl ClientSegPool {
                 large_file_paths: large_file_paths.clone(),
                 side_transfer_worker,
                 attach_owner_ref,
+                allocation_authority,
+                owner_placement_class,
+                owner_local_target_bytes,
+                rpc_caller_register_node_segments: RPCCaller::new(),
+                master_registration_terminal_tx: new_master_registration_terminal_tx(),
                 cluster_name: cluster_name.clone(),
                 etcd_addresses: etcd_addresses.clone(),
                 require_transfer_rpc_fast_path_ready_timeout,
@@ -510,7 +783,7 @@ impl ClientSegPool {
         })?;
 
         let mmap_file_path = Path::new(base_path).join("mmap.file");
-        if mmap_file_path.exists() {
+        if std::fs::symlink_metadata(&mmap_file_path).is_ok() {
             std::fs::remove_file(&mmap_file_path).map_err(|e| {
                 KvError::SharedMem(
                     crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
@@ -522,27 +795,68 @@ impl ClientSegPool {
             })?;
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o666)
-            .open(&mmap_file_path)
-            .map_err(|e| {
-                KvError::SharedMem(
+        let file = if owner_segment_memfd {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd;
+            use std::os::unix::fs::symlink;
+
+            let name = CString::new("fluxon-owner-segment").expect("static memfd name");
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC as u32) };
+            if fd < 0 {
+                return Err(KvError::SharedMem(
                     crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
                         path: mmap_file_path.to_string_lossy().to_string(),
                         len: map_len as u64,
-                        detail: format!("Failed to create mmap.file: {}", e),
+                        detail: format!("memfd_create failed: {}", std::io::Error::last_os_error()),
                     },
-                )
-            })?;
+                ));
+            }
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let procfs_target = format!("/proc/{}/fd/{fd}", std::process::id());
+            if let Err(error) = symlink(&procfs_target, &mmap_file_path) {
+                return Err(KvError::SharedMem(
+                    crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
+                        path: mmap_file_path.to_string_lossy().to_string(),
+                        len: map_len as u64,
+                        detail: format!(
+                            "failed to publish memfd procfs symlink target={procfs_target}: {error}"
+                        ),
+                    },
+                ));
+            }
+            tracing::info!(
+                path = %mmap_file_path.display(),
+                target = %procfs_target,
+                len = map_len,
+                "owner DRAM segment uses memfd pathname attach"
+            );
+            file
+        } else {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o666)
+                .open(&mmap_file_path)
+                .map_err(|e| {
+                    KvError::SharedMem(
+                        crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
+                            path: mmap_file_path.to_string_lossy().to_string(),
+                            len: map_len as u64,
+                            detail: format!("Failed to create mmap.file: {}", e),
+                        },
+                    )
+                })?
+        };
 
         let fd = file.as_raw_fd();
         unsafe {
             let ret = libc::ftruncate(fd, map_len as i64);
             if ret != 0 {
+                if owner_segment_memfd {
+                    let _ = std::fs::remove_file(&mmap_file_path);
+                }
                 return Err(KvError::SharedMem(
                     crate::rpcresp_kvresult_convert::msg_and_error::SharedMemError::MappingFailed {
                         path: mmap_file_path.to_string_lossy().to_string(),
@@ -617,6 +931,11 @@ impl ClientSegPool {
             large_file_paths,
             side_transfer_worker,
             attach_owner_ref,
+            allocation_authority,
+            owner_placement_class,
+            owner_local_target_bytes,
+            rpc_caller_register_node_segments: RPCCaller::new(),
+            master_registration_terminal_tx: new_master_registration_terminal_tx(),
             cluster_name,
             etcd_addresses,
             require_transfer_rpc_fast_path_ready_timeout,
@@ -637,40 +956,10 @@ impl ClientSegPool {
         &self.inner().large_file_paths
     }
 
-    fn transfer_rpc_fast_path_eligible_members(&self) -> Vec<ClusterMember> {
+    fn transfer_rpc_fast_path_required_members(&self) -> TransferRpcRequiredPeerSet {
         let inner = self.inner();
         let self_info = inner.view().cluster_manager().get_self_info();
-        inner
-            .view()
-            .cluster_manager()
-            .get_client_members()
-            .into_iter()
-            .filter(|member| member.id != self_info.id)
-            .filter(|member| {
-                member
-                    .metadata
-                    .get("client")
-                    .is_some_and(|value| value == "true")
-            })
-            .filter(|member| {
-                member
-                    .metadata
-                    .get("p2p_relay")
-                    .is_some_and(|value| value == "true")
-            })
-            .filter(|member| {
-                !member
-                    .metadata
-                    .get("external_client")
-                    .is_some_and(|value| value == "true")
-            })
-            .filter(|member| {
-                !member
-                    .metadata
-                    .get("side_transfer_worker")
-                    .is_some_and(|value| value == "true")
-            })
-            .collect()
+        transfer_rpc_required_peer_set(&self_info.id, inner.view().cluster_manager().get_members())
     }
 
     fn format_transfer_rpc_fast_path_pending_details(
@@ -719,10 +1008,10 @@ impl ClientSegPool {
         let self_info = inner.view().cluster_manager().get_self_info();
 
         loop {
-            let eligible_members = self.transfer_rpc_fast_path_eligible_members();
-            if !eligible_members.is_empty() {
+            let required_peers = self.transfer_rpc_fast_path_required_members();
+            if required_peers.has_complete_roles() {
                 let snapshot = inner.view().p2p_module().tier_snapshot();
-                let all_ready = eligible_members.iter().all(|member| {
+                let all_ready = required_peers.members.iter().all(|member| {
                     let peer_id = member.id.clone().into();
                     snapshot
                         .peer_gen(&peer_id)
@@ -732,7 +1021,8 @@ impl ClientSegPool {
                     tracing::info!(
                         owner_id = %self_info.id,
                         owner_start_time = self_info.node_start_time,
-                        peer_count = eligible_members.len(),
+                        peer_count = required_peers.members.len(),
+                        owner_peer_count = required_peers.owner_peer_count,
                         elapsed_ms = started_at.elapsed().as_millis(),
                         "required transfer-rpc fast path ready for all eligible owner peers"
                     );
@@ -742,16 +1032,19 @@ impl ClientSegPool {
 
             let elapsed = started_at.elapsed();
             if elapsed >= timeout {
-                let detail = if eligible_members.is_empty() {
+                let detail = if !required_peers.has_complete_roles() {
                     format!(
-                        "no eligible owner peers observed within {:?}; self={} start_time={}",
-                        timeout, self_info.id, self_info.node_start_time
+                        "required owner peer set incomplete within {:?}; self={} start_time={} owner_peer_count={}",
+                        timeout,
+                        self_info.id,
+                        self_info.node_start_time,
+                        required_peers.owner_peer_count,
                     )
                 } else {
                     format!(
                         "pending peers after {:?}: {}",
                         timeout,
-                        self.format_transfer_rpc_fast_path_pending_details(&eligible_members)
+                        self.format_transfer_rpc_fast_path_pending_details(&required_peers.members)
                     )
                 };
                 return Err(KvError::Api(ApiError::Unknown {
@@ -1090,15 +1383,24 @@ impl LogicalModule for ClientSegPool {
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
         let _ = self.remove_side_transfer_peer().await;
-        loop {
-            if self.inner().view().client_kv_api().can_be_dropped() {
-                tracing::info!("ClientSegPool can be dropped");
-                break;
+        if !matches!(
+            self.inner()
+                .view()
+                .cluster_manager()
+                .get_self_info()
+                .node_role(),
+            NodeRole::External
+        ) {
+            loop {
+                if self.inner().view().client_kv_api().can_be_dropped() {
+                    tracing::info!("ClientSegPool can be dropped");
+                    break;
+                }
+                tracing::info!(
+                    "ClientSegPool waiting ClientKvApi can not be dropped , will try again after 3s (some user memholder may still be in use)"
+                );
+                tokio::time::sleep(Duration::from_secs(3)).await;
             }
-            tracing::info!(
-                "ClientSegPool waiting ClientKvApi can not be dropped , will try again after 3s (some user memholder may still be in use)"
-            );
-            tokio::time::sleep(Duration::from_secs(3)).await;
         }
 
         if self.0.cpu_allocated_mem.read().await.is_some() {
@@ -1111,6 +1413,15 @@ impl LogicalModule for ClientSegPool {
 impl ClientSegPool {
     pub async fn init2_for_init_dag(&self) -> KvResult<()> {
         let inner = &self.0;
+        if matches!(
+            inner.view().cluster_manager().get_self_info().node_role(),
+            NodeRole::External
+        ) {
+            // External clients contribute no cache segment. They construct this
+            // module only to provide lifetime guards for an explicitly
+            // registered GPU staging range.
+            return Ok(());
+        }
 
         // English note:
         // - Invariant: register inbound RPC handlers before any awaited etcd operations that
@@ -1120,15 +1431,14 @@ impl ClientSegPool {
         // - This must be done before `set_self_shared_*` because those methods await etcd writes.
         if !inner.side_transfer_worker {
             let view = inner.view().clone();
-            RPCHandler::<RequestSegmentRegistrationReq>::new().regist(
-                inner.view().p2p_module(),
-                move |resp, req| {
+            RPCHandler::<RequestSegmentRegistrationReq>::new()
+                .regist_for_init_dag(inner.view().p2p_module(), move |resp, req| {
                     let view = view.clone();
                     let view_task = view.clone();
                     let req = req.serialize_part;
                     let _ = view.spawn("rpc_request_segment_registration", async move {
                         let response = handle_segment_registration_request(view_task, req).await;
-                        if let Err(e) = resp.send_resp(response).await {
+                        if let Err(e) = send_control_plane_rpc_response(&resp, response).await {
                             tracing::error!(
                                 "Failed to send RequestSegmentRegistrationResp: {:?}",
                                 e
@@ -1136,14 +1446,49 @@ impl ClientSegPool {
                         }
                     });
                     Ok(())
-                },
-            );
+                })
+                .await?;
+
+            let view = inner.view().clone();
+            RPCHandler::<ConfirmNodeSegmentsRegisteredReq>::new()
+                .regist_for_init_dag(inner.view().p2p_module(), move |resp, req| {
+                    let view = view.clone();
+                    let view_task = view.clone();
+                    let caller = resp.node_id();
+                    let caller_node_start_time = resp.node_start_time();
+                    let req = req.serialize_part;
+                    let _ = view.spawn("rpc_confirm_node_segments_registered", async move {
+                        let response = handle_node_segments_registered_confirmation(
+                            &view_task,
+                            &caller,
+                            caller_node_start_time,
+                            req,
+                        );
+                        if let Err(error) = send_control_plane_rpc_response(
+                            &resp,
+                            MsgPack {
+                                serialize_part: response,
+                                raw_bytes: Vec::new(),
+                            },
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                %error,
+                                master = %caller,
+                                master_node_start_time = caller_node_start_time,
+                                "failed to send master-pull registration terminal response"
+                            );
+                        }
+                    });
+                    Ok(())
+                })
+                .await?;
 
             RPCCaller::<ResolveSideTransferLaneReq>::new().regist(inner.view().p2p_module());
             let view = inner.view().clone();
-            RPCHandler::<ResolveSideTransferLaneReq>::new().regist(
-                inner.view().p2p_module(),
-                move |resp, req| {
+            RPCHandler::<ResolveSideTransferLaneReq>::new()
+                .regist_for_init_dag(inner.view().p2p_module(), move |resp, req| {
                     let view = view.clone();
                     let view_task = view.clone();
                     let req = req.serialize_part;
@@ -1155,9 +1500,13 @@ impl ClientSegPool {
                         }
                     });
                     Ok(())
-                },
-            );
+                })
+                .await?;
         }
+
+        inner
+            .rpc_caller_register_node_segments
+            .regist(inner.view().p2p_module());
 
         let owner_ref = inner
             .attach_owner_ref
@@ -1193,6 +1542,227 @@ impl ClientSegPool {
             tracing::info!("No CPU memory allocated, no segments to register");
         }
         Ok(())
+    }
+
+    fn node_segment_registration(
+        inner: &ClientSegPoolInner,
+        cpu_mem: &ClientMappedMem,
+    ) -> NodeSegmentRegistration {
+        NodeSegmentRegistration {
+            allocation_authority: inner.allocation_authority,
+            owner_placement_class: inner.owner_placement_class,
+            owner_local_target_bytes: inner.owner_local_target_bytes,
+            seg_map: new_map!(HashMap {
+                "cpu:0".to_string() => (
+                    SegmentDeviceDescription::Cpu,
+                    SegmentDeviceMemInfo {
+                        addr: cpu_mem.allocated_addr,
+                        len: cpu_mem.allocated_size,
+                    },
+                )
+            }),
+        }
+    }
+
+    /// Complete the owner-side distributed init DAG by registering the exact
+    /// segment generation at the master and waiting for its idempotent ACK.
+    pub async fn register_master_for_init_dag(&self) -> KvResult<()> {
+        const REGISTRATION_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+        const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+        const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+        let inner = &self.0;
+        if inner.side_transfer_worker
+            || matches!(
+                inner.view().cluster_manager().get_self_info().node_role(),
+                NodeRole::External
+            )
+        {
+            return Ok(());
+        }
+
+        let registration = {
+            let cpu_mem_guard = inner.cpu_allocated_mem.read().await;
+            let Some(cpu_mem) = cpu_mem_guard.as_ref() else {
+                tracing::info!(
+                    "No CPU segment; owner-to-master segment registration DAG node is a no-op"
+                );
+                return Ok(());
+            };
+            Self::node_segment_registration(inner, cpu_mem)
+        };
+        let self_info = inner.view().cluster_manager().get_self_info();
+        let owner_node_start_time = self_info.node_start_time;
+        let request = MsgPack {
+            serialize_part: RegisterNodeSegmentsReq {
+                owner_node_start_time,
+                registration,
+            },
+            raw_bytes: Vec::new(),
+        };
+
+        let master_node_id = inner
+            .view()
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let master_node_id = master_node_id.into();
+        let mut master_pull_terminal_rx = inner.master_registration_terminal_tx.subscribe();
+        let mut attempt = 0u64;
+        let mut backoff = INITIAL_RETRY_BACKOFF;
+        loop {
+            if master_registration_terminal_matches(
+                inner,
+                master_pull_terminal_rx.borrow().as_ref(),
+                &master_node_id,
+                owner_node_start_time,
+            ) {
+                let terminal = master_pull_terminal_rx
+                    .borrow()
+                    .clone()
+                    .expect("matched master registration terminal");
+                tracing::info!(
+                    owner = %self_info.id,
+                    owner_node_start_time,
+                    master = %master_node_id,
+                    master_node_start_time = terminal.master_node_start_time,
+                    "owner registration DAG completed through master-pull terminal"
+                );
+                self.notify_external_ready().await?;
+                return Ok(());
+            }
+
+            attempt = attempt.saturating_add(1);
+            let readiness = inner
+                .view()
+                .p2p_module()
+                .ensure_peer_send_ready(&master_node_id)
+                .await;
+            let readiness = readiness.and_then(|()| {
+                let snapshot = inner.view().p2p_module().tier_snapshot();
+                let peer_gen = snapshot.peer_gen(&master_node_id);
+                let send_ready = peer_gen
+                    .as_ref()
+                    .is_some_and(|peer_gen| snapshot.is_any_send_ready(peer_gen));
+                let bidirectional_advertised = peer_gen
+                    .as_ref()
+                    .is_some_and(|peer_gen| snapshot.is_bidirectional_direct_advertised(peer_gen));
+                let ready = send_ready && bidirectional_advertised;
+                if send_ready && (attempt == 1 || attempt.is_power_of_two()) {
+                    let self_id = &snapshot.self_peer_gen.peer_id;
+                    let forward_advertised = snapshot
+                        .direct_graph
+                        .get(self_id)
+                        .is_some_and(|targets| targets.contains(&master_node_id));
+                    let reverse_advertised = snapshot
+                        .direct_graph
+                        .get(&master_node_id)
+                        .is_some_and(|targets| targets.contains(self_id));
+                    let peer_gen = peer_gen.as_ref().expect("ready peer generation");
+                    tracing::info!(
+                        owner = %self_info.id,
+                        master = %master_node_id,
+                        attempt,
+                        intra_ready = snapshot.is_send_ready_intra_effective(peer_gen),
+                        direct_ready = snapshot.is_send_ready_direct(peer_gen),
+                        bidirectional_advertised,
+                        forward_advertised,
+                        reverse_advertised,
+                        "owner registration DAG observed P2P dependency state"
+                    );
+                }
+                if ready {
+                    Ok(())
+                } else {
+                    Err(crate::p2p::P2PError::NoConnectionReady {
+                        nodeid: master_node_id.to_string(),
+                    })
+                }
+            });
+            let result = match readiness {
+                Ok(()) => Some(
+                    call_control_plane_rpc(
+                        &inner.rpc_caller_register_node_segments,
+                        inner.view().p2p_module(),
+                        master_node_id.clone(),
+                        request.clone(),
+                        Some(REGISTRATION_RPC_TIMEOUT),
+                        1,
+                    )
+                    .await,
+                ),
+                Err(error) => {
+                    if attempt == 1 || attempt.is_power_of_two() {
+                        tracing::info!(
+                            owner = %self_info.id,
+                            owner_node_start_time,
+                            master = %master_node_id,
+                            attempt,
+                            %error,
+                            "owner registration DAG is waiting for the bidirectional P2P graph node"
+                        );
+                    }
+                    None
+                }
+            };
+
+            match result {
+                None => {}
+                Some(Ok(response)) => {
+                    crate::rpcresp_kvresult_convert::try_from_code(
+                        response.serialize_part.error_code,
+                        response.serialize_part.error_json,
+                    )?;
+                    if response.serialize_part.accepted_owner_node_start_time
+                        != owner_node_start_time
+                    {
+                        return Err(KvError::Api(ApiError::OwnerStartTimeMismatch {
+                            expected: owner_node_start_time,
+                            got: response.serialize_part.accepted_owner_node_start_time,
+                        }));
+                    }
+                    tracing::info!(
+                        owner = %self_info.id,
+                        owner_node_start_time,
+                        master = %master_node_id,
+                        attempt,
+                        "owner segment registration DAG terminal acknowledged by master"
+                    );
+                    self.notify_external_ready().await?;
+                    return Ok(());
+                }
+                Some(Err(error)) => {
+                    if attempt == 1 || attempt.is_power_of_two() {
+                        tracing::warn!(
+                            owner = %self_info.id,
+                            owner_node_start_time,
+                            master = %master_node_id,
+                            attempt,
+                            %error,
+                            "owner segment registration DAG edge is not ready; retrying"
+                        );
+                    }
+                }
+            }
+
+            let sleep = tokio::time::sleep(backoff);
+            tokio::pin!(sleep);
+            tokio::select! {
+                changed = master_pull_terminal_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(KvError::Api(ApiError::InvalidArgument {
+                            detail: "master registration terminal channel closed during init DAG"
+                                .to_string(),
+                        }));
+                    }
+                }
+                _ = &mut sleep => {}
+            }
+            backoff = backoff
+                .checked_mul(2)
+                .unwrap_or(MAX_RETRY_BACKOFF)
+                .min(MAX_RETRY_BACKOFF);
+        }
     }
 
     /// After the owner has completed master segment registration, notify external by
@@ -1348,6 +1918,81 @@ impl ClientSegPool {
     }
 }
 
+fn handle_node_segments_registered_confirmation(
+    view: &ClientSegPoolView,
+    caller: &NodeID,
+    caller_node_start_time: i64,
+    req: ConfirmNodeSegmentsRegisteredReq,
+) -> ConfirmNodeSegmentsRegisteredResp {
+    let self_info = view.cluster_manager().get_self_info();
+    let error = if req.owner_node_start_time != self_info.node_start_time {
+        Some(KvError::Api(ApiError::OwnerStartTimeMismatch {
+            expected: self_info.node_start_time,
+            got: req.owner_node_start_time,
+        }))
+    } else if req.master_node_start_time != caller_node_start_time {
+        Some(KvError::Api(ApiError::InvalidArgument {
+            detail: format!(
+                "master registration terminal generation mismatch: transport={} request={}",
+                caller_node_start_time, req.master_node_start_time
+            ),
+        }))
+    } else {
+        match view
+            .cluster_manager()
+            .get_member_info_cached(caller.as_ref())
+        {
+            Some(member)
+                if member.node_role() == NodeRole::Master
+                    && member.node_start_time == caller_node_start_time =>
+            {
+                None
+            }
+            Some(member) => Some(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "registration terminal source is not the current master generation: node={} role={:?} cached_generation={} transport_generation={}",
+                    caller,
+                    member.node_role(),
+                    member.node_start_time,
+                    caller_node_start_time
+                ),
+            })),
+            None => Some(KvError::Api(ApiError::InvalidArgument {
+                detail: format!(
+                    "registration terminal source is absent from current membership: node={} generation={}",
+                    caller, caller_node_start_time
+                ),
+            })),
+        }
+    };
+
+    if let Some(error) = error {
+        return ConfirmNodeSegmentsRegisteredResp::from_error(&error);
+    }
+
+    view.client_seg_pool()
+        .inner()
+        .master_registration_terminal_tx
+        .send_replace(Some(MasterRegistrationTerminal {
+            master_node_id: caller.to_string(),
+            master_node_start_time: caller_node_start_time,
+            owner_node_start_time: self_info.node_start_time,
+        }));
+    tracing::info!(
+        owner = %self_info.id,
+        owner_node_start_time = self_info.node_start_time,
+        master = %caller,
+        master_node_start_time = caller_node_start_time,
+        "owner observed master-pull segment registration DAG terminal"
+    );
+    ConfirmNodeSegmentsRegisteredResp {
+        error_code: OK,
+        error_json: String::new(),
+        accepted_owner_node_start_time: self_info.node_start_time,
+        accepted_master_node_start_time: caller_node_start_time,
+    }
+}
+
 /// Handle segment registration request from master
 async fn handle_segment_registration_request(
     view: ClientSegPoolView,
@@ -1372,33 +2017,24 @@ async fn handle_segment_registration_request(
     let inner = &client_seg_pool.inner();
     let cpu_mem_guard = inner.cpu_allocated_mem.read().await;
     if let Some(cpu_mem) = cpu_mem_guard.as_ref() {
-        let seg_map = new_map!(HashMap {
-            "cpu:0".to_string() => (
-                SegmentDeviceDescription::Cpu,
-                SegmentDeviceMemInfo {
-                    addr: cpu_mem.allocated_addr,
-                    len: cpu_mem.allocated_size,
-                },
-            )
-        });
+        let registration = ClientSegPool::node_segment_registration(inner, cpu_mem);
 
-        tracing::info!("Sending segment map to master: {:?}", seg_map);
+        tracing::info!(
+            "Sending segment map to master recovery pull: {:?}",
+            registration.seg_map
+        );
         let resp = MsgPack {
             serialize_part: RequestSegmentRegistrationResp {
                 error_code: OK,
                 error_json: String::new(),
-                seg_map,
+                registration: Some(registration),
             },
             raw_bytes: Vec::new(),
         };
-        // After preparing a valid registration response, publish shared.json asynchronously.
-        // notify_external_ready() performs its own transfer-rpc readiness wait when required.
-        let view_task = view.clone();
-        let _ = view.spawn("notify_external_ready_after_registration", async move {
-            if let Err(e) = view_task.client_seg_pool().notify_external_ready().await {
-                tracing::warn!("Failed to notify external ready (memory.file): {}", e);
-            }
-        });
+        // This master-pull response is recovery evidence, not the owner-side DAG
+        // terminal: the owner cannot know whether the master received and installed
+        // it.  Only RegisterNodeSegmentsResp is an acknowledgement, so shared.json
+        // remains unpublished until register_master_for_init_dag receives that ACK.
         resp
     } else {
         tracing::info!("No CPU memory allocated, reporting not configured to master.");

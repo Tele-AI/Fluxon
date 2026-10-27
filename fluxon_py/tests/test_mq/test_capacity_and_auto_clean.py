@@ -46,6 +46,7 @@ TTL_SECONDS = CHAN_MIN_TTL_SECONDS
 PAYLOAD_SIZE_BYTES = 100 * 1024 * 1024
 BLOCK_TIMEOUT_SECONDS = 10.0
 CLOSE_JOIN_TIMEOUT_SECONDS = 10.0
+PREFIX_INDEX_TIMEOUT_SECONDS = 30.0
 NON_CAPACITY_EXTRA_SUCCESS_PUTS = 8
 MPSC_PHYSICAL_FILL_HEADROOM_DENOMINATOR = 2
 
@@ -201,6 +202,18 @@ def run_for_chan_type(chan_type: ChanType, cap_check: CapCheck) -> None:
     block_probe_state: BlockingProbeState | None = None
     if cap_check == CapCheck.REQUIRED:
         assert extra_producer is not None
+        # Capacity uses an asynchronous prefix index; wait for the initial puts.
+        prefix = f"/mpmc/{producer.get_chan_id()}/"
+        deadline = time.monotonic() + PREFIX_INDEX_TIMEOUT_SECONDS
+        while True:
+            count = store.count_prefix(prefix).unwrap("observe initial MQ payloads")
+            if count == CAPACITY:
+                break
+            assert count < CAPACITY, f"unexpected MQ payload count: {count} > {CAPACITY}"
+            assert time.monotonic() < deadline, (
+                f"prefix index did not observe {CAPACITY} initial MQ payloads: count={count}"
+            )
+            time.sleep(0.05)
         block_probe_state = BlockingProbeState()
         block_probe_thread = threading.Thread(
             target=_run_blocking_probe,

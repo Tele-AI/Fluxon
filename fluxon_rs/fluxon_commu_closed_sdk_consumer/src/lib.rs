@@ -15,8 +15,9 @@ use fluxon_commu_contract::{
     ClosedRuntimeDispatchTransportPolicy, ClosedRuntimeError, ClosedRuntimeHandle,
     ClosedRuntimeHostCallbackHandle, ClosedRuntimeLocalMemoryKind, ClosedRuntimeP2pCall,
     ClosedRuntimeP2pCallRawObservedRequestView, ClosedRuntimeP2pResponse,
-    ClosedRuntimeP2pSendResponseRawRequestView, ClosedRuntimePeerGen, ClosedRuntimeRawSlice,
-    ClosedRuntimeRequest, ClosedRuntimeResponse, ClosedRuntimeTransferEngineCall,
+    ClosedRuntimeP2pSendResponseRawRequestView, ClosedRuntimePeerGen,
+    ClosedRuntimeProcessLoggingConfig, ClosedRuntimeRawSlice, ClosedRuntimeRequest,
+    ClosedRuntimeResponse, ClosedRuntimeTransferEngineCall,
     ClosedRuntimeTransferEngineOpenRuntimeRequest, ClosedRuntimeTransferEngineOpenRuntimeResponse,
     ClosedRuntimeTransferEngineResponse, ClosedRuntimeUserRpcBytesRequestView,
     ClosedRuntimeUserRpcHandlerLocalObserveView, ClosedRuntimeWireBodyView,
@@ -26,8 +27,8 @@ use fluxon_commu_contract::{
 
 pub mod rdma_probe;
 
-pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 7;
-pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 9;
+pub const FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION: u32 = 8;
+pub const FLUXON_COMMU_CLOSED_ABI_VERSION: u32 = 10;
 pub const FLUXON_COMMU_CLOSED_HOST_CALLBACKS_ABI_VERSION: u32 = 8;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_OK: i32 = 0;
 pub const FLUXON_COMMU_CLOSED_RUNTIME_RESULT_ERR: i32 = 1;
@@ -1667,6 +1668,18 @@ pub async fn runtime_invoke(
     }
 }
 
+pub async fn initialize_process_logging(
+    config: ClosedRuntimeProcessLoggingConfig,
+) -> Result<String, ClosedSdkConsumerError> {
+    assert_abi_compatible()?;
+    match runtime_invoke(&ClosedRuntimeRequest::InitializeProcessLogging { config }).await? {
+        ClosedRuntimeResponse::ProcessLoggingInitialized { absolute_path } => Ok(absolute_path),
+        other => Err(ClosedSdkConsumerError::RuntimeUnexpectedResponse {
+            detail: format!("{other:?}"),
+        }),
+    }
+}
+
 pub async fn construct_cluster_manager_handle(
     arg: fluxon_commu_contract::ClusterManagerNewArg,
 ) -> Result<ClosedRuntimeHandle, ClosedSdkConsumerError> {
@@ -2362,60 +2375,27 @@ pub async fn drop_runtime_handle(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        FLUXON_COMMU_CLOSED_ABI_VERSION, FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION, abi_version,
+        assert_abi_compatible, query_version, sdk_schema_version,
+    };
 
     #[test]
-    fn bundled_sdk_declares_watch_backed_transfer_link_snapshot() {
+    fn bundled_sdk_matches_the_consumer_contract() {
         assert_eq!(
             env!("FLUXON_COMMU_CLOSED_TRANSFER_LINK_SNAPSHOT_MODE"),
             "watch-v1"
         );
-    }
+        assert_eq!(sdk_schema_version(), FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION);
+        assert_eq!(abi_version(), FLUXON_COMMU_CLOSED_ABI_VERSION);
+        assert_abi_compatible().expect("bundled closed SDK ABI must match the consumer");
 
-    #[test]
-    fn abi9_marker_is_capability_miss_for_optional_fast_path() {
-        let result =
-            optional_direct_fast_path_call::<()>(Err(ClosedSdkConsumerError::RuntimeError {
-                error: ClosedRuntimeError::TransferEngine {
-                    detail: ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER.to_string(),
-                },
-            }));
-
-        assert!(matches!(result, Ok(None)));
-    }
-
-    #[test]
-    fn abi9_marker_is_typed_error_for_required_fast_path() {
-        let result =
-            required_direct_fast_path_call::<()>(Err(ClosedSdkConsumerError::RuntimeError {
-                error: ClosedRuntimeError::TransferEngine {
-                    detail: ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER.to_string(),
-                },
-            }));
-
-        assert!(matches!(
-            result,
-            Err(ClosedSdkConsumerError::RequiredDirectFastPathNotReady)
-        ));
-    }
-
-    #[test]
-    fn non_marker_transfer_engine_error_remains_runtime_error() {
-        let result =
-            optional_direct_fast_path_call::<()>(Err(ClosedSdkConsumerError::RuntimeError {
-                error: ClosedRuntimeError::TransferEngine {
-                    detail: format!(
-                        "{}: peer unavailable",
-                        ABI9_DIRECT_FAST_PATH_NOT_READY_MARKER
-                    ),
-                },
-            }));
-
-        assert!(matches!(
-            result,
-            Err(ClosedSdkConsumerError::RuntimeError {
-                error: ClosedRuntimeError::TransferEngine { .. }
-            })
-        ));
+        let version = query_version().expect("bundled closed SDK version query must succeed");
+        assert_eq!(
+            version.sdk_schema_version,
+            FLUXON_COMMU_CLOSED_SDK_SCHEMA_VERSION
+        );
+        assert_eq!(version.abi_version, FLUXON_COMMU_CLOSED_ABI_VERSION);
+        assert_eq!(version.boundary_mode, "closed-sdk-consumer");
     }
 }

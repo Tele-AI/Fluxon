@@ -1,17 +1,26 @@
 use super::msg_and_error::OK;
-use super::msg_and_error::{ErrorCode, KvError, KvResult};
+use super::msg_and_error::{
+    ApiError, ConfigError, ErrorCode, KvError, KvResult, SharedMemError, UnreachableError,
+};
 use crate::client_kv_api::msg_pack::{
-    ExternalDeleteAckResp, ExternalDeleteResp, ExternalGetResp, ExternalIsExistResp,
-    ExternalPutCommitResp, ExternalPutRevokeResp, ExternalPutStartResp, ExternalPutTransferEndResp,
-    SsdReplicaPersistResp, SsdStageReadResp,
+    ExternalBatchDeleteAckResp, ExternalBatchGetCancelResp, ExternalBatchGetItemResp,
+    ExternalBatchGetResp, ExternalBatchGetStartResp, ExternalBatchGetTransferResp,
+    ExternalBatchIsExistResp, ExternalBatchPutCommitItemResp, ExternalBatchPutCommitResp,
+    ExternalBatchPutStartItemResp, ExternalBatchPutStartResp, ExternalBatchPutTransferEndItemResp,
+    ExternalBatchPutTransferEndResp, ExternalDeleteAckResp, ExternalDeleteResp, ExternalGetResp,
+    ExternalIsExistResp, ExternalObservabilitySnapshotResp, ExternalPutCommitResp,
+    ExternalPutRevokeResp, ExternalPutStartResp, ExternalPutTransferEndResp,
 };
 use crate::master_kv_router::msg_pack::{
-    BatchDeleteAckResp, BatchDeleteClientKvMetaCacheResp, BatchSsdReplicaEvictResp, DeleteAckResp,
-    DeleteResp, GetDoneResp, GetMasterOnlyMetricPartResp, GetMetaResp, GetRevokeResp, GetStartResp,
-    MemHolderKeepAliveResp, MemHolderReleaseResp, PutDoneResp, PutRevokeResp, PutStartResp,
-    SsdReplicaCommitResp, SsdStageBeginResp,
+    BatchDeleteAckResp, BatchDeleteClientKvMetaCacheResp, BatchIsExistResp,
+    BatchPreparePutKeysResp, BatchReleasePutKeyReservationsResp, DeleteAckResp, DeleteResp,
+    GetDoneResp, GetMasterOnlyMetricPartResp, GetMetaResp, GetRevokeResp, GetStartResp,
+    MemHolderKeepAliveResp, MemHolderReleaseResp, OwnerLocalReserveControlResp, PutAppendDoneResp,
+    PutAppendRevokeResp, PutAppendStartResp, PutDoneResp, PutRevokeResp, PutStartResp,
 };
-use crate::master_seg_manager::msg_pack::RequestSegmentRegistrationResp;
+use crate::master_seg_manager::msg_pack::{
+    ConfirmNodeSegmentsRegisteredResp, RegisterNodeSegmentsResp, RequestSegmentRegistrationResp,
+};
 use crate::memholder::ExternalMemHolderInfo;
 
 /// Shared helpers to convert RPC response structs into KvResult types for KV APIs
@@ -55,6 +64,16 @@ impl ToResult for ExternalIsExistResp {
         }
         if self.error_code == super::msg_and_error::codes_api::API_KEY_NOT_FOUND {
             return Ok(false);
+        }
+        Err(KvError::from_json(self.error_code, &self.error_json))
+    }
+}
+
+impl ToResult for ExternalBatchIsExistResp {
+    type Ok = Vec<bool>;
+    fn to_result(self) -> KvResult<Self::Ok> {
+        if self.error_code == OK {
+            return Ok(self.exists_list);
         }
         Err(KvError::from_json(self.error_code, &self.error_json))
     }
@@ -133,6 +152,27 @@ impl ToResult for ExternalDeleteAckResp {
     }
 }
 
+impl ToResult for ExternalBatchDeleteAckResp {
+    type Ok = ExternalBatchDeleteAckResp;
+    fn to_result(self) -> KvResult<Self::Ok> {
+        if self.error_code == OK {
+            Ok(self)
+        } else {
+            Err(KvError::from_json(self.error_code, &self.error_json))
+        }
+    }
+}
+
+impl ToResult for BatchIsExistResp {
+    type Ok = Vec<bool>;
+    fn to_result(self) -> KvResult<Self::Ok> {
+        if self.error_code == OK {
+            return Ok(self.exists_list);
+        }
+        Err(KvError::from_json(self.error_code, &self.error_json))
+    }
+}
+
 /// Centralized: convert code+desc to KvError or Ok if code==Ok
 pub fn try_from_code(code: ErrorCode, json: String) -> KvResult<()> {
     if code == OK {
@@ -147,6 +187,26 @@ impl FromError for RequestSegmentRegistrationResp {
         let code = e.code();
         Self {
             error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromError for RegisterNodeSegmentsResp {
+    fn from_error(e: &KvError) -> Self {
+        Self {
+            error_code: e.code(),
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+
+impl FromError for ConfirmNodeSegmentsRegisteredResp {
+    fn from_error(e: &KvError) -> Self {
+        Self {
+            error_code: e.code(),
             error_json: e.to_json(),
             ..Default::default()
         }
@@ -224,6 +284,135 @@ impl FromError for ExternalIsExistResp {
         }
     }
 }
+impl FromError for ExternalBatchIsExistResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchGetResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchGetItemResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchGetStartResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchGetTransferResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchGetCancelResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+        }
+    }
+}
+impl FromError for ExternalBatchPutStartResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchPutStartItemResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchPutTransferEndResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchPutTransferEndItemResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchPutCommitResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalBatchPutCommitItemResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for ExternalObservabilitySnapshotResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
 impl FromError for ExternalDeleteAckResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
@@ -234,17 +423,7 @@ impl FromError for ExternalDeleteAckResp {
         }
     }
 }
-impl FromError for SsdStageReadResp {
-    fn from_error(e: &KvError) -> Self {
-        let code = e.code();
-        Self {
-            error_code: code,
-            error_json: e.to_json(),
-            ..Default::default()
-        }
-    }
-}
-impl FromError for SsdReplicaPersistResp {
+impl FromError for ExternalBatchDeleteAckResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
         Self {
@@ -286,15 +465,6 @@ impl FromError for GetDoneResp {
         }
     }
 }
-impl FromError for SsdStageBeginResp {
-    fn from_error(e: &KvError) -> Self {
-        let code = e.code();
-        Self {
-            error_code: code,
-            error_json: e.to_json(),
-        }
-    }
-}
 impl FromError for PutStartResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
@@ -325,7 +495,7 @@ impl FromError for PutDoneResp {
         }
     }
 }
-impl FromError for SsdReplicaCommitResp {
+impl FromError for OwnerLocalReserveControlResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
         Self {
@@ -335,7 +505,47 @@ impl FromError for SsdReplicaCommitResp {
         }
     }
 }
-impl FromError for BatchSsdReplicaEvictResp {
+impl FromError for BatchPreparePutKeysResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for BatchReleasePutKeyReservationsResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for PutAppendStartResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for PutAppendRevokeResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for PutAppendDoneResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
         Self {
@@ -396,6 +606,16 @@ impl FromError for BatchDeleteAckResp {
     }
 }
 impl FromError for GetMetaResp {
+    fn from_error(e: &KvError) -> Self {
+        let code = e.code();
+        Self {
+            error_code: code,
+            error_json: e.to_json(),
+            ..Default::default()
+        }
+    }
+}
+impl FromError for BatchIsExistResp {
     fn from_error(e: &KvError) -> Self {
         let code = e.code();
         Self {

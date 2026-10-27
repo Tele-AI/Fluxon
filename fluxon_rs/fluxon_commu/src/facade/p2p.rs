@@ -31,10 +31,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
 use crate::closed_sdk::{
-    construct_p2p_module_handle, drop_runtime_handle, is_live_dependent_drop_error,
-    p2p_call_raw_observed, p2p_register_dispatch, p2p_register_rpc_response_msg_id,
+    RuntimeHandleRelease, construct_p2p_module_handle, drop_runtime_handle, p2p_call_raw_observed,
+    p2p_register_dispatch, p2p_register_rpc_response_msg_id,
     p2p_register_user_rpc_bytes_handler, p2p_register_user_rpc_bytes_handler_async,
-    p2p_send_response_raw, spawn_deferred_drop_runtime_handle,
+    p2p_send_response_raw,
 };
 use fluxon_commu_closed_sdk_consumer::p2p_module_call;
 use fluxon_commu_closed_sdk_consumer::{ClosedRuntimeDispatchRequestRef, ClosedSdkConsumerError};
@@ -239,10 +239,31 @@ pub mod __hidden {
 
 pub use self::__hidden::{P2pModuleView, P2pModuleViewTrait};
 
+fn bind_dispatch_view<F>(
+    view: P2pModuleView,
+    handler: F,
+) -> impl Fn(ClosedRuntimeDispatchRequestRef<'_>, bytes::Bytes) -> P2PResult<()> + Send + Sync
+where
+    F: Fn(&str, &P2pModule, ClosedRuntimeDispatchRequestRef<'_>, &bytes::Bytes) -> P2PResult<()>
+        + Send
+        + Sync,
+{
+    move |request, body| {
+        // The closed transport may finish dispatch after its host framework is released.
+        // Admit only a live owner, and retain it through all nested view accesses.
+        let owner = view.upgrade_arc().ok_or_else(|| P2pError::Other {
+            detail: "P2P dispatch rejected: host framework has been released".to_string(),
+        })?;
+        handler(request.reply_next_hop, owner.p2p_module(), request, &body)
+    }
+}
+
 struct ClosedP2pRuntime {
     arg: CommuP2pModuleNewArg,
     handle: OnceLock<ClosedRuntimeHandle>,
     construct_lock: AsyncMutex<()>,
+    shutdown_started: std::sync::atomic::AtomicBool,
+    release: RuntimeHandleRelease,
     view: OnceLock<P2pModuleView>,
     tier_snapshot: Arc<RwLock<Arc<CommuTierSnapshot>>>,
     scheduled_rpc_response_msg_ids: Mutex<HashSet<MsgId>>,
@@ -261,6 +282,8 @@ impl ClosedP2pRuntime {
             arg,
             handle: OnceLock::new(),
             construct_lock: AsyncMutex::new(()),
+            shutdown_started: std::sync::atomic::AtomicBool::new(false),
+            release: RuntimeHandleRelease::new(),
             view: OnceLock::new(),
             snapshot_poller_started: std::sync::atomic::AtomicBool::new(false),
         }
@@ -377,10 +400,28 @@ impl P2pModule {
 
     #[doc(hidden)]
     pub async fn ensure_closed_runtime_handle(&self) -> P2PResult<ClosedRuntimeHandle> {
+        if self
+            .closed
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(P2pError::Other {
+                detail: "P2pModule is closed".to_string(),
+            });
+        }
         if let Some(handle) = self.closed_runtime_handle() {
             return Ok(handle);
         }
         let _guard = self.closed.construct_lock.lock().await;
+        if self
+            .closed
+            .shutdown_started
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(P2pError::Other {
+                detail: "P2pModule is closed".to_string(),
+            });
+        }
         if let Some(handle) = self.closed_runtime_handle() {
             return Ok(handle);
         }
@@ -737,23 +778,46 @@ impl P2pModule {
     {
         {
             let view = self.module_view();
+            let owner = view
+                .upgrade_arc()
+                .expect("P2P dispatch registration requires a live host framework");
             tokio::spawn(async move {
-                let handle = match view.p2p_module().ensure_closed_runtime_handle().await {
+                let handle = match owner.p2p_module().ensure_closed_runtime_handle().await {
                     Ok(handle) => handle,
                     Err(_) => return,
                 };
-                let _ = p2p_register_dispatch(
-                    handle,
-                    msg_id,
-                    Arc::new(
-                        move |request: ClosedRuntimeDispatchRequestRef<'_>, body: bytes::Bytes| {
-                            f(request.reply_next_hop, view.p2p_module(), request, &body).map(|_| ())
-                        },
-                    ),
-                )
-                .await;
+                let _ =
+                    p2p_register_dispatch(handle, msg_id, Arc::new(bind_dispatch_view(view, f)))
+                        .await;
             });
         }
+    }
+
+    /// Install a dispatch handler as an awaited init-DAG action.
+    ///
+    /// Startup-critical handlers must use this form so the publishing DAG step
+    /// cannot complete while the closed runtime still lacks the handler.
+    pub(crate) async fn regist_dispatch_raw_for_init_dag<F>(
+        &self,
+        msg_id: MsgId,
+        f: F,
+    ) -> P2PResult<()>
+    where
+        F: Fn(
+                &str,
+                &P2pModule,
+                ClosedRuntimeDispatchRequestRef<'_>,
+                &bytes::Bytes,
+            ) -> P2PResult<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let view = self.module_view();
+        let handle = self.ensure_closed_runtime_handle().await?;
+        p2p_register_dispatch(handle, msg_id, Arc::new(bind_dispatch_view(view, f)))
+            .await
+            .map_err(p2p_closed_sdk_error)
     }
 
     pub(crate) fn register_rpc_response_msg_id(&self, msg_id: MsgId) {
@@ -962,22 +1026,22 @@ impl LogicalModule for P2pModule {
     }
 
     async fn shutdown(&self) -> Result<(), Self::Error> {
-        {
-            if let Some(handle) = self.closed_runtime_handle() {
-                match drop_runtime_handle(handle).await {
-                    Ok(()) => {}
-                    Err(error) if is_live_dependent_drop_error(&error) => {
-                        tracing::info!(
-                            handle_raw = handle.raw,
-                            "deferring closed P2pModule handle drop until runtime dependents drain"
-                        );
-                        spawn_deferred_drop_runtime_handle(handle, "p2p_shutdown_deferred");
-                    }
-                    Err(error) => return Err(p2p_closed_sdk_error(error)),
+        self.closed
+            .shutdown_started
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Serialize final release with construction so late registrations cannot reopen it.
+        let _guard = self.closed.construct_lock.lock().await;
+        let handle = self.closed_runtime_handle();
+        self.closed
+            .release
+            .run(move || async move {
+                if let Some(handle) = handle {
+                    drop_runtime_handle(handle).await?;
                 }
-            }
-            Ok(())
-        }
+                Ok(())
+            })
+            .await
+            .map_err(p2p_closed_sdk_error)
     }
 }
 
@@ -991,6 +1055,10 @@ pub mod rpc {
     use crate::p2p::{P2PResult, P2pError, P2pModule, RpcTransportPolicy};
     use crate::{NodeID, TaskId};
     use tracing::warn;
+
+    fn should_wait_before_rpc_retry(attempt_idx: usize, total_attempts: usize) -> bool {
+        attempt_idx.saturating_add(1) < total_attempts
+    }
 
     pub use fluxon_commu_contract::p2p::rpc::*;
 
@@ -1007,6 +1075,7 @@ pub mod rpc {
     pub struct Responser {
         task_id: TaskId,
         node_id: NodeID,
+        node_start_time: i64,
         reply_next_hop: NodeID,
         incoming_local_observe: crate::p2p::WireTransportLocalObserve,
         view: P2pModuleView,
@@ -1065,6 +1134,11 @@ pub mod rpc {
             self.node_id.clone()
         }
 
+        /// Exact logical-source generation authenticated by the transport.
+        pub fn node_start_time(&self) -> i64 {
+            self.node_start_time
+        }
+
         pub fn task_id(&self) -> TaskId {
             self.task_id
         }
@@ -1095,6 +1169,11 @@ pub mod rpc {
 
         pub fn node_id(&self) -> NodeID {
             self.responsor.node_id()
+        }
+
+        /// Exact logical-source generation authenticated by the transport.
+        pub fn node_start_time(&self) -> i64 {
+            self.responsor.node_start_time()
         }
 
         pub fn task_id(&self) -> TaskId {
@@ -1211,6 +1290,15 @@ pub mod rpc {
             regist_rpc_recv::<R, _>(p2p, req_handler);
         }
 
+        /// Await handler installation for a startup-critical init-DAG step.
+        pub async fn regist_for_init_dag<F>(&self, p2p: &P2pModule, req_handler: F) -> P2PResult<()>
+        where
+            F: Fn(RPCResponsor<R>, MsgPack<R>) -> P2PResult<()> + Send + Sync + 'static,
+            R: Default,
+        {
+            regist_rpc_recv_for_init_dag::<R, _>(p2p, req_handler).await
+        }
+
         pub async fn call(
             &self,
             p2p: &P2pModule,
@@ -1259,6 +1347,7 @@ pub mod rpc {
                 Responser {
                     task_id: request_view.task_id,
                     node_id: logical_source,
+                    node_start_time: request_view.logical_source_node_start_time,
                     reply_next_hop: reply_next_hop.to_string().into(),
                     incoming_local_observe: crate::p2p::WireTransportLocalObserve {
                         frame_recv_done_ts_us: request_view.incoming_frame_recv_done_ts_us,
@@ -1298,6 +1387,49 @@ pub mod rpc {
         });
     }
 
+    pub async fn regist_rpc_recv_for_init_dag<REQ, F>(
+        p2p: &P2pModule,
+        req_handler: F,
+    ) -> P2PResult<()>
+    where
+        REQ: RPCReq + Default,
+        F: Fn(RPCResponsor<REQ>, MsgPack<REQ>) -> P2PResult<()> + Send + Sync + 'static,
+    {
+        let req_type = REQ::default();
+        let msg_id = req_type.msg_id();
+        let view = p2p.module_view();
+        p2p.regist_dispatch_raw_for_init_dag(
+            msg_id,
+            move |_reply_next_hop, _p2p, request_view, data| {
+                let raw_lengths = request_view.body_raw_bytes_lengths;
+                let req = MsgPack::<REQ>::decode_from_body_view(
+                    request_view.body_serialize_part_len,
+                    raw_lengths,
+                    data,
+                )?;
+                let rpc_resp = RPCResponsor {
+                    responsor: Responser {
+                        task_id: request_view.task_id,
+                        node_id: request_view.logical_source_peer_id.to_string().into(),
+                        node_start_time: request_view.logical_source_node_start_time,
+                        reply_next_hop: request_view.reply_next_hop.to_string().into(),
+                        incoming_local_observe: crate::p2p::WireTransportLocalObserve {
+                            frame_recv_done_ts_us: request_view.incoming_frame_recv_done_ts_us,
+                            dispatch_enqueued_ts_us: request_view.incoming_dispatch_enqueued_ts_us,
+                            dispatch_started_ts_us: request_view.incoming_dispatch_started_ts_us,
+                            complete_pending_call_ts_us: request_view
+                                .incoming_complete_pending_call_ts_us,
+                        },
+                        view: view.clone(),
+                    },
+                    _phantom: PhantomData,
+                };
+                req_handler(rpc_resp, req)
+            },
+        )
+        .await
+    }
+
     async fn run_rpc_attempts<T, Call, CallFuture>(
         shutdown_poller: &fluxon_framework_compiled::shutdown::ShutdownPoller,
         attempts: usize,
@@ -1320,7 +1452,6 @@ pub mod rpc {
             if attempt_idx != 0 {
                 warn!("RPC call retrying, msg_id={msg_id}");
             }
-
             match call().await {
                 Ok(resp) => {
                     if failed_count > 0 {
@@ -1361,11 +1492,13 @@ pub mod rpc {
         timeout: Option<std::time::Duration>,
         transport_policy: RpcTransportPolicy,
     ) -> P2PResult<MsgPack<REQ::Resp>> {
+        validate_explicit_rpc_timeout(timeout)?;
         let shutdown_poller = p2p.module_view().register_shutdown_poller();
         let msg_id = req.msg_id();
+        let attempts = retry.max(1);
         run_rpc_attempts(
             &shutdown_poller,
-            retry,
+            attempts,
             msg_id,
             Duration::from_secs(5),
             || {
@@ -1402,6 +1535,8 @@ pub mod rpc {
         timeout: Option<std::time::Duration>,
         transport_policy: RpcTransportPolicy,
     ) -> P2PResult<RpcCallObservedOutput<REQ::Resp>> {
+        validate_explicit_rpc_timeout(timeout)?;
+
         regist_rpc_send::<REQ>(p2p);
 
         {
@@ -1412,31 +1547,12 @@ pub mod rpc {
                 .await?;
         }
 
-        let timeout_duration = match timeout {
-            Some(duration) => {
-                let min_duration = Duration::from_secs(MIN_EXPLICIT_RPC_TIMEOUT_SECS);
-                if duration < min_duration {
-                    return Err(P2pError::InvalidRpcTimeout {
-                        timeout_ms: duration.as_secs() * 1_000
-                            + u64::from(duration.subsec_millis()),
-                        min_timeout_ms: MIN_EXPLICIT_RPC_TIMEOUT_SECS * 1_000,
-                        reason: format!(
-                            "Explicit RPC timeout below {}s is forbidden.",
-                            MIN_EXPLICIT_RPC_TIMEOUT_SECS
-                        ),
-                    });
-                }
-                Some(duration)
-            }
-            None => None,
-        };
-
         let wire_encode_started_at = Instant::now();
         let msg_id = req.msg_id();
         let wire_body = req.into_wire_body()?;
         let wire_encode_us = duration_to_i64_us(wire_encode_started_at.elapsed());
         let raw_output = p2p
-            .call_raw_observed(node, msg_id, wire_body, timeout_duration, transport_policy)
+            .call_raw_observed(node, msg_id, wire_body, timeout, transport_policy)
             .await?;
         let response_local_observe = raw_output.message.local_observe;
         let resp_decode_started_at = Instant::now();
@@ -1515,81 +1631,16 @@ pub mod rpc {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    mod retry_tests {
+        use super::should_wait_before_rpc_retry;
 
-        #[tokio::test]
-        async fn rpc_attempts_recover_after_transient_transport_error() {
-            let shutdown_poller = fluxon_framework_compiled::shutdown::ShutdownPoller::new();
-            let call_count = AtomicUsize::new(0);
-
-            let response = run_rpc_attempts(&shutdown_poller, 3, 4003, Duration::ZERO, || {
-                let attempt = call_count.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    if attempt == 0 {
-                        Err(P2pError::SendFailed {
-                            detail: "transient ICE publisher failure".to_string(),
-                        })
-                    } else {
-                        Ok(17)
-                    }
-                }
-            })
-            .await
-            .expect("a transient transport failure should recover on retry");
-
-            assert_eq!(response, 17);
-            assert_eq!(call_count.load(Ordering::SeqCst), 2);
-        }
-
-        #[tokio::test]
-        async fn rpc_attempts_preserve_the_last_transport_error() {
-            let shutdown_poller = fluxon_framework_compiled::shutdown::ShutdownPoller::new();
-            let call_count = AtomicUsize::new(0);
-
-            let error =
-                run_rpc_attempts::<(), _, _>(&shutdown_poller, 3, 4003, Duration::ZERO, || {
-                    let attempt = call_count.fetch_add(1, Ordering::SeqCst);
-                    async move {
-                        if attempt < 2 {
-                            Err(P2pError::NoConnectionReady {
-                                nodeid: "owner-0".to_string(),
-                            })
-                        } else {
-                            Err(P2pError::SendFailed {
-                                detail: "final ICE publisher failure".to_string(),
-                            })
-                        }
-                    }
-                })
-                .await
-                .expect_err("all injected RPC attempts must fail");
-
-            assert_eq!(call_count.load(Ordering::SeqCst), 3);
-            assert!(matches!(
-                error,
-                P2pError::SendFailed { detail }
-                    if detail == "final ICE publisher failure"
-            ));
-        }
-
-        #[tokio::test]
-        async fn rpc_attempts_stop_before_calling_after_shutdown() {
-            let shutdown_poller = fluxon_framework_compiled::shutdown::ShutdownPoller::new();
-            shutdown_poller.shutdown();
-            let call_count = AtomicUsize::new(0);
-
-            let error =
-                run_rpc_attempts::<(), _, _>(&shutdown_poller, 3, 4003, Duration::ZERO, || {
-                    call_count.fetch_add(1, Ordering::SeqCst);
-                    async { Ok(()) }
-                })
-                .await
-                .expect_err("shutdown must prevent the RPC call");
-
-            assert_eq!(call_count.load(Ordering::SeqCst), 0);
-            assert!(matches!(error, P2pError::SystemShutdown {}));
+        #[test]
+        fn final_failed_attempt_never_adds_retry_delay() {
+            assert!(!should_wait_before_rpc_retry(0, 0));
+            assert!(!should_wait_before_rpc_retry(0, 1));
+            assert!(should_wait_before_rpc_retry(0, 3));
+            assert!(should_wait_before_rpc_retry(1, 3));
+            assert!(!should_wait_before_rpc_retry(2, 3));
         }
     }
 }
@@ -1622,6 +1673,156 @@ pub fn network_transport_kind() -> P2pTransportKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DispatchTestOwner {
+        module: P2pModule,
+        released: Arc<AtomicBool>,
+    }
+
+    impl Drop for DispatchTestOwner {
+        fn drop(&mut self) {
+            self.released.store(true, Ordering::Release);
+        }
+    }
+
+    impl P2pModuleAccessTrait for DispatchTestOwner {
+        fn p2p_module(&self) -> &P2pModule {
+            &self.module
+        }
+    }
+
+    impl ClusterManagerAccessTrait for DispatchTestOwner {
+        fn cluster_manager(&self) -> &crate::ClusterManager {
+            unreachable!("dispatch lifetime tests do not use cluster services")
+        }
+    }
+
+    impl ResourceRegistryAccessTrait for DispatchTestOwner {
+        fn resource_registry(&self) -> &ResourceRegistry {
+            unreachable!("dispatch lifetime tests do not use registry services")
+        }
+    }
+
+    impl ViewShutdownExt for DispatchTestOwner {
+        fn register_shutdown_poller(&self) -> ShutdownPoller {
+            unreachable!("dispatch lifetime tests do not use shutdown services")
+        }
+
+        fn register_shutdown_waiter(&self) -> ShutdownWaiter {
+            unreachable!("dispatch lifetime tests do not use shutdown services")
+        }
+    }
+
+    impl AsyncPanicSendExt for DispatchTestOwner {
+        fn async_panic(&self, message: String) {
+            panic!("{message}");
+        }
+    }
+
+    impl ViewSpawnExt for DispatchTestOwner {
+        fn push_join_handle(&self, _: String, _: JoinHandle<()>) {
+            unreachable!("dispatch lifetime tests do not spawn tasks")
+        }
+
+        fn runtime_num_workers(&self) -> usize {
+            1
+        }
+
+        fn spawn_boxed(
+            &self,
+            _: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+        ) -> JoinHandle<()> {
+            unreachable!("dispatch lifetime tests do not spawn tasks")
+        }
+    }
+
+    fn dispatch_test_owner() -> (Arc<DispatchTestOwner>, P2pModuleView, Arc<AtomicBool>) {
+        let released = Arc::new(AtomicBool::new(false));
+        let owner = Arc::new(DispatchTestOwner {
+            module: P2pModule {
+                closed: ClosedP2pRuntime::new(CommuP2pModuleNewArg::new(
+                    None,
+                    P2pTcpThreadTransportTuning::default(),
+                    false,
+                    false,
+                )),
+            },
+            released: released.clone(),
+        });
+        let erased: Arc<dyn P2pModuleViewTrait> = owner.clone();
+        let view = P2pModuleView::new(&erased);
+        owner.module.attach_view(view.clone());
+        (owner, view, released)
+    }
+
+    fn dispatch_test_request() -> ClosedRuntimeDispatchRequestRef<'static> {
+        ClosedRuntimeDispatchRequestRef {
+            reply_next_hop: "test-peer",
+            msg_id: 1,
+            task_id: 1,
+            logical_source_peer_id: "test-peer",
+            logical_source_node_start_time: 1,
+            logical_target_peer_id: "test-owner",
+            logical_target_node_start_time: 1,
+            remaining_hops: 0,
+            default_resp_transport_policy:
+                fluxon_commu_contract::ClosedRuntimeDispatchTransportPolicy::ForceTransport,
+            incoming_frame_recv_done_ts_us: 0,
+            incoming_dispatch_enqueued_ts_us: 0,
+            incoming_dispatch_started_ts_us: 0,
+            incoming_complete_pending_call_ts_us: 0,
+            body_serialize_part_len: 0,
+            body_raw_bytes_lengths: &[],
+        }
+    }
+
+    #[test]
+    fn dispatch_retains_owner_through_nested_view_access_without_a_reference_cycle() {
+        let (owner, view, released) = dispatch_test_owner();
+        let last_owner = Mutex::new(Some(owner));
+        let nested_view = view.clone();
+        let observed_release = released.clone();
+        let callback = bind_dispatch_view(view.clone(), move |_, module, _, _| {
+            drop(last_owner.lock().unwrap().take());
+            assert!(!observed_release.load(Ordering::Acquire));
+            assert!(std::ptr::eq(module, nested_view.p2p_module()));
+            Ok(())
+        });
+
+        callback(dispatch_test_request(), bytes::Bytes::new()).unwrap();
+        assert!(released.load(Ordering::Acquire));
+        assert!(view.upgrade_arc().is_none());
+        assert!(callback(dispatch_test_request(), bytes::Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn dispatch_rejects_released_owner_before_entering_the_host_handler() {
+        let (owner, view, released) = dispatch_test_owner();
+        let callback = bind_dispatch_view(view, |_, _, _, _| {
+            panic!("a late dispatch must not enter its released host")
+        });
+        drop(owner);
+
+        assert!(released.load(Ordering::Acquire));
+        assert!(matches!(
+            callback(dispatch_test_request(), bytes::Bytes::new()),
+            Err(P2pError::Other { detail }) if detail.contains("host framework has been released")
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_p2p_rejects_late_handle_construction_and_repeated_shutdown_succeeds() {
+        let (owner, _, _) = dispatch_test_owner();
+        LogicalModule::shutdown(&owner.module).await.unwrap();
+        let error = owner
+            .module
+            .ensure_closed_runtime_handle()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, P2pError::Other { detail } if detail.contains("is closed")));
+        LogicalModule::shutdown(&owner.module).await.unwrap();
+    }
 
     #[test]
     fn closed_runtime_p2p_error_keeps_its_detail_and_transport_category() {

@@ -1,4 +1,4 @@
 modules:
   - path: fluxon_rs/moka
     repo: https://github.com/ActivePeter/moka
-    checkout: main
+    checkout: 9c116bf3cf79e31ff119cc08a3ca3919565cc196

@@ -1,22 +1,30 @@
 use super::{
     MasterKvRouterView,
     msg_pack::{
-        BatchDeleteAckReq, BatchDeleteAckResp, BatchDeleteClientKvMetaCacheReq,
-        BatchSsdReplicaEvictReq, BatchSsdReplicaEvictResp, DeleteAckReq, DeleteAckResp,
-        DeleteClientKvMetaCacheItem, DeleteReq, DeleteResp,
+        BatchDeleteAckReq, BatchDeleteAckResp, DeleteAckReq, DeleteAckResp, DeleteReq, DeleteResp,
     },
 };
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::put::PutIDForAKey;
-use crate::master_seg_manager::one_seg_allocator::Allocation;
-use crate::memholder::{EnsureMemholderMgmtDeleteActorOwned, MasterOwnerMemMgr};
+use crate::memholder::{
+    EnsureMemholderMgmtDeleteActorOwned, MasterOwnerMemMgr, MemholderManagerTrait,
+};
 use crate::{
-    cluster_manager::NodeID,
-    p2p::msg_pack::{MsgPack, RPCCaller},
+    p2p::msg_pack::MsgPack,
     rpcresp_kvresult_convert::msg_and_error::{self, kv},
 };
 use limit_thirdparty::tokio;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+
+#[cfg(any(test, feature = "test_bins"))]
+use super::msg_pack::{BatchDeleteClientKvMetaCacheReq, DeleteClientKvMetaCacheItem};
+#[cfg(any(test, feature = "test_bins"))]
+use crate::{
+    cluster_manager::NodeID,
+    p2p::{control_plane_rpc::call_control_plane_rpc, msg_pack::RPCCaller},
+};
+#[cfg(any(test, feature = "test_bins"))]
+use std::time::Duration;
 
 /// Remove a key from master indices and trigger client cache invalidation broadcast.
 ///
@@ -26,7 +34,7 @@ use std::{sync::Arc, time::Duration};
 ///
 /// It removes the key from `kv_routes`, then asynchronously:
 /// - emits a `DeleteKeyInfo` to the shared delete broadcast actor for clients
-/// - removes the key from every node's local `node_kv_cache_controller`
+/// - point-removes the exact version from ring-B and tier1 metadata caches
 pub fn do_delete_one_kv_all_replicas(
     view: &MasterKvRouterView,
     key: String,
@@ -35,8 +43,6 @@ pub fn do_delete_one_kv_all_replicas(
         view.master_kv_router().inner().kv_routes.remove(&key)
     {
         let deleted_put_id = kv_route_info.put_id;
-        view.master_kv_router()
-            .unregister_route_replicas(&key, &kv_route_info);
         tracing::info!("Deleted kv_routes entry for key: {}", key);
 
         // Spawn async follow-up: broadcast + per-node cache cleanup
@@ -47,9 +53,7 @@ pub fn do_delete_one_kv_all_replicas(
                 if view.master_kv_router().prefix_index_enabled() {
                     let inner = view.master_kv_router().inner();
                     let mut tree = inner.prefix_index.write().await;
-                    if !inner.kv_routes.contains_key(&key_clone) {
-                        tree.remove(&key_clone);
-                    }
+                    tree.remove(&key_clone, deleted_put_id);
                 }
 
                 if let Err(err) = view
@@ -66,22 +70,9 @@ pub fn do_delete_one_kv_all_replicas(
                     tracing::warn!("Failed to send delete broadcast: {}", err);
                 }
 
-                // Remove from all node caches that hold replicas of this key
-                let node_replicas = kv_route_info.node_replicas.read();
-                for (node_id, replicas) in node_replicas.iter() {
-                    if replicas.tomb_tag.is_tomb() || replicas.memory.is_none() {
-                        continue;
-                    }
-                    if let Some(cache) = view.master_kv_router().get_node_cache_controller(node_id)
-                    {
-                        let _ = cache.remove(&key_clone);
-                        tracing::debug!(
-                            "Removed key {} from node cache controller: {}",
-                            key_clone,
-                            node_id
-                        );
-                    }
-                }
+                view.master_kv_router()
+                    .remove_route_cache_entries_exact(&key_clone, &kv_route_info)
+                    .await;
             }
         });
 
@@ -91,13 +82,13 @@ pub fn do_delete_one_kv_all_replicas(
     }
 }
 
+/// Test-only direct route removal. Production eviction uses the fenced owner reclaim protocol.
+#[cfg(any(test, feature = "test_bins"))]
 pub fn evict_one_kv_replica_for_node(
     view: &MasterKvRouterView,
     key: String,
     node_id: NodeID,
-    generation: i64,
     put_id: PutIDForAKey,
-    allocation: &Arc<Allocation>,
 ) -> Result<(), msg_and_error::ErrorCode> {
     let route = if let Some(route) = view.master_kv_router().inner().kv_routes.get(&key) {
         route.clone()
@@ -124,33 +115,31 @@ pub fn evict_one_kv_replica_for_node(
         return Ok(());
     }
 
-    let removed_replica =
-        route.remove_memory_replica_if_allocation(&node_id, generation, allocation);
+    let removed_replica = {
+        let mut node_replicas = route.node_replicas.write();
+        node_replicas.remove(&node_id).is_some()
+    };
     if !removed_replica {
         tracing::debug!(
-            "Local replica eviction ignored because node replica changed: key={} node_id={} generation={} put_id=({},{})",
+            "Local replica eviction ignored because node replica is already absent: key={} node_id={} put_id=({},{})",
             key,
             node_id,
-            generation,
             put_id.0,
             put_id.1
         );
         return Ok(());
     }
-    view.master_kv_router()
-        .unregister_member_replica_if_absent(&key, &route, &node_id, generation);
 
-    let last_replica_gone = !route.has_live_replica();
+    let last_replica_gone = route.node_replicas.read().is_empty();
     if last_replica_gone {
-        let route_for_compare = route.clone();
         let removed = view
             .master_kv_router()
             .inner()
             .kv_routes
             .remove_if(&key, |_, current| {
-                Arc::ptr_eq(current, &route_for_compare)
+                Arc::ptr_eq(current, &route)
                     && current.put_id == put_id
-                    && !current.has_live_replica()
+                    && current.node_replicas.read().is_empty()
             })
             .is_some();
         if removed && view.master_kv_router().prefix_index_enabled() {
@@ -159,9 +148,7 @@ pub fn evict_one_kv_replica_for_node(
             let _ = view.spawn("local_evict_remove_prefix_index", async move {
                 let inner = view_task.master_kv_router().inner();
                 let mut tree = inner.prefix_index.write().await;
-                if !inner.kv_routes.contains_key(&key_for_prefix) {
-                    tree.remove(&key_for_prefix);
-                }
+                tree.remove(&key_for_prefix, put_id);
             });
         }
     }
@@ -182,15 +169,15 @@ pub fn evict_one_kv_replica_for_node(
             },
             raw_bytes: Vec::new(),
         };
-        match rpc_caller
-            .call(
-                view_task.p2p_module(),
-                node_for_delete.clone(),
-                req,
-                Some(Duration::from_secs(60)),
-                0,
-            )
-            .await
+        match call_control_plane_rpc(
+            &rpc_caller,
+            view_task.p2p_module(),
+            node_for_delete.clone(),
+            req,
+            Some(Duration::from_secs(60)),
+            0,
+        )
+        .await
         {
             Ok(resp) => {
                 if resp.serialize_part.error_code == msg_and_error::OK {
@@ -228,149 +215,6 @@ pub fn evict_one_kv_replica_for_node(
     });
 
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SsdReplicaRemoval {
-    pub replica_removed: bool,
-    pub route_removed: bool,
-}
-
-fn remove_ssd_replica_if_version(
-    route: &OneKvNodesRoutes,
-    node_id: &NodeID,
-    generation: i64,
-    put_id: PutIDForAKey,
-) -> bool {
-    route.put_id == put_id && route.remove_ssd_replica_if_generation(node_id, generation)
-}
-
-pub(crate) fn remove_one_ssd_replica_for_node(
-    view: &MasterKvRouterView,
-    key: &str,
-    node_id: &NodeID,
-    put_id: PutIDForAKey,
-) -> SsdReplicaRemoval {
-    let route = {
-        let Some(route) = view.master_kv_router().inner().kv_routes.get(key) else {
-            return SsdReplicaRemoval::default();
-        };
-        route.clone()
-    };
-    let Some(replica_generation) = route.node_replica_generation(node_id) else {
-        return SsdReplicaRemoval::default();
-    };
-    if !remove_ssd_replica_if_version(&route, node_id, replica_generation, put_id) {
-        return SsdReplicaRemoval::default();
-    }
-    view.master_kv_router().unregister_member_replica_if_absent(
-        key,
-        &route,
-        node_id,
-        replica_generation,
-    );
-
-    let route_removed = if route.has_live_replica() {
-        false
-    } else {
-        let route_for_compare = route.clone();
-        view.master_kv_router()
-            .inner()
-            .kv_routes
-            .remove_if(key, |_, current| {
-                Arc::ptr_eq(current, &route_for_compare)
-                    && current.put_id == put_id
-                    && !current.has_live_replica()
-            })
-            .is_some()
-    };
-
-    SsdReplicaRemoval {
-        replica_removed: true,
-        route_removed,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::master_kv_router::{KvNodeReplicas, KvSsdReplicaInfo};
-    use crate::master_seg_manager::NodeTombTag;
-
-    #[test]
-    fn ssd_replica_cleanup_is_scoped_to_put_id() {
-        let route = OneKvNodesRoutes::new((10, 2), None);
-        let node_id: NodeID = "owner-a".to_string().into();
-        route.node_replicas.write().insert(
-            node_id.clone(),
-            KvNodeReplicas {
-                generation: 1,
-                tomb_tag: NodeTombTag::new(),
-                memory: None,
-                ssd: Some(KvSsdReplicaInfo { len: 4096 }),
-            },
-        );
-
-        assert!(!remove_ssd_replica_if_version(&route, &node_id, 1, (9, 7)));
-        assert!(
-            route
-                .node_replicas
-                .read()
-                .get(&node_id)
-                .is_some_and(|replicas| replicas.ssd.is_some())
-        );
-
-        assert!(remove_ssd_replica_if_version(&route, &node_id, 1, (10, 2)));
-        assert!(route.node_replicas.read().get(&node_id).is_none());
-    }
-}
-
-pub async fn handle_batch_ssd_replica_evict(
-    view: MasterKvRouterView,
-    req: MsgPack<BatchSsdReplicaEvictReq>,
-    req_node_id: NodeID,
-) -> MsgPack<BatchSsdReplicaEvictResp> {
-    let requested_count = req.serialize_part.evictions.len();
-    let mut removed_count = 0u32;
-    let mut removed_route_keys = Vec::new();
-
-    for replica in &req.serialize_part.evictions {
-        let removal =
-            remove_one_ssd_replica_for_node(&view, &replica.key, &req_node_id, replica.put_id);
-        if removal.replica_removed {
-            removed_count = removed_count.saturating_add(1);
-        }
-        if removal.route_removed {
-            removed_route_keys.push(replica.key.clone());
-        }
-    }
-
-    if !removed_route_keys.is_empty() && view.master_kv_router().prefix_index_enabled() {
-        let inner = view.master_kv_router().inner();
-        let mut tree = inner.prefix_index.write().await;
-        for key in &removed_route_keys {
-            if !inner.kv_routes.contains_key(key) {
-                tree.remove(key);
-            }
-        }
-    }
-
-    tracing::debug!(
-        "Handled SSD replica eviction batch: node={} requested={} removed={} routes_removed={}",
-        req_node_id,
-        requested_count,
-        removed_count,
-        removed_route_keys.len()
-    );
-
-    MsgPack {
-        serialize_part: BatchSsdReplicaEvictResp {
-            removed_count,
-            error_code: msg_and_error::OK,
-            error_json: String::new(),
-        },
-        raw_bytes: Vec::new(),
-    }
 }
 
 pub async fn handle_delete(

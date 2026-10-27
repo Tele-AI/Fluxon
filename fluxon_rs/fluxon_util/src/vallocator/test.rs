@@ -1,6 +1,41 @@
 use crate::vallocator::VirtualAllocator;
 
 #[test]
+fn virtual_allocator_keeps_sglang_pages_exact_instead_of_power_of_two_rounding() {
+    const PAGE_BYTES: u64 = 4_718_592;
+    let allocator = VirtualAllocator::new(PAGE_BYTES * 3).unwrap();
+    let first = allocator.alloc(PAGE_BYTES).unwrap();
+    let second = allocator.alloc(PAGE_BYTES).unwrap();
+    let third = allocator.alloc(PAGE_BYTES).unwrap();
+
+    assert_eq!(first.size, PAGE_BYTES);
+    assert_eq!(second.size, PAGE_BYTES);
+    assert_eq!(third.size, PAGE_BYTES);
+    assert_eq!(allocator.get_allocated_size(), PAGE_BYTES * 3);
+    assert!(allocator.alloc(PAGE_BYTES).is_err());
+
+    allocator.free(second.start_addr, second.size).unwrap();
+    allocator.free(first.start_addr, first.size).unwrap();
+    allocator.free(third.start_addr, third.size).unwrap();
+    assert_eq!(allocator.get_allocated_size(), 0);
+
+    let whole = allocator.alloc(PAGE_BYTES * 3).unwrap();
+    assert_eq!(whole.start_addr, 0);
+    assert_eq!(whole.size, PAGE_BYTES * 3);
+}
+
+#[test]
+fn virtual_allocator_rounds_only_to_transfer_page_alignment() {
+    let allocator = VirtualAllocator::new(16 * 1024).unwrap();
+    let region = allocator.alloc(4097).unwrap();
+    assert_eq!(region.start_addr, 0);
+    assert_eq!(region.size, 8192);
+    assert_eq!(allocator.get_allocated_size(), 8192);
+    allocator.free(region.start_addr, region.size).unwrap();
+    assert_eq!(allocator.get_allocated_size(), 0);
+}
+
+#[test]
 fn test_empty_frame_allocator() {
     let mut frame = crate::vallocator::frame::FrameAllocator::<32>::new();
     assert!(frame.alloc(1).0.is_none());

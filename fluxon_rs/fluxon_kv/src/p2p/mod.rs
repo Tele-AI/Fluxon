@@ -1,3 +1,4 @@
+pub(crate) mod control_plane_rpc;
 pub mod msg_pack;
 pub mod p2p_module;
 

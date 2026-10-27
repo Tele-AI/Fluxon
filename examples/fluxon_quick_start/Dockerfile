@@ -31,4 +31,4 @@ RUN install -m 0755 /app/examples/fluxon_quick_start/bin/etcd /usr/local/bin/etc
 RUN install -m 0755 /app/examples/fluxon_quick_start/bin/etcdctl /usr/local/bin/etcdctl
 RUN install -m 0755 /app/examples/fluxon_quick_start/bin/greptime /usr/local/bin/greptime
 
-ENTRYPOINT ["python3", "/app/examples/fluxon_quick_start/start.py"]
+ENTRYPOINT ["python3", "-m", "fluxon_py.quick_start"]

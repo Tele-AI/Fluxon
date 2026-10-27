@@ -85,7 +85,7 @@ class TestTopAttentionCommonContract(unittest.TestCase):
             self.assertEqual(prepared_env["LD_LIBRARY_PATH"], f"{active_libs_dir.resolve()}:/usr/lib:/opt/custom")
             self.assertEqual(prepared_env["PATH"], "/usr/bin")
 
-    def test_prepare_cargo_env_places_authoritative_fluxon_root_before_closed_sdk_runtime(self) -> None:
+    def test_prepare_cargo_env_prefers_closed_sdk_and_retains_wheel_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             active_site_packages = root / "venv" / "lib" / "python3.12" / "site-packages"
@@ -120,7 +120,7 @@ class TestTopAttentionCommonContract(unittest.TestCase):
             self.assertEqual(prepared_env["FLUXON_COMMU_CLOSED_SDK_ROOT"], str(closed_sdk_root.resolve()))
             self.assertEqual(
                 prepared_env["LD_LIBRARY_PATH"],
-                f"{active_libs_dir.resolve()}:{(closed_sdk_root / 'lib').resolve()}:/usr/lib:/opt/custom",
+                f"{(closed_sdk_root / 'lib').resolve()}:{active_libs_dir.resolve()}:/usr/lib:/opt/custom",
             )
             self.assertEqual(prepared_env["PATH"], "/usr/bin")
 

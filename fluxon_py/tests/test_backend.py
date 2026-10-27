@@ -5,6 +5,7 @@ import ctypes
 import os
 import sys
 import time
+import uuid
 from typing import Callable, List, Optional, Tuple, Union
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
@@ -12,11 +13,13 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from fluxon_py.api_error import (
     ApiError,
     EtcdError,
+    KeyAlreadyExistsError,
     KeyNotFoundError,
     TransportName,
     TransportUser,
 )
-from fluxon_py.kvclient.kvclient_interface import KvClient, MemHolder
+from fluxon_py.kvclient.fluxon import FluxonKVCacheStore
+from fluxon_py.kvclient.kvclient_interface import KvClient, MemHolder, PutOptionalArgs
 from fluxon_py.kvclient.nonzerocopy_encode import (
     DLPackBytesView,
     _dlpack_cpu_tensor_info,
@@ -92,6 +95,8 @@ def _build_test_plan(selected_test_id: Optional[str]) -> List[Tuple[str, Callabl
         ("rpc_roundtrip_dlpack_tensor", test_rpc_roundtrip_dlpack_tensor),
         ("key_not_found", test_key_not_found),
     ]
+    if KV_SVC_TYPE.lower() == "fluxon":
+        common_tests.append(("put_reject_if_exists", test_put_reject_if_exists))
     if KV_SVC_TYPE.lower() == "mooncake":
         common_tests.append(("mooncake_renew_put_and_get", test_mooncake_renew_put_and_get))
     if selected_test_id is None:
@@ -241,6 +246,89 @@ def test_basic_put_and_get() -> int:
     if not close_store_or_log("basic_put_and_get success path", store):
         return 7
     return 0
+
+
+def test_put_reject_if_exists() -> int:
+    """Exercise create-only and overwrite semantics through every native PUT binding."""
+    if KV_SVC_TYPE.lower() != "fluxon":
+        return 0
+
+    store = new_shared_stores(
+        key_prefix="test_put_reject_if_exists",
+        count=1,
+        backend_type=KV_SVC_TYPE,
+        instance_suffix=TEST_INSTANCE_SUFFIX,
+    )[0]
+    assert isinstance(store, FluxonKVCacheStore)
+    key_prefix = f"/test_put_reject_if_exists/{uuid.uuid4().hex}"
+    exists_code = -KeyAlreadyExistsError(message="duplicate key").code()
+
+    def submit_put(
+        mode: str, key: str, payload: bytes, opts: Optional[PutOptionalArgs]
+    ) -> int:
+        # Keep the raw buffer alive until each synchronous completion boundary.
+        buffer = ctypes.create_string_buffer(payload)
+        ptr = ctypes.addressof(buffer)
+        if mode == "async":
+            result = store.put(key, {"payload": payload}, opts=opts).unwrap().wait()
+        elif mode == "blocking":
+            result = store.put_blocking(key, {"payload": payload}, opts=opts)
+        elif mode == "batch":
+            result = store.batch_put_blocking([key], [{"payload": payload}], opts=opts)[0]
+        elif mode == "payload_async":
+            result = store.put_payload_from_ptr(key, ptr, len(payload), opts=opts).unwrap().wait()
+        elif mode == "payload_blocking":
+            result = store.put_payload_from_ptr_blocking(key, ptr, len(payload), opts=opts)
+        elif mode == "batch_payload":
+            return store.batch_put_from([key], [ptr], [len(payload)], opts=opts)[0]
+        else:
+            raise AssertionError(f"unknown PUT mode: {mode}")
+        if result.is_ok():
+            result.unwrap()
+            return 0
+        error = result.unwrap_error()
+        assert isinstance(error, KeyAlreadyExistsError), error
+        return -error.code()
+
+    failed = False
+    try:
+        for mode in (
+            "async",
+            "blocking",
+            "batch",
+            "payload_async",
+            "payload_blocking",
+            "batch_payload",
+        ):
+            key = f"{key_prefix}/{mode}"
+            create_only = PutOptionalArgs(reject_if_exists=True)
+            assert submit_put(mode, key, b"original", create_only) == 0, mode
+            duplicate_code = submit_put(mode, key, b"rejected", create_only)
+            # Raw batch reports native KV ApiError codes; Result paths map to Python errors.
+            expected_code = -123 if mode == "batch_payload" else exists_code
+            assert duplicate_code == expected_code, (mode, duplicate_code, expected_code)
+            assert (
+                store.get_blocking(key).unwrap().access().unwrap()["payload"] == b"original"
+            ), mode
+            assert submit_put(mode, key, b"default overwrite", None) == 0, mode
+            assert (
+                store.get_blocking(key).unwrap().access().unwrap()["payload"]
+                == b"default overwrite"
+            ), mode
+            assert submit_put(
+                mode, key, b"explicit overwrite", PutOptionalArgs(reject_if_exists=False)
+            ) == 0, mode
+            assert (
+                store.get_blocking(key).unwrap().access().unwrap()["payload"]
+                == b"explicit overwrite"
+            ), mode
+    except Exception:
+        logging.exception("PUT create-only/overwrite contract failed")
+        failed = True
+    finally:
+        if not close_store_or_log("put_reject_if_exists", store):
+            failed = True
+    return 1 if failed else 0
 
 
 def test_put_and_get_flat_dict() -> int:

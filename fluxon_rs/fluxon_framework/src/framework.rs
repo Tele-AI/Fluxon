@@ -238,9 +238,14 @@ macro_rules! define_module {
                         .view
                         .upgrade()
                         .expect("view of module has been dropped before spawn");
+                    let task_view_ref = view_ref.clone();
+                    let guarded = async move {
+                        let _task_view = task_view_ref;
+                        fut.await;
+                    };
                     let boxed: ::std::pin::Pin<
                         Box<dyn ::std::future::Future<Output = ()> + Send>,
-                    > = Box::pin(fut);
+                    > = Box::pin(guarded);
                     let handle = fluxon_framework_compiled::spawn::ViewSpawnExt::spawn_boxed(
                         &*view_ref,
                         boxed,
