@@ -5,11 +5,12 @@ use crate::master_kv_router::msg_pack::{
     BatchEvictOwnerSourceReq, BatchGetBindReq, BatchGetDoneReq, BatchGetPlanReq, BatchGetRevokeReq,
     BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq, BatchPreparePutKeysReq,
     BatchPublishOwnerSsdReq, BatchPutAppendDoneReq, BatchPutAppendStartReq, BatchPutDoneReq,
-    BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq, CountPrefixReq,
-    DeleteAckReq, DeleteReq, GetDoneReq, GetMasterOnlyMetricPartReq, GetMetaReq, GetRevokeReq,
-    GetStartReq, GroupedBatchPutDoneReq, MemHolderKeepAliveReq, MemHolderReleaseReq,
-    OwnerLocalReserveControlReq, PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq,
-    PutDoneReq, PutRevokeReq, PutStartReq, SsdStageBeginReq, SsdStageDoneReq,
+    BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
+    BatchSsdReplicaEvictReq, CountPrefixReq, DeleteAckReq, DeleteReq, GetDoneReq,
+    GetMasterOnlyMetricPartReq, GetMetaReq, GetRevokeReq, GetStartReq, GroupedBatchPutDoneReq,
+    MemHolderKeepAliveReq, MemHolderReleaseReq, OwnerLocalReserveControlReq, PutAppendDoneReq,
+    PutAppendRevokeReq, PutAppendStartReq, PutDoneReq, PutRevokeReq, PutStartReq, SsdStageBeginReq,
+    SsdStageDoneReq,
 };
 use crate::master_seg_manager::msg_pack::{
     ConfirmNodeSegmentsRegisteredReq, OwnerCapacityReportReq, RegisterNodeSegmentsReq,
@@ -63,6 +64,7 @@ impl_control_plane_rpc_req!(
     BatchOwnerReclaimReq,
     BatchEnqueueReplicaTaskReq,
     BatchDeleteClientKvMetaCacheReq,
+    BatchSsdReplicaEvictReq,
     PutStartReq,
     PutRevokeReq,
     PutDoneReq,
@@ -151,6 +153,7 @@ mod tests {
         assert_control_plane_rpc::<BatchOwnerReclaimReq>();
         assert_control_plane_rpc::<BatchEnqueueReplicaTaskReq>();
         assert_control_plane_rpc::<BatchDeleteClientKvMetaCacheReq>();
+        assert_control_plane_rpc::<BatchSsdReplicaEvictReq>();
         assert_control_plane_rpc::<PutStartReq>();
         assert_control_plane_rpc::<PutRevokeReq>();
         assert_control_plane_rpc::<PutDoneReq>();

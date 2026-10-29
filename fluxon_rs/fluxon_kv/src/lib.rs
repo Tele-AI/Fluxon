@@ -8,6 +8,8 @@ pub mod panel_proxy;
 // #[cfg(test)]
 pub mod key_prefix;
 pub mod kv_ssd_storage;
+mod kv_ssd_storage2;
+mod kv_ssd_storage_foyer;
 #[cfg(feature = "test_bins")]
 pub mod kv_test;
 pub mod kvlease;
@@ -1100,6 +1102,7 @@ fn build_side_transfer_worker_config_yaml(
             ssd_write_rate_limit_bytes_per_sec: None,
             ssd_write_burst_bytes: None,
             ssd_capacity_writeback_enabled: None,
+            kv_ssd_writeback: Default::default(),
             p2p_listen_port: side_config.fluxonkv_spec.p2p_listen_port,
             redis_compat: None,
             sub_cluster: None,
@@ -2269,15 +2272,22 @@ async fn run_client_impl(
         .map(|ssd| {
             config
                 .large_file_paths
-                .kv_ssd_storage_root(&config.cluster_name, &config.instance_key)
-                .map(|root_dir| KvSsdStorageInit {
-                    roots: vec![KvSsdStorageRootLimit {
-                        root_dir,
-                        limit_bytes: ssd.limit_bytes,
-                    }],
-                    write_rate_limit_bytes_per_sec: ssd.write_rate_limit_bytes_per_sec,
-                    write_burst_bytes: ssd.write_burst_bytes,
-                    capacity_writeback_enabled: ssd.capacity_writeback_enabled,
+                .kv_ssd_storage_root_limits(
+                    &config.cluster_name,
+                    &config.instance_key,
+                    &ssd.large_limit_size,
+                )
+                .map(|roots| KvSsdStorageInit {
+                    root_limits: roots
+                        .into_iter()
+                        .map(|(root_dir, limit_bytes)| KvSsdStorageRootLimit {
+                            root_dir,
+                            limit_bytes,
+                        })
+                        .collect(),
+                    uring_mode: config.test_spec_config.kv_ssd_uring_mode,
+                    backend: config.test_spec_config.kv_ssd_storage_backend,
+                    writeback: ssd.writeback.clone(),
                 })
         })
         .transpose()?;

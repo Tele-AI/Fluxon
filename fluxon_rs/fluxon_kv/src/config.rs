@@ -109,6 +109,35 @@ pub enum TcpThreadReactorWaitMode {
     EventDriven,
 }
 
+/// Native SSD read submission mode.  `SingleBuffer` is the compatibility
+/// default; `Iovec` keeps the same storage contract while allowing the uring
+/// worker to submit a scatter/gather request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvSsdUringMode {
+    SingleBuffer,
+    Iovec,
+}
+
+impl Default for KvSsdUringMode {
+    fn default() -> Self {
+        Self::SingleBuffer
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KvSsdStorageBackend {
+    Native,
+    Foyer,
+}
+
+impl Default for KvSsdStorageBackend {
+    fn default() -> Self {
+        Self::Native
+    }
+}
+
 /// Experimental source ordering for an external planned Get when SSD routes
 /// are present. The default preserves the sealed r89 behavior so a new
 /// release does not silently change an existing baseline.
@@ -242,6 +271,10 @@ pub struct TestSpecConfig {
     pub side_transfer_worker_p2p_port_base: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub side_transfer_role: Option<SideTransferRole>,
+    #[serde(default)]
+    pub kv_ssd_uring_mode: KvSsdUringMode,
+    #[serde(default)]
+    pub kv_ssd_storage_backend: KvSsdStorageBackend,
 }
 
 impl Default for TestSpecConfig {
@@ -279,8 +312,22 @@ impl Default for TestSpecConfig {
             side_transfer_worker_count: 0,
             side_transfer_worker_p2p_port_base: None,
             side_transfer_role: None,
+            kv_ssd_uring_mode: KvSsdUringMode::default(),
+            kv_ssd_storage_backend: KvSsdStorageBackend::default(),
         }
     }
+}
+
+fn validate_test_spec_kv_ssd_backend(test_spec_config: &TestSpecConfig) -> KvResult<()> {
+    if test_spec_config.kv_ssd_storage_backend == KvSsdStorageBackend::Foyer
+        && test_spec_config.kv_ssd_uring_mode != KvSsdUringMode::SingleBuffer
+    {
+        return Err(ConfigError::InvalidClientConfig {
+            detail: "test_spec_config.kv_ssd_uring_mode is only valid with test_spec_config.kv_ssd_storage_backend=native".to_string(),
+        }
+        .into_kverror());
+    }
+    Ok(())
 }
 
 fn resolve_enable_transfer_rpc_fast_path(
@@ -1006,6 +1053,11 @@ pub struct FluxonKvSpecYaml {
     /// while making capacity victims follow the ordinary direct-Drop path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssd_capacity_writeback_enabled: Option<bool>,
+    /// Native SSD writer limits.  The legacy rate/burst fields above remain
+    /// accepted for existing owner configurations and are mapped into the
+    /// compatibility limiter below.
+    #[serde(default)]
+    pub kv_ssd_writeback: KvSsdWritebackConfig,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2p_listen_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1021,9 +1073,93 @@ pub struct LargeFilePathsYaml(pub Vec<String>);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvSsdStorageConfig {
     pub limit_bytes: u64,
+    pub large_limit_size: Vec<u64>,
     pub write_rate_limit_bytes_per_sec: Option<u64>,
     pub write_burst_bytes: Option<u64>,
     pub capacity_writeback_enabled: bool,
+    pub writeback: KvSsdWritebackConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct KvSsdWritebackConfig {
+    pub batch_max_bytes: u64,
+    pub batch_max_items: usize,
+    pub batch_max_wait_us: u64,
+    pub max_inflight_batches: usize,
+    pub max_inflight_ops: usize,
+    pub required_queue_bytes: u64,
+    pub early_queue_bytes: u64,
+    /// Compatibility limiter used by the older owner-local admission path.
+    /// These fields are deliberately outside the native queue accounting.
+    #[serde(skip)]
+    pub legacy_rate_limit_bytes_per_sec: Option<u64>,
+    #[serde(skip)]
+    pub legacy_burst_bytes: Option<u64>,
+    #[serde(skip, default = "default_true")]
+    pub capacity_writeback_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for KvSsdWritebackConfig {
+    fn default() -> Self {
+        Self {
+            batch_max_bytes: 512 * 1024 * 1024,
+            batch_max_items: 32,
+            // Keep a short coalescing window so concurrent early writes reach
+            // the native writer together instead of becoming one-item flushes.
+            // Deployments can still override this in kv_ssd_writeback.
+            batch_max_wait_us: 5_000,
+            max_inflight_batches: 4,
+            max_inflight_ops: 8,
+            required_queue_bytes: 2 * 1024 * 1024 * 1024,
+            early_queue_bytes: 1024 * 1024 * 1024,
+            legacy_rate_limit_bytes_per_sec: None,
+            legacy_burst_bytes: None,
+            capacity_writeback_enabled: true,
+        }
+    }
+}
+
+impl KvSsdWritebackConfig {
+    pub(crate) fn validate(&self) -> KvResult<()> {
+        let detail = if self.batch_max_bytes == 0 {
+            Some("batch_max_bytes must be positive".to_string())
+        } else if self.batch_max_items == 0
+            || self.batch_max_items > crate::kv_ssd_storage::MAX_PERSIST_BATCH_ITEMS
+        {
+            Some(format!(
+                "batch_max_items must be in 1..={}",
+                crate::kv_ssd_storage::MAX_PERSIST_BATCH_ITEMS
+            ))
+        } else if self.max_inflight_batches < 2 {
+            Some("max_inflight_batches must be at least 2".to_string())
+        } else if self.max_inflight_ops == 0 {
+            Some("max_inflight_ops must be positive".to_string())
+        } else if self.required_queue_bytes == 0 || self.required_queue_bytes > u32::MAX as u64 {
+            Some(format!("required_queue_bytes must be in 1..={}", u32::MAX))
+        } else if self.early_queue_bytes == 0 || self.early_queue_bytes >= self.required_queue_bytes
+        {
+            Some(
+                "early_queue_bytes must be positive and smaller than required_queue_bytes"
+                    .to_string(),
+            )
+        } else if self.batch_max_bytes > self.required_queue_bytes {
+            Some("batch_max_bytes must not exceed required_queue_bytes".to_string())
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: format!("fluxonkv_spec.kv_ssd_writeback.{detail}"),
+            }
+            .into_kverror());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1165,6 +1301,50 @@ impl LargeFilePaths {
             crate::kv_ssd_storage::safe_path_component(instance_key)
         ));
         self.resolve_preferred_root_subdir(&relative_dir, "kv ssd storage")
+    }
+
+    /// Resolve one SSD storage directory and capacity per configured large-file
+    /// root.  The source SSD backend shards across devices, so preserving root
+    /// order here is part of the storage routing contract.
+    pub fn kv_ssd_storage_root_limits(
+        &self,
+        cluster_name: &str,
+        instance_key: &str,
+        large_limit_size: &[u64],
+    ) -> KvResult<Vec<(PathBuf, u64)>> {
+        if large_limit_size.len() != self.paths.len() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: format!(
+                    "large_limit_size length must match large_file_paths length: large_limit_size={} large_file_paths={}",
+                    large_limit_size.len(),
+                    self.paths.len()
+                ),
+            }
+            .into_kverror());
+        }
+        let relative_dir = PathBuf::from(format!(
+            "{cluster_name}_cluster_kv_ssd_storage/{}",
+            crate::kv_ssd_storage::safe_path_component(instance_key)
+        ));
+        let mut roots = Vec::new();
+        let mut errors = Vec::new();
+        for (root, limit_bytes) in self.paths.iter().zip(large_limit_size.iter().copied()) {
+            let candidate = Path::new(root).join(&relative_dir);
+            match fs::create_dir_all(&candidate) {
+                Ok(()) => roots.push((candidate, limit_bytes)),
+                Err(err) => errors.push(format!("{} ({err})", candidate.display())),
+            }
+        }
+        if roots.is_empty() {
+            return Err(ConfigError::InvalidClientConfig {
+                detail: format!(
+                    "large_file_paths contains no usable root for kv ssd storage; tried: {}",
+                    errors.join(", ")
+                ),
+            }
+            .into_kverror());
+        }
+        Ok(roots)
     }
 }
 
@@ -1445,6 +1625,8 @@ impl ClientConfigYaml {
         validate_owner_local_reserve_timeouts(&test_spec_config)?;
         validate_owner_local_reserve_expected_capacity(&test_spec_config)?;
         validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
+        validate_test_spec_kv_ssd_backend(&test_spec_config)?;
+        self.fluxonkv_spec.kv_ssd_writeback.validate()?;
 
         // Role selection contract:
         // - Missing contribute_to_cluster_pool_size means "zero-contribution" mode.
@@ -1804,6 +1986,10 @@ impl ClientConfigYaml {
             }
         };
 
+        let mut kv_ssd_writeback = self.fluxonkv_spec.kv_ssd_writeback.clone();
+        kv_ssd_writeback.legacy_rate_limit_bytes_per_sec = ssd_write_rate_limit_bytes_per_sec;
+        kv_ssd_writeback.legacy_burst_bytes = ssd_write_burst_bytes;
+        kv_ssd_writeback.capacity_writeback_enabled = ssd_capacity_writeback_enabled;
         let ssd_storage = if is_external {
             if write_limit.is_some() || self.fluxonkv_spec.ssd_capacity_writeback_enabled.is_some()
             {
@@ -1829,34 +2015,37 @@ impl ClientConfigYaml {
                     None
                 }
                 Some(YamlNullable::Value(limits)) => {
-                    if large_file_paths.paths.len() != 1 || limits.len() != 1 {
+                    if large_file_paths.paths.len() != limits.len() || limits.is_empty() {
                         return Err(ConfigError::InvalidClientConfig {
                             detail: format!(
-                                "SSD-enabled owners require exactly one local large_file_paths root and one large_limit_size value: roots={} limits={}",
+                                "fluxonkv_spec.large_limit_size length must match fluxonkv_spec.large_file_paths length: roots={} limits={}",
                                 large_file_paths.paths.len(),
                                 limits.len()
                             ),
                         }
                         .into_kverror());
                     }
-                    let limit_bytes = limits[0];
-                    if limit_bytes < crate::kv_ssd_storage::MIN_CAPACITY_BYTES {
-                        return Err(ConfigError::InvalidClientConfig {
-                            detail: format!(
-                                "fluxonkv_spec.large_limit_size[0] must be at least {} bytes",
-                                crate::kv_ssd_storage::MIN_CAPACITY_BYTES
-                            ),
+                    for (index, limit_bytes) in limits.iter().copied().enumerate() {
+                        if limit_bytes < crate::kv_ssd_storage::SSD_ALIGNMENT as u64 {
+                            return Err(ConfigError::InvalidClientConfig {
+                                detail: format!(
+                                    "fluxonkv_spec.large_limit_size[{index}] must be at least {} bytes",
+                                    crate::kv_ssd_storage::SSD_ALIGNMENT
+                                ),
+                            }
+                            .into_kverror());
                         }
-                        .into_kverror());
                     }
                     let (write_rate_limit_bytes_per_sec, write_burst_bytes) = write_limit
                         .map(|(rate, burst)| (Some(rate), Some(burst)))
                         .unwrap_or((None, None));
                     Some(KvSsdStorageConfig {
-                        limit_bytes,
+                        limit_bytes: limits[0],
+                        large_limit_size: limits,
                         write_rate_limit_bytes_per_sec,
                         write_burst_bytes,
                         capacity_writeback_enabled: ssd_capacity_writeback_enabled,
+                        writeback: kv_ssd_writeback,
                     })
                 }
             }
@@ -2216,6 +2405,7 @@ impl MasterConfigYaml {
             .into_kverror());
         }
         validate_test_spec_tcp_thread_tuning(&test_spec_config)?;
+        validate_test_spec_kv_ssd_backend(&test_spec_config)?;
         let protocol = apply_test_spec_rdma_device_names_to_protocol(
             self.protocol.unwrap_or(ProtocolConfig {
                 protocol_type: ProtocolType::Rdma,
@@ -2262,6 +2452,16 @@ mod tests {
         let path = std::env::temp_dir().join(format!("{}_{}", prefix, Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn kv_ssd_writeback_default_coalescing_wait_is_overridable() {
+        assert_eq!(KvSsdWritebackConfig::default().batch_max_wait_us, 5_000);
+
+        let configured: KvSsdWritebackConfig =
+            serde_yaml::from_str("batch_max_wait_us: 1000\n").unwrap();
+        assert_eq!(configured.batch_max_wait_us, 1_000);
+        configured.validate().unwrap();
     }
 
     #[test]
@@ -2761,7 +2961,7 @@ fluxonkv_spec:
     }
 
     #[test]
-    fn owner_ssd_config_requires_one_local_root_and_one_capacity() {
+    fn owner_ssd_config_accepts_multiple_local_roots_and_validates_capacities() {
         let valid = ClientConfigYaml::from_str(
             r#"
 instance_key: test_ssd_owner
@@ -2822,6 +3022,34 @@ fluxonkv_spec:
   large_file_paths:
     - /mnt/nvme0/mjq_build/fluxon_config_ssd_local_a
     - /mnt/nvme0/mjq_build/fluxon_config_ssd_local_b
+  large_limit_size: [67108864, 134217728]
+  sub_cluster: rack-a
+"#,
+        )
+        .unwrap()
+        .verify()
+        .unwrap();
+        assert_eq!(
+            multiple_roots
+                .ssd_storage
+                .as_ref()
+                .map(|ssd| ssd.large_limit_size.as_slice()),
+            Some([67108864, 134217728].as_slice())
+        );
+
+        let mismatched_roots = ClientConfigYaml::from_str(
+            r#"
+instance_key: test_ssd_owner
+contribute_to_cluster_pool_size:
+  dram: 16777216
+  vram: {}
+fluxonkv_spec:
+  etcd_addresses: ["127.0.0.1:2379"]
+  cluster_name: test_cluster
+  share_mem_path: /mnt/nvme0/mjq_build/fluxon_config_ssd_share
+  large_file_paths:
+    - /mnt/nvme0/mjq_build/fluxon_config_ssd_local_a
+    - /mnt/nvme0/mjq_build/fluxon_config_ssd_local_b
   large_limit_size: [67108864]
   sub_cluster: rack-a
 "#,
@@ -2830,9 +3058,9 @@ fluxonkv_spec:
         .verify()
         .unwrap_err();
         assert!(
-            multiple_roots
+            mismatched_roots
                 .to_string()
-                .contains("SSD-enabled owners require exactly one local large_file_paths root")
+                .contains("large_limit_size length must match fluxonkv_spec.large_file_paths")
         );
 
         let too_small = ClientConfigYaml::from_str(
@@ -2846,14 +3074,14 @@ fluxonkv_spec:
   cluster_name: test_cluster
   share_mem_path: /mnt/nvme0/mjq_build/fluxon_config_ssd_share
   large_file_paths: [/mnt/nvme0/mjq_build/fluxon_config_ssd_local]
-  large_limit_size: [67108863]
+  large_limit_size: [511]
   sub_cluster: rack-a
 "#,
         )
         .unwrap()
         .verify()
         .unwrap_err();
-        assert!(too_small.to_string().contains("must be at least 67108864"));
+        assert!(too_small.to_string().contains("must be at least 512"));
     }
 
     #[test]

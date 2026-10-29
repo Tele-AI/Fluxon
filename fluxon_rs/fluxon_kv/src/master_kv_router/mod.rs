@@ -15,6 +15,7 @@ mod tiered_writeback;
 use self::{
     count_prefix_index::PrefixRadixTree,
     delete::handle_batch_delete_ack,
+    delete::handle_batch_ssd_replica_evict,
     delete::handle_delete,
     delete::handle_delete_ack,
     get::{
@@ -29,12 +30,12 @@ use self::{
         BatchGetRevokeReq, BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq,
         BatchPreparePutKeysReq, BatchPublishOwnerSsdReq, BatchPutAppendDoneReq,
         BatchPutAppendStartReq, BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq,
-        BatchReleasePutKeyReservationsReq, CountPrefixReq, CountPrefixResp, DeleteAckReq,
-        DeleteReq, GetAllocationMode, GetDoneReq, GetDoneResp, GetMetaReq, GetRevokeReq,
-        GetSourceKind, GetStartReq, GroupedBatchPutDoneReq, OwnerLocalReserveControlOp,
-        OwnerLocalReserveControlReq, OwnerLocalReserveControlResp, OwnerReclaimItem,
-        PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq, PutAtomicGroup, PutDoneReq,
-        PutRevokeReq, PutStartReq, SsdStageBeginReq, SsdStageDoneReq,
+        BatchReleasePutKeyReservationsReq, BatchSsdReplicaEvictReq, CountPrefixReq,
+        CountPrefixResp, DeleteAckReq, DeleteReq, GetAllocationMode, GetDoneReq, GetDoneResp,
+        GetMetaReq, GetRevokeReq, GetSourceKind, GetStartReq, GroupedBatchPutDoneReq,
+        OwnerLocalReserveControlOp, OwnerLocalReserveControlReq, OwnerLocalReserveControlResp,
+        OwnerReclaimItem, PutAppendDoneReq, PutAppendRevokeReq, PutAppendStartReq, PutAtomicGroup,
+        PutDoneReq, PutRevokeReq, PutStartReq, SsdStageBeginReq, SsdStageDoneReq,
     },
     placement::{PlacementPolicy, build_placement_policy},
     put::{
@@ -5214,6 +5215,20 @@ impl MasterKvRouter {
             view.spawn("rpc_ssd_stage_done", async move {
                 let ack = handle_ssd_stage_done(task_view, msg, req_node_id).await;
                 let _ = send_control_plane_rpc_response(&resp, ack).await;
+            });
+            Ok(())
+        });
+
+        let view = self.0.view().clone();
+        RPCHandler::<BatchSsdReplicaEvictReq>::new().regist(p2p, move |resp, msg| {
+            let view = view.clone();
+            let task_view = view.clone();
+            let req_node_id = resp.node_id().clone();
+            view.spawn("rpc_batch_ssd_replica_evict", async move {
+                let ack = handle_batch_ssd_replica_evict(task_view, msg, req_node_id).await;
+                if let Err(err) = send_control_plane_rpc_response(&resp, ack).await {
+                    error!("Failed to send BatchSsdReplicaEvictResp: {:?}", err);
+                }
             });
             Ok(())
         });
