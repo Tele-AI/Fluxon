@@ -302,6 +302,25 @@ async fn get_owner_probe_value(
     }
 }
 
+async fn wait_for_external_route_publication(
+    view: &crate::external_client_api::ExternalClientApiView,
+    key: &str,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let api = view.external_client_api();
+    timeout(deadline.saturating_duration_since(Instant::now()), async {
+        loop {
+            // Default existence checks query Master instead of the local snapshot.
+            if api.inner().is_exist(key).await? {
+                return Ok::<(), anyhow::Error>(());
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("external route publication timed out: key={}", key))?
+}
+
 async fn fetch_transfer_link_te_value(
     cluster_name: &str,
     from_instance_key: &str,
@@ -380,6 +399,20 @@ async fn verify_rdma_transfer_data_link(
             sleep(Duration::from_secs(1)).await;
             continue;
         }
+
+        // The probe reads from another Owner, so it needs the Master route.
+        wait_for_external_route_publication(
+            &probe_writer_framework.external_client_api_view(),
+            attempt_key.as_str(),
+            deadline,
+        )
+        .await
+        .unwrap_or_else(|err| {
+            panic!(
+                "closed transfer data probe publication failed: cluster={} from={} to={} key={} attempt={} err={}",
+                cluster_name, from_instance_key, to_instance_key, attempt_key, attempt, err
+            )
+        });
 
         let payload = match get_owner_probe_value(requester_framework, attempt_key.as_str()).await {
             Ok(payload) => payload,
@@ -1301,6 +1334,14 @@ async fn perform_external_client_crud_operations(
             return Err(e.into());
         }
     }
+
+    // Same-owner GET above checks local completion; global existence needs publication.
+    wait_for_external_route_publication(
+        &view,
+        key,
+        Instant::now() + Duration::from_secs(KV_TEST_TRANSFER_PROBE_IO_TIMEOUT_SECS),
+    )
+    .await?;
 
     // EXIST操作
     match api.inner().is_exist(key).await {
