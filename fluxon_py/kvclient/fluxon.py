@@ -1962,6 +1962,12 @@ class FluxonKVCacheStore(KvClient, KvLeaseApi, KvRpcApi):
         return int(plan_ptr)
 
     def local_fast_put_commit(self, plan_ptr: int) -> KvFuture:
+        """Commit a plan after the caller has finished writing its values.
+
+        For local-first write-back, future success confirms local commit and
+        handoff to the Owner's background publication task. Master route
+        publication may still be pending; restore must use actual GET hits.
+        """
         if self._client is None:
             raise RuntimeError(
                 "Store not initialized when local_fast_put_commit(). Call setup() first."

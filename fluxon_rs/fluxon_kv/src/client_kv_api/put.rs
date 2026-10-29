@@ -47,6 +47,7 @@ use crate::{
 };
 use chrono::Utc;
 use fluxon_commu::TransferBreakdown;
+use futures::{StreamExt, stream::FuturesUnordered};
 use limit_thirdparty::tokio;
 use std::future::Future;
 use std::sync::{Arc, atomic::Ordering};
@@ -56,6 +57,7 @@ use std::time::{Duration, Instant};
 // result per KV. Batches run sequentially so a capacity contraction cannot
 // flood the peer with many large reservation requests at once.
 const OWNER_SOURCE_EVICTION_RPC_BATCH: usize = 256;
+const OWNER_EARLY_SSD_QUEUE_CAPACITY: usize = 4096;
 
 fn duration_to_i64_us(duration: std::time::Duration) -> i64 {
     duration.as_micros().min(i64::MAX as u128) as i64
@@ -817,6 +819,113 @@ struct OwnerLocalSsdPutCandidate {
     /// resource admission already happened upstream.
     value_len: u64,
     selected_victim: Option<Arc<OwnerSourceEvictionVictim>>,
+}
+
+struct OwnerEarlySsdPutCandidate {
+    key: String,
+    put_id: PutIDForAKey,
+    value_len: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct OwnerEarlySsdQueueSnapshot {
+    pub(super) queued_items: usize,
+    pub(super) peak_queued_items: usize,
+    pub(super) enqueued_items: u64,
+    pub(super) queue_full_dropped: u64,
+    pub(super) closed_dropped: u64,
+    pub(super) inflight_batches: usize,
+    pub(super) peak_inflight_batches: usize,
+}
+
+struct OwnerEarlySsdQueueState {
+    sender: Option<tokio::sync::ampsc::Sender<OwnerEarlySsdPutCandidate>>,
+    receiver: Option<tokio::sync::ampsc::Receiver<OwnerEarlySsdPutCandidate>>,
+    finished: bool,
+    snapshot: OwnerEarlySsdQueueSnapshot,
+}
+
+/// Owns metadata admission and the barrier before SSD storage is released.
+pub(super) struct OwnerEarlySsdQueue {
+    state: parking_lot::Mutex<OwnerEarlySsdQueueState>,
+    changed: ::tokio::sync::Notify,
+}
+
+impl OwnerEarlySsdQueue {
+    pub(super) fn new() -> Arc<Self> {
+        let (sender, receiver) = tokio::sync::ampsc::channel(OWNER_EARLY_SSD_QUEUE_CAPACITY);
+        Arc::new(Self {
+            state: parking_lot::Mutex::new(OwnerEarlySsdQueueState {
+                sender: Some(sender),
+                receiver: Some(receiver),
+                finished: false,
+                snapshot: OwnerEarlySsdQueueSnapshot::default(),
+            }),
+            changed: ::tokio::sync::Notify::new(),
+        })
+    }
+
+    fn enqueue(&self, candidate: OwnerEarlySsdPutCandidate) -> bool {
+        let mut state = self.state.lock();
+        let Some(sender) = state.sender.as_ref() else {
+            state.snapshot.closed_dropped += 1;
+            return false;
+        };
+        match sender.try_send(candidate) {
+            Ok(()) => {
+                state.snapshot.enqueued_items += 1;
+                state.snapshot.queued_items += 1;
+                state.snapshot.peak_queued_items = state
+                    .snapshot
+                    .peak_queued_items
+                    .max(state.snapshot.queued_items);
+                true
+            }
+            Err(::tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                state.snapshot.queue_full_dropped += 1;
+                false
+            }
+            Err(::tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                state.snapshot.closed_dropped += 1;
+                false
+            }
+        }
+    }
+
+    fn dequeued(&self) {
+        let mut state = self.state.lock();
+        state.snapshot.queued_items -= 1;
+    }
+
+    fn set_inflight_batches(&self, count: usize) {
+        let mut state = self.state.lock();
+        state.snapshot.inflight_batches = count;
+        state.snapshot.peak_inflight_batches = state.snapshot.peak_inflight_batches.max(count);
+    }
+
+    pub(super) fn snapshot(&self) -> OwnerEarlySsdQueueSnapshot {
+        self.state.lock().snapshot
+    }
+
+    pub(super) fn close_admission(&self) {
+        {
+            let mut state = self.state.lock();
+            state.sender.take();
+            // Construction can fail before the receiver is handed to an actor.
+            // The receiver's current owner completes cleanup in that case.
+            if state.receiver.take().is_some() {
+                state.snapshot.closed_dropped += state.snapshot.queued_items as u64;
+                state.snapshot.queued_items = 0;
+                state.finished = true;
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
+    pub(super) async fn wait_finished(&self) {
+        // After handoff, only the dispatcher can complete its active flights.
+        fluxon_util::notify_state::wait_until(&self.changed, || self.state.lock().finished).await;
+    }
 }
 
 struct OwnerLocalSsdPutLeader {
@@ -1802,36 +1911,14 @@ impl ClientKvApiInner {
     fn start_owner_local_ssd_puts(
         &self,
         candidates: Vec<OwnerLocalSsdPutCandidate>,
-        resources_pre_admitted: bool,
     ) -> Vec<Option<Arc<OwnerLocalSsdPutSharedOp>>> {
-        // Early backing is optional work. Apply its independent byte budget
-        // before touching the per-key generation table or pinning a source.
-        // Last-backing callers have already performed the same admission while
-        // deciding which capacity victims may enter durability, so they pass
-        // resources_pre_admitted=true and must not be charged twice.
-        let admission = if resources_pre_admitted {
-            vec![true; candidates.len()]
-        } else {
-            let lengths = candidates
-                .iter()
-                .map(|candidate| candidate.value_len)
-                .collect::<Vec<_>>();
-            self.ssd_storage
-                .as_ref()
-                .map(|store| store.admit_owner_write_candidates(&lengths))
-                .unwrap_or_else(|| vec![false; candidates.len()])
-        };
+        // Last-backing callers already admitted these capacity victims.
         let mut operations = std::iter::repeat_with(|| None)
             .take(candidates.len())
             .collect::<Vec<_>>();
         let mut leaders = Vec::new();
         let mut unused_pre_admission_lengths = Vec::new();
-        for (index, (candidate, admitted_by_resource)) in
-            candidates.into_iter().zip(admission).enumerate()
-        {
-            if !admitted_by_resource {
-                continue;
-            }
+        for (index, candidate) in candidates.into_iter().enumerate() {
             let pre_admitted_len = candidate.value_len;
             match self.begin_owner_local_ssd_put(
                 &candidate.key,
@@ -1875,42 +1962,52 @@ impl ClientKvApiInner {
             return operations;
         }
 
-        let admitted_lengths = leaders
-            .iter()
-            .map(|leader| leader.admission_len)
-            .collect::<Vec<_>>();
-        let permit = match self.try_acquire_local_ssd_persist_batch(leaders.len()) {
-            Ok(Some(permit)) => permit,
-            Ok(None) => {
-                if let Some(store) = self.ssd_storage.as_ref() {
+        let store = self
+            .ssd_storage
+            .as_ref()
+            .expect("owner local SSD leaders require storage");
+        let (batch_max_bytes, batch_max_items) = store.write_batch_limits();
+        for leaders in group_owner_local_ssd_put_leaders(leaders, batch_max_bytes, batch_max_items)
+        {
+            let admitted_lengths = leaders
+                .iter()
+                .map(|leader| leader.admission_len)
+                .collect::<Vec<_>>();
+            let permit = match self.try_acquire_local_ssd_persist_batch(&admitted_lengths) {
+                Ok(Some(permit)) => permit,
+                Ok(None) => {
                     store.refund_owner_write_admission(&admitted_lengths);
+                    for leader in leaders {
+                        self.finish_owner_local_ssd_put(
+                            &leader.op,
+                            OwnerLocalSsdPutOutcome::Dropped,
+                        );
+                    }
+                    continue;
                 }
-                for leader in leaders {
-                    self.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Dropped);
-                }
-                return operations;
-            }
-            Err(err) => {
-                if let Some(store) = self.ssd_storage.as_ref() {
+                Err(err) => {
                     store.refund_owner_write_admission(&admitted_lengths);
+                    tracing::warn!(
+                        items = leaders.len(),
+                        error = %err,
+                        "owner local SSD durability batch admission failed"
+                    );
+                    for leader in leaders {
+                        self.finish_owner_local_ssd_put(
+                            &leader.op,
+                            OwnerLocalSsdPutOutcome::Failed,
+                        );
+                    }
+                    continue;
                 }
-                tracing::warn!(
-                    items = leaders.len(),
-                    error = %err,
-                    "owner local SSD durability batch admission failed"
-                );
-                for leader in leaders {
-                    self.finish_owner_local_ssd_put(&leader.op, OwnerLocalSsdPutOutcome::Failed);
-                }
-                return operations;
-            }
-        };
+            };
 
-        let spawn_view = self.view.clone_view();
-        let task_view = spawn_view.clone();
-        let _ = spawn_view.spawn("owner_local_ssd_put_batch", async move {
-            run_owner_local_ssd_put_batch(task_view, leaders, permit).await;
-        });
+            let spawn_view = self.view.clone_view();
+            let task_view = spawn_view.clone();
+            let _ = spawn_view.spawn("owner_local_ssd_put_batch", async move {
+                run_owner_local_ssd_put_batch(task_view, leaders, permit).await;
+            });
+        }
         operations
     }
 
@@ -1918,18 +2015,32 @@ impl ClientKvApiInner {
         &self,
         candidates: Vec<(String, PutIDForAKey, u64)>,
     ) {
-        let _ = self.start_owner_local_ssd_puts(
-            candidates
-                .into_iter()
-                .map(|(key, put_id, value_len)| OwnerLocalSsdPutCandidate {
-                    key,
-                    put_id,
-                    value_len,
-                    selected_victim: None,
-                })
-                .collect(),
-            false,
-        );
+        let Some(queue) = self.owner_early_ssd_queue.as_ref() else {
+            return;
+        };
+        let store = self
+            .ssd_storage
+            .as_ref()
+            .expect("early SSD queue requires storage");
+        // Optional byte admission stays before metadata enqueue, flight creation,
+        // and source pinning. A large Put spans multiple bounded admission batches.
+        for batch in candidates.chunks(crate::kv_ssd_storage::MAX_PERSIST_BATCH_ITEMS) {
+            let lengths = batch.iter().map(|(_, _, len)| *len).collect::<Vec<_>>();
+            let admission = store.admit_owner_write_candidates(&lengths);
+            let mut refunded = Vec::new();
+            for ((key, put_id, value_len), admitted) in batch.iter().zip(admission) {
+                if admitted
+                    && !queue.enqueue(OwnerEarlySsdPutCandidate {
+                        key: key.clone(),
+                        put_id: *put_id,
+                        value_len: *value_len,
+                    })
+                {
+                    refunded.push(*value_len);
+                }
+            }
+            store.refund_owner_write_admission(&refunded);
+        }
     }
 
     pub(crate) fn start_early_owner_local_ssd_put(
@@ -2686,11 +2797,7 @@ impl ClientKvApiInner {
             },
             raw_bytes: Vec::new(),
         };
-        let master_node_id = self
-            .view
-            .cluster_manager()
-            .find_or_wait_master_node()
-            .await?;
+        let master_node_id = self.find_put_master_before_shutdown().await?;
         let resp = self
             .rpc_caller_batch_publish_owner_ssd
             .call_with_transport_policy(
@@ -4411,7 +4518,6 @@ async fn process_owner_source_eviction_batch(
                         selected_victim: Some(victim.clone()),
                     })
                     .collect(),
-                true,
             )
         },
     )
@@ -4674,6 +4780,300 @@ pub fn spawn_owner_hot_retry_actor(view: ClientKvApiView) {
     });
 }
 
+fn group_owner_local_ssd_put_leaders(
+    leaders: Vec<OwnerLocalSsdPutLeader>,
+    max_bytes: u64,
+    max_items: usize,
+) -> Vec<Vec<OwnerLocalSsdPutLeader>> {
+    assert!(max_bytes > 0);
+    assert!((1..=crate::kv_ssd_storage::MAX_PERSIST_BATCH_ITEMS).contains(&max_items));
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut current_bytes = 0u64;
+    for leader in leaders {
+        let aligned_len =
+            crate::kv_ssd_storage::align_ssd_io_len(u64::from(leader.memory_info.len))
+                .expect("MemoryInfo len must fit native SSD alignment");
+        if !current.is_empty()
+            && (current.len() >= max_items || current_bytes.saturating_add(aligned_len) > max_bytes)
+        {
+            groups.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(aligned_len);
+        current.push(leader);
+        // Preserve the storage policy that admits an oversized value on its own.
+        if current.len() >= max_items || aligned_len > max_bytes {
+            groups.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+#[cfg(test)]
+mod owner_local_ssd_put_batch_tests {
+    use super::{
+        OwnerLocalSsdPutLeader, OwnerLocalSsdPutSharedOp, group_owner_local_ssd_put_leaders,
+    };
+    use crate::client_kv_api::ClientKvApiView;
+    use crate::memholder::{MemoryInfo, MemoryInfoDropAction};
+    use std::sync::{Arc, Weak};
+
+    fn leaders(lengths: &[u32]) -> Vec<OwnerLocalSsdPutLeader> {
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(index, len)| {
+                let key = index.to_string();
+                OwnerLocalSsdPutLeader {
+                    op: OwnerLocalSsdPutSharedOp::new(&key, (index as u64, 0)),
+                    memory_info: Arc::new(MemoryInfo {
+                        offset: 0,
+                        addr: 0,
+                        len: *len,
+                        holder_id: index as u64,
+                        key,
+                        master_node_id: "owner".into(),
+                        view: ClientKvApiView {
+                            view: Weak::<crate::FrameworkInner>::new(),
+                        },
+                        drop_action: MemoryInfoDropAction::None,
+                    }),
+                    admission_len: 0,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn item_limit_preserves_every_leader_in_order() {
+        let groups = group_owner_local_ssd_put_leaders(
+            leaders(&[9 * 1024 * 1024; 65]),
+            512 * 1024 * 1024,
+            32,
+        );
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [32, 32, 1]);
+        let keys = groups
+            .into_iter()
+            .flatten()
+            .map(|leader| leader.op.key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            (0..65).map(|index| index.to_string()).collect::<Vec<_>>()
+        );
+        assert!(group_owner_local_ssd_put_leaders(Vec::new(), 512, 1).is_empty());
+    }
+
+    #[test]
+    fn byte_limit_counts_alignment_and_isolates_oversized_values() {
+        let groups =
+            group_owner_local_ssd_put_leaders(leaders(&[513, 1, 512, 1537, 1, 1]), 1024, 4);
+        let keys = groups
+            .into_iter()
+            .map(|group| {
+                group
+                    .into_iter()
+                    .map(|leader| leader.op.key.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![vec!["0"], vec!["1", "2"], vec!["3"], vec!["4", "5"]]
+        );
+    }
+
+    #[test]
+    fn early_metadata_queue_rejects_overflow_and_closed_admission() {
+        let queue = super::OwnerEarlySsdQueue::new();
+        let candidate = |index| super::OwnerEarlySsdPutCandidate {
+            key: format!("queue-{index}"),
+            put_id: (1, 0),
+            value_len: 4096,
+        };
+        for index in 0..super::OWNER_EARLY_SSD_QUEUE_CAPACITY {
+            assert!(queue.enqueue(candidate(index)));
+        }
+        assert!(!queue.enqueue(candidate(super::OWNER_EARLY_SSD_QUEUE_CAPACITY)));
+        assert_eq!(
+            queue.snapshot().queued_items,
+            super::OWNER_EARLY_SSD_QUEUE_CAPACITY
+        );
+        assert_eq!(queue.snapshot().queue_full_dropped, 1);
+        queue.close_admission();
+        assert!(!queue.enqueue(candidate(0)));
+        assert_eq!(queue.snapshot().queued_items, 0);
+        assert_eq!(
+            queue.snapshot().closed_dropped,
+            super::OWNER_EARLY_SSD_QUEUE_CAPACITY as u64 + 1
+        );
+    }
+}
+
+pub(super) fn spawn_owner_early_ssd_dispatcher(
+    view: ClientKvApiView,
+    queue: Arc<OwnerEarlySsdQueue>,
+) {
+    let mut rx = queue
+        .state
+        .lock()
+        .receiver
+        .take()
+        .expect("early SSD dispatcher has one receiver");
+    let task_view = view.clone();
+    let _ = view.spawn("owner_early_ssd_dispatcher", async move {
+        let inner = task_view.client_kv_api().inner();
+        let store = inner.ssd_storage.as_ref().expect("early SSD storage");
+        let (max_bytes, max_items) = store.write_batch_limits();
+        let max_inflight = store.max_early_persist_batches();
+        let mut active = FuturesUnordered::new();
+        let mut lookahead: Option<OwnerEarlySsdPutCandidate> = None;
+        let mut pending = Vec::new();
+        let stopped = fluxon_util::notify_state::wait_until(&queue.changed, || {
+            queue.state.lock().sender.is_none()
+        });
+        tokio::pin!(stopped);
+
+        'dispatch: loop {
+            // This bound covers copy, I/O, and route publication. The native
+            // copy permit alone ends before route publication completes.
+            if active.len() == max_inflight {
+                tokio::select! {
+                    biased;
+                    _ = &mut stopped => break,
+                    _ = active.next() => queue.set_inflight_batches(active.len()),
+                }
+                continue;
+            }
+            let first = if let Some(candidate) = lookahead.take() {
+                candidate
+            } else {
+                loop {
+                    tokio::select! {
+                    biased;
+                        _ = &mut stopped => break 'dispatch,
+                        _ = active.next(), if !active.is_empty() => {
+                            queue.set_inflight_batches(active.len());
+                        }
+                        candidate = rx.recv() => {
+                            let Some(candidate) = candidate else { break 'dispatch; };
+                            queue.dequeued();
+                            break candidate;
+                        }
+                    }
+                }
+            };
+            let mut batch_bytes = crate::kv_ssd_storage::align_ssd_io_len(first.value_len)
+                .expect("published value len must fit SSD alignment");
+            pending.push(first);
+            while pending.len() < max_items && batch_bytes < max_bytes {
+                let Ok(candidate) = rx.try_recv() else { break; };
+                queue.dequeued();
+                let aligned = crate::kv_ssd_storage::align_ssd_io_len(candidate.value_len)
+                    .expect("published value len must fit SSD alignment");
+                if batch_bytes.saturating_add(aligned) > max_bytes {
+                    lookahead = Some(candidate);
+                    break;
+                }
+                batch_bytes += aligned;
+                pending.push(candidate);
+            }
+            let lengths = pending.iter().map(|item| item.value_len).collect::<Vec<_>>();
+            let admission = store.acquire_persist_batch(
+                crate::kv_ssd_storage::KvSsdPersistClass::BestEffortEarly,
+                &lengths,
+            );
+            tokio::pin!(admission);
+            queue.set_inflight_batches(active.len() + 1);
+            let permit = loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut stopped => break 'dispatch,
+                    _ = active.next(), if !active.is_empty() => {
+                        queue.set_inflight_batches(active.len() + 1);
+                    }
+                    result = &mut admission => break result,
+                }
+            };
+            let mut permit = match permit {
+                Ok(permit) => permit,
+                Err(error) => {
+                    tracing::warn!(items = pending.len(), %error, "early SSD batch admission failed");
+                    store.refund_owner_write_admission(&lengths);
+                    pending.clear();
+                    queue.set_inflight_batches(active.len());
+                    continue;
+                }
+            };
+            if queue.state.lock().sender.is_none() {
+                break;
+            }
+            let mut leaders = Vec::with_capacity(pending.len());
+            let mut refunded = Vec::new();
+            // No payload reference or generation flight exists while admission
+            // waits. Validate the exact generation only after acquiring credit.
+            for candidate in std::mem::take(&mut pending) {
+                match inner.begin_owner_local_ssd_put(&candidate.key, candidate.put_id, None) {
+                    OwnerLocalSsdPutReservation::Leader { op, memory_info } => {
+                        if u64::from(memory_info.len) != candidate.value_len {
+                            refunded.push(candidate.value_len);
+                            inner.finish_owner_local_ssd_put(&op, OwnerLocalSsdPutOutcome::Failed);
+                        } else {
+                            leaders.push(OwnerLocalSsdPutLeader {
+                                op,
+                                memory_info,
+                                admission_len: candidate.value_len,
+                            });
+                        }
+                    }
+                    OwnerLocalSsdPutReservation::Follower(_)
+                    | OwnerLocalSsdPutReservation::SourceUnavailable => {
+                        refunded.push(candidate.value_len);
+                    }
+                }
+            }
+            store.refund_owner_write_admission(&refunded);
+            if !leaders.is_empty() {
+                permit.retain_item_count(leaders.len());
+                active.push(run_owner_local_ssd_put_batch(task_view.clone(), leaders, permit));
+            }
+            queue.set_inflight_batches(active.len());
+        }
+
+        // Stop unpinned metadata first, then finish every installed generation
+        // before publishing the completion barrier consumed by before_shutdown.
+        rx.close();
+        if let Some(candidate) = lookahead.take() {
+            pending.push(candidate);
+        }
+        while let Ok(candidate) = rx.try_recv() {
+            queue.dequeued();
+            pending.push(candidate);
+        }
+        store.refund_owner_write_admission(
+            &pending.iter().map(|item| item.value_len).collect::<Vec<_>>(),
+        );
+        queue.state.lock().snapshot.closed_dropped += pending.len() as u64;
+        drop(pending);
+        while active.next().await.is_some() {
+            queue.set_inflight_batches(active.len());
+        }
+        {
+            let mut state = queue.state.lock();
+            assert!(state.sender.is_none());
+            assert_eq!(state.snapshot.queued_items, 0);
+            state.snapshot.inflight_batches = 0;
+            state.finished = true;
+        }
+        queue.changed.notify_waiters();
+    });
+}
+
 async fn run_owner_local_ssd_put_batch(
     view: ClientKvApiView,
     leaders: Vec<OwnerLocalSsdPutLeader>,
@@ -4693,6 +5093,9 @@ async fn run_owner_local_ssd_put_batch(
             put_id: leader.op.put_id,
             addr: holder.memory_info.addr,
             len: u64::from(holder.memory_info.len),
+            priority: crate::kv_ssd_storage::KvSsdPersistPriority::new(
+                crate::kv_ssd_storage::KvSsdPersistClass::BestEffortEarly,
+            ),
         });
         holders.push(holder);
     }
@@ -5698,18 +6101,11 @@ async fn publish_owner_local_job_with_completion(
                     ));
                     let _ = inner.owner_hot_admit_published_committed(&item.key, item.put_id);
                 }
-                let _ = inner.start_owner_local_ssd_puts(
+                inner.start_early_owner_local_ssd_puts(
                     promoted_items
                         .iter()
-                        .filter(|item| item.make_replica_task)
-                        .map(|item| OwnerLocalSsdPutCandidate {
-                            key: item.key.clone(),
-                            put_id: item.put_id,
-                            value_len: item.value_len,
-                            selected_victim: None,
-                        })
+                        .map(|item| (item.key.clone(), item.put_id, item.value_len))
                         .collect(),
-                    false,
                 );
                 for &index in &promoted_indices {
                     let item = &job.items[index];

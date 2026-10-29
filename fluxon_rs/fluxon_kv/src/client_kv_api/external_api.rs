@@ -1355,6 +1355,8 @@ mod external_get_start_batch_tests {
         validate_external_get_consume_prefix,
     };
     use crate::client_kv_api::msg_pack::{
+        ExternalBatchPutStartItemReq, ExternalBatchPutStartReq,
+        ExternalBatchPutTransferEndItemReq, ExternalBatchPutTransferEndReq,
         ExternalPlannedGetItem, ExternalPutStartReq, ExternalPutTransferEndReq,
     };
     use crate::client_kv_api::{
@@ -1906,15 +1908,33 @@ mod external_get_start_batch_tests {
     }
 
     #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn single_external_put_uses_owner_slot_without_master_allocator() {
+    async fn single_external_put_keeps_local_ack_and_early_ssd_without_remote_replica() {
         let _test_guard = integration_test_lock().await;
         let value_len = 4096_u64;
+        let ssd_root = std::env::temp_dir().join(format!(
+            "fluxon-early-ssd-local-ack-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         let (master, owner) = start_master_and_client_with_client_config(
             "single_external_owner_slot_master",
             "single_external_owner_slot_owner",
             |config| {
                 config.owner_placement_class = Some(OwnerPlacementClass::Inference);
                 config.replica_writeback_hot_capacity_ratio = Some(0.5);
+                config.large_file_paths = crate::config::LargeFilePaths {
+                    paths: vec![ssd_root.to_string_lossy().into_owned()],
+                };
+                config.ssd_storage = Some(crate::config::KvSsdStorageConfig {
+                    limit_bytes: crate::kv_ssd_storage::MIN_CAPACITY_BYTES,
+                    large_limit_size: vec![crate::kv_ssd_storage::MIN_CAPACITY_BYTES],
+                    write_rate_limit_bytes_per_sec: None,
+                    write_burst_bytes: None,
+                    capacity_writeback_enabled: true,
+                    writeback: crate::config::KvSsdWritebackConfig::default(),
+                });
+                config.test_spec_config.kv_ssd_storage_backend =
+                    crate::config::KvSsdStorageBackend::Native;
                 config
                     .test_spec_config
                     .owner_local_reserve_expected_capacity =
@@ -1976,8 +1996,11 @@ mod external_get_start_batch_tests {
             );
         }
 
-        let finish = api
-            .external_put_transfer_end(ExternalPutTransferEndReq {
+        let (publication_entered, release_publication) =
+            api.test_record().pause_next_owner_local_publish();
+        let finish = limit_thirdparty::tokio::time::timeout(
+            Duration::from_secs(5),
+            api.external_put_transfer_end(ExternalPutTransferEndReq {
                 key: key.to_string(),
                 len: value_len,
                 src_offset: start.src_offset,
@@ -1988,10 +2011,45 @@ mod external_get_start_batch_tests {
                 lease_id: None,
                 started_time: owner_info.node_start_time,
                 test_observe_put_phases: false,
-            })
-            .await
-            .expect("single external PutTransferEnd must publish the owner slot");
+            }),
+        )
+        .await
+        .expect("local ACK must complete while Master publication and SSD are paused")
+        .expect("single external PutTransferEnd must commit the owner slot");
         assert_eq!(finish.error_code, OK, "{}", finish.error_json);
+        limit_thirdparty::tokio::time::timeout(Duration::from_secs(5), publication_entered)
+            .await
+            .expect("publication worker must reach the gate")
+            .expect("publication worker reached gate");
+        assert!(
+            master
+                .master_kv_router_view()
+                .master_kv_router()
+                .inner()
+                .kv_routes
+                .get(key)
+                .is_none(),
+            "ACK must precede Master publication"
+        );
+        assert_eq!(
+            inner
+                .ssd_storage
+                .as_ref()
+                .expect("SSD enabled")
+                .usage_snapshot()
+                .write_candidate_items,
+            0,
+            "SSD work must remain outside the local ACK"
+        );
+        let local_holder = inner
+            .local_visible_mem_holder(key)
+            .expect("ACK makes the owner DRAM bytes visible");
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(local_holder.addr as *const u8, payload.len()) },
+            payload
+        );
+        drop(local_holder);
+        release_publication.send(()).expect("resume publication");
 
         let holder = limit_thirdparty::tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -2009,23 +2067,389 @@ mod external_get_start_batch_tests {
 
         limit_thirdparty::tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let exact_route_published = master
+                let exact_ssd_route_published = master
                     .master_kv_router_view()
                     .master_kv_router()
                     .inner()
                     .kv_routes
                     .get(key)
-                    .is_some_and(|route| route.put_id == put_id);
-                if exact_route_published {
+                    .is_some_and(|route| {
+                        route.put_id == put_id
+                            && route.node_replicas.read().get(&owner_node_id).is_some_and(
+                                |replicas| {
+                                    replicas.memory.is_some()
+                                        && replicas
+                                            .ssd
+                                            .as_ref()
+                                            .is_some_and(|ssd| ssd.len == value_len)
+                                },
+                            )
+                    });
+                if exact_ssd_route_published {
                     break;
                 }
                 limit_thirdparty::tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("single external Put exact master route was not published");
+        .expect("early SSD must publish the exact route before DRAM eviction");
+        let mut ssd_payload = vec![0u8; payload.len()];
+        limit_thirdparty::tokio::time::timeout(
+            Duration::from_secs(5),
+            inner
+                .ssd_storage
+                .as_ref()
+                .expect("SSD enabled")
+                .load_into_addr(
+                    key,
+                    put_id,
+                    ssd_payload.as_mut_ptr() as u64,
+                    value_len,
+                    value_len,
+                ),
+        )
+        .await
+        .expect("SSD read timed out")
+        .expect("read the published exact SSD generation");
+        assert_eq!(ssd_payload, payload);
+        assert_eq!(inner.runtime_observe_snapshot().remote_put_transfers, 0);
+        assert_eq!(
+            inner
+                .owner_remote_put_counters
+                .leaders
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "early SSD must not enable remote replica tasks"
+        );
         inner.delete(key).await.expect("delete regression-test key");
-        stop_master_and_client(master, owner).await;
+        owner.shutdown().await.expect("shutdown SSD owner");
+        master.shutdown().await.expect("shutdown test master");
+        std::fs::remove_dir_all(ssd_root).expect("remove SSD test root");
+    }
+
+    #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn external_early_ssd_queue_roundtrips_large_prefix_without_pinning() {
+        let _test_guard = integration_test_lock().await;
+        let value_len = 4096_u64;
+        let item_count = crate::kv_ssd_storage::MAX_PERSIST_BATCH_ITEMS + 1;
+        let ssd_root = std::env::temp_dir().join(format!(
+            "fluxon-early-ssd-queue-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let (master, owner) = start_master_and_client_with_client_config(
+            "early_ssd_queue_master",
+            "early_ssd_queue_owner",
+            |config| {
+                config.owner_placement_class = Some(OwnerPlacementClass::Inference);
+                config.replica_writeback_hot_capacity_ratio = Some(0.5);
+                config.large_file_paths = crate::config::LargeFilePaths {
+                    paths: vec![ssd_root.to_string_lossy().into_owned()],
+                };
+                config.ssd_storage = Some(crate::config::KvSsdStorageConfig {
+                    limit_bytes: crate::kv_ssd_storage::MIN_CAPACITY_BYTES,
+                    large_limit_size: vec![crate::kv_ssd_storage::MIN_CAPACITY_BYTES],
+                    write_rate_limit_bytes_per_sec: None,
+                    write_burst_bytes: None,
+                    capacity_writeback_enabled: true,
+                    writeback: crate::config::KvSsdWritebackConfig::default(),
+                });
+                config.test_spec_config.kv_ssd_storage_backend =
+                    crate::config::KvSsdStorageBackend::Native;
+                config
+                    .test_spec_config
+                    .owner_local_reserve_expected_capacity =
+                    Some(OwnerLocalReserveExpectedCapacity {
+                        value_len,
+                        payload_capacity_bytes: config.contribute_to_cluster_pool_size.dram / 2,
+                    });
+            },
+        )
+        .await;
+        let owner_view = owner.client_kv_api_view();
+        let api = owner_view.client_kv_api();
+        let inner = api.inner();
+        let owner_info = owner_view.cluster_manager().get_self_info();
+        let owner_node_id: crate::cluster_manager::NodeID = owner_info.id.clone().into();
+        let store = inner.ssd_storage.as_ref().expect("SSD enabled");
+        let queue = inner
+            .owner_early_ssd_queue
+            .as_ref()
+            .expect("early SSD queue");
+        let mut permits = Vec::new();
+        for _ in 0..3 {
+            permits.push(
+                store
+                    .try_acquire_persist_batch(
+                        crate::kv_ssd_storage::KvSsdPersistClass::BestEffortEarly,
+                        &[value_len],
+                    )
+                    .expect("acquire early SSD credit")
+                    .expect("three early SSD credits are initially available"),
+            );
+        }
+        let keys = (0..item_count)
+            .map(|index| format!("queued-prefix-{index}"))
+            .collect::<Vec<_>>();
+        let mut payloads = (0..item_count)
+            .map(|index| {
+                let mut payload = vec![0xa5; value_len as usize];
+                payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                payload
+            })
+            .collect::<Vec<_>>();
+        let started = api
+            .external_batch_put_start(ExternalBatchPutStartReq {
+                items: keys
+                    .iter()
+                    .map(|key| ExternalBatchPutStartItemReq {
+                        key: key.clone(),
+                        len: value_len,
+                        reject_if_inflight_same_key: true,
+                        reject_if_exist_same_key: true,
+                        make_replica_task: false,
+                        preferred_sub_cluster: None,
+                        radix: None,
+                    })
+                    .collect(),
+                atomic_group_lens: None,
+                started_time: owner_info.node_start_time,
+            })
+            .await
+            .expect("reserve the full prefix in owner DRAM");
+        assert_eq!(started.error_code, OK, "{}", started.error_json);
+        assert_eq!(started.items.len(), item_count);
+        let mut put_ids = Vec::with_capacity(item_count);
+        let mut commits = Vec::with_capacity(item_count);
+        for ((key, item), payload) in keys.iter().zip(started.items).zip(&payloads) {
+            assert_eq!(item.error_code, OK, "{}", item.error_json);
+            assert!(item.peer_id.is_none());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    payload.as_ptr(),
+                    (item.src_base_addr + item.src_offset) as *mut u8,
+                    payload.len(),
+                );
+            }
+            put_ids.push(item.put_id.expect("reserved generation"));
+            commits.push(ExternalBatchPutTransferEndItemReq {
+                key: key.clone(),
+                len: value_len,
+                src_offset: item.src_offset,
+                target_offset: item.target_offset,
+                peer_id: item.peer_id,
+                target_base_addr: None,
+                put_id: item.put_id,
+                lease_id: None,
+            });
+        }
+        let committed = ::tokio::time::timeout(
+            Duration::from_secs(5),
+            api.external_batch_put_transfer_end(ExternalBatchPutTransferEndReq {
+                items: commits,
+                started_time: owner_info.node_start_time,
+                transfer_concurrency: 4,
+            }),
+        )
+        .await
+        .expect("DRAM ACK must not wait for SSD credits")
+        .expect("commit the full prefix");
+        assert_eq!(committed.error_code, OK, "{}", committed.error_json);
+        assert_eq!(committed.items.len(), item_count);
+        assert!(committed.items.iter().all(|item| item.error_code == OK));
+        ::tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = queue.snapshot();
+                if snapshot.enqueued_items >= item_count as u64 && snapshot.inflight_batches > 0 {
+                    break;
+                }
+                ::tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every page must enter the early queue while credits are held");
+        assert_eq!(
+            inner
+                .owner_local_ssd_put_counters
+                .leaders
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "waiting metadata must not install a source-holding flight"
+        );
+        assert_eq!(store.usage_snapshot().persist_requests, 0);
+
+        // Delete a queued generation while credits remain exhausted. Its source
+        // must be releasable, and the later replacement must be persisted exactly.
+        let replaced = item_count - 1;
+        let old_put_id = put_ids[replaced];
+        let old_source = Arc::downgrade(
+            &inner
+                .local_visible_mem_holder(&keys[replaced])
+                .expect("queued DRAM source"),
+        );
+        ::tokio::time::timeout(Duration::from_secs(5), inner.delete(&keys[replaced]))
+            .await
+            .expect("queued metadata must not block Delete")
+            .expect("delete the queued generation");
+        ::tokio::time::timeout(Duration::from_secs(5), async {
+            while old_source.upgrade().is_some() {
+                ::tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("queued metadata must not retain the deleted DRAM source");
+        payloads[replaced].fill(0x3c);
+        let replacement = api
+            .external_put_start(ExternalPutStartReq {
+                key: keys[replaced].clone(),
+                len: value_len,
+                reject_if_inflight_same_key: true,
+                reject_if_exist_same_key: true,
+                make_replica_task: false,
+                preferred_sub_cluster: None,
+                started_time: owner_info.node_start_time,
+                test_observe_put_phases: false,
+            })
+            .await
+            .expect("reserve replacement generation");
+        assert_eq!(replacement.error_code, OK, "{}", replacement.error_json);
+        put_ids[replaced] = replacement.put_id.expect("replacement generation");
+        assert_ne!(put_ids[replaced], old_put_id);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                payloads[replaced].as_ptr(),
+                (replacement.src_base_addr + replacement.src_offset) as *mut u8,
+                value_len as usize,
+            );
+        }
+        let committed = api
+            .external_put_transfer_end(ExternalPutTransferEndReq {
+                key: keys[replaced].clone(),
+                len: value_len,
+                src_offset: replacement.src_offset,
+                target_offset: replacement.target_offset,
+                peer_id: None,
+                target_base_addr: None,
+                put_id: replacement.put_id,
+                lease_id: None,
+                started_time: owner_info.node_start_time,
+                test_observe_put_phases: false,
+            })
+            .await
+            .expect("commit replacement generation");
+        assert_eq!(committed.error_code, OK, "{}", committed.error_json);
+        drop(permits);
+
+        ::tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let all_published = keys.iter().zip(&put_ids).all(|(key, put_id)| {
+                    master
+                        .master_kv_router_view()
+                        .master_kv_router()
+                        .inner()
+                        .kv_routes
+                        .get(key)
+                        .is_some_and(|route| {
+                            route.put_id == *put_id
+                                && route.node_replicas.read().get(&owner_node_id).is_some_and(
+                                    |replicas| {
+                                        replicas
+                                            .ssd
+                                            .as_ref()
+                                            .is_some_and(|ssd| ssd.len == value_len)
+                                    },
+                                )
+                        })
+                });
+                if all_published && queue.snapshot().inflight_batches == 0 {
+                    break;
+                }
+                ::tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all pages, including the tail, must publish SSD backing");
+        for ((key, put_id), payload) in keys.iter().zip(&put_ids).zip(&payloads) {
+            let mut actual = vec![0; value_len as usize];
+            store
+                .load_into_addr(
+                    key,
+                    *put_id,
+                    actual.as_mut_ptr() as u64,
+                    value_len,
+                    value_len,
+                )
+                .await
+                .expect("read each exact SSD generation");
+            assert_eq!(&actual, payload, "SSD prefix page {key}");
+        }
+        let mut obsolete = vec![0; value_len as usize];
+        assert!(
+            store
+                .load_into_addr(
+                    &keys[replaced],
+                    old_put_id,
+                    obsolete.as_mut_ptr() as u64,
+                    value_len,
+                    value_len
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(store.usage_snapshot().persist_successes, item_count as u64);
+        assert_eq!(queue.snapshot().queue_full_dropped, 0);
+        assert!(queue.snapshot().peak_inflight_batches <= 3);
+        assert_eq!(inner.runtime_observe_snapshot().remote_put_transfers, 0);
+
+        // Shutdown must wake a dispatcher waiting for credits that this test
+        // deliberately retains until after the successful close barrier.
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(
+                store
+                    .try_acquire_persist_batch(
+                        crate::kv_ssd_storage::KvSsdPersistClass::BestEffortEarly,
+                        &[value_len],
+                    )
+                    .expect("acquire shutdown-test credit")
+                    .expect("idle early credit"),
+            );
+        }
+        let before_enqueued = queue.snapshot().enqueued_items;
+        let before_leaders = inner
+            .owner_local_ssd_put_counters
+            .leaders
+            .load(std::sync::atomic::Ordering::Relaxed);
+        inner.start_early_owner_local_ssd_put(&keys[0], put_ids[0], value_len);
+        ::tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = queue.snapshot();
+                if snapshot.enqueued_items > before_enqueued
+                    && snapshot.queued_items == 0
+                    && snapshot.inflight_batches == 1
+                {
+                    break;
+                }
+                ::tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dispatcher must be waiting for a held early credit");
+        assert_eq!(
+            inner
+                .owner_local_ssd_put_counters
+                .leaders
+                .load(std::sync::atomic::Ordering::Relaxed),
+            before_leaders,
+        );
+        ::tokio::time::timeout(Duration::from_secs(15), owner.shutdown())
+            .await
+            .expect("shutdown must cancel waiting early admission")
+            .expect("close SSD owner");
+        assert_eq!(queue.snapshot().inflight_batches, 0);
+        drop(held);
+        master.shutdown().await.expect("close test master");
+        std::fs::remove_dir_all(ssd_root).expect("remove SSD queue test root");
     }
 
     #[limit_thirdparty::tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -5135,13 +5559,11 @@ impl HandlerForExternalClient for ClientKvApi {
                 pending.put_id.0,
                 pending.put_id.1,
             ));
-            if pending.make_replica_task {
-                early_ssd_candidates.push((
-                    pending.key.clone(),
-                    pending.put_id,
-                    u64::from(pending.local_cache_publish.len),
-                ));
-            }
+            early_ssd_candidates.push((
+                pending.key.clone(),
+                pending.put_id,
+                u64::from(pending.local_cache_publish.len),
+            ));
             if pending.make_replica_task && pending.remote_replica_admitted {
                 remote_replica_pending.push((
                     pending.key.clone(),
@@ -5527,13 +5949,11 @@ impl HandlerForExternalClient for ClientKvApi {
                 pending.put_id.0,
                 pending.put_id.1,
             ));
-            if pending.make_replica_task {
-                early_ssd_candidates.push((
-                    pending.key.clone(),
-                    pending.put_id,
-                    u64::from(pending.local_cache_publish.len),
-                ));
-            }
+            early_ssd_candidates.push((
+                pending.key.clone(),
+                pending.put_id,
+                u64::from(pending.local_cache_publish.len),
+            ));
             if pending.make_replica_task && pending.remote_replica_admitted {
                 remote_replica_pending.push((
                     pending.key.clone(),

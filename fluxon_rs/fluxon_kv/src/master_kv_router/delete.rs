@@ -1,9 +1,11 @@
 use super::{
     MasterKvRouterView,
     msg_pack::{
-        BatchDeleteAckReq, BatchDeleteAckResp, DeleteAckReq, DeleteAckResp, DeleteReq, DeleteResp,
+        BatchDeleteAckReq, BatchDeleteAckResp, BatchSsdReplicaEvictReq, BatchSsdReplicaEvictResp,
+        DeleteAckReq, DeleteAckResp, DeleteReq, DeleteResp,
     },
 };
+use crate::cluster_manager::NodeID;
 use crate::master_kv_router::OneKvNodesRoutes;
 use crate::master_kv_router::put::PutIDForAKey;
 use crate::memholder::{
@@ -19,10 +21,7 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "test_bins"))]
 use super::msg_pack::{BatchDeleteClientKvMetaCacheReq, DeleteClientKvMetaCacheItem};
 #[cfg(any(test, feature = "test_bins"))]
-use crate::{
-    cluster_manager::NodeID,
-    p2p::{control_plane_rpc::call_control_plane_rpc, msg_pack::RPCCaller},
-};
+use crate::p2p::{control_plane_rpc::call_control_plane_rpc, msg_pack::RPCCaller};
 #[cfg(any(test, feature = "test_bins"))]
 use std::time::Duration;
 
@@ -215,6 +214,113 @@ pub fn evict_one_kv_replica_for_node(
     });
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SsdReplicaRemoval {
+    pub replica_removed: bool,
+    pub route_removed: bool,
+}
+
+fn remove_ssd_replica_if_version(
+    route: &OneKvNodesRoutes,
+    node_id: &NodeID,
+    put_id: PutIDForAKey,
+) -> bool {
+    route.put_id == put_id && route.remove_ssd_replica(node_id)
+}
+
+pub(crate) fn remove_one_ssd_replica_for_node(
+    view: &MasterKvRouterView,
+    key: &str,
+    node_id: &NodeID,
+    put_id: PutIDForAKey,
+) -> SsdReplicaRemoval {
+    let route = {
+        let Some(route) = view.master_kv_router().inner().kv_routes.get(key) else {
+            return SsdReplicaRemoval::default();
+        };
+        route.clone()
+    };
+    if !remove_ssd_replica_if_version(&route, node_id, put_id) {
+        return SsdReplicaRemoval::default();
+    }
+
+    let has_live_replica = route
+        .node_replicas
+        .read()
+        .values()
+        .any(super::KvNodeReplicas::has_live_backing);
+    let route_removed = if has_live_replica {
+        false
+    } else {
+        view.master_kv_router()
+            .inner()
+            .kv_routes
+            .remove_if(key, |_, current| {
+                Arc::ptr_eq(current, &route)
+                    && current.put_id == put_id
+                    && !current
+                        .node_replicas
+                        .read()
+                        .values()
+                        .any(super::KvNodeReplicas::has_live_backing)
+            })
+            .is_some()
+    };
+
+    SsdReplicaRemoval {
+        replica_removed: true,
+        route_removed,
+    }
+}
+
+pub async fn handle_batch_ssd_replica_evict(
+    view: MasterKvRouterView,
+    req: MsgPack<BatchSsdReplicaEvictReq>,
+    req_node_id: NodeID,
+) -> MsgPack<BatchSsdReplicaEvictResp> {
+    let requested_count = req.serialize_part.evictions.len();
+    let mut removed_count = 0u32;
+    let mut removed_route_keys = Vec::new();
+
+    for replica in &req.serialize_part.evictions {
+        let removal =
+            remove_one_ssd_replica_for_node(&view, &replica.key, &req_node_id, replica.put_id);
+        if removal.replica_removed {
+            removed_count = removed_count.saturating_add(1);
+        }
+        if removal.route_removed {
+            removed_route_keys.push((replica.key.clone(), replica.put_id));
+        }
+    }
+
+    if !removed_route_keys.is_empty() && view.master_kv_router().prefix_index_enabled() {
+        let inner = view.master_kv_router().inner();
+        let mut tree = inner.prefix_index.write().await;
+        for (key, put_id) in &removed_route_keys {
+            if !inner.kv_routes.contains_key(key) {
+                tree.remove(key, *put_id);
+            }
+        }
+    }
+
+    tracing::debug!(
+        node = %req_node_id,
+        requested = requested_count,
+        removed = removed_count,
+        routes_removed = removed_route_keys.len(),
+        "Handled SSD replica eviction batch"
+    );
+
+    MsgPack {
+        serialize_part: BatchSsdReplicaEvictResp {
+            removed_count,
+            error_code: msg_and_error::OK,
+            error_json: String::new(),
+        },
+        raw_bytes: Vec::new(),
+    }
 }
 
 pub async fn handle_delete(

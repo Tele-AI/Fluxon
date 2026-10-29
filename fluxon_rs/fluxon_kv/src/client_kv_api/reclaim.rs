@@ -448,6 +448,9 @@ async fn persist_prepared_reclaim_batch_to_ssd(
             put_id: item.put_id,
             addr,
             len,
+            priority: crate::kv_ssd_storage::KvSsdPersistPriority::new(
+                crate::kv_ssd_storage::KvSsdPersistClass::RequiredLastBacking,
+            ),
         });
         source_indices.push(*index);
         source_holders.push(holder);

@@ -59,6 +59,52 @@ pub struct GetExternalSinkTarget {
     pub requester_node_start_time: i64,
 }
 
+/// One non-empty source-to-compact mapping for a sparse SSD read.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+pub struct SparseGetRange {
+    pub src_offset: u64,
+    pub dst_offset: u64,
+    pub len: u64,
+}
+
+/// SSD eviction notification emitted by the native storage ring after a
+/// generation is overwritten.  The owner forwards these exact identities to
+/// the master so stale SSD routes can be removed without touching memory
+/// routes.
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
+pub struct SsdReplicaEviction {
+    pub key: String,
+    pub put_id: PutIDForAKey,
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchSsdReplicaEvictReq {
+    pub evictions: Vec<SsdReplicaEviction>,
+}
+
+impl MsgPackSerializePart for BatchSsdReplicaEvictReq {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchSsdReplicaEvictReq as u32
+    }
+}
+
+#[derive(Default, Debug, Clone, Encode, Decode)]
+pub struct BatchSsdReplicaEvictResp {
+    pub removed_count: u32,
+    pub error_code: ErrorCode,
+    pub error_json: String,
+}
+
+impl MsgPackSerializePart for BatchSsdReplicaEvictResp {
+    fn msg_id(&self) -> u32 {
+        MsgId::BatchSsdReplicaEvictResp as u32
+    }
+}
+
+impl RPCReq for BatchSsdReplicaEvictReq {
+    type Resp = BatchSsdReplicaEvictResp;
+}
+
 #[derive(Default, Debug, Clone, Encode, Decode)]
 pub struct GetStartReq {
     pub key: String,

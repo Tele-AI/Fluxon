@@ -99,6 +99,8 @@ pub enum MsgId {
     OwnerSegmentTransferResp = 3084,
     OwnerCapacityReportReq = 3085,
     OwnerCapacityReportResp = 3086,
+    BatchSsdReplicaEvictReq = 3087,
+    BatchSsdReplicaEvictResp = 3088,
     ExternalGetReq = 4001,
     ExternalGetResp = 4002,
     ExternalPutStartReq = 4003,

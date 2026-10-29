@@ -615,9 +615,11 @@ impl KvTestStorageProfile {
             Self::Memory => None,
             Self::Ssd | Self::MemorySsd => Some(KvSsdStorageConfig {
                 limit_bytes: KV_TEST_SSD_STORAGE_BYTES,
+                large_limit_size: vec![KV_TEST_SSD_STORAGE_BYTES],
                 write_rate_limit_bytes_per_sec: None,
                 write_burst_bytes: None,
                 capacity_writeback_enabled: true,
+                writeback: Default::default(),
             }),
         }
     }

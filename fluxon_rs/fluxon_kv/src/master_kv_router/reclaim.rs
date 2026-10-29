@@ -3546,9 +3546,11 @@ mod owner_get_holding_reclaim_tests {
             |config| {
                 config.ssd_storage = Some(KvSsdStorageConfig {
                     limit_bytes: MIN_CAPACITY_BYTES,
+                    large_limit_size: vec![MIN_CAPACITY_BYTES],
                     write_rate_limit_bytes_per_sec: None,
                     write_burst_bytes: None,
                     capacity_writeback_enabled: true,
+                    writeback: Default::default(),
                 });
                 config.share_mem_path = root.join("source/sharemem").to_string_lossy().into_owned();
                 config.large_file_paths.paths =

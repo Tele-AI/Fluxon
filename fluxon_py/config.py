@@ -173,6 +173,8 @@ test_spec_config:                      # Test-only config overrides (dict(option
   legacy_a19_global_demotion_one_phase: false # Explicit a19 one-RPC demotion recovery mode; default keeps exact owner reservation (bool(optional))
   ssd_read_source_policy: legacy_remote_first # legacy_remote_first|local_ssd_only_first (str(optional))
   post_read_remote_policy: retain      # retain|drop exact remote DRAM source after a local Get backing commits (str(optional))
+  kv_ssd_uring_mode: single_buffer     # Native SSD read mode: single_buffer|iovec (str(optional))
+  kv_ssd_storage_backend: native       # SSD storage backend: native|foyer (str(optional))
   owner_local_reserve_soft_wait_timeout_ms: # Local-reserve polling interval, >0 (int(optional))
   owner_local_reserve_hard_timeout_ms: # Local-reserve end-to-end claim timeout, > soft wait (int(optional))
   owner_local_reserve_expected_capacity: # Owner-only local-reserve prewarm target (dict(optional))
@@ -220,6 +222,14 @@ fluxonkv_spec:                        # fluxon kv specific config (dict(optional
   ssd_write_rate_limit_bytes_per_sec: # Optional non-queueing SSD write rate (int(optional))
   ssd_write_burst_bytes:              # Paired immediate SSD write burst (int(optional))
   ssd_capacity_writeback_enabled:     # Preserve last backing during capacity eviction; omitted means true (bool(optional))
+  kv_ssd_writeback:                   # Native SSD writer queue overrides (dict(optional))
+    batch_max_bytes:                  # Maximum bytes in one native write batch (int(optional))
+    batch_max_items:                  # Maximum items in one native write batch (int(optional))
+    batch_max_wait_us:                # Maximum native write batch wait (int(optional))
+    max_inflight_batches:             # Maximum native write batches in flight (int(optional))
+    max_inflight_ops:                 # Maximum native write operations in flight (int(optional))
+    required_queue_bytes:             # Required-priority queue byte budget (int(optional))
+    early_queue_bytes:                # Early-priority queue byte budget (int(optional))
   p2p_listen_port:                    # P2P QUIC listen port override (int(optional))
   redis_compat:                       # Enable Redis protocol shim (dict(optional))
     listen_addr:                      # TCP listen addr, e.g. "127.0.0.1:16379" (str)
@@ -318,6 +328,8 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
         "legacy_a19_global_demotion_one_phase",
         "ssd_read_source_policy",
         "post_read_remote_policy",
+        "kv_ssd_uring_mode",
+        "kv_ssd_storage_backend",
         "owner_local_reserve_soft_wait_timeout_ms",
         "owner_local_reserve_hard_timeout_ms",
         "owner_local_reserve_expected_capacity",
@@ -431,6 +443,19 @@ def _normalize_test_spec_config(raw: Any, ctx: str) -> Dict[str, Any]:
                 f"{ctx}.protocol_type must be one of {sorted(allowed_protocol_types)}, got {protocol_type!r}"
             )
         out["protocol_type"] = protocol_type
+
+    for key, allowed_values in (
+        ("kv_ssd_uring_mode", {"single_buffer", "iovec"}),
+        ("kv_ssd_storage_backend", {"native", "foyer"}),
+    ):
+        value = raw.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str) or value not in allowed_values:
+            raise ValueError(
+                f"{ctx}.{key} must be one of {sorted(allowed_values)}, got {value!r}"
+            )
+        out[key] = value
 
     transport_mode = raw.get("transport_mode")
     transport_mode_was_explicit = transport_mode is not None
@@ -722,6 +747,48 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
     if "transfer_engine" in spec:
         raise ValueError("fluxonkv_spec.transfer_engine has been removed from Fluxon KV config")
 
+    if "kv_ssd_writeback" in spec:
+        writeback = spec["kv_ssd_writeback"]
+        if not isinstance(writeback, dict):
+            raise ValueError("fluxonkv_spec.kv_ssd_writeback must be a mapping")
+        for key in (
+            "batch_max_bytes",
+            "batch_max_items",
+            "batch_max_wait_us",
+            "max_inflight_batches",
+            "max_inflight_ops",
+            "required_queue_bytes",
+            "early_queue_bytes",
+        ):
+            if key not in writeback:
+                continue
+            value = writeback[key]
+            minimum = 0 if key == "batch_max_wait_us" else 1
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                raise ValueError(
+                    f"fluxonkv_spec.kv_ssd_writeback.{key} must be an integer >= {minimum}"
+                )
+        required_bytes = writeback.get("required_queue_bytes", 2 * 1024**3)
+        early_bytes = writeback.get("early_queue_bytes", 1024**3)
+        if not 1 <= writeback.get("batch_max_items", 32) <= 256:
+            raise ValueError("fluxonkv_spec.kv_ssd_writeback.batch_max_items must be in 1..256")
+        if writeback.get("max_inflight_batches", 4) < 2:
+            raise ValueError("fluxonkv_spec.kv_ssd_writeback.max_inflight_batches must be >= 2")
+        if required_bytes > 2**32 - 1 or early_bytes >= required_bytes:
+            raise ValueError(
+                "SSD queue budgets require early_queue_bytes < required_queue_bytes <= 4294967295"
+            )
+        if writeback.get("batch_max_bytes", 512 * 1024**2) > required_bytes:
+            raise ValueError("SSD batch_max_bytes must not exceed required_queue_bytes")
+
+    ssd_uring_mode = test_spec_config.get("kv_ssd_uring_mode", "single_buffer")
+    ssd_storage_backend = test_spec_config.get("kv_ssd_storage_backend", "native")
+    if ssd_storage_backend == "foyer" and ssd_uring_mode != "single_buffer":
+        raise ValueError(
+            "test_spec_config.kv_ssd_uring_mode is only valid with "
+            "test_spec_config.kv_ssd_storage_backend=native"
+        )
+
     if is_zero_contribution:
         if owner_placement_class is not None:
             raise ValueError("owner_placement_class is only valid on owner configs")
@@ -746,6 +813,7 @@ def _validate_fluxonkv_contract(cfg: Dict[str, Any]) -> None:
             "ssd_write_rate_limit_bytes_per_sec",
             "ssd_write_burst_bytes",
             "ssd_capacity_writeback_enabled",
+            "kv_ssd_writeback",
         ]
         for key in forbidden_spec_keys:
             if key in spec:

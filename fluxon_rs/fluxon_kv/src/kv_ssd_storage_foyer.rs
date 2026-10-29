@@ -384,6 +384,22 @@ impl FoyerKvSsdStorage {
         Ok(entry)
     }
 
+    pub(crate) async fn remove_exact(&self, key: &str, put_id: PutIDForAKey) -> bool {
+        let _persist_permit = self.persist_gate.lock().await;
+        let cache_key = FoyerKvSsdKey {
+            key: key.to_string(),
+            put_id,
+        };
+        let removed = self.entry_lengths.lock().remove(&cache_key);
+        self.cache.remove(&cache_key);
+        if let Some(len) = removed {
+            self.logical_used_bytes.fetch_sub(len, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     fn forget_entry(&self, key: &FoyerKvSsdKey) {
         if let Some(len) = self.entry_lengths.lock().remove(key) {
             self.logical_used_bytes.fetch_sub(len, Ordering::Relaxed);

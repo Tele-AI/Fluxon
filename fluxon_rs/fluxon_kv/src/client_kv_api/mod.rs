@@ -31,7 +31,8 @@ use crate::master_kv_router::msg_pack::{
     BatchGetStartItemResp, BatchGetStartReq, BatchIsExistReq, BatchOwnerReclaimReq,
     BatchPreparePutKeysReq, BatchPublishOwnerSsdReq, BatchPutAppendDoneReq, BatchPutAppendStartReq,
     BatchPutDoneReq, BatchPutRevokeReq, BatchPutStartReq, BatchReleasePutKeyReservationsReq,
-    DeleteClientKvMetaCacheItem, GetBindTarget, GroupedBatchPutDoneReq, RadixKvMetadata,
+    BatchSsdReplicaEvictReq, DeleteClientKvMetaCacheItem, GetBindTarget, GroupedBatchPutDoneReq,
+    RadixKvMetadata, SsdReplicaEviction,
 };
 use crate::master_lease_manager::msg_pack::{AllocateClientLeaseReq, ClientLeaseKeepaliveReq};
 use crate::memholder::{AllMemholderRefCount, ExternalMemHolderInfo, MemoryInfo, UserMemHolder};
@@ -72,7 +73,7 @@ use fluxon_util::pin_aware_moka::{PinAwareMoka, PinGuard};
 use limit_thirdparty::tokio;
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -82,6 +83,9 @@ use tracing::warn;
 
 const OWNER_LOCAL_PUBLISH_QUEUE_CAPACITY: usize = 4096;
 const OWNER_LOCAL_PUBLISH_MAX_INFLIGHT: usize = 64;
+const SSD_EVICTION_BATCH_MAX_ITEMS: usize = 256;
+const SSD_EVICTION_BATCH_MAX_DELAY: Duration = Duration::from_millis(10);
+const SSD_EVICTION_BATCH_RETRY_DELAY: Duration = Duration::from_millis(100);
 const SSD_STAGE_RPC_TIMEOUT: Duration = Duration::from_secs(300);
 const SSD_STAGE_TERMINAL_TTL: Duration = Duration::from_secs(10 * 60);
 const SSD_STAGE_DONE_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
@@ -4329,6 +4333,80 @@ fn now_unix_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn spawn_ssd_replica_eviction_batch(
+    view: ClientKvApiView,
+    mut rx: ::tokio::sync::mpsc::Receiver<Vec<SsdReplicaEviction>>,
+) {
+    let view_for_task = view.clone();
+    let _ = view.spawn("ssd_replica_eviction_batch", async move {
+        let mut pending = VecDeque::new();
+        let mut rx_closed = false;
+        let mut shutdown_waiter = view_for_task.register_shutdown_waiter();
+
+        'actor: loop {
+            if pending.is_empty() {
+                let received = tokio::select! {
+                    received = rx.recv() => received,
+                    _ = shutdown_waiter.wait() => break 'actor,
+                };
+                match received {
+                    Some(replicas) => pending.extend(replicas),
+                    None => break,
+                }
+            }
+
+            let deadline = ::tokio::time::Instant::now() + SSD_EVICTION_BATCH_MAX_DELAY;
+            while pending.len() < SSD_EVICTION_BATCH_MAX_ITEMS && !rx_closed {
+                let received = tokio::select! {
+                    received = ::tokio::time::timeout_at(deadline, rx.recv()) => received,
+                    _ = shutdown_waiter.wait() => break 'actor,
+                };
+                match received {
+                    Ok(Some(replicas)) => pending.extend(replicas),
+                    Ok(None) => rx_closed = true,
+                    Err(_) => break,
+                }
+            }
+
+            let batch_len = pending.len().min(SSD_EVICTION_BATCH_MAX_ITEMS);
+            let batch = pending.drain(..batch_len).collect::<Vec<_>>();
+            let retry_batch = batch.clone();
+            let send_result = tokio::select! {
+                result = view_for_task
+                    .client_kv_api()
+                    .inner()
+                    .evict_ssd_replicas_from_master(batch) => result,
+                _ = shutdown_waiter.wait() => break 'actor,
+            };
+            match send_result {
+                Ok(removed_count) => tracing::debug!(
+                    requested = batch_len,
+                    removed = removed_count,
+                    "Sent SSD replica eviction batch"
+                ),
+                Err(err) => {
+                    tracing::warn!(
+                        requested = batch_len,
+                        error = %err,
+                        "Failed to send SSD replica eviction batch; retaining it for retry"
+                    );
+                    for eviction in retry_batch.into_iter().rev() {
+                        pending.push_front(eviction);
+                    }
+                    tokio::select! {
+                        _ = ::tokio::time::sleep(SSD_EVICTION_BATCH_RETRY_DELAY) => {}
+                        _ = shutdown_waiter.wait() => break 'actor,
+                    }
+                }
+            }
+
+            if rx_closed && pending.is_empty() {
+                break;
+            }
+        }
+    });
+}
+
 impl std::ops::Deref for ClientKvApiViewHolder {
     type Target = ClientKvApiView;
 
@@ -4392,6 +4470,7 @@ pub struct ClientKvApiInner {
     owner_remote_put_counters: Arc<OwnerRemotePutCounters>,
     owner_remote_put_admission: Arc<OwnerRemotePutAdmission>,
     owner_local_ssd_put_counters: Arc<OwnerLocalSsdPutCounters>,
+    owner_early_ssd_queue: Option<Arc<put::OwnerEarlySsdQueue>>,
     planned_get_counters: OwnerPlannedGetCounters,
     ssd_stage_counters: OwnerSsdStageCounters,
     owner_hot_retry_queue: Arc<OwnerHotRetryQueue>,
@@ -4483,6 +4562,7 @@ pub struct ClientKvApiInner {
     rpc_caller_batch_put_append_done: RPCCaller<BatchPutAppendDoneReq>,
     rpc_caller_batch_evict_owner_source: RPCCaller<BatchEvictOwnerSourceReq>,
     rpc_caller_batch_publish_owner_ssd: RPCCaller<BatchPublishOwnerSsdReq>,
+    rpc_caller_batch_ssd_replica_evict: RPCCaller<BatchSsdReplicaEvictReq>,
     rpc_caller_delete: RPCCaller<DeleteReq>,
     rpc_caller_batch_delete_ack: RPCCaller<BatchDeleteAckReq>,
     rpc_caller_batch_is_exist: RPCCaller<BatchIsExistReq>,
@@ -4579,12 +4659,15 @@ impl ClientKvApiInner {
 
     pub(crate) fn try_acquire_local_ssd_persist_batch(
         &self,
-        item_count: usize,
+        lengths: &[u64],
     ) -> KvResult<Option<KvSsdPersistBatchPermit>> {
         let Some(store) = self.ssd_storage.as_ref() else {
             return Ok(None);
         };
-        store.try_acquire_persist_batch(item_count)
+        store.try_acquire_persist_batch(
+            crate::kv_ssd_storage::KvSsdPersistClass::BestEffortEarly,
+            lengths,
+        )
     }
 
     async fn discard_local_ssd_replica(
@@ -4596,6 +4679,35 @@ impl ClientKvApiInner {
             return false;
         };
         store.remove_exact(key, put_id).await
+    }
+
+    async fn evict_ssd_replicas_from_master(
+        &self,
+        evictions: Vec<SsdReplicaEviction>,
+    ) -> KvResult<u32> {
+        let master_node_id = self
+            .view
+            .cluster_manager()
+            .find_or_wait_master_node()
+            .await?;
+        let response = call_control_plane_rpc(
+            &self.rpc_caller_batch_ssd_replica_evict,
+            self.view.p2p_module(),
+            master_node_id.into(),
+            crate::p2p::msg_pack::MsgPack {
+                serialize_part: BatchSsdReplicaEvictReq { evictions },
+                raw_bytes: Vec::new(),
+            },
+            Some(Duration::from_secs(10)),
+            2,
+        )
+        .await
+        .map_err(KvError::from)?;
+        crate::rpcresp_kvresult_convert::try_from_code(
+            response.serialize_part.error_code,
+            response.serialize_part.error_json,
+        )?;
+        Ok(response.serialize_part.removed_count)
     }
 
     async fn begin_ssd_stage(&self, get_id: u64) -> KvResult<bool> {
@@ -12759,13 +12871,17 @@ mod owner_reclaim_slot_tests {
             owner_placement_class:
                 crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
             ssd_storage: Some(KvSsdStorageInit {
-                roots: vec![KvSsdStorageRootLimit {
+                root_limits: vec![KvSsdStorageRootLimit {
                     root_dir: root.clone(),
                     limit_bytes: MIN_CAPACITY_BYTES,
                 }],
-                write_rate_limit_bytes_per_sec: Some(1),
-                write_burst_bytes: Some(4),
-                capacity_writeback_enabled: true,
+                uring_mode: crate::config::KvSsdUringMode::SingleBuffer,
+                backend: crate::config::KvSsdStorageBackend::Native,
+                writeback: crate::config::KvSsdWritebackConfig {
+                    legacy_rate_limit_bytes_per_sec: Some(1),
+                    legacy_burst_bytes: Some(4),
+                    ..Default::default()
+                },
             }),
         })
         .await
@@ -12808,6 +12924,85 @@ mod owner_reclaim_slot_tests {
             .close()
             .await
             .expect("close SSD store");
+        drop(api);
+        fs::remove_dir_all(root).expect("remove SSD test root");
+    }
+
+    #[limit_thirdparty::tokio::test]
+    async fn early_ssd_large_put_queues_metadata_without_generation_flights() {
+        let root = std::env::temp_dir().join(format!(
+            "fluxon-early-large-put-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let api = ClientKvApi::construct(ClientKvApiNewArg {
+            test_spec_config: TestSpecConfig::default(),
+            owner_hot_cache_capacity_bytes: None,
+            owner_local_reserve_physical_capacity_bytes: 0,
+            allocation_authority:
+                crate::master_seg_manager::msg_pack::SegmentAllocationAuthority::Master,
+            owner_placement_class:
+                crate::master_seg_manager::msg_pack::OwnerPlacementClass::Invalid,
+            ssd_storage: Some(KvSsdStorageInit {
+                root_limits: vec![KvSsdStorageRootLimit {
+                    root_dir: root.clone(),
+                    limit_bytes: MIN_CAPACITY_BYTES,
+                }],
+                uring_mode: crate::config::KvSsdUringMode::SingleBuffer,
+                backend: crate::config::KvSsdStorageBackend::Native,
+                writeback: crate::config::KvSsdWritebackConfig::default(),
+            }),
+        })
+        .await
+        .expect("construct SSD-enabled test ClientKvApi");
+        let item_count = crate::kv_ssd_storage::MAX_PERSIST_BATCH_ITEMS + 1;
+        api.inner().start_early_owner_local_ssd_puts(
+            (0..item_count)
+                .map(|index| (format!("early-large-put-{index}"), (84, 1), 4096))
+                .collect(),
+        );
+        let queue = api
+            .inner()
+            .owner_early_ssd_queue
+            .as_ref()
+            .expect("SSD queue");
+        assert_eq!(queue.snapshot().enqueued_items, item_count as u64);
+        assert_eq!(queue.snapshot().queued_items, item_count);
+        assert_eq!(
+            api.inner()
+                .owner_local_ssd_put_counters
+                .leaders
+                .load(Ordering::Relaxed),
+            0,
+            "queued metadata must not create generation flights"
+        );
+        for index in 0..item_count {
+            let key = format!("early-large-put-{index}");
+            assert!(
+                api.inner()
+                    .owner_key_control
+                    .lock_key(&key)
+                    .get(&key)
+                    .is_none()
+            );
+        }
+        for _ in 0..2 {
+            limit_thirdparty::tokio::time::timeout(Duration::from_secs(5), async {
+                fluxon_framework::LogicalModule::prepare_shutdown(&api)
+                    .await
+                    .unwrap();
+                fluxon_framework::LogicalModule::before_shutdown(&api)
+                    .await
+                    .unwrap();
+                fluxon_framework::LogicalModule::shutdown(&api)
+                    .await
+                    .unwrap();
+            })
+            .await
+            .expect("unstarted SSD dispatcher shutdown must complete");
+        }
+        assert_eq!(queue.snapshot().queued_items, 0);
+        assert_eq!(queue.snapshot().closed_dropped, item_count as u64);
         drop(api);
         fs::remove_dir_all(root).expect("remove SSD test root");
     }
@@ -15302,6 +15497,9 @@ impl ClientKvApi {
                             admission_not_admitted_bytes = snapshot.remote_put_admission_not_admitted_bytes,
                             "owner unified remote Put flight snapshot"
                         );
+                        let early = view_task.client_kv_api().inner()
+                            .owner_early_ssd_queue.as_ref()
+                            .map(|queue| queue.snapshot()).unwrap_or_default();
                         tracing::info!(
                             active = snapshot.local_ssd_put_flights_active,
                             leaders = snapshot.local_ssd_put_flight_leaders,
@@ -15312,6 +15510,13 @@ impl ClientKvApi {
                             dropped = snapshot.local_ssd_put_dropped,
                             obsolete = snapshot.local_ssd_put_obsolete,
                             failed = snapshot.local_ssd_put_failed,
+                            early_queued_items = early.queued_items,
+                            early_peak_queued_items = early.peak_queued_items,
+                            early_enqueued_items = early.enqueued_items,
+                            early_queue_full_dropped = early.queue_full_dropped,
+                            early_closed_dropped = early.closed_dropped,
+                            early_inflight_batches = early.inflight_batches,
+                            early_peak_inflight_batches = early.peak_inflight_batches,
                             "owner local SSD Put flight snapshot"
                         );
                         if snapshot.hot_cache_capacity_bytes > 0 {
@@ -15386,6 +15591,7 @@ impl ClientKvApi {
             test_spec_config.owner_remote_put_max_inflight_items,
         );
         let owner_local_ssd_put_counters = Arc::new(OwnerLocalSsdPutCounters::default());
+        let owner_early_ssd_queue = ssd_storage.as_ref().map(|_| put::OwnerEarlySsdQueue::new());
         let owner_hot_retry_queue = Arc::new(OwnerHotRetryQueue::new(owner_hot_counters.clone()));
         let owner_hot_cache = owner_hot_cache_capacity_bytes.map(|capacity_bytes| {
             build_owner_hot_cache(
@@ -15426,6 +15632,7 @@ impl ClientKvApi {
             owner_remote_put_counters,
             owner_remote_put_admission,
             owner_local_ssd_put_counters,
+            owner_early_ssd_queue,
             planned_get_counters: OwnerPlannedGetCounters::default(),
             ssd_stage_counters: OwnerSsdStageCounters::default(),
             owner_hot_retry_queue,
@@ -15492,6 +15699,7 @@ impl ClientKvApi {
             rpc_caller_batch_put_append_done: RPCCaller::new(),
             rpc_caller_batch_evict_owner_source: RPCCaller::new(),
             rpc_caller_batch_publish_owner_ssd: RPCCaller::new(),
+            rpc_caller_batch_ssd_replica_evict: RPCCaller::new(),
             rpc_caller_delete: RPCCaller::new(),
             rpc_caller_batch_delete_ack: RPCCaller::new(),
             rpc_caller_batch_is_exist: RPCCaller::new(),
@@ -15579,6 +15787,9 @@ impl ClientKvApi {
             .regist(inner.view.p2p_module());
         inner
             .rpc_caller_batch_publish_owner_ssd
+            .regist(inner.view.p2p_module());
+        inner
+            .rpc_caller_batch_ssd_replica_evict
             .regist(inner.view.p2p_module());
         inner.rpc_caller_delete.regist(inner.view.p2p_module());
         inner
@@ -16070,6 +16281,21 @@ impl ClientKvApi {
             .expect("delete_ack_batch rx already taken, that's impossible");
         delete::spawn_owner_delete_ack_batch(inner.view.clone_view(), delete_ack_batch_rx);
 
+        if let Some(store) = inner.ssd_storage.as_ref() {
+            let eviction_rx = store
+                .take_eviction_rx()
+                .expect("SSD eviction receiver must only be taken during client initialization");
+            spawn_ssd_replica_eviction_batch(inner.view.clone_view(), eviction_rx);
+            put::spawn_owner_early_ssd_dispatcher(
+                inner.view.clone_view(),
+                inner
+                    .owner_early_ssd_queue
+                    .as_ref()
+                    .expect("SSD queue")
+                    .clone(),
+            );
+        }
+
         if inner.owner_hot_cache.is_some() {
             if let Some(owner_hot_eviction_rx) = inner.owner_hot_eviction_rx.lock().take() {
                 put::spawn_owner_source_eviction_dispatcher(
@@ -16289,6 +16515,9 @@ impl LogicalModule for ClientKvApi {
 
     async fn prepare_shutdown(&self) -> Result<(), Self::Error> {
         self.0.native_put_operations.close_admission();
+        if let Some(queue) = self.0.owner_early_ssd_queue.as_ref() {
+            queue.close_admission();
+        }
         Ok(())
     }
 
@@ -16296,6 +16525,9 @@ impl LogicalModule for ClientKvApi {
         // The framework has signalled admission cancellation, while P2P and
         // the cluster manager remain live for reservation cleanup.
         self.0.native_put_operations.wait_finished().await?;
+        if let Some(queue) = self.0.owner_early_ssd_queue.as_ref() {
+            queue.wait_finished().await;
+        }
         // High cohesion: handle KV client drop readiness here
         tracing::info!("ClientKvApi before_shutdown: waiting until safe to drop");
         loop {
